@@ -1,9 +1,9 @@
 #[cfg(any(test, debug_assertions))]
 use super::super::AssemblerStage;
 use super::super::{
-    Assembler, COMPARE_OP, Instruction, Item, LayoutAssembler, NOP, POP_JUMP_IF_FALSE,
-    POP_JUMP_IF_TRUE, STORE_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT, UNPACK_SEQUENCE,
-    UnoptimizedCode, ends_scope, is_unconditional_jump,
+    Assembler, COMPARE_OP, CONTAINS_OP, IS_OP, Instruction, Item, LayoutAssembler, NOP,
+    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, STORE_FAST, STORE_FAST_STORE_FAST, TO_BOOL, UNARY_NOT,
+    UNPACK_SEQUENCE, UnoptimizedCode, ends_scope, is_unconditional_jump,
 };
 use crate::CompileError;
 use crate::assembler::ConstantTable;
@@ -93,8 +93,8 @@ fn optimize_boolean_conversions_and_redundant_stores(
 
     let was_boolean_conversion = items
         .iter()
-        // Match the graph pass: a comparison moved into TO_BOOL leaves a folded slot.
-        .map(|item| matches!(item, Item::Instruction(instruction) if matches!(instruction.opcode, TO_BOOL | UNARY_NOT | COMPARE_OP)))
+        // A comparison folded into TO_BOOL or UNARY_NOT leaves a redundant slot.
+        .map(|item| matches!(item, Item::Instruction(instruction) if matches!(instruction.opcode, TO_BOOL | UNARY_NOT | COMPARE_OP | CONTAINS_OP | IS_OP)))
         .collect::<Vec<_>>();
     if let Some(constants) = constants {
         remove_none_comparison_boolean_conversions(

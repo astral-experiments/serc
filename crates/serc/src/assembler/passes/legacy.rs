@@ -13,9 +13,9 @@ use crate::target::opcodes::{
     CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, CLEANUP_THROW, COMPARE_OP, CONTAINS_OP, COPY,
     COPY_FREE_VARS, END_ASYNC_FOR, END_SEND, GET_ANEXT, IS_OP, JUMP_BACKWARD,
     JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LOAD_CLOSURE, LOAD_CONST, LOAD_FAST,
-    LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP, PUSH_NULL, RERAISE, RESUME,
-    RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_ATTR, STORE_DEREF, STORE_FAST,
-    STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, STORE_NAME, STORE_SLICE,
+    LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_EXCEPT, POP_TOP, PUSH_NULL, RERAISE,
+    RESUME, RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_ATTR, STORE_DEREF,
+    STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, STORE_NAME, STORE_SLICE,
     STORE_SUBSCR, TO_BOOL, UNARY_NOT, YIELD_VALUE,
 };
 use crate::target::operands::ResumeLocation;
@@ -31,7 +31,7 @@ impl Assembler {
     /// Restores erased return `POP_BLOCK` records until each legacy target's native removal phase.
     pub(super) fn restore_legacy_return_pop_blocks(
         graph: &mut BlockGraph,
-        boundaries: &FxHashMap<Label, usize>,
+        boundaries: &FxHashMap<Label, (usize, SourceLocation)>,
     ) {
         if boundaries.is_empty() {
             return;
@@ -43,13 +43,9 @@ impl Assembler {
                 match item {
                     Item::Instruction(instruction) => depth = instruction.depth_after(),
                     Item::Label(label) => {
-                        if let Some(&count) = boundaries.get(label) {
-                            let mut marker = Instruction::synthetic(
-                                NOP,
-                                Operand::Value(0),
-                                SourceLocation::NONE,
-                                depth,
-                            );
+                        if let Some(&(count, location)) = boundaries.get(label) {
+                            let mut marker =
+                                Instruction::synthetic(NOP, Operand::Value(0), location, depth);
                             marker.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
                             marker.fusion_policy.mark_converted_pop_block();
                             insertions.push((ItemPosition::new(block, offset + 1), marker, count));
@@ -164,7 +160,7 @@ impl OptimizationPipeline {
         }
         let mut repeated_predecessors = if self.python_version == PythonVersion::Py312 {
             let mut tails = self.legacy_repeated_tail_predecessors(&original_arrays);
-            self.record_repeated_conditional_fallthroughs(&original_arrays, &mut tails);
+            self.record_repeated_exit_predecessors(&original_arrays, &mut tails);
             tails
         } else {
             Vec::new()
@@ -275,7 +271,8 @@ impl OptimizationPipeline {
                         && *instruction == expected
                         && (instructions.next().is_none()
                             || (expected.opcode == NOP
-                                && expected.fusion_policy.is_converted_pop_block()))
+                                && expected.fusion_policy.is_converted_pop_block())
+                            || expected.opcode == POP_EXCEPT)
                         && predecessors.get(&block) == Some(&before)
                     {
                         predecessors.insert(block, native);
@@ -1001,6 +998,13 @@ impl OptimizationPipeline {
                 // Inlineable unlocated joins use the same flag for a later modern
                 // copy phase; they contain no native NOP and remain threadable here.
                 if !is_unconditional_jump(bridge.opcode)
+                    // In 3.13 a target's omitted NOPs still precede its jump until
+                    // the cleanup pass following jump threading.
+                    || (self.python_version == PythonVersion::Py313
+                        && self.graph[target].items().iter().map_while(|item| match item {
+                            Item::Label(label) => Some(label),
+                            Item::Instruction(_) => None,
+                        }).any(|label| self.exception_owner_provenance.legacy_early_copy_slots.contains_key(label)))
                     || (!bridge.jump_policy.allows_threading_target()
                         && !bridge.no_location_policy.allows_block_inlining())
                     // 3.13 does not thread conditional jumps through JUMP_NO_INTERRUPT.
@@ -1362,8 +1366,10 @@ impl OptimizationPipeline {
                     // Ordinary try lowering keeps POP_BLOCK as a hidden copy
                     // slot. Its surviving unlocated exit jump has the same
                     // original constant-loop predecessor before line resolution.
-                    || (is_unconditional_jump(first.opcode)
-                        && first.location == SourceLocation::NONE)
+                    // After copying a small return, that same jump is its leading NOP.
+                    || (first.location == SourceLocation::NONE
+                        && (is_unconditional_jump(first.opcode)
+                            || (first.opcode == NOP && self.graph[target].last_instruction().is_some_and(|tail| crate::target::is_scope_exit_for(self.python_version, tail.opcode)))))
                 })
                 && restored.insert((source, target))
             {
@@ -2132,8 +2138,8 @@ impl OptimizationPipeline {
         Some(tails)
     }
 
-    /// Records a jump reached only by falling through a twice-queued conditional.
-    fn record_repeated_conditional_fallthroughs(
+    /// Retains the native counts on exit jumps and handler cleanups reached from a twice-queued block.
+    fn record_repeated_exit_predecessors(
         &self,
         arrays: &LegacyInstructionArrays,
         tails: &mut Vec<(BasicBlockId, Instruction, usize, usize)>,
@@ -2147,70 +2153,92 @@ impl OptimizationPipeline {
             self.graph.label_block(last.jump_target()?)
         };
         let order = self.graph.order();
-        for (index, &[first, second, exit]) in order.array_windows().enumerate() {
-            if conditional_target(first) != Some(second)
-                || conditional_target(second).is_none_or(|target| target == exit)
-            {
+        for (index, &[first, second, fallthrough]) in order.array_windows().enumerate() {
+            if conditional_target(first) != Some(second) {
                 continue;
             }
-            let [Some(first_array), Some(second_array), Some(exit_array)] =
-                [first, second, exit].map(|block| arrays.get(block))
-            else {
-                continue;
-            };
-            if first_array == second_array || second_array == exit_array {
+            let target = block_jump_target(self.graph[second].items())
+                .and_then(|label| self.graph.label_block(label));
+            if target == Some(fallthrough) {
                 continue;
             }
-            let mut instructions = self.graph[exit]
-                .items()
-                .iter()
-                .filter_map(Item::as_instruction);
-            let Some(jump) = instructions.next() else {
-                continue;
-            };
-            if instructions.next().is_some()
-                || !matches!(jump.opcode, JUMP_FORWARD | JUMP_BACKWARD)
-                || jump.location != SourceLocation::NONE
-                || tails.iter().any(|(block, ..)| *block == exit)
-            {
-                continue;
-            }
-            let predecessors = incoming.get_or_insert_with(|| self.legacy_predecessors());
-            if predecessors.get(&second) != Some(&2) || predecessors.get(&exit) != Some(&1) {
-                continue;
-            }
-            // SETUP targets also enter the native walk. Both successors must be
-            // reached exclusively via the ordinary edges above.
-            let enters_join = |label| {
-                self.graph
-                    .label_block(label)
-                    .is_some_and(|block| block == second || block == exit)
-            };
-            if self
-                .exception_regions
-                .iter()
-                .any(|region| enters_join(region.target))
-                || self
-                    .exception_owner_provenance
-                    .legacy_native_setup_targets
+            for exit in std::iter::once(fallthrough).chain(target) {
+                let [Some(first_array), Some(second_array), Some(exit_array)] =
+                    [first, second, exit].map(|block| arrays.get(block))
+                else {
+                    continue;
+                };
+                if first_array == second_array || second_array == exit_array {
+                    continue;
+                }
+                let mut instructions = self.graph[exit]
+                    .items()
                     .iter()
-                    .any(|(_, label)| enters_join(*label))
-            {
-                continue;
+                    .filter_map(Item::as_instruction);
+                let Some(head) = instructions.next() else {
+                    continue;
+                };
+                let sole_jump = exit == fallthrough
+                    && block_has_fallthrough(self.graph[second].items())
+                    && matches!(head.opcode, JUMP_FORWARD | JUMP_BACKWARD)
+                    && instructions.clone().next().is_none();
+                // A handler cleanup is reached by the second block's jump. Cold placement
+                // can reverse that jump without changing the native predecessor count.
+                let handler_cleanup = Some(exit) == target
+                    && (head.opcode == POP_EXCEPT
+                        || (head.opcode == NOP
+                            && head.fusion_policy.is_converted_pop_block()
+                            && instructions.next().is_some_and(|ins| {
+                                ins.opcode == POP_EXCEPT && ins.location == SourceLocation::NONE
+                            })))
+                    && self.graph[exit]
+                        .last_instruction()
+                        .is_some_and(|ins| is_unconditional_jump(ins.opcode))
+                    && instructions.all(|ins| ins.location == SourceLocation::NONE);
+                if (!sole_jump && !handler_cleanup)
+                    || head.location != SourceLocation::NONE
+                    || tails.iter().any(|(block, ..)| *block == exit)
+                {
+                    continue;
+                }
+                let predecessors = incoming.get_or_insert_with(|| self.legacy_predecessors());
+                if predecessors.get(&second) != Some(&2) || predecessors.get(&exit) != Some(&1) {
+                    continue;
+                }
+                // SETUP targets also enter the native walk. Both successors must be
+                // reached exclusively via the ordinary edges above.
+                let enters_join = |label| {
+                    self.graph
+                        .label_block(label)
+                        .is_some_and(|block| block == second || block == exit)
+                };
+                if self
+                    .exception_regions
+                    .iter()
+                    .any(|region| enters_join(region.target))
+                    || self
+                        .exception_owner_provenance
+                        .legacy_native_setup_targets
+                        .iter()
+                        .any(|(_, label)| enters_join(*label))
+                {
+                    continue;
+                }
+                // The first conditional queues its target and fallthrough before
+                // either is marked visited. Each pop of the second block
+                // charges both surviving successors.
+                let mut expected = *head;
+                if sole_jump
+                    && let Some(target) = head
+                        .forward_target()
+                        .and_then(|label| self.graph.label_block(label))
+                    && order.get(index + 3) == Some(&target)
+                {
+                    // Removing a jump to the following block preserves its location and predecessors.
+                    legacy_nop(&mut expected);
+                }
+                tails.push((exit, expected, 1, 2));
             }
-            // The first conditional queues its target and fallthrough before
-            // either is marked visited. Each pop of the second conditional
-            // charges its fallthrough; the jump therefore has two predecessors.
-            let mut expected = *jump;
-            if let Some(target) = jump
-                .forward_target()
-                .and_then(|label| self.graph.label_block(label))
-                && order.get(index + 3) == Some(&target)
-            {
-                // Removing a jump to the following block preserves its location and predecessors.
-                legacy_nop(&mut expected);
-            }
-            tails.push((exit, expected, 1, 2));
         }
     }
 
@@ -2404,7 +2432,16 @@ impl OptimizationPipeline {
                 }
             }
         }
+        let shared_cleanup_blocks = if self.python_version == PythonVersion::Py313 {
+            self.folded_original_predecessor_targets
+                .iter()
+                .filter_map(|label| self.graph.label_block(*label))
+                .collect::<FxHashSet<_>>()
+        } else {
+            FxHashSet::default()
+        };
         for (index, block) in order.iter().copied().enumerate() {
+            let shared_cleanup = shared_cleanup_blocks.contains(&block);
             let mut location = SourceLocation::NONE;
             let mut follows_generator_prefix = false;
             for instruction in self.graph.instructions_mut(block) {
@@ -2417,7 +2454,11 @@ impl OptimizationPipeline {
                     // Native propagation ignores modern preservation flags except
                     // certified shared POP_BLOCKs and later prefix insertion.
                     if !inserted_generator_pop
-                        && !legacy_pop_block_keeps_no_location(self.python_version, instruction)
+                        && !legacy_shared_entry_keeps_no_location(
+                            self.python_version,
+                            instruction,
+                            shared_cleanup,
+                        )
                     {
                         instruction.location = location;
                     }
@@ -2451,7 +2492,7 @@ impl OptimizationPipeline {
                 if predecessors.get(&successor) == Some(&1)
                     && let Some(first) = self.graph.instructions_mut(successor).next()
                     && first.location.line < 0
-                    && !legacy_pop_block_keeps_no_location(self.python_version, first)
+                    && !legacy_shared_entry_keeps_no_location(self.python_version, first, shared_cleanup_blocks.contains(&successor))
                     // A cold bridge beyond an erased loop test has no located
                     // predecessor in its original layout.
                     && !(self.python_version == PythonVersion::Py313
@@ -2466,16 +2507,21 @@ impl OptimizationPipeline {
     }
 }
 
-/// Keeps a shared `POP_BLOCK` unlocated while 3.13 still has its folded predecessor.
+/// Keeps a shared `POP_BLOCK` or synthesized format prefix unlocated across 3.13 folding.
 ///
 /// The compiler certifies joins whose constant-test false edge has already been
 /// elided. Native 3.13 resolves locations before folding that edge; 3.12 folds
 /// first, so its remaining predecessor may donate a location normally.
-fn legacy_pop_block_keeps_no_location(version: PythonVersion, instruction: &Instruction) -> bool {
+fn legacy_shared_entry_keeps_no_location(
+    version: PythonVersion,
+    instruction: &Instruction,
+    shared_cleanup: bool,
+) -> bool {
     version == PythonVersion::Py313
-        && instruction.opcode == NOP
-        && instruction.fusion_policy.is_converted_pop_block()
         && instruction.no_location_policy.preserves_location()
+        && (instruction.opcode == LOAD_CONST
+            || (instruction.opcode == POP_EXCEPT && shared_cleanup)
+            || (instruction.opcode == NOP && instruction.fusion_policy.is_converted_pop_block()))
 }
 
 /// Recovers native 3.13's direction-independent JUMP pseudo-op.

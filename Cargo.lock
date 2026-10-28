@@ -1302,8 +1302,7 @@ dependencies = [
 [[package]]
 name = "ruff_python_parser"
 version = "0.0.15"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5e8801707fbf7f737fb8c924cf7c47c32d6bea0f5cb6aabdef70db9cd4ee05cb"
+source = "git+https://github.com/astral-sh/ruff?rev=9d0f58b1d2fb1cf1062d3ff99b18ebf293563f6f#9d0f58b1d2fb1cf1062d3ff99b18ebf293563f6f"
 dependencies = [
  "bitflags",
  "bstr",

@@ -2,6 +2,10 @@
 members = ["crates/*"]
 resolver = "2"
 
+[patch.crates-io]
+# Backport the semicolon parser fixes until the next Ruff dependency update.
+ruff_python_parser = { git = "https://github.com/astral-sh/ruff", rev = "9d0f58b1d2fb1cf1062d3ff99b18ebf293563f6f" }
+
 [workspace.package]
 edition = "2024"
 rust-version = "1.96.0"

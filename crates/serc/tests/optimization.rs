@@ -1960,20 +1960,24 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 
 #[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
-    let source = "def sample(flag, left, right):
+    for (binding, cause) in [(" as error", " from error"), ("", "")] {
+        let source = format!(
+            "def sample(flag, left, right):
     if flag:
         try:
             right = first()
-        except KeyError as error:
+        except KeyError{binding}:
             try:
                 left = second()
             except ValueError:
-                raise RuntimeError from error
+                raise RuntimeError{cause}
     else:
         left = third()
     return left, right
-";
-    assert_matches_cpython(source, "nested_recovery_tuple.py", &LEVELS);
+"
+        );
+        assert_matches_cpython(&source, "nested_recovery_tuple.py", &LEVELS);
+    }
 }
 
 #[test]
@@ -8713,6 +8717,7 @@ fn while_break_keeps_fallthrough_else_exception_owner() {
                     "result = ready",
                     "pass",
                     "if ready:\n            return ready",
+                    "if ready:\n            resource.closed()\n        return ready",
                 ] {
                     let source = format!(
                         "{coroutine}def sample(resource, items, ready):\n    try:\n        while {condition}:\n            {prefix}if not ready:\n                break\n    except CancelledError:\n        raise\n    except Error as error:\n        resource.failed(error)\n    else:\n        {otherwise}\n"
@@ -9683,7 +9688,15 @@ fn threaded_handler_booleans_append_an_unowned_marker() {
             or second
         ) or other
 ";
-    for source in [source.to_owned(), source.replace(" or ", " and ")] {
+    let same_line = source.replace(
+        "(\n            first\n            or second\n        )",
+        "(first or second)",
+    );
+    for source in [
+        source.to_owned(),
+        source.replace(" or ", " and "),
+        same_line,
+    ] {
         assert_matches_cpython_versions(
             &source,
             "threaded_handler_boolean.py",
@@ -25976,4 +25989,9190 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
         return result
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
+}
+
+#[test]
+fn an_empty_finally_copies_its_local_return() {
+    let source = r"def read(fetch):
+    try:
+        value = fetch()
+    except ValueError:
+        raise
+    finally:
+        assert fetch.ready
+    return value
+";
+    assert_matches_cpython(source, "empty_finally_return.py", &LEVELS);
+}
+
+#[test]
+fn folded_handler_preserves_the_managed_assertion_exit() {
+    let source = "def check(manager, value):
+    with manager:
+        try:
+            prepare(value)
+            assert valid(value)
+        except ValueError as error:
+            assert False, error
+";
+    assert_matches_cpython(source, "managed_assertion_exit.py", &LEVELS);
+}
+
+#[test]
+fn copied_membership_keeps_the_return_cleanup_owners() {
+    let source = r#"async def read(flag, item, value):
+    state = "idle"
+    try:
+        if flag:
+            one()
+            two()
+            three()
+            return item
+        return item
+    except KeyError:
+        state = "old"
+    except ValueError:
+        state = "bad"
+    finally:
+        result = value if state in {"old", "bad", "idle"} else None
+"#;
+    assert_matches_cpython(source, "copied_membership_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn nested_guard_keeps_its_backedge_before_a_discarded_assertion() {
+    let source = r"
+def collect(items, enabled, ready):
+    for item in items:
+        if enabled:
+            if ready:
+                item = (value for value in items)
+            assert item
+        else:
+            item = fallback()
+        assert item
+";
+    assert_matches_cpython(source, "nested_guard_backedge.py", &LEVELS);
+}
+
+#[test]
+fn erased_short_circuit_condition_keeps_the_shared_loop_backedge() {
+    let source = r"
+def process(items, left, right):
+    for item in items:
+        if left or right:
+            assert item
+        assert left
+";
+    assert_matches_cpython(source, "shared_short_circuit_backedge.py", &LEVELS);
+}
+
+#[test]
+fn branched_handler_exits_share_a_local_attribute_return() {
+    let source = r"def lookup(obj, outer, inner):
+    try:
+        if outer:
+            if inner:
+                take()
+            else:
+                release()
+    except LookupError:
+        if inner:
+            recover()
+        else:
+            reset()
+    return obj.value
+";
+    assert_matches_cpython(source, "handler_attribute_return.py", &LEVELS);
+}
+
+#[test]
+fn copied_try_exits_keep_their_predecessors_positions() {
+    let source = r"def choose(items, update, stop, value):
+    for item in items:
+        try:
+            if item > 0:
+                if update:
+                    value = read(item)
+            elif item < 0:
+                if stop:
+                    break
+            else:
+                continue
+        except LookupError:
+            raise
+        observe(value)
+    return value
+";
+    assert_matches_cpython_versions(
+        source,
+        "copied_try_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn folded_normal_edges_keep_the_manager_exit_unlocated() {
+    let source = r"def guarded(manager, visit):
+    with manager:
+        try:
+            visit()
+        except LookupError:
+            pass
+        else:
+            assert False
+
+def consume(outer, inner, receive, finish):
+    with outer:
+        with inner:
+            try:
+                while True:
+                    receive()
+            finally:
+                finish()
+";
+    assert_matches_cpython(source, "manager_exit.py", &LEVELS);
+}
+
+#[test]
+fn folded_guard_drops_its_nop_before_an_implicit_return() {
+    let source = r#"
+def choose(ready):
+    if ready:
+        if not "ready":
+            return False
+
+
+if __debug__ and 0:
+    run()
+"#;
+    assert_matches_cpython(source, "folded_guard_return.py", &LEVELS);
+}
+
+#[test]
+fn small_match_return_is_copied_before_handler_jump_locations() {
+    let source = r"
+def choose(subject, first, second):
+    match subject:
+        case ():
+            if first and second:
+                try:
+                    run()
+                    return True
+                except ValueError:
+                    pass
+    return False
+";
+    assert_matches_cpython(source, "short_match_return.py", &LEVELS);
+}
+
+#[test]
+fn try_else_exits_after_a_finalizer_need_a_unique_guard_donor() {
+    for guard in ["active", "record is not None and active"] {
+        let source = format!(
+            "def process(records, active, result):
+    for record in records:
+        try:
+            try:
+                prepare()
+            except LookupError:
+                raise
+            else:
+                if {guard}:
+                    try:
+                        consume(record)
+                    finally:
+                        record = None
+        except ValueError:
+            raise
+        finally:
+            finish(result)
+"
+        );
+        assert_matches_cpython(&source, "shared_try_else_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_finalizer_guards_copy_iterator_returns_in_source_order() {
+    let source = r"def process(items, options):
+    for item in items:
+        try:
+            consume(item)
+        except Interrupted:
+            break
+        finally:
+            if options.enabled:
+                if options.preview:
+                    show(item)
+                if options.save:
+                    save(item)
+";
+    assert_matches_cpython(source, "copied_iterator_return_order.py", &LEVELS);
+}
+
+#[test]
+fn nested_try_branch_copies_the_outer_constant_return() {
+    let source = r"def choose(outer, first, second, fallback):
+    try:
+        if outer:
+            try:
+                if first:
+                    pass
+                elif second:
+                    pass
+            except LookupError:
+                pass
+        elif fallback:
+            pass
+    except ValueError:
+        pass
+    return 0
+";
+    assert_matches_cpython(source, "nested_try_branch_return.py", &LEVELS);
+}
+
+#[test]
+fn an_iterator_break_keeps_the_conditional_arm_owner_before_an_attribute_return() {
+    for guard in ["", "    assert store.value is not None\n"] {
+        let source = format!(
+            "def choose(store, items, key):\n    if store.ready:\n        try:\n            if key is not None:\n                for item in items:\n                    if item:\n                        break\n            else:\n                store.value = key\n        except ValueError:\n            pass\n{guard}    return defaults.value\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "conditional_iterator_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn a_conditional_value_reuses_the_unprotected_setup_after_nested_managers() {
+    for prefix in [
+        "",
+        "    pass\n",
+        "    result = None\n",
+        "    if other:\n        work()\n",
+    ] {
+        let source = format!(
+            "def choose(value, other):\n{prefix}    with first(), second(), third():\n        try:\n            result = take() if value is None else other\n        except ValueError:\n            pass\n    return other\n"
+        );
+        assert_matches_cpython(&source, "nested_conditional_value.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_match_keeps_a_return_guards_original_success_jump() {
+    for (test, otherwise, continuation) in [
+        ("item", "pass", "return values, fallback, item"),
+        (
+            "item is None",
+            "return None",
+            "try:\n        answer = values[fallback]\n    except IndexError:\n        return None\n    return answer",
+        ),
+    ] {
+        let source = format!(
+            "def choose(values, fallback):
+    match values:
+        case [outer]:
+            match outer:
+                case [item]:
+                    if {test}:
+                        return fallback
+                case _:
+                    {otherwise}
+        case _:
+            {otherwise}
+    {continuation}
+"
+        );
+        assert_matches_cpython(&source, "nested_match_return_guard.py", &LEVELS);
+    }
+}
+
+#[test]
+fn finalizer_branches_copy_the_iterator_discard_after_a_break() {
+    let source = r#"def scan(items, ready, target):
+    if False:
+        use("unused")
+    for item in items:
+        try:
+            break
+        finally:
+            if ready:
+                use(item)
+            elif target is None:
+                use("fallback")
+    finish()
+"#;
+    assert_matches_cpython(source, "branched_finalizer_break.py", &LEVELS);
+}
+
+#[test]
+fn folded_assertion_arms_wait_to_copy_the_following_return() {
+    for test in [
+        "value < left if ready else 2",
+        "2 if ready else value < left",
+    ] {
+        let source = format!(
+            "def choose(items, value, left, right, ready):
+    selected = [item for item in items]
+    assert {test}
+    return left, right
+"
+        );
+        assert_matches_cpython(&source, "folded_assertion_arm.py", &LEVELS);
+    }
+}
+
+#[test]
+fn comparison_cleanup_copies_a_small_iterator_return() {
+    for result in ["'missing'", "(low, high)"] {
+        let source = format!(
+            "def select(items, ready, low, mid, high):
+    if ready:
+        pass
+    else:
+        for item in items:
+            if low == mid == high:
+                return item
+            return {result}
+"
+        );
+        assert_matches_cpython(&source, "iterator_comparison_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn discarded_conditional_values_copy_their_handler_exit() {
+    for expression in [
+        "left(value) if flag else right(value)",
+        "left(value) or right(value)",
+    ] {
+        let source = format!(
+            "async def run(flag, value):
+    try:
+        work()
+    except ValueError:
+        {expression}
+    finally:
+        finish()
+"
+        );
+        assert_matches_cpython(&source, "handler_value_discard.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_comprehension_attribute_store_donates_its_branch_return() {
+    let source = r"def collect(obj, items, ready):
+    if ready:
+        if obj.values is None:
+            obj.values = [item for item in items]
+        assert obj.values
+";
+    assert_matches_cpython(source, "comprehension_attribute_return.py", &LEVELS);
+}
+
+#[test]
+fn returning_calls_copy_short_finalizers_with_their_exception_ranges() {
+    for cleanup in ["del value", "pass", "del value, flag"] {
+        let source = format!(
+            "def choose(value, flag):\n    try:\n        return build(value if flag else None)\n    finally:\n        {cleanup}\n"
+        );
+        assert_matches_cpython(&source, "returning_call_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_same_line_loop_return_keeps_its_guards_false_edge() {
+    let source = r"def scan(items, wanted):
+    for item in items:
+        try:
+            if wanted in item: return
+        except ValueError:
+            pass
+        if item:
+            consume(item)
+";
+    assert_matches_cpython(source, "same_line_loop_return.py", &LEVELS);
+}
+
+#[test]
+fn managed_finalizers_copy_saved_and_constant_iterator_returns() {
+    let source = r"def find(items, manager, value):
+    try:
+        for item in items:
+            try:
+                return value
+            finally:
+                with manager:
+                    record(item)
+    except ValueError:
+        pass
+
+def visit(groups, manager):
+    for group in groups:
+        for item in group:
+            try:
+                work(item)
+            except ValueError as error:
+                return
+            finally:
+                with manager:
+                    record(item)
+";
+    assert_matches_cpython(source, "managed_iterator_returns.py", &LEVELS);
+}
+
+#[test]
+fn a_folded_branch_does_not_repeat_its_line_before_a_finalizer() {
+    let source = r"def pick():
+    try:
+        if True:
+            work()
+        else:
+            fallback()
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "folded_branch_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn wide_comparison_arm_keeps_other_tuple_return_copies_in_order() {
+    let source = r"def choose(low, value, high, first, outer, inner, selected, left, right):
+    if first:
+        if low < value < high:
+            left = low + value
+        else:
+            left = low
+    elif outer:
+        if inner:
+            if selected:
+                right = high
+            else:
+                right = low + left
+        else:
+            right = low
+    else:
+        right = high
+    return left, right
+";
+    assert_matches_cpython(source, "wide_comparison_arm.py", &LEVELS);
+}
+
+#[test]
+fn a_folded_condition_skips_the_shared_fallthrough_jump() {
+    let source = r"def pick(enabled, take, value, alternate):
+    if enabled:
+        if value if take else False:
+            apply()
+    elif alternate:
+        fallback()
+    finish()
+";
+    assert_matches_cpython(source, "folded_fallthrough_jump.py", &LEVELS);
+}
+
+#[test]
+fn nested_finalizer_store_exits_respect_guard_reachability() {
+    let source = r"async def finish(state):
+    def closing():
+        return closed
+    try:
+        try:
+            work()
+        finally:
+            if state and state.ready:
+                value = None
+    finally:
+        closed = True
+
+def unreachable_store():
+    try:
+        try:
+            work()
+        finally:
+            if False:
+                value = None
+    finally:
+        closed = True
+";
+    assert_matches_cpython(source, "nested_finalizer_store.py", &LEVELS);
+}
+
+#[test]
+fn a_nested_handler_preserves_the_normal_exits_trailing_pass() {
+    let source = r"def scan(items):
+    try:
+        work()
+        pass
+    except:
+        for item in items:
+            try:
+                consume(item)
+            except:
+                break
+    finish()
+";
+    assert_matches_cpython(source, "nested_handler_trailing_pass.py", &LEVELS);
+}
+
+#[test]
+fn nested_branch_joins_copy_the_original_normal_try_arrays() {
+    let source = r"def choose(a, b, c, d, selected):
+    if a:
+        if b:
+            if c:
+                if d:
+                    try:
+                        if selected:
+                            use()
+                        else:
+                            other()
+                    except ValueError:
+                        pass
+                else:
+                    pass
+            else:
+                pass
+        else:
+            pass
+    else:
+        pass
+    return True
+";
+    assert_matches_cpython(source, "nested_branch_joins.py", &LEVELS);
+}
+
+#[test]
+fn final_else_supplies_the_normal_finalizer_jump_before_manager_cleanup() {
+    let source = r"def finish(manager, first, second):
+    with manager as resource:
+        try:
+            work(resource)
+        finally:
+            if first:
+                pass
+            elif second:
+                other()
+            else:
+                from .helpers import done
+";
+    assert_matches_cpython(source, "manager_final_else.py", &LEVELS);
+}
+
+#[test]
+fn a_returning_finalizer_copies_the_call_after_a_conditional_argument() {
+    let source = r"def run(enabled, saved, value, flag):
+    if enabled:
+        try:
+            return saved
+        finally:
+            finish(arg=value if flag else None)
+";
+    assert_matches_cpython(source, "returning_finalizer_call.py", &LEVELS);
+}
+
+#[test]
+fn a_completed_call_enters_the_finalizer_at_the_inner_join() {
+    let source = r"def process(value, owner, ready):
+    try:
+        try:
+            if ready:
+                if done():
+                    return
+                owner.send(value)
+            else:
+                state = {}
+        except KeyError as error:
+            recover(error)
+    except OSError:
+        report()
+    finally:
+        consume(value)
+";
+    assert_matches_cpython(source, "completed_call_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn captured_handler_names_keep_the_cleanup_copy_order() {
+    let source = r"def inspect(flag, other):
+    try:
+        start()
+    except ValueError as error:
+        if matches(lambda: error):
+            if flag:
+                work()
+            else:
+                pass
+        elif other:
+            recover()
+        else:
+            raise
+    return True
+";
+    assert_matches_cpython(source, "captured_handler_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn copied_raises_fuse_adjacent_local_loads_under_the_same_handler() {
+    let source = r"def explicit(value, fallback, flag):
+    try:
+        run()
+    except ValueError as err:
+        err.detail = value if flag else fallback
+        raise err
+
+def reraising(box, value, flag):
+    try:
+        return run()
+    finally:
+        box.value = value if flag else None
+";
+    assert_matches_cpython(source, "copied_raise_loads.py", &LEVELS);
+}
+
+#[test]
+fn a_raising_else_guard_reaches_the_continuation_after_recovery() {
+    let source = r"def process(entries, key, ready, value):
+    try:
+        value = entries[key]
+    except KeyError:
+        if ready or empty():
+            value = 1
+        else:
+            value = 0
+    else:
+        if not valid(value) or value < 0:
+            raise ValueError
+    for entry in entries:
+        consume(value, entry)
+";
+    assert_matches_cpython(source, "raising_else_guard.py", &LEVELS);
+}
+
+#[test]
+fn nested_assignments_copy_an_unprotected_named_cleanup_in_order() {
+    let source = r"def choose(value, first, second):
+    try:
+        work()
+    except ValueError as error:
+        try:
+            if first:
+                if second:
+                    value = 1
+                else:
+                    value = 2
+            else:
+                value = error.detail
+        except LookupError:
+            value = 3
+    return value
+";
+    assert_matches_cpython(source, "nested_assignment_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn terminal_try_pass_counts_toward_the_shared_return_size() {
+    let source = r"def update(first, second, box):
+    try:
+        if first:
+            box.value = 1
+        elif second:
+            pass
+        elif box.ready and box.active:
+            work()
+        pass
+    except:
+        pass
+
+def without_pass(first, second, box):
+    try:
+        if first:
+            box.value = 1
+        elif second:
+            pass
+        elif box.ready and box.active:
+            work()
+    except:
+        pass
+";
+    assert_matches_cpython(source, "shared_try_return.py", &LEVELS);
+}
+
+#[test]
+fn a_completed_manager_await_reaches_its_join_after_cold_cleanup() {
+    let source = r"async def process(resource, ready):
+    try:
+        if ready:
+            async with scope():
+                await work()
+        else:
+            await recover()
+    except ValueError as error:
+        try:
+            close()
+        finally:
+            raise error
+    resource.finish()
+";
+    assert_matches_cpython(source, "awaited_cleanup_join.py", &LEVELS);
+}
+
+#[test]
+fn successful_guards_reach_the_normal_finalizer_after_cold_handlers() {
+    let guarded = r"def run(value, ready):
+    try:
+        if not ready():
+            raise ValueError
+    except KeyError as err:
+        report(err)
+    except LookupError as err:
+        repair()
+    finally:
+        try:
+            value.close()
+        except OSError:
+            report()
+        value.flush()
+";
+    assert_matches_cpython(guarded, "guarded_finalizer.py", &LEVELS);
+
+    let awaited = r"async def run(value, ready):
+    async with scope():
+        try:
+            await value.prepare()
+            assert await ready()
+        except OSError as err:
+            if value.failed or retry():
+                raise err
+        finally:
+            if value.active:
+                await value.close()
+";
+    assert_matches_cpython(awaited, "asserted_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn protected_manager_keeps_pass_after_a_conditional() {
+    let source = r"def sample(flag, manager):
+    try:
+        with manager as resource:
+            start(resource)
+            if flag:
+                use(resource)
+            pass
+    except Error:
+        report()
+    finish()
+";
+    assert_matches_cpython(source, "manager_pass.py", &LEVELS);
+}
+
+#[test]
+fn nested_guard_threads_through_the_join_after_a_raise() {
+    let source = r"def scan(items, first, second, value):
+    while items:
+        if first:
+            if second:
+                if not value:
+                    break
+            else:
+                raise ValueError(value)
+        elif not value:
+            pass
+        value = 1
+";
+    assert_matches_cpython(source, "raising_guard_join.py", &LEVELS);
+}
+
+#[test]
+fn terminal_pattern_guard_restarts_the_loop_after_storing_captures() {
+    for body in ["return value", "pass"] {
+        let source = format!(
+            "def run(values, expected, ready):
+    for value in values:
+        if ready:
+            visit(value)
+        else:
+            match value:
+                case (Entry(active=True), item) if item is expected:
+                    {body}
+"
+        );
+        assert_matches_cpython(&source, "guarded_loop_capture.py", &LEVELS);
+    }
+    let literal = "def run(values, ready):
+    for value in values:
+        if ready:
+            match value:
+                case [1, 2] if ready:
+                    pass
+";
+    assert_matches_cpython(literal, "guarded_loop_literal.py", &LEVELS);
+}
+
+#[test]
+fn a_direct_arm_reaches_the_receiver_after_nested_handler_cleanup() {
+    let source = r"def process(value, flag):
+    try:
+        while flag:
+            if value:
+                break
+            work()
+    except LookupError:
+        try:
+            repair()
+        finally:
+            value.close()
+    value.ready()
+";
+    assert_matches_cpython(source, "handler_loop_receiver.py", &LEVELS);
+}
+
+#[test]
+fn branch_copies_the_setup_for_a_protected_raise_with_a_cause() {
+    let source = r"def dispatch(err, cause, replacement, flag):
+    if flag:
+        err = ValueError
+    else:
+        err = replacement
+    try:
+        raise err from cause
+    finally:
+        cleanup()
+";
+    assert_matches_cpython(source, "protected_raise.py", &LEVELS);
+}
+
+#[test]
+fn a_folded_import_branch_starts_a_fresh_borrow_block() {
+    for tail in ["", "    return value\n"] {
+        let source = format!(
+            "def process(owner, value, ready):\n    if ready:\n        def inner():\n            return (value, owner)\n        if True:\n            from helpers import entry\n{tail}"
+        );
+        assert_matches_cpython(&source, "folded_import.py", &LEVELS);
+    }
+}
+
+#[test]
+fn manager_suppression_replays_nested_normal_try_exits() {
+    let source = r"
+def choose(manager):
+    try:
+        try:
+            with manager as value:
+                return 1
+        except ValueError:
+            pass
+    except RuntimeError:
+        pass
+    return None
+
+def one_cleanup(manager):
+    try:
+        with manager as value:
+            return 1
+    except ValueError:
+        pass
+    return None
+";
+    assert_matches_cpython(source, "manager_suppression_nested_exits.py", &LEVELS);
+}
+
+#[test]
+fn bare_raise_copies_the_local_attribute_store_after_recovery() {
+    let source = r"def handle(obj):
+    try:
+        run()
+    except ValueError as err:
+        try:
+            run()
+        except KeyError:
+            pass
+        obj.saved = err
+        raise
+    finally:
+        release()
+";
+    assert_matches_cpython(source, "store_before_reraise.py", &LEVELS);
+}
+
+#[test]
+fn normal_try_exit_copies_keep_the_width_of_a_folded_return_operand() {
+    let source = r"
+def choose(ready, other, box, manager):
+    try:
+        if ready:
+            with manager as value:
+                pass
+        elif other:
+            box.value = 1
+            return box.value
+    except ValueError:
+        pass
+    return -1
+
+def choose_with_pass(ready, other, box, manager):
+    try:
+        if other:
+            if ready:
+                with manager as value:
+                    pass
+            elif other:
+                box.value = 1
+                return box.value
+        else:
+            pass
+    except ValueError:
+        pass
+    return -1
+";
+    assert_matches_cpython(source, "normal_try_folded_return.py", &LEVELS);
+}
+
+#[test]
+fn recovery_suffix_keeps_the_assigned_try_exit_reachable_for_borrowing() {
+    for recovery in [
+        r"            try:
+                repair()
+            except KeyError:
+                repair()",
+        r"            for item in items:
+                try:
+                    repair()
+                except KeyError:
+                    repair()",
+    ] {
+        let source = format!(
+            r"async def process(record, ready, items):
+    try:
+        result = await fetch()
+    except ValueError as error:
+        if ready:
+{recovery}
+        record.flush()
+    finally:
+        record.flush()
+    record.finish()
+"
+        );
+        assert_matches_cpython(&source, "assigned_try_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn trailing_pass_separates_a_nested_branch_from_the_implicit_return() {
+    let source = r"
+def choose(ready, selected, manager):
+    if ready:
+        pass
+    else:
+        with manager:
+            value = 1
+        if selected:
+            observe()
+        else:
+            consume(value)
+        pass
+
+def choose_without_pass(ready, selected):
+    if ready:
+        pass
+    else:
+        if selected:
+            observe()
+        else:
+            consume()
+";
+    assert_matches_cpython(source, "nested_branch_pass.py", &LEVELS);
+}
+
+#[test]
+fn literal_arithmetic_tuples_preserve_the_following_guard_owner() {
+    let source = r"bounds = {'range': (0, 4 - 3)}
+try:
+    if active:
+        pass
+except ValueError:
+    pass
+def finish() -> Result:
+    pass
+";
+    assert_matches_cpython_versions(source, "case.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
+fn a_copied_finalizer_call_keeps_the_coroutine_on_its_nested_guard() {
+    let source = r"async def run(active, value):
+    try:
+        work()
+    except ValueError:
+        return make(convert(value))
+    finally:
+        value.clean(value)
+        clean(value)
+        try:
+            if active:
+                pass
+        finally:
+            pass
+";
+    assert_matches_cpython_versions(source, "case.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
+fn nested_handler_jumps_stop_at_a_shared_raise() {
+    let source = r"def handle(outer):
+    try:
+        record()
+    except OSError:
+        if outer:
+            if True:
+                try:
+                    work()
+                except ValueError:
+                    pass
+            else:
+                work()
+        else:
+            record()
+        raise Trouble()
+";
+    assert_matches_cpython(source, "nested_handler_raise.py", &LEVELS);
+}
+
+#[test]
+fn manager_exit_copies_both_named_handler_cleanups_before_a_local_return() {
+    let source = r"def run(manager, value):
+    try:
+        pass
+    except OSError as outer:
+        try:
+            pass
+        except ValueError as middle:
+            try:
+                with manager:
+                    work()
+            except LookupError as inner:
+                pass
+    return value
+";
+    assert_matches_cpython(source, "nested_named_manager_return.py", &LEVELS);
+}
+
+#[test]
+fn terminal_comparison_cleanup_copies_a_short_else_return() {
+    let source = r"
+def nested(ready, low, value, high, box):
+    if ready:
+        if low <= value < high:
+            return 1
+        else:
+            return box.attribute
+    elif high:
+        pass
+
+
+def following(ready, low, value, high):
+    if ready:
+        if low <= value < high:
+            return
+        global result
+        result = value
+    else:
+        consume()
+
+
+def long_exit(ready, low, value, high, box):
+    if ready:
+        if low <= value < high:
+            return 1
+        else:
+            return box.attribute(value, high)
+    elif high:
+        pass
+";
+    assert_matches_cpython(source, "comparison_cleanup_return.py", &LEVELS);
+}
+
+#[test]
+fn copied_handler_backedges_leave_the_enclosing_loop_body_try() {
+    let source = r"def scan(items, active):
+    for item in items:
+        try:
+            try:
+                visit(item)
+            except ValueError:
+                if active:
+                    recover()
+                else:
+                    yield item
+        except KeyError:
+            pass
+";
+    assert_matches_cpython_versions(
+        source,
+        "handler_backedge_unwind.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn nested_negated_comparison_keeps_its_forward_loop_exit() {
+    assert_matches_cpython(
+        r"
+def nested(items, ready, low, high):
+    for item in items:
+        if True:
+            if ready:
+                pass
+            elif not low <= item < high:
+                pass
+        else:
+            pass
+
+
+def direct(items, ready, low, high):
+    for item in items:
+        if ready:
+            pass
+        elif not low <= item < high:
+            pass
+",
+        "nested_comparison_backedge.py",
+        &LEVELS,
+    );
+}
+
+#[test]
+fn nested_finalizers_keep_the_shared_store_and_reraise() {
+    let source = r"def recover(flag):
+    global dirty
+    try:
+        work()
+    finally:
+        try:
+            if flag:
+                left()
+            else:
+                right()
+        finally:
+            dirty = False
+";
+    assert_matches_cpython(source, "shared_finally_store.py", &LEVELS);
+}
+
+#[test]
+fn nested_recovery_preserves_the_shared_global_store() {
+    let source = r"def update():
+    global dirty
+    try:
+        try:
+            process()
+        except LookupError:
+            try:
+                record()
+            except ValueError:
+                pass
+    except OSError:
+        pass
+    dirty = False
+";
+    assert_matches_cpython(source, "recovery_global_store.py", &LEVELS);
+}
+
+#[test]
+fn match_case_copies_each_short_circuit_condition_exit() {
+    let source = r"
+def copied(outer, inner, marker, item):
+    match outer:
+        case 'selected':
+            match inner:
+                case _ if ready(item):
+                    if marker is not None and check(
+                        item
+                    ):
+                        emit(item)
+    finish(item)
+
+def single(outer, inner, marker, item):
+    match outer:
+        case 'selected':
+            match inner:
+                case _ if ready(item):
+                    if marker is not None:
+                        emit(item)
+    finish(item)
+";
+    assert_matches_cpython(source, "match_condition_exits.py", &LEVELS);
+}
+
+#[test]
+fn nested_handlers_keep_the_try_bridge_before_a_local_return() {
+    let source = r"def run(ready, value):
+    if ready:
+        try:
+            pass
+        except OSError:
+            try:
+                pass
+            except ValueError:
+                try:
+                    pass
+                except LookupError:
+                    pass
+    else:
+        pass
+    return value
+";
+    assert_matches_cpython(source, "nested_handler_local_return.py", &LEVELS);
+}
+
+#[test]
+fn module_loop_keeps_the_shared_true_edge_after_assertions_are_removed() {
+    let source = r"for item in items:
+    if first or second or third:
+        assert seen(item)
+    else:
+        assert check(item)
+";
+    assert_matches_cpython(source, "erased_loop_else.py", &LEVELS);
+}
+
+#[test]
+fn a_successful_chained_assertion_leaves_the_loop_body_handler() {
+    let source = r"def scan(values, manager, active):
+    with manager:
+        for value in values:
+            try:
+                if active:
+                    assert 0 <= measure(value) <= 10
+            except ValueError:
+                pass
+";
+    assert_matches_cpython_versions(
+        source,
+        "chained_assertion_try_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn terminal_named_handler_keeps_its_imports_eager() {
+    let source = r"try:
+    import primary
+except ImportError as error:
+    if enabled:
+        import secondary
+        from helpers import fallback
+    else:
+        pass
+";
+    assert_matches_cpython(source, "handler_imports.py", &LEVELS);
+}
+
+#[test]
+fn nested_try_exits_share_a_local_attribute_return() {
+    let source = r"def fetch(obj, outer, inner):
+    try:
+        if outer:
+            if inner:
+                work()
+            else:
+                recover()
+        else:
+            finish()
+    except LookupError:
+        pass
+    return obj.value
+";
+    assert_matches_cpython(source, "nested_attribute_return.py", &LEVELS);
+}
+
+#[test]
+fn guarded_for_break_copies_handler_cleanup_after_a_prefix() {
+    for test in ["ready", "True"] {
+        let source = format!(
+            "def run(values, ready):
+    for value in values:
+        try:
+            work(value)
+        except LookupError:
+            if {test}:
+                step()
+                for element in values:
+                    break
+        finish(value)
+"
+        );
+        assert_matches_cpython(&source, "guarded_for_handler.py", &LEVELS);
+    }
+}
+
+#[test]
+fn negated_chained_comparison_shares_the_final_pass_return() {
+    let source = r"
+def falls_through(ready, left, item, right):
+    if ready:
+        emit()
+    elif not left <= item < right:
+        pass
+
+def has_else(ready, left, item, right):
+    if ready:
+        emit()
+    elif not left <= item < right:
+        pass
+    else:
+        clean()
+";
+    assert_matches_cpython(source, "comparison_pass_return.py", &LEVELS);
+}
+
+#[test]
+fn break_after_a_manager_exit_does_not_repeat_its_line() {
+    for (declaration, manager) in [("def", "with"), ("async def", "async with")] {
+        let source = format!(
+            "{declaration} run(outer, inner):
+    while True:
+        {manager} outer:
+            with inner:
+                pass
+            break
+    finish()
+"
+        );
+        assert_matches_cpython(&source, "break_after_manager_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn attribute_guards_reuse_the_stored_value_before_the_normal_finalizer() {
+    let source = r"def run(value):
+    with resource:
+        state = value
+        assert value
+        first = prepare()
+        second = prepare()
+        value = prepare()
+        third = prepare()
+        last = prepare()
+        try:
+            item = prepare()
+        finally:
+            if state.config.enabled:
+                work()
+            clean()
+        return item
+";
+    assert_matches_cpython(source, "finalizer_attribute_guard.py", &LEVELS);
+}
+
+#[test]
+fn short_circuited_operand_jumps_to_its_shared_literal_return() {
+    let source = r"
+def folded(ready, active):
+    if ready or (active and not (
+        False
+        and check()
+    )) or other():
+        return False
+    emit()
+    return True
+
+def runtime(ready, active, flag):
+    if ready or (active and not (flag and check())) or other():
+        return False
+    emit()
+    return True
+
+def guarded(item, ready):
+    try:
+        if ready:
+            return item
+        elif item:
+            assert 0 or 'yes' or check(item)
+        else:
+            other()
+        return None
+    except OSError:
+        close()
+";
+    assert_matches_cpython(source, "short_circuit_return.py", &LEVELS);
+}
+
+#[test]
+fn guarded_named_handler_reaches_the_shared_tuple_return() {
+    let source = "def resolve(left, right, read, keep):
+    if read:
+        try:
+            left = read(right)
+        except ValueError as error:
+            if keep:
+                pass
+            else:
+                raise error
+    else:
+        left = 1
+    return left, right
+";
+    assert_matches_cpython(source, "guarded_recovery_tuple.py", &LEVELS);
+}
+
+#[test]
+fn folded_conditional_guard_keeps_each_falling_return_location() {
+    let source = r"
+def falls_through(ready, item):
+    if check(item) if not ready else None:
+        emit(item)
+
+def returns(ready, item):
+    if check(item) if not ready else None:
+        return item
+
+def raises(ready, item):
+    if check(item) if ready else None:
+        raise ValueError()
+";
+    assert_matches_cpython(source, "folded_guard_returns.py", &LEVELS);
+}
+
+#[test]
+fn same_line_return_omits_the_marker_before_manager_cleanup() {
+    for sep in ["; ", "\n        "] {
+        let source =
+            format!("def run(manager):\n    with manager:\n        process(){sep}return True\n");
+        assert_matches_cpython(&source, "manager_same_line_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_saved_try_else_return_can_supply_the_finalizer_guard_owner() {
+    for returned in ["value", "default"] {
+        let source = format!(
+            "def run(value):\n    try:\n        if value:\n            pass\n        state = prepare(key=lookup(key=value))\n        try:\n            value.check()\n        except OSError:\n            pass\n        else:\n            done = False\n            return {returned}\n    except OSError:\n        pass\n    finally:\n        if state is not None and not done:\n            pass\n"
+        );
+        assert_matches_cpython(&source, "saved_try_else_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn chained_comparison_success_copies_a_pass_arm_and_return() {
+    let source = r"def both_chains(left, mid, right, low, center, high):
+    if left <= mid <= right and low <= center <= high:
+        pass
+    else:
+        mid = None
+    return mid
+
+def single_chain(left, mid, right):
+    if left <= mid <= right:
+        pass
+    else:
+        mid = None
+    return mid
+
+def live_arm(left, mid, right, low, center, high):
+    if left <= mid <= right and low <= center <= high:
+        keep()
+    else:
+        mid = None
+    return mid
+";
+    assert_matches_cpython(source, "chained_comparison_pass_exit.py", &LEVELS);
+}
+
+#[test]
+fn nested_manager_returns_count_an_ordinary_try_before_the_finalizer_guard() {
+    for managers in ["first", "first, second", "first, second, third"] {
+        let source = format!(
+            "def run(value):\n    try:\n        with {managers}:\n            if value:\n                prepare()\n            return value\n    except ValueError:\n        recover()\n    finally:\n        if value is None:\n            finish()\n"
+        );
+        assert_matches_cpython(&source, "nested_manager_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn closure_try_else_guards_reuse_the_enclosing_finally_handler() {
+    for condition in ["state", "state.ready", "state.ready()"] {
+        let source = format!(
+            "def bind(state):\n    def run(item):\n        try:\n            item.check()\n        except ValueError:\n            recover()\n        else:\n            if not {condition}:\n                state.finish()\n        finally:\n            state.close()\n    return run\n"
+        );
+        assert_matches_cpython(&source, "closure_try_else.py", &LEVELS);
+    }
+}
+
+#[test]
+fn discarded_from_import_reserves_reused_names_before_handler_constants() {
+    let source = "record('start')
+try:
+    raise ImportError
+    from early import apple, pear
+except ImportError:
+    record('middle')
+    from late import apple, pear
+";
+    assert_matches_cpython(source, "discarded_from_import.py", &LEVELS);
+}
+
+#[test]
+fn optimized_generator_results_retain_their_arm_exit() {
+    let source = r"def falling(active, items):
+    if active:
+        finish()
+    else:
+        all(f(x) for x in items for _ in extras)
+
+def jumping(active, items):
+    if active:
+        tuple(f(x) for x in items)
+    else:
+        return finish()
+
+def stored(active, items):
+    if active:
+        saved = list(read(item) for item in items)
+    else:
+        raise ValueError()
+";
+    assert_matches_cpython(source, "generator_result_exits.py", &LEVELS);
+}
+
+#[test]
+fn a_folded_bitmask_keeps_its_coroutine_owner_before_a_try_guard() {
+    for operator in ["|", "&"] {
+        let source = format!(
+            "async def run(item):
+    value = await item()
+    flags = ((1 << 12)
+             {operator} (1 << 13)
+             {operator} (1 << 14))
+    try:
+        if item and item.ready:
+            emit(value, flags)
+    except LookupError:
+        recover()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "folded_try_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn forward_arm_jumps_reach_borrowed_locals_after_nested_try_exits() {
+    let source = r"def prepare(value, flag):
+    try:
+        try:
+            if flag:
+                pass
+            else:
+                result = 1
+        except ValueError:
+            pass
+    except LookupError:
+        pass
+    use(value, 1)
+
+def update(value, first, second):
+    try:
+        try:
+            if first:
+                if second:
+                    mark()
+            elif second:
+                store()
+        except ValueError:
+            recover()
+    except LookupError:
+        pass
+    value.update()
+";
+    assert_matches_cpython(source, "nested_try_arm_borrowing.py", &LEVELS);
+}
+
+#[test]
+fn named_handler_guards_copy_their_cleanup_and_literal_return() {
+    let source = r"def nested(first, second):
+    try:
+        read()
+    except LookupError as outer:
+        try:
+            recover(outer)
+        except ValueError as inner:
+            if first and second:
+                report(inner)
+
+def guarded(flag, value):
+    try:
+        read()
+    except ValueError as error:
+        assert error.args
+        if flag and 0 < value < 10:
+            observe(value)
+";
+    assert_matches_cpython(source, "named_guard_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn conditional_augmented_assignment_rejoins_before_the_arm_exit() {
+    let source = r"def jumping(active, ready, saved):
+    if active:
+        saved += 1 if ready else 2
+    else:
+        finish()
+
+def falling(active, ready, saved):
+    if active:
+        saved += 1 if ready else 2
+";
+    assert_matches_cpython(
+        source,
+        "conditional_augmented_assignment_footer.py",
+        &LEVELS,
+    );
+}
+
+#[test]
+fn falling_if_arm_keeps_its_value_discard_separate_from_the_return() {
+    let source = r"def falling(active, ready):
+    if active:
+        read() if ready else None
+
+def jumping(active, ready):
+    if active:
+        read() if ready else None
+    else:
+        finish()
+
+def direct(ready):
+    read() if ready else None
+";
+    assert_matches_cpython(source, "falling_conditional_discard.py", &LEVELS);
+}
+
+#[test]
+fn post_finally_call_guards_keep_slots_across_a_removed_jump() {
+    for condition in [
+        "str(value).startswith('a')",
+        "obj.check(value, other, flag=isinstance(extra, Kind))",
+        "obj.check(other)",
+    ] {
+        let source = format!(
+            "async def run(obj, value, other, extra, ready):
+    try:
+        work()
+    finally:
+        if ready:
+            finish()
+    if not {condition}:
+        return value
+    return False
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "post_finally_call.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn conditional_discards_copy_their_protected_value_and_normal_exit() {
+    let source = r"def managed_discard(value, ready):
+    with manager:
+        try:
+            value == 0 if ready else False
+        except ValueError as exc:
+            raise LookupError() from exc
+        finish()
+
+async def iterated_discard(items):
+    items = await fetch(items)
+    for value in items:
+        try:
+            compute(value) if value else 0
+        except ValueError:
+            continue
+        observe(value)
+    finish()
+
+def finalized_discard(item, ready):
+    try:
+        compute() if ready else (None, None)
+    except (OSError, ValueError):
+        pass
+    finally:
+        cleanup(item)
+";
+    assert_matches_cpython(source, "protected_value_discard.py", &LEVELS);
+}
+
+#[test]
+fn short_circuit_handler_discards_copy_their_return_cleanup() {
+    let source = r"def recover(enabled, item):
+    try:
+        fetch(item)
+    except LookupError as error:
+        enabled and report(error)
+
+async def retry(enabled, item):
+    try:
+        await fetch(item)
+    except LookupError:
+        enabled or report(item)
+";
+    assert_matches_cpython(source, "short_handler_discard.py", &LEVELS);
+}
+
+#[test]
+fn attribute_store_join_precedes_a_folded_terminal_guard() {
+    let source = r"def run(obj, value):
+    obj.result = compute() if value is sentinel else value
+    if __debug__:
+        observe()
+";
+    for source in [
+        source.to_owned(),
+        source.replace(" if value is sentinel else value", ""),
+    ] {
+        assert_matches_cpython(&source, "folded_attribute_guard.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_handler_return_leaves_the_copied_try_else_pop_unowned() {
+    let source = r"def collect(flag, manager, ready):
+    with manager:
+        try:
+            try:
+                pass
+            except ValueError:
+                return None
+            if flag:
+                pass
+        finally:
+            try:
+                flag.write(limit=limit)
+            except TimeoutError:
+                pass
+            else:
+                if not ready:
+                    pass
+";
+    assert_matches_cpython_versions(
+        source,
+        "handler_else_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn conditional_attribute_store_keeps_its_return_boundary_with_an_annotation() {
+    let source = r"def run(obj, value, enabled):
+    if enabled:
+        obj.result: str = compute(value) if value else None
+    else:
+        obj.result = value
+";
+    for source in [
+        source.to_owned(),
+        source.replace(": str", ""),
+        source.replace("    else:\n        obj.result = value\n", ""),
+    ] {
+        assert_matches_cpython(&source, "conditional_attribute_store.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_handlers_copy_the_sole_fallthrough_cleanup() {
+    let source = r"def recover(enabled, valid, value):
+    try:
+        if enabled:
+            try:
+                validate(value)
+            except LookupError:
+                if valid and value:
+                    pass
+                else:
+                    raise ValueError from cause
+    except TypeError:
+        report()
+";
+    assert_matches_cpython(source, "sole_handler_exit.py", &LEVELS);
+}
+
+#[test]
+fn named_handler_branches_copy_cleanup_at_their_original_join() {
+    let source = r"def recover(flag, ready, value):
+    try:
+        work()
+    except LookupError as error:
+        if flag is not None:
+            if ready:
+                report(error)
+            else:
+                value = fallback()
+    return value
+
+def single_arm(flag, ready, value):
+    try:
+        work()
+    except LookupError as error:
+        if flag:
+            return value
+        else:
+            if ready:
+                raise ValueError
+            else:
+                report(error)
+    return value
+";
+    assert_matches_cpython(source, "named_branch_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn module_pass_join_precedes_the_enclosing_guard_return() {
+    let source = r"if enabled:
+    if ready:
+        for item in items:
+            work(item)
+    else:
+        finish()
+    pass
+";
+    for source in [source.to_owned(), source.replace("    pass\n", "")] {
+        assert_matches_cpython(&source, "module_pass_join.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_fused_loop_prefix_preserves_the_unowned_threaded_finally_jump() {
+    let source = r"def collect(items, manager):
+    with manager:
+        while True:
+            first, second = items
+            try:
+                break
+            finally:
+                if not first:
+                    inspect(second)
+";
+    assert_matches_cpython_versions(
+        source,
+        "fused_finally_jump.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn elided_assertions_preserve_handler_arm_cleanup_locations() {
+    let source = r"def run(ready):
+    try:
+        assert valid()
+    except AssertionError:
+        if ready:
+            first()
+            assert valid()
+        else:
+            second()
+            assert valid()
+    finish()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("            assert valid()\n", ""),
+    ] {
+        assert_matches_cpython(&source, "elided_handler_arm.py", &LEVELS);
+    }
+}
+
+#[test]
+fn terminal_guard_edges_locate_returns_after_elided_assertions() {
+    let source = r"def shared(first, second, a, b, c):
+    if first:
+        work()
+    elif second:
+        if a and b and c:
+            return
+        assert valid()
+    else:
+        assert valid()
+
+async def unique(ready, value):
+    result = await start()
+    if ready:
+        saved = result()
+        if not value:
+            assert saved()
+            return
+        assert saved()
+";
+    assert_matches_cpython(source, "elided_guard_returns.py", &LEVELS);
+}
+
+#[test]
+fn folded_while_uses_its_false_edge_for_the_implicit_return() {
+    let source = r"def drain(reader):
+    if True:
+        while not reader.done:
+            yield reader.next()
+    else:
+        yield None
+";
+    assert_matches_cpython(source, "folded_while_return.py", &LEVELS);
+}
+
+#[test]
+fn manager_exits_copy_a_short_normal_finalizer_return() {
+    for value in ["value", "value.method()"] {
+        let source = format!(
+            "def run(manager, value):\n    try:\n        with manager:\n            work()\n    except ValueError:\n        recover()\n    finally:\n        return {value}\n"
+        );
+        assert_matches_cpython(&source, "manager_finalizer_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn guarded_reraises_preserve_the_normal_finalizer_borrow_entry() {
+    let source = r"def read(flag, value):
+    try:
+        yield value
+    except ValueError as exc:
+        if flag:
+            raise
+        finish()
+    finally:
+        choice = flag or value.ready
+        value.close()
+    return value
+
+def finish_value(flag, guard, value):
+    try:
+        if guard:
+            pass
+        pass
+    except ValueError as exc:
+        if flag:
+            raise
+        return value
+    finally:
+        value.close()
+    return value
+";
+    assert_matches_cpython(source, "guarded_reraise_finally.py", &LEVELS);
+}
+
+#[test]
+fn elided_inner_try_setup_compacts_before_a_located_handler_pop() {
+    let source = r"def compare(values):
+    for item in values:
+        try:
+            work()
+        except TypeError:
+            try:
+                assert is_valid(item)
+            except ValueError:
+                assert other(item)
+";
+    assert_matches_cpython(source, "empty_handler_setup.py", &LEVELS);
+}
+
+#[test]
+fn unlocated_exit_of_a_nested_named_handler_keeps_its_jump() {
+    let source = r"def read(value, gate):
+    try:
+        prepare()
+    except OSError as error:
+        if gate:
+            try:
+                retry()
+            except LookupError as error:
+                if gate:
+                    value = recover()
+        else:
+            report()
+    return value
+";
+    assert_matches_cpython(source, "nested_named_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn normal_try_jump_reaches_the_named_cleanup_on_its_second_visit() {
+    let source = r"def recover(value, retry):
+    try:
+        prepare()
+    except OSError as error:
+        if retry:
+            try:
+                value = read()
+            except ValueError as detail:
+                report(detail)
+        else:
+            value = fallback(error)
+    return value
+";
+    assert_matches_cpython(source, "nested_handler.py", &LEVELS);
+}
+
+#[test]
+fn a_try_else_keeps_a_shared_conditional_exit_unlocated() {
+    let source = r"def update(active, first, ready, target):
+    try:
+        prepare()
+    except ValueError:
+        pass
+    else:
+        if active or ready:
+            if first:
+                pass
+            else:
+                if ready:
+                    if first:
+                        pass
+                    else:
+                        target[0] = ready
+        else:
+            pass
+    finish()
+";
+    assert_matches_cpython(source, "shared_try_else_exit.py", &LEVELS);
+}
+
+#[test]
+fn a_guard_locates_the_jump_after_inlined_handler_pops() {
+    let source = r"def attempt(enabled, retry, value):
+    if enabled:
+        try:
+            read()
+        except ValueError:
+            try:
+                read()
+            except ValueError:
+                try:
+                    read()
+                except ValueError:
+                    try:
+                        read()
+                    except:
+                        if enabled:
+                            pass
+                        elif retry:
+                            pass
+    return value
+";
+    assert_matches_cpython(source, "nested_handler_exit_jump.py", &LEVELS);
+}
+
+#[test]
+fn saved_iterator_returns_keep_the_named_cleanup_on_the_finally_guard() {
+    let source = r"def process(items, flag):
+    try:
+        start()
+    except ValueError as error:
+        for item in items:
+            try:
+                return item.close()
+            except KeyError:
+                pass
+    finally:
+        if flag:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "iterator_handler.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn a_loop_tail_guard_survives_iterator_cleanup() {
+    let source = r"def drain(running, ready, retry, items):
+    while running:
+        try:
+            if ready:
+                try:
+                    read()
+                finally:
+                    for item in items:
+                        release(item)
+        except ValueError as error:
+            if retry:
+                pass
+            else:
+                break
+";
+    assert_matches_cpython(source, "loop_tail_guard.py", &LEVELS);
+}
+
+#[test]
+fn a_copied_exception_cleanup_keeps_its_backedge_line() {
+    let source = r"def scan(items, ready, active):
+    for item in items:
+        try:
+            if active:
+                try:
+                    read(item)
+                except ValueError as error:
+                    try:
+                        if ready:
+                            pass
+                    except LookupError:
+                        pass
+        except TypeError:
+            pass
+";
+    assert_matches_cpython(source, "copied_cleanup_backedge.py", &LEVELS);
+}
+
+#[test]
+fn implicit_return_after_a_comprehension_keeps_the_result_store_position() {
+    let source = r"
+def folded(values):
+    if True:
+        result = [item for item in values]
+    assert result
+
+def shared(values, left, right):
+    if left:
+        pass
+    else:
+        if right:
+            pass
+        else:
+            result = {item for item in values}
+        assert result
+";
+    assert_matches_cpython_versions(
+        source,
+        "comprehension_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn a_guard_can_locate_a_surviving_normal_try_exit() {
+    for continuation in ["notify()", "return ready"] {
+        let source = format!(
+            "async def receive(ready):
+    try:
+        if ready:
+            try:
+                return await read()
+            finally:
+                await release()
+    except ValueError:
+        pass
+    try:
+        notify()
+    except ValueError:
+        pass
+
+def scan(ready, items):
+    try:
+        prepare()
+    except ValueError:
+        pass
+    else:
+        if ready:
+            for item in items:
+                try:
+                    consume(item)
+                except LookupError:
+                    pass
+                else:
+                    break
+            else:
+                raise KeyError(ready)
+    {continuation}
+"
+        );
+        assert_matches_cpython(&source, "guarded_try_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn short_circuit_loop_exits_inherit_each_condition_edge() {
+    let source = r"def guarded(items, left, middle, right):
+    for item in items:
+        try:
+            if not ((left(item) and middle(item)) or right(item)):
+                work(item)
+        except ValueError:
+            raise
+
+def nested(items, a, b, c, d):
+    for item in items:
+        if enabled():
+            while (a(item) and b(item)) or (c(item) and d(item)):
+                if ready(item):
+                    break
+                work(item)
+        else:
+            finish(item)
+";
+    assert_matches_cpython(source, "compound_loop_guard.py", &LEVELS);
+}
+
+#[test]
+fn terminal_try_pass_locates_the_copied_implicit_return() {
+    for predecessor in ["value", "if True:\n            del value"] {
+        let source = format!(
+            "def run(value):\n    try:\n        {predecessor}\n        pass\n    except ValueError:\n        return value\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "terminal_try_pass.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn a_threaded_pass_join_keeps_its_line_before_a_named_raise() {
+    for exit in ["raise Failure", "return left"] {
+        let source = format!(
+            "def finish(ready, flag, left):
+    if ready:
+        if flag:
+            if left:
+                pass
+            else:
+                pass
+        else:
+            pass
+    else:
+        work()
+    {exit}
+"
+        );
+        assert_matches_cpython(&source, "threaded_named_raise.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_partial_else_keeps_each_loop_predecessors_line() {
+    let source = r"def scan():
+    while ready():
+        if enabled():
+            if available():
+                update()
+            else:
+                if permitted():
+                    if pending():
+                        record()
+        else:
+            if retry():
+                refresh()
+            else:
+                break
+";
+    assert_matches_cpython(source, "nested_guard_loop.py", &LEVELS);
+}
+
+#[test]
+fn managed_finally_guards_reuse_the_condition_after_one_fusion() {
+    for guard in ["check(value, limit)", "value == limit.current()"] {
+        let source = format!(
+            "def run(value, limit):
+    try:
+        with acquire():
+            try:
+                return value
+            except ValueError:
+                pass
+            finally:
+                if {guard}:
+                    record()
+    finally:
+        finish()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_finally_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn a_shared_named_cleanup_locates_its_split_implicit_return() {
+    let source = r"def finish(enabled, value):
+    try:
+        try:
+            if enabled:
+                try:
+                    work()
+                except ValueError as error:
+                    if value:
+                        pass
+                    else:
+                        record(value)
+        except LookupError:
+            pass
+    except OSError:
+        pass
+";
+    assert_matches_cpython(source, "split_handler_return.py", &LEVELS);
+}
+
+#[test]
+fn a_constant_line_and_unary_return_share_the_exit_copy_budget() {
+    for (marker, expression) in [
+        ("'marker'", "-value"),
+        ("'marker'", "not value"),
+        ("1 + 2", "-value"),
+    ] {
+        let source = format!(
+            "def finish(flag, value):
+    if flag:
+        value = first()
+    else:
+        value = second()
+    {marker}
+    return {expression}
+"
+        );
+        assert_matches_cpython(&source, "marked_unary_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn earlier_conditional_arms_reach_normal_finalizer_local_loads() {
+    let source = r"def guarded(ready, flag, value, other):
+    try:
+        if ready:
+            if other:
+                use(value)
+        elif flag:
+            use(flag)
+    except ValueError:
+        raise
+    finally:
+        value.attr = flag
+
+def folded(ready, flag, value):
+    try:
+        if ready:
+            assert True
+            value.attr = flag
+        elif flag:
+            use(flag)
+    except ValueError as exc:
+        pass
+    finally:
+        value.attr
+";
+    assert_matches_cpython_versions(
+        source,
+        "conditional_finalizer_loads.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn copied_finalizer_break_keeps_its_line_inside_an_enclosing_try() {
+    let source = r"def scan(item, flag):
+    try:
+        while True:
+            try:
+                if flag:
+                    work()
+                else:
+                    read()
+                break
+            except ValueError:
+                return
+            finally:
+                if not flag:
+                    cleanup(item)
+            pass
+        pass
+        finish(item)
+    finally:
+        cleanup(item)
+";
+    assert_matches_cpython(source, "split_finalizer_break.py", &LEVELS);
+}
+
+#[test]
+fn multiline_string_additions_keep_their_owner_before_a_try_guard() {
+    let source = r#"def render(value):
+    with acquire():
+        if value:
+            text = (
+                "a"
+                + "b"
+                + "c"
+                + "d"
+                + "e"
+                + "f"
+                + f"{value}"
+            )
+            try:
+                if not check(value):
+                    emit(text)
+            except ValueError:
+                recover()
+"#;
+    assert_matches_cpython_versions(
+        source,
+        "string_addition_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn consecutive_try_else_guards_reuse_the_last_protected_store() {
+    for guard in ["flag", "not flag or reject(second)"] {
+        let source = format!(
+            "def scan(values, flag):
+    for item in values:
+        try:
+            first = lookup(1, item)
+        except ValueError:
+            pass
+        else:
+            try:
+                second = lookup(2, first)
+            except TypeError:
+                pass
+            else:
+                if {guard}:
+                    break
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "try_else_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn surviving_threaded_join_locates_a_four_slot_return() {
+    for returned in ["left", "left, right", "left, right, key"] {
+        let source = format!(
+            "def finish(gate, key, left, right):
+    if gate:
+        try:
+            work()
+        except ValueError as error:
+            pass
+        else:
+            if key:
+                use(left)
+            else:
+                use(right)
+    else:
+        right = left
+    return {returned}
+"
+        );
+        assert_matches_cpython(&source, "threaded_return_join.py", &LEVELS);
+    }
+}
+
+#[test]
+fn copied_discard_and_return_fold_the_immediate_constant_arm() {
+    for value in ["'ready'", "3", "None", "item"] {
+        let source =
+            format!("def select(flag, item):\n    {value} if flag else 'later'\n    return\n");
+        assert_matches_cpython(&source, "copied_constant_discard.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_handler_return_folds_the_ordinary_try_and_finalizer_pops_together() {
+    let source = r"async def run(value, flag):
+    try:
+        try:
+            check()
+        except ValueError:
+            await visit(value)
+            return make(value)
+    except TypeError:
+        report()
+    finally:
+        if flag:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "adjacent_cleanup_pops.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn an_inner_finalizer_unwinds_before_the_manager_of_a_saved_return() {
+    let source = r"async def run(value, flag, active):
+    try:
+        with use():
+            try:
+                if active:
+                    return value
+            finally:
+                record(value)
+    except LookupError:
+        pass
+    finally:
+        if flag is not None:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "inner_finalizer_manager.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn a_final_else_pass_uses_the_finalizers_pop_block() {
+    let source = "def update(error, sent):\n    try:\n        if sent:\n            raise error\n        else:\n            pass\n    finally:\n        cleanup()\n";
+    assert_matches_cpython(source, "passing_finally.py", &LEVELS);
+}
+
+#[test]
+fn iterator_break_uses_the_discarded_finalizer_expressions_position() {
+    let source = r"def scan(items, manager):
+    with manager:
+        for item in items:
+            try:
+                break
+            finally:
+                finish(item)
+        else:
+            raise LookupError
+    after()
+";
+    assert_matches_cpython(source, "iterator_finalizer_exit.py", &LEVELS);
+}
+
+#[test]
+fn named_handler_returns_keep_the_manager_discard_on_the_finally_guard() {
+    for kind in ["def", "async def"] {
+        let source = format!(
+            "{kind} run(value, flag):\n    try:\n        with use():\n            try:\n                work()\n            except LookupError as error:\n                if flag:\n                    return value\n    except OSError:\n        pass\n    finally:\n        if flag is not None:\n            finish()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "named_manager_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn erased_else_assertion_preserves_the_final_try_guard_location() {
+    let source = "def scan(rows, flag):\n    for row in rows:\n        try:\n            if row == 1:\n                one()\n            elif row == 2:\n                two()\n            else:\n                assert False\n        except LookupError:\n            if flag:\n                recover()\n";
+    assert_matches_cpython(source, "erased_else_guard.py", &LEVELS);
+}
+
+#[test]
+fn normal_finalizers_borrow_locals_after_guarded_handler_exits() {
+    let source = r"def reset(settings, skip):
+    try:
+        result = work()
+    except ValueError:
+        if skip:
+            return 0
+        result = fallback()
+    finally:
+        restore(**settings)
+    return result
+
+def finish(resource, lock, items):
+    try:
+        work()
+    except ValueError:
+        with lock:
+            ready = resource in items
+        if not ready:
+            raise
+        record()
+    finally:
+        with resource.lock:
+            release()
+";
+    assert_matches_cpython_versions(
+        source,
+        "guarded_handler_locals.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn literal_return_copies_the_split_named_handler_cleanup() {
+    let source = r"def acquire(accept):
+    try:
+        try:
+            start()
+        except Busy as busy:
+            if accept(busy):
+                try:
+                    retry()
+                except Empty as empty:
+                    return False
+                finally:
+                    try:
+                        state = release()
+                    except Closed:
+                        pass
+    except Aborted:
+        pass
+";
+    assert_matches_cpython(source, "split_named_cleanup_return.py", &LEVELS);
+}
+
+#[test]
+fn nested_manager_returns_keep_the_outer_discard_on_the_finally_guard() {
+    for source in [
+        r"def run(items, flag):
+    try:
+        with first(), second():
+            for item in items:
+                if item:
+                    return
+    finally:
+        if flag is not None:
+            finish()
+",
+        r"def run(items, flag):
+    for value in items:
+        try:
+            with first():
+                try:
+                    with second():
+                        if value:
+                            return
+                except LookupError:
+                    pass
+        finally:
+            if flag is not None:
+                finish()
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "nested_manager_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn protected_while_copies_its_backedge_before_a_final_else_break() {
+    let source = "def scan(flag):\n    while True:\n        try:\n            first = read()\n            if flag:\n                second = read()\n                if first == second:\n                    break\n            else:\n                break\n        except LookupError:\n            return None\n    return first\n";
+    assert_matches_cpython(source, "protected_while_break.py", &LEVELS);
+}
+
+#[test]
+fn protected_while_guard_reaches_the_trailing_pass_backedge() {
+    let source = "def scan(flag):\n    while flag:\n        try:\n            item = read()\n            if ready(item):\n                flag = item\n                pass\n        except LookupError:\n            break\n        pass\n    return flag\n";
+    assert_matches_cpython(source, "guarded_while_pass.py", &LEVELS);
+}
+
+#[test]
+fn loop_else_assertions_locate_the_normal_manager_exit() {
+    let source = r"def scan(items, manager, flag):
+    with manager:
+        for item in items:
+            consume(item)
+        else:
+            assert flag
+
+def stop_early(items, manager, flag):
+    with manager:
+        for item in items:
+            if item:
+                break
+        else:
+            assert flag
+
+async def collect(items, first, second, ready):
+    with first, second:
+        async for item in items:
+            consume(item)
+        else:
+            assert ready
+
+def retry(manager, ready):
+    with manager:
+        while pending():
+            update()
+        else:
+            assert ready
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_loop_assertion.py",
+        &[OptimizationLevel::Zero],
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn protected_for_keeps_the_backedge_after_a_trailing_pass() {
+    let source = "def scan(items, flag):\n    try:\n        for item in items:\n            if flag:\n                use(item)\n            pass\n    except LookupError:\n        recover()\n";
+    assert_matches_cpython(source, "protected_for_pass.py", &LEVELS);
+}
+
+#[test]
+fn erased_assertions_keep_the_try_else_guards_backedge_location() {
+    for exit in ["raise ValueError(item)", "return", "break"] {
+        let source = format!(
+            "def scan(items, flag):\n    for item in items:\n        try:\n            value = read(item)\n        except LookupError:\n            recover()\n        else:\n            if flag:\n                {exit}\n            assert value\n"
+        );
+        assert_matches_cpython(&source, "guarded_else_assertion.py", &LEVELS);
+    }
+}
+
+#[test]
+fn handler_return_guards_reuse_the_original_exception_slots() {
+    for (value, guard) in [
+        ("(1, 2, 3)", "flag"),
+        ("(1, 2)", "flag is not None"),
+        ("(1, 2, 3, 4)", "flag"),
+        ("(first(), second(), third())", "flag"),
+    ] {
+        let source = format!(
+            "def run(items, flag):\n    for item in items:\n        try:\n            work(item)\n        except LookupError:\n            return {value}\n        finally:\n            if {guard}:\n                finish()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "handler_return_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn iterator_exhaustion_locates_the_normal_manager_exit() {
+    let source = r"def choose(manager, first, second, items):
+    with manager:
+        if first:
+            return 1
+        elif second:
+            return 2
+        else:
+            for item in items:
+                consume(item)
+
+async def read(groups):
+    for group in groups:
+        with manager():
+            async for item in await group.items():
+                consume(item)
+            assert ready
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_iterator_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn guarded_cases_keep_the_wildcard_store_location() {
+    let source = r"def select(item, value, fallback, ready):
+    try:
+        match item:
+            case Entry() as entry if ready:
+                value = turn(value)
+            case _:
+                value = fallback
+    except Failure as error:
+        recover(error)
+    try:
+        inspect(value)
+    except OtherError:
+        pass
+";
+    assert_matches_cpython(source, "guarded_case_wildcard_store.py", &LEVELS);
+}
+
+#[test]
+fn preceding_branch_keeps_the_final_continue_guards_backedges_separate() {
+    let source = r"def update(items, early, left, right):
+    for item in items:
+        if ready(item):
+            if early:
+                if done(item):
+                    continue
+            elif left and right:
+                continue
+            assert item
+        else:
+            record(item)
+";
+    assert_matches_cpython(source, "shared_elif_before_erased_assertion.py", &LEVELS);
+}
+
+#[test]
+fn async_iterator_exhaustion_keeps_its_line_before_an_async_with_exit() {
+    let source = r"async def stream(manager, items, enabled):
+    async with manager:
+        if enabled:
+            async for item in items:
+                yield item
+        else:
+            raise ValueError
+";
+    assert_matches_cpython_versions(
+        source,
+        "async_iterator_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn a_folded_try_else_marker_keeps_the_replacement_jumps_owner() {
+    let source = r"def run(ready):
+    try:
+        try:
+            work()
+        except LookupError:
+            recover()
+        else:
+            if __debug__:
+                observe()
+    finally:
+        finish()
+";
+    for source in [source.to_owned(), source.replace("__debug__", "ready")] {
+        assert_matches_cpython(&source, "folded_try_else_marker.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_break_through_nested_try_exits_reaches_the_finalizer() {
+    let source = r"def drain(stream, items, ready):
+    try:
+        try:
+            while True:
+                if ready:
+                    break
+                for item in items:
+                    pass
+        except ValueError:
+            raise
+    except RuntimeError as error:
+        pass
+    finally:
+        stream.close()
+    stream.flush()
+";
+    assert_matches_cpython(source, "compound_try_break_exit.py", &LEVELS);
+}
+
+#[test]
+fn guarded_nested_try_reaches_the_outer_finalizer() {
+    let source = r"def close(ready, resource):
+    try:
+        if ready:
+            try:
+                work()
+            finally:
+                if ready:
+                    finish()
+    except OSError:
+        pass
+    finally:
+        resource.close()
+    return 0
+";
+    assert_matches_cpython(source, "guarded_nested_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn erased_assertions_leave_a_continue_guards_false_backedges_separate() {
+    let source = r"def update(items, first, second):
+    for item in items:
+        if ready(item):
+            if first and second:
+                record(item)
+                continue
+            assert item
+        elif pending(item):
+            finish(item)
+";
+    assert_matches_cpython(source, "guard_before_erased_assertion.py", &LEVELS);
+}
+
+#[test]
+fn erased_loop_arm_keeps_its_backedges_before_branching_elif_tests() {
+    for check in [
+        "any(value for value in row)",
+        "check(left if choose else right)",
+    ] {
+        let source = format!(
+            "def scan(rows, left, right, choose):\n    for row in rows:\n        if left or right:\n            assert row\n        elif {check}:\n            record(row)\n"
+        );
+        assert_matches_cpython(&source, "erased_arm_before_elif.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_folded_guard_in_a_try_arm_keeps_its_threaded_jump_unprotected() {
+    let source = r"def run(choose, ready):
+    try:
+        if choose:
+            work()
+            if __debug__:
+                note()
+        else:
+            wait()
+    finally:
+        finish()
+";
+    for source in [source.to_owned(), source.replace("__debug__", "ready")] {
+        assert_matches_cpython(&source, "folded_try_arm.py", &LEVELS);
+    }
+}
+
+#[test]
+fn match_guard_failures_share_the_enclosing_branch_exit() {
+    let source = r"def check(value, enabled, ready):
+    if active:
+        match value:
+            case Node(data) if enabled and ready:
+                return data
+    else:
+        skip()
+    record(value)
+    finish()
+";
+    assert_matches_cpython(source, "match_guard_branch.py", &LEVELS);
+}
+
+#[test]
+fn a_twice_visited_guard_keeps_its_fallthrough_jump_unlocated() {
+    let loop_body = "    for item in items:\n        if enabled:\n            if ready:\n                assert value\n            use(value)\n";
+    let branch_body = "    if first:\n        pass\n    elif second:\n        if enabled:\n            if ready:\n                assert value\n            use(value)\n    elif False:\n        pass\n";
+    for body in [loop_body, branch_body] {
+        let source = format!(
+            "def run(items, first, second, enabled, ready, value):\n{body}    if False:\n        return None\n    else:\n        return value\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "repeated_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
+fn nested_handler_pop_uses_its_only_live_predecessor() {
+    let source = "def work(value, condition):
+    try:
+        save()
+    except ValueError:
+        try:
+            save()
+        except ValueError:
+            try:
+                save()
+            except ValueError:
+                try:
+                    save()
+                except KeyError as cause:
+                    pass
+    return value
+";
+    assert_matches_cpython(source, "nested_handler_live_exit.py", &LEVELS);
+}
+
+#[test]
+fn nested_finalizer_reaches_the_enclosing_branch_exit() {
+    let source = r"def scan(items, enabled, ready):
+    for item in items:
+        try:
+            if enabled:
+                try:
+                    read(item)
+                finally:
+                    if ready:
+                        record(item)
+            else:
+                skip(item)
+        finally:
+            release(item)
+";
+    assert_matches_cpython(source, "nested_finalizer_branch.py", &LEVELS);
+}
+
+#[test]
+fn shared_try_else_exit_precedes_the_next_loop_condition() {
+    let source = r"def scan(items, enabled, flag, done):
+    for item in items:
+        if enabled:
+            try:
+                read(item)
+            except OSError:
+                recover()
+            else:
+                if flag:
+                    record(item)
+        else:
+            skip(item)
+        if done:
+            flush()
+";
+    assert_matches_cpython(source, "shared_try_else_exit.py", &LEVELS);
+}
+
+#[test]
+fn named_handler_uses_the_original_comprehension_assignment_span() {
+    let source = "def work(flag, items):
+    try:
+        prepare()
+    except ValueError as error:
+        if flag:
+            pass
+        else:
+            result = [item for item in items]
+    finally:
+        done()
+";
+    assert_matches_cpython(source, "named_comprehension_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn nested_else_assertion_shares_its_success_exit() {
+    let source = r"def check(enabled, ready, left, right):
+    if enabled:
+        if ready:
+            prepare()
+        else:
+            assert left or right, message()
+    else:
+        recover()
+    finish()
+";
+    assert_matches_cpython(source, "shared_assertion_exit.py", &LEVELS);
+}
+
+#[test]
+fn nested_loop_exit_reuses_the_normal_finalizer_line() {
+    let source = "def drain(active, pending):
+    try:
+        try:
+            while active or pending:
+                pass
+        except KeyError:
+            raise
+    except ValueError:
+        raise
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "nested_loop_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn folded_loop_exhaustion_forwards_the_original_finalizer_edge() {
+    let source = "def drain(ready):
+    try:
+        try:
+            while True:
+                if ready:
+                    break
+                pass
+        except KeyError:
+            raise
+    except ValueError:
+        raise
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "folded_loop_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn loop_else_preserves_a_shared_conditional_exit() {
+    let source = r"def scan(items, enabled, ready, retry):
+    if enabled:
+        for item in items:
+            consume(item)
+        else:
+            if ready:
+                finish()
+            else:
+                prepare()
+                if retry:
+                    for item in items:
+                        record(item)
+    else:
+        skip()
+    flush()
+";
+    assert_matches_cpython(source, "loop_else_exit.py", &LEVELS);
+}
+
+#[test]
+fn folded_return_guard_keeps_the_original_finalizer_predecessor() {
+    let source = "def work(state, skip, value):\n    try:\n        if not skip:\n            if 1:\n                return value\n    finally:\n        state.count -= 1\n";
+    assert_matches_cpython(source, "folded_guard_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn copied_return_finalizer_drops_a_line_supplied_by_the_operand() {
+    let source = "def choose(item):\n    try:\n        return item.value if item is not None else None\n    finally:\n        del item\n";
+    assert_matches_cpython(source, "copied_return_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn negated_comparisons_drop_a_redundant_operand_line() {
+    for comparison in ["needle in items[key]", "needle is items[key]"] {
+        let source = format!(
+            "def check(needle, items, key):\n    return not (\n        {comparison}\n    )\n"
+        );
+        assert_matches_cpython(&source, "negated_comparison.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_finalizer_keeps_its_unprotected_return_marker() {
+    let source = "def clear(obj):\n    try:\n        try:\n            try: pass\n            finally: obj.value = None\n        except ValueError: pass\n    except KeyError: pass\n    return result.value\n";
+    assert_matches_cpython(source, "nested_finalizer_return.py", &LEVELS);
+}
+
+#[test]
+fn a_folded_while_test_and_its_guard_share_the_copied_return() {
+    let source = r"def scan(start, ready, item):
+    if start:
+        if ready:
+            while True:
+                if finished(item):
+                    break
+                item = next_item()
+    else:
+        pass
+    return None
+";
+    assert_matches_cpython(source, "guarded_loop_return.py", &LEVELS);
+    let continued = source.replace("return None", "finish(item)");
+    for (index, version) in [(2, PythonVersion::Py314), (3, PythonVersion::Py315)] {
+        for level in LEVELS {
+            let [native, actual] =
+                compile_both(&continued, "guarded_loop_continuation.py", version, level);
+            assert_outputs_match(
+                probe(index).args([
+                    "-I",
+                    "-S",
+                    "-c",
+                    "import marshal, sys; sys.stdout.buffer.write(marshal.load(sys.stdin.buffer).co_consts[0].co_code)",
+                ]),
+                [&native, &actual],
+            );
+        }
+    }
+}
+
+#[test]
+fn an_authored_loop_break_reaches_the_normal_finalizer_load() {
+    let source = "async def poll(ready):\n    local = open_resource()\n    try:\n        if first():\n            while True:\n                if ready:\n                    break\n        elif second():\n            pass\n    except ValueError:\n        pass\n    finally:\n        await local.finish()\n";
+    for source in [
+        source.to_owned(),
+        source.replace(
+            "if ready:\n                    break",
+            "if ready or second():\n                    break\n                await local.step()",
+        ),
+    ] {
+        assert_matches_cpython(&source, "loop_finalizer_load.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_guard_can_locate_an_ownerless_try_exit_before_a_copied_return() {
+    let source = "def read(source):\n    try:\n        if source and source[0]:\n            try:\n                if valid(source):\n                    return 'yes'\n            except Exception as error:\n                warn(error)\n                reset()\n    except LookupError:\n        pass\n    return 'no'\n";
+    assert_matches_cpython(source, "guarded_try_return.py", &LEVELS);
+}
+
+#[test]
+fn legacy_handler_return_counts_each_protected_scope() {
+    let source = r"def consume(active):
+    try:
+        while active:
+            try:
+                try:
+                    work()
+                except LookupError:
+                    if active:
+                        try:
+                            close()
+                        except OSError:
+                            pass
+                        return
+            except TypeError:
+                pass
+    except ValueError:
+        pass
+";
+    assert_matches_cpython_versions(
+        source,
+        "handler_scope_return.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
+fn final_case_keeps_a_broken_iterators_exhaustion_line() {
+    let source = "def read(items, tokens):\n    for item in items:\n        match item:\n            case 0:\n                for token in tokens:\n                    if token:\n                        break\n        consume(item)\n";
+    assert_matches_cpython(source, "case_iterator_exit.py", &LEVELS);
+}
+
+#[test]
+fn a_terminal_conditional_discards_the_comprehension_after_restoring_its_locals() {
+    for result in [
+        "[visit(x) for x in xs]",
+        "{x for x in xs}",
+        "{x: x for x in xs}",
+    ] {
+        let source = format!("def render(xs, enabled):\n    visit(xs) if enabled else {result}\n");
+        assert_matches_cpython(&source, "discard_comprehension.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_named_handler_copies_a_branch_loops_hidden_return() {
+    for prefix in ["", "async "] {
+        let source = format!(
+            "{prefix}def run(ready, items, check):\n    try:\n        check(ready)\n    except LookupError as error:\n        if check(error):\n            check(ready)\n        else:\n            while ready:\n                active = [item for item in items if check(item) and check(ready)]\n                if not active:\n                    break\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "guarded_handler_loop.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
+fn a_final_guard_locates_the_normal_exit_before_async_cleanup() {
+    let source = r"async def run(manager, value):
+    async with manager:
+        outer = acquire()
+        try:
+            if first(value):
+                pass
+            elif second(value):
+                try:
+                    pass
+                except ValueError as error:
+                    pass
+                finally:
+                    await inner.stop()
+        except ValueError as error:
+            pass
+        finally:
+            await outer.stop()
+";
+    assert_matches_cpython(source, "guarded_async_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn folding_keeps_the_shared_exit_after_a_partial_guard_unlocated() {
+    for (kind, branch) in [
+        ("def", "if True:\n   if guard:\n    work()"),
+        (
+            "def",
+            "if True:\n   if guard:\n    work()\n  else:\n   unused()",
+        ),
+        (
+            "async def",
+            "if first:\n   pass\n  elif second:\n   if guard:\n    work(guard)\n  else:\n   assert False",
+        ),
+    ] {
+        let source = format!(
+            "{kind} dispatch(outer, first, second, guard):\n if outer:\n  {branch}\n else:\n  fallback()\n finish()\n"
+        );
+        assert_matches_cpython(&source, "shared_guard_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_copied_finalizer_keeps_its_pop_on_the_conditional_fallthrough() {
+    for exit in ["raise value", "return value"] {
+        let source = format!(
+            "def run(choose, value):\n    try:\n        if choose:\n            first(value)\n        else:\n            last(value)\n    except ValueError:\n        pass\n    finally:\n        {exit}\n"
+        );
+        assert_matches_cpython(&source, "conditional_finalizer_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_terminal_try_keeps_its_original_break_until_the_return_is_copied() {
+    for body in [
+        "async with manager:\n                use(ready)",
+        "if ready:\n                async with manager:\n                    use(ready)\n            else:\n                use(ready)",
+    ] {
+        let source = format!(
+            "async def run(ready, manager, use):\n    while True:\n        try:\n            {body}\n        except ValueError as error:\n            pass\n        break\n"
+        );
+        assert_matches_cpython(&source, "shared_break.py", &LEVELS);
+    }
+}
+
+#[test]
+fn folded_named_handler_return_owns_the_finalizer_guard_marker() {
+    let source = r"def collect(value, owner):
+    try:
+        work()
+    except LookupError as error:
+        value = first(value) or alternate(value)
+        value = normalize(convert(value))
+        return (encode(pack(value)), [(1, 2), (3, encode(pack(value)))], value)
+    finally:
+        if owner is not None:
+            close(owner)
+";
+    assert_matches_cpython_versions(
+        source,
+        "named_result_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn copied_conditional_return_uses_the_guard_before_an_erased_else() {
+    let source = "def sample(value, enabled, ready):\n    if value == 1:\n        if enabled:\n            pass\n        else:\n            if ready:\n                pass\n            elif value == 2:\n                pass\n            elif value:\n                result = value\n            else:\n                assert False\n    elif value == 4:\n        pass\n    return result\n";
+    assert_matches_cpython(source, "guard_return.py", &LEVELS);
+}
+
+#[test]
+fn folded_disjunction_keeps_the_nested_else_fallthrough_position() {
+    for (condition, arm) in [
+        ("item.ready or True", "pass"),
+        ("item.ready or True", "return item"),
+        ("True or item.ready", "pass"),
+        ("item.ready or True or item.extra", "pass"),
+    ] {
+        let source = format!(
+            "def visit(item):\n    if {condition}:\n        if item.mode:\n            {arm}\n        else:\n            item.update()\n    else:\n        pass\n    consume(item)\n"
+        );
+        assert_matches_cpython(&source, "folded_else.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_shared_match_case_exit_stays_unlocated_when_copying_a_return() {
+    for tail in ["return target", "return None", "return work(value, target)"] {
+        let source = format!(
+            "def choose(value, target, enabled):\n    match value:\n        case 1 | 2:\n            if enabled:\n                consume(value)\n            else:\n                if value:\n                    target.value = value\n    {tail}\n"
+        );
+        assert_matches_cpython(&source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_match_guard_keeps_the_assignment_fallthrough_position() {
+    for action in ["options[value] = ready", "notify(ready)"] {
+        let source = format!(
+            "def choose(value, options, ready):\n    match value:\n        case 1:\n            if ready or valid(value):\n                if ready:\n                    pass\n                else:\n                    {action}\n    return consume(options, ready)\n"
+        );
+        assert_matches_cpython(&source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_loop_capture_keeps_the_stores_line_on_its_backedge() {
+    let source = r"def consume(items, ready):
+    while ready and items:
+        match items.pop():
+            case selected:
+                assert selected
+";
+    assert_matches_cpython(source, "erased_loop_capture.py", &LEVELS);
+}
+
+#[test]
+fn a_sole_try_else_exit_locates_the_following_finalizer() {
+    for tail in ["item.done = ready", "ready += 1", "notify()"] {
+        let source = format!(
+            "def finish(ready, item, notify):\n    try:\n        while True:\n            try:\n                if ready:\n                    break\n            except ValueError as error:\n                pass\n    except KeyError:\n        raise\n    else:\n        {tail}\n    finally:\n        if ready:\n            pass\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "else_before_finally.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
+fn overriding_returns_preserve_the_surviving_else_marker() {
+    for (body, tail) in [
+        ("if ready:\n            work()", "pass"),
+        (
+            "while True:\n            try:\n                if ready:\n                    break\n            except ValueError as error:\n                pass",
+            "item.done = value",
+        ),
+    ] {
+        let source = format!(
+            "def finish(ready, value, item, work):\n    try:\n        {body}\n    except KeyError:\n        raise\n    except IndexError:\n        return value\n    else:\n        {tail}\n    finally:\n        return value\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "else_before_return.py",
+            &LEVELS,
+            &[PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn nested_conditionals_copy_a_guarded_try_exit_onto_the_local_return() {
+    let source = r"def sample(value, found, ready):
+    if found:
+        if ready:
+            try:
+                if missing(value):
+                    raise ValueError(value)
+            except TimeoutError as error:
+                pass
+        else:
+            raise ValueError(value)
+    elif value:
+        pass
+    return value
+";
+    assert_matches_cpython(source, "nested_guard_return.py", &LEVELS);
+}
+
+#[test]
+fn nested_cleanup_keeps_the_enclosing_guards_exit_location() {
+    let source = r"def run(outer, ready, value):
+    if outer:
+        if not ready:
+            try:
+                use(value)
+            finally:
+                try:
+                    close(value)
+                except LookupError:
+                    pass
+    else:
+        raise ValueError
+    finish(value)
+";
+    assert_matches_cpython(source, "nested_guard_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn nested_else_while_break_keeps_its_condition_location() {
+    let source = r"def scan(outer, ready, value):
+    if outer:
+        if ready:
+            pass
+        else:
+            while value:
+                consume(value)
+                break
+    else:
+        replace(value)
+    finish(value)
+
+def nested(outer, active, ready, value):
+    if outer:
+        if active:
+            if ready:
+                consume(value)
+            else:
+                while value:
+                    if done(value):
+                        break
+                    value = advance(value)
+        else:
+            replace(value)
+    finish(value)
+";
+    assert_matches_cpython(source, "nested_while_exit.py", &LEVELS);
+}
+
+#[test]
+fn nested_guard_locates_the_exit_after_its_last_arm_is_removed() {
+    for tail in [
+        "if True:\n                return value",
+        "if active:\n                pass\n            else:\n                assert False",
+    ] {
+        let source = format!(
+            "def choose(outer, flag, active, value):\n    if outer:\n        if flag:\n            {tail}\n    else:\n        value = fallback()\n    use(value)\n"
+        );
+        assert_matches_cpython(&source, "nested_guard_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn folded_boolean_arms_locate_their_conditional_jumps() {
+    let source = r"def configure(target, enabled, value, fallback):
+    target.checked = not not value if enabled else fallback
+    target.raw = None or value if enabled else fallback
+    target.shared = True and (value or fallback) if enabled else fallback
+    target.fallback = fallback
+";
+    assert_matches_cpython(source, "conditional_boolean_location.py", &LEVELS);
+}
+
+#[test]
+fn folded_loop_break_keeps_its_check_after_handler_cleanup() {
+    let source = r"def recover():
+    try:
+        attempt()
+    except ValueError:
+        while True:
+            break
+    finish()
+";
+    assert_matches_cpython(source, "handler_loop_break.py", &LEVELS);
+}
+
+#[test]
+fn legacy_threading_stops_at_an_omitted_normal_try_pop() {
+    let source = r"def optional(ready):
+    try:
+        if ready:
+            before()
+            if __debug__:
+                visit()
+    except LookupError:
+        recover()
+    done()
+
+def checked(value):
+    try:
+        if value:
+            assert (
+                True
+                if check(value)
+                else False
+            ), 'expected'
+    except AssertionError as error:
+        pass
+    done(value)
+    return True
+";
+    assert_matches_cpython_versions(
+        source,
+        "threaded_try_pop.py",
+        &LEVELS,
+        &[PythonVersion::Py313],
+    );
+}
+
+#[test]
+fn normal_finally_inlines_a_small_overriding_return() {
+    for result in ["True", "finish()"] {
+        let source = format!(
+            "def sample(reader, value):
+    try:
+        found = reader.lookup(value)
+    except LookupError:
+        return False
+    finally:
+        return {result}
+"
+        );
+        assert_matches_cpython(&source, "copied_finally_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn named_handler_return_compaction_selects_the_finalizer_truth_marker_owner() {
+    for returned in ["finish(item)", "finish(item, other)", "callback(item)"] {
+        for guard in ["ready", "not ready"] {
+            let source = format!(
+                r"async def run(item, other, ready, callback):
+    try:
+        begin()
+    finally:
+        try:
+            try:
+                visit(item)
+            except LookupError as caught:
+                if ready:
+                    return {returned}
+        finally:
+            if {guard}:
+                release()
+"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "named_handler_guard_slot.py",
+                &LEVELS,
+                &[PythonVersion::Py314],
+            );
+        }
+    }
+}
+
+#[test]
+fn raising_while_else_preserves_the_break_on_a_copied_return() {
+    let source = r"def sample(ready, enabled):
+    try:
+        while ready():
+            try:
+                if enabled:
+                    step()
+                else:
+                    break
+            except ValueError:
+                pass
+        else:
+            raise LookupError
+    except TypeError:
+        pass
+";
+    assert_matches_cpython(source, "while_else_break_return.py", &LEVELS);
+}
+
+#[test]
+fn deferred_finalizer_returns_keep_their_cleanup_range_and_line() {
+    let linear = r"async def run(value, ready):
+    try:
+        prepare()
+    finally:
+        try:
+            if ready:
+                try:
+                    await inspect(value)
+                except ValueError as error:
+                    if ready:
+                        return result(error)
+        finally:
+            await release(value)
+";
+    assert_matches_cpython(linear, "deferred_finalizer.py", &LEVELS);
+
+    let branched = linear.replace(
+        "            await release(value)",
+        "            if ready:\n                release(value)\n            else:\n                recover(value)",
+    );
+    assert_matches_cpython_versions(
+        &branched,
+        "deferred_finalizer.py",
+        &LEVELS,
+        &[PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn copied_handler_cleanup_inherits_each_boolean_operand_location() {
+    let source = r"def scan(items, enabled):
+    for item in items:
+        try:
+            consume(item)
+        except LookupError:
+            if enabled:
+                item and report(item)
+            else:
+                raise
+";
+    assert_matches_cpython(source, "boolean_handler_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn returning_through_nested_finally_restores_the_outer_exception_last() {
+    let source = r"def run(value):
+    try:
+        start()
+    finally:
+        try:
+            return value
+        finally:
+            finish()
+
+async def recover(value):
+    try:
+        start()
+    finally:
+        try:
+            await inspect(value)
+        except ValueError as error:
+            return result(error)
+        finally:
+            await finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_finally.py",
+        &LEVELS,
+        &[PythonVersion::Py312, PythonVersion::Py313],
+    );
+}
+
+#[test]
+fn legacy_while_retest_keeps_trailing_pass_lines() {
+    let source = r"def drain(manager, stop):
+    try:
+        with manager:
+            while ready():
+                if stop:
+                    return True
+                pass
+    except ValueError:
+        return False
+    return True
+";
+    assert_matches_cpython(source, "while_retest_pass.py", &LEVELS);
+    let two_passes = source.replace(
+        "                pass",
+        "                pass\n                pass",
+    );
+    assert_matches_cpython_versions(
+        &two_passes,
+        "while_retest_passes.py",
+        &LEVELS,
+        &[PythonVersion::Py312, PythonVersion::Py313],
+    );
+}
+
+#[test]
+fn loop_else_branches_locate_each_copy_of_an_implicit_return() {
+    let source = r"def choose(values, early, ready):
+    if early:
+        prepare()
+    else:
+        for value in values:
+            work(value)
+        else:
+            if ready:
+                yield first()
+            else:
+                yield second()
+";
+    assert_matches_cpython(source, "loop_else_branch_returns.py", &LEVELS);
+    let guarded = r"def iterate(values, active, ready):
+    if active:
+        for value in values:
+            work(value)
+        else:
+            if ready:
+                yield value
+";
+    assert_matches_cpython(guarded, "loop_else_guard_return.py", &LEVELS);
+}
+
+#[test]
+fn erased_handler_guards_keep_their_shared_cleanup_unlocated() {
+    let sources = [
+        r"def inspect(items, flag):
+    for item in items:
+        try:
+            try:
+                use(item)
+            except ValueError:
+                if flag:
+                    assert item
+                if check(item) is False:
+                    return False
+        except RuntimeError:
+            raise
+    return True
+",
+        r"def recover(flag, value):
+    with manage():
+        try:
+            use(value)
+        except ValueError as error:
+            if flag:
+                if check(value):
+                    assert value
+                value = retry()
+            else:
+                raise RuntimeError() from error
+        finish(value)
+",
+    ];
+    for source in sources {
+        assert_matches_cpython(source, "erased_handler_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn normal_finally_pop_keeps_a_trailing_try_body_pass() {
+    let source = r"def process(items):
+    try:
+        for item in items:
+            touch(item)
+        pass
+    finally:
+        close()
+
+
+def poll(ready):
+    while ready():
+        try:
+            while active():
+                step()
+            update()
+            pass
+        finally:
+            close()
+";
+    assert_matches_cpython(source, "normal_finally_pass_line.py", &LEVELS);
+}
+
+#[test]
+fn a_named_handler_still_owns_the_finally_copied_on_its_return() {
+    let source = r"def choose(value):
+    try:
+        return read(value)
+    except ValueError as first:
+        try:
+            try:
+                return retry(first)
+            except RuntimeError as second:
+                try:
+                    return fallback(second)
+                finally:
+                    release(second)
+        finally:
+            reset(value)
+";
+    assert_matches_cpython(source, "named_handler_finalizer.py", &LEVELS);
+    assert_matches_cpython(
+        &source
+            .replace(" as first", "")
+            .replace("retry(first)", "retry(value)"),
+        "unnamed_outer_handler_finalizer.py",
+        &LEVELS,
+    );
+}
+
+#[test]
+fn an_empty_handler_try_keeps_its_finally_on_the_normal_exit() {
+    let source = "def recover(flag):\n    try:\n        visit()\n    except ValueError:\n        try:\n            assert flag\n        except IndexError:\n            raise\n        finally:\n            finish()\n";
+    for body in ["assert flag", "pass", "work()"] {
+        assert_matches_cpython(
+            &source.replace("assert flag", body),
+            "empty_handler_try_finally.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn tuple_return_joins_stay_unlocated_after_copying_try_exits() {
+    let source = r"def guarded(flag, left, right):
+    try:
+        if flag:
+            try:
+                if ready(left):
+                    update(left)
+                else:
+                    update(right)
+            except OSError:
+                recover()
+    except ValueError:
+        log()
+    return left, right
+
+
+def fallthrough(flag, ready, left, right):
+    if flag:
+        if ready:
+            try:
+                update(left)
+            except ValueError as error:
+                log(error)
+        else:
+            left = update(right)
+    else:
+        observe(right)
+    return left, right
+
+
+def recovered(flag, left, right, enabled):
+    if enabled:
+        if flag:
+            try:
+                touch(left)
+            except KeyError as error:
+                try:
+                    touch(left)
+                except ArithmeticError:
+                    touch(right)
+    else:
+        consume(right)
+    return left, right
+";
+    assert_matches_cpython(source, "shared_tuple_return_joins.py", &LEVELS);
+}
+
+#[test]
+fn an_inner_finalizer_keeps_the_surrounding_exception_handler() {
+    let source = r"def choose(items):
+    try:
+        value = items[0]
+    except IndexError:
+        try:
+            other = items[1]
+        except IndexError:
+            return -1
+        else:
+            return other
+        finally:
+            finish()
+    else:
+        return value
+    finally:
+        done()
+";
+    assert_matches_cpython(source, "nested_finalizer_handler_return.py", &LEVELS);
+}
+
+#[test]
+fn generator_handler_returns_keep_the_try_around_their_finalizer() {
+    let source = r"def visit(items):
+    try:
+        while True:
+            try:
+                item = take(items)
+            except StopIteration as stop:
+                return stop.value
+            finally:
+                finish(items)
+            yield item
+    except GeneratorExit:
+        close(items)
+        raise
+";
+    assert_matches_cpython(source, "generator_handler_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn discarded_constant_fstrings_leave_a_slot_for_the_next_condition() {
+    let source = r#"def check(value):
+    "documentation"
+    PREFIX
+    try:
+        if value:
+            return value
+    except ValueError:
+        recover()
+"#;
+    for prefix in ["f'constant'", "'second string'"] {
+        assert_matches_cpython(
+            &source.replace("PREFIX", prefix),
+            "discarded_fstring.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn a_while_loop_in_finally_preserves_handler_restoration_order() {
+    let source = r"def collect(flag):
+    try:
+        perform()
+    finally:
+        while flag:
+            try:
+                finish()
+            except ValueError:
+                return
+";
+    assert_matches_cpython(source, "finally_while_handler_return.py", &LEVELS);
+}
+
+#[test]
+fn chained_loop_condition_copies_short_terminal_arms() {
+    let source = r"def search(low, value, high, items):
+    while ready(value):
+        if low <= value < high:
+            return value
+        elif value < low:
+            advance()
+        else:
+            retreat()
+    for item in items:
+        if low < item < high:
+            raise LookupError
+        else:
+            visit(item)
+    return None
+";
+    assert_matches_cpython(source, "chained_loop_terminal_arms.py", &LEVELS);
+}
+
+#[test]
+fn nested_handler_cleanup_jumps_to_the_shared_method_return() {
+    let source = r"def choose(flag, value):
+    try:
+        prepare()
+        if flag != value:
+            try:
+                update(value)
+            except ValueError:
+                try:
+                    recover(value)
+                except OSError:
+                    log()
+    except TypeError:
+        return flag.finish()
+    return value.finish()
+";
+    assert_matches_cpython(source, "nested_handler_method_return.py", &LEVELS);
+}
+
+#[test]
+fn nested_handler_arms_copy_their_implicit_name_cleanup() {
+    let source = r"def scan(first, second):
+    try:
+        visit()
+    except ValueError as error:
+        if first:
+            if second:
+                use(error)
+            else:
+                raise
+        else:
+            report(error)
+";
+    assert_matches_cpython(source, "conditional_name_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn manager_suppression_reaches_the_shared_guarded_return() {
+    let source = r"def lookup(value):
+    try:
+        prepare()
+        if ready(value):
+            try:
+                with acquire(value) as resource:
+                    return resource.read()
+            except LookupError:
+                return None
+    except TypeError:
+        return None
+    return None
+";
+    for body in [
+        source.to_owned(),
+        source.replace(
+            "with acquire(value) as resource:\n                    return resource.read()",
+            "return acquire(value)",
+        ),
+    ] {
+        assert_matches_cpython(&body, "guarded_manager_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn legacy_returns_discard_the_iterator_after_a_guarded_finalizer() {
+    for result in ["item", "1"] {
+        let source = format!(
+            "def select(items):
+    for item in items:
+        try:
+            try:
+                return {result}
+            finally:
+                if item:
+                    clean(item)
+        except ValueError:
+            continue
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "finally_iterator_discard.py",
+            &LEVELS,
+            &[PythonVersion::Py312, PythonVersion::Py313],
+        );
+    }
+}
+
+#[test]
+fn erased_else_keeps_the_nested_fallthrough_line() {
+    let source = r"def apply(active, items):
+    if first(active) or second(active):
+        if choose(items):
+            for item in items:
+                process(item)
+        else:
+            process(items)
+    else:
+        assert False
+    if ready(items):
+        finish(items)
+";
+    for tail in [
+        "process(items)",
+        "for item in items:\n                process(item)",
+    ] {
+        assert_matches_cpython(
+            &source.replace("process(items)", tail),
+            "erased_else_fallthrough.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn erased_assertion_after_nested_condition_preserves_the_loop_backedge() {
+    let source = r"def validate(rows, enabled, check):
+    for row in rows:
+        if enabled:
+            process(row)
+        else:
+            if check:
+                if row.ready:
+                    row = normalize(row)
+            assert row
+";
+    assert_matches_cpython(source, "conditional_before_erased_assert.py", &LEVELS);
+}
+
+#[test]
+fn an_asserted_else_keeps_its_success_line_before_a_local_return() {
+    let source = r"def check(value):
+    try:
+        value = build()
+    except ValueError:
+        value = fallback()
+    else:
+        assert ready(value)
+    return value
+";
+    for guard in ["ready(value)", "not ready(value)", "ready(value) or value"] {
+        assert_matches_cpython(
+            &source.replace("assert ready(value)", &format!("assert {guard}")),
+            "asserted_else_return.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn a_nested_return_guard_keeps_shared_fallthrough_unlocated() {
+    let source = r"def choose(obj, value):
+    if obj:
+        if value:
+            if ready():
+                pass
+            else:
+                value = create()
+                if ready() and 0 < value < 40:
+                    return value
+        else:
+            return value
+    return 512
+";
+    for test in [
+        "ready() and 0 < value < 40",
+        "ready() and check(value)",
+        "value",
+    ] {
+        assert_matches_cpython(
+            &source.replace("ready() and 0 < value < 40", test),
+            "nested_guard_fallthrough.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn erased_loop_else_guards_keep_the_false_backedge() {
+    let source = r"async def dispatch(events, manager):
+    async with manager:
+        async for event in events:
+            if event:
+                try:
+                    process(event)
+                except ValueError as error:
+                    report(error)
+            else:
+                assert event is None
+
+def consume(rows, manager):
+    with manager:
+        for row in rows:
+            if row:
+                if row.ready:
+                    process(row)
+            else:
+                assert row is None
+";
+    assert_matches_cpython(source, "erased_loop_else.py", &LEVELS);
+}
+
+#[test]
+fn nested_for_else_conditions_keep_their_forward_exit() {
+    let source = r"def find(rows, enabled):
+    for row in rows:
+        if row:
+            if row.first:
+                return row
+            elif enabled and row.second:
+                return row
+        else:
+            break
+    else:
+        return enabled
+
+async def record(events, enabled):
+    async for event in events:
+        if event:
+            if enabled:
+                store(event)
+        else:
+            continue
+    else:
+        yield None
+";
+    assert_matches_cpython(source, "nested_for_else_conditions.py", &LEVELS);
+}
+
+#[test]
+fn folded_conditions_keep_shared_return_copies_unlocated() {
+    let source = r"def choose(a, b, c):
+    if a:
+        if b:
+            if c:
+                result = first()
+            elif True:
+                result = second()
+        elif True:
+            result = third()
+    else:
+        result = fallback()
+    return result
+";
+    for clause in ["elif True:", "elif c:", "else:"] {
+        assert_matches_cpython(
+            &source.replace("elif True:", clause),
+            "folded_shared_return.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn consecutive_literal_memberships_preserve_the_following_try_setup_slot() {
+    let source = r"def choose(value, enabled):
+    if enabled:
+        first = value in {'a', 'b'}
+        second = value in {'b', 'c'}
+        try:
+            result = first if second else False
+        except KeyError:
+            recover()
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "folded_memberships.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
+fn pair_assignments_keep_the_original_store_line_on_copied_returns() {
+    let pair = "left, right = obj.left, obj.right";
+    let nested =
+        format!("if ready():\n                {pair}\n            else:\n                {pair}");
+    for (first, second) in [(nested.as_str(), pair), (pair, nested.as_str())] {
+        let source = format!(
+            r"def choose(flag, obj):
+    if flag == 1:
+        if ready():
+            {first}
+        else:
+            {second}
+    elif flag == 2:
+        {pair}
+    else:
+        {pair}
+    return left, right
+"
+        );
+        assert_matches_cpython(&source, "pair_assignment_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn terminal_try_else_keeps_separate_legacy_loop_returns() {
+    for body in ["process(item)", "yield item"] {
+        let source = format!(
+            "def run(item, ready):\n    try:\n        prepare()\n    except LookupError:\n        pass\n    else:\n        while ready(item):\n            {body}\n"
+        );
+        assert_matches_cpython(&source, "try_else_loop.py", &LEVELS);
+    }
+}
+
+#[test]
+fn terminal_try_else_loop_return_uses_the_false_edge() {
+    let source = r"def run(items, ready):
+    if ready:
+        try:
+            prepare(items)
+        except LookupError:
+            pass
+        else:
+            while ready:
+                for item in items:
+                    process(item)
+";
+    assert_matches_cpython(source, "try_else_loop.py", &LEVELS);
+}
+
+#[test]
+fn nested_assignments_copy_the_normal_try_tuple_return() {
+    let source = r"def choose(active, mode, left, right):
+    try:
+        if active:
+            if mode:
+                if ready():
+                    left = first()
+                else:
+                    left = second()
+            elif enabled():
+                left = other()
+        else:
+            left = default()
+    except LookupError:
+        pass
+    return left, right
+";
+    for tail in ["left, right", "left, right, mode"] {
+        assert_matches_cpython(
+            &source.replace("return left, right", &format!("return {tail}")),
+            "nested_assignment_return.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn folded_loop_tail_disjunction_preserves_borrow_entries() {
+    for condition in ["True or ready", "ready or True", "not (False and ready)"] {
+        let source = format!(
+            "def run(value, items, ready):\n    for item in items:\n        if {condition}:\n            consume(value, item)\n"
+        );
+        assert_matches_cpython(&source, "folded_loop_condition.py", &LEVELS);
+    }
+}
+
+#[test]
+fn terminal_conditional_discards_borrow_only_the_jumping_arm() {
+    for expression in [
+        "call(value) if flag else value",
+        "value if flag else call(value)",
+    ] {
+        let source = format!("def f(value, flag):\n    {expression}\n");
+        assert_matches_cpython_versions(
+            &source,
+            "terminal_conditional_discard.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn handler_breaks_keep_the_copied_finalizer_pop() {
+    let source = r"def stream(items, marker):
+    try:
+        while True:
+            try:
+                value = next(items)
+            except StopIteration:
+                break
+            finally:
+                if marker is not None:
+                    notify(marker)
+            yield value
+    except LookupError:
+        recover()
+    finally:
+        finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "handler_break_guard.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
+fn copied_unlocated_try_exit_stops_only_borrow_fallthrough() {
+    for first in [
+        "return None",
+        "try:\n                prepare()\n            except ValueError:\n                pass",
+    ] {
+        let source = format!(
+            "def run(value, ready):\n    try:\n        if ready:\n            {first}\n        else:\n            try:\n                prepare()\n            except ValueError:\n                pass\n    except TypeError:\n        pass\n    consume(value)\n"
+        );
+        assert_matches_cpython(&source, "copied_try_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn iterator_returns_reuse_the_finalizer_pop_for_attribute_tests() {
+    let source = r"async def first(items, item):
+    try:
+        for item in items:
+            observe(item)
+            return 1
+    except LookupError:
+        recover()
+    finally:
+        if item.active:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "iterator_attribute.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
+fn continued_handler_truth_tests_reuse_the_finalizer_pop() {
+    let source = r"async def retry(value, ready):
+    while ready:
+        try:
+            step(value)
+        except LookupError as cause:
+            if value:
+                await value.report()
+                continue
+        finally:
+            if value:
+                pass
+            finish(value)
+";
+    assert_matches_cpython_versions(
+        source,
+        "continued_truth.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
+fn protected_assignment_locates_a_shared_tuple_return() {
+    let source = r"def choose(enabled, test, left, right):
+    if enabled:
+        try:
+            if test:
+                left = first()
+            else:
+                right = second()
+        except ValueError:
+            right = recover()
+    else:
+        left = fallback()
+    return left, right
+";
+    assert_matches_cpython(source, "protected_assignment_return.py", &LEVELS);
+}
+
+#[test]
+fn unnamed_handler_returns_keep_the_try_around_an_async_generator_loop() {
+    let source = r"async def run(items, item, ready):
+    yield item
+    try:
+        while ready:
+            try:
+                work(item)
+            except LookupError:
+                return
+            finally:
+                item = None
+    except OSError:
+        recover()
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "handler_loop_finally.py", &LEVELS);
+}
+
+#[test]
+fn returning_through_interleaved_handlers_and_finalizers_keeps_their_owners() {
+    for loop_header in ["while ready", "for item in items"] {
+        let source = format!(
+            r"def run(items, ready):
+    try:
+        {loop_header}:
+            try:
+                work()
+            except ValueError as outer:
+                try:
+                    start()
+                except KeyError as inner:
+                    return
+                finally:
+                    if ready:
+                        close()
+    except RuntimeError:
+        recover()
+    finally:
+        if ready:
+            finish()
+"
+        );
+        assert_matches_cpython(&source, "interleaved_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_guarded_assertion_keeps_one_line_event_on_its_normal_try_exit() {
+    let source = r"def verify(enabled, value):
+    if enabled:
+        try:
+            assert value
+        except ValueError:
+            pass
+    else:
+        skip()
+    finish()
+
+def folded():
+    try:
+        assert True
+    except ValueError:
+        pass
+    finish()
+";
+    assert_matches_cpython(source, "assertion_success_exit.py", &LEVELS);
+}
+
+#[test]
+fn class_annotation_indices_include_unreachable_branches() {
+    let source = r"class Row:
+    if False:
+        unused: A
+    if enabled:
+        field: B
+    try:
+        work()
+    finally:
+        outcome: C
+";
+    assert_matches_cpython(source, "conditional_class_annotations.py", &LEVELS);
+}
+
+#[test]
+fn terminal_while_else_gives_each_break_its_implicit_return_line() {
+    let source = r"def poll(enabled, ready, done, value):
+    if enabled:
+        while ready:
+            if done:
+                break
+            check(value)
+        else:
+            finish(value)
+
+def wait(ready, done, value):
+    try:
+        while ready():
+            if done():
+                break
+            visit(value)
+        else:
+            raise LookupError
+    except LookupError:
+        recover(value)
+        raise
+";
+    assert_matches_cpython(source, "while_else_scope_exit.py", &LEVELS);
+}
+
+#[test]
+fn protected_while_break_counts_its_unwind_before_copying_the_return() {
+    let source = r"def select(ready, value):
+    while True:
+        try:
+            if ready:
+                visit(value)
+            else:
+                update(value)
+            break
+        except LookupError:
+            retry(value)
+    return value
+
+def managed(manager, value):
+    while True:
+        try:
+            with manager:
+                visit(value)
+            break
+        except LookupError:
+            retry(value)
+    return value
+";
+    assert_matches_cpython(source, "protected_break_copy.py", &LEVELS);
+}
+
+#[test]
+fn guarded_handler_return_keeps_the_normal_finalizer_reachable_for_borrowing() {
+    let source = r"def check(client):
+    try:
+        client.check()
+    except ValueError as error:
+        if error.code == 401:
+            return False
+    except OSError:
+        report()
+    finally:
+        client.restore()
+    return True
+";
+    assert_matches_cpython(source, "guarded_handler_return.py", &LEVELS);
+}
+
+#[test]
+fn a_try_inside_a_returning_handler_keeps_the_finalizer_protected() {
+    let source = r"async def run():
+    try:
+        try:
+            work()
+        except LookupError:
+            try:
+                return None
+            except KeyError:
+                recover()
+        finally:
+            try:
+                finish()
+            except ValueError:
+                recover()
+    except OSError:
+        recover()
+";
+    assert_matches_cpython(source, "handler_try_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn nested_try_joins_the_named_handler_cleanup_before_its_return() {
+    let source = r"def lookup(obj, key):
+    if not obj:
+        try:
+            obj = outer()
+        except LookupError as error:
+            reset()
+            if key:
+                args = build()
+                if args:
+                    try:
+                        obj = inner()
+                    except ValueError:
+                        raise error
+                else:
+                    raise error
+    return obj
+";
+    assert_matches_cpython(source, "nested_try_handler_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn annotation_only_local_branches_emit_no_line_marker() {
+    let source = r"def choose(enabled, value):
+    if enabled:
+        item: int
+    if value:
+        item = int(value)
+    else:
+        item = 0
+    return item
+";
+    assert_matches_cpython(source, "annotation_only_branch.py", &LEVELS);
+}
+
+#[test]
+fn shared_nested_exit_does_not_inherit_the_fallthrough_store_line() {
+    let source = r"def select(outer, inner, manager, left, right):
+    if outer:
+        if inner:
+            with manager:
+                left = 1
+        else:
+            left = 2
+    else:
+        left = 3
+    return left, right
+";
+    assert_matches_cpython(source, "shared_store_exit.py", &LEVELS);
+}
+
+#[test]
+fn handler_branches_keep_their_jump_when_a_tuple_return_enlarges_the_cleanup() {
+    for handler in ["except ValueError:", "except ValueError as exc:"] {
+        let source = format!(
+            "def f(x, y):\n    try:\n        read()\n    {handler}\n        if x:\n            if y:\n                first()\n            else:\n                second()\n        else:\n            third()\n    return x, y\n"
+        );
+        assert_matches_cpython(&source, "handler_return_copy.py", &LEVELS);
+    }
+}
+
+#[test]
+fn chained_comparison_body_returns_at_the_last_assignment_target() {
+    for assignment in ["_, _ = pair()", "a = b = pair()"] {
+        let source = format!("def f(n):\n    if 0 <= n <= 10:\n        {assignment}\n");
+        assert_matches_cpython(&source, "chained_compare_assignment.py", &LEVELS);
+    }
+}
+
+#[test]
+fn return_after_reordered_finalizer_stores_inherits_the_original_last_target() {
+    let source = "def f(a, b, c):\n    try:\n        return True\n    finally:\n        a, b, c = None, None, None\n";
+    assert_matches_cpython(source, "finalizer_store_locations.py", &LEVELS);
+}
+
+#[test]
+fn while_else_fallthrough_retains_its_line_after_try_exit_copying() {
+    let source = r"def search(ready, stop, value):
+    try:
+        while ready:
+            if stop:
+                break
+            visit(value)
+        else:
+            fallback(value)
+    except LookupError:
+        recover(value)
+    return value
+
+def stop_early(ready, value):
+    try:
+        while ready:
+            break
+        else:
+            return value
+    except LookupError:
+        recover(value)
+    return value
+";
+    assert_matches_cpython(source, "retained_while_else_exit.py", &LEVELS);
+}
+
+#[test]
+fn formatted_comprehensions_inherit_the_complete_filter_location() {
+    for source in [
+        "def f(rows):\n    return ['key=%s' % (key,) for key in rows if key is not None]\n",
+        "def f(rows):\n    return ('key=%s' % (key,)\n            for key in rows\n            if key is None)\n",
+    ] {
+        assert_matches_cpython(source, "formatted_comprehension_filter.py", &LEVELS);
+    }
+}
+
+#[test]
+fn copied_finalizer_break_keeps_its_line_across_a_scope_handler_split() {
+    let source = r"async def update(retry, budget, cost):
+    while True:
+        try:
+            if retry:
+                refresh()
+                continue
+            break
+        except ValueError as error:
+            if retry:
+                continue
+            raise error
+        finally:
+            if budget:
+                budget -= cost
+    finish(budget)
+    return budget
+";
+    assert_matches_cpython(source, "split_finalizer_exit.py", &LEVELS);
+}
+
+#[test]
+fn same_line_returns_retain_their_unwind_location() {
+    let source = r"def run(ready, value):
+    try:
+        if ready: return
+        consume(value)
+    finally:
+        cleanup(value)
+    return done(value)
+
+def check(value):
+    with guard():
+        try:
+            if value == 2: return 2
+            consume(value)
+        except Error:
+            recover(value)
+    return done(value)
+";
+    assert_matches_cpython(source, "single_line_return.py", &LEVELS);
+}
+
+#[test]
+fn a_protected_branch_keeps_a_pass_after_an_empty_join() {
+    let source = r"def choose(first, second, enabled, value):
+    try:
+        if first:
+            other(value)
+        elif second:
+            if enabled:
+                consume(value)
+            pass
+    except Error as exc:
+        recover(exc)
+    finally:
+        finish(value)
+    return value
+";
+    assert_matches_cpython(source, "protected_branch_pass.py", &LEVELS);
+}
+
+#[test]
+fn copied_returns_keep_break_lines_after_try_and_while_else_suites() {
+    let source = r"def choose(first, value):
+    if first:
+        while True:
+            try:
+                inspect(value)
+                break
+            except LookupError:
+                recover(value)
+    else:
+        fallback(value)
+    return value
+
+def retry(first, running, ready, value):
+    if first:
+        while running:
+            if ready:
+                break
+        else:
+            expired(value)
+    else:
+        fallback(value)
+    return value
+";
+    assert_matches_cpython(source, "copied_break_returns.py", &LEVELS);
+}
+
+#[test]
+fn a_same_line_break_keeps_its_event_after_the_loop_backedge() {
+    let source = r"def read(ready, value):
+    while True:
+        if ready: break
+    finish(value)
+";
+    assert_matches_cpython(source, "loop_break.py", &LEVELS);
+}
+
+#[test]
+fn closure_cells_sort_by_their_mangled_names() {
+    let source = r"class Middle:
+    def factory(self):
+        __value = 1
+        _Zulu = 2
+        return lambda: (__value, _Zulu)
+";
+    assert_matches_cpython(source, "closure_cells.py", &LEVELS);
+}
+
+#[test]
+fn protected_for_else_copies_each_short_circuit_backedge() {
+    let source = r"def scan(values, selected, ready):
+    with manager():
+        for value in values:
+            if selected(value):
+                if ready and value.active:
+                    use(value)
+            else:
+                pass
+        else:
+            raise LookupError
+";
+    assert_matches_cpython(source, "loop_short_circuit.py", &LEVELS);
+}
+
+#[test]
+fn conditional_exits_share_the_named_handler_cleanup() {
+    let source = r"def check(ready, value):
+    try:
+        visit(value)
+    except ValueError as error:
+        if ready:
+            assert value, str(error)
+    finish(value)
+
+def choose(first, second, value):
+    try:
+        visit(value)
+    except ValueError as error:
+        if first:
+            return error
+        elif second:
+            if value:
+                report(error)
+    finish(value)
+";
+    assert_matches_cpython(source, "handler_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn annotation_locals_intern_matching_constant_tuple_slots() {
+    for source in [
+        "def annotated(value: int): pass\ndef literal(): return '.format'\n",
+        "def literal(): return ('x.format'[1:],)\nif False:\n    def annotated(value: int): pass\n",
+        "seed = None\nif False:\n    type Answer = int\ndef literal(): return '.format'\n",
+        "seed = None\nif False:\n    def outer():\n        def inner() -> int: pass\ndef literal(): return '.format'\n",
+        "seed = None\nif False:\n    def generic[T: int](): pass\ndef literal(): return '.format'\n",
+        "class C:\n    def annotated(value: int): pass\ndef literal(): return ('.format', '__classdict__')\n",
+    ] {
+        assert_matches_cpython(source, "annotation_locals.py", &LEVELS);
+    }
+}
+
+#[test]
+fn wildcard_fallthrough_locates_the_normal_try_exit() {
+    let source = r"def check(kind, first, second):
+    try:
+        match kind:
+            case 1:
+                result = first
+            case _:
+                result = second
+    except ValueError:
+        raise
+    observe(result)
+";
+    for tail in ["result = second", "observe(second)", "pass"] {
+        let source = source.replace("result = second", tail);
+        assert_matches_cpython(&source, "wildcard_try_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn handler_returns_protect_pop_except_with_the_intervening_finally() {
+    for (outer, value) in [("KeyError", "1"), ("KeyError as error", "recover(error)")] {
+        let source = format!(
+            r"def read(key):
+    try:
+        first(key)
+    except {outer}:
+        try:
+            second(key)
+        except ValueError:
+            return {value}
+        finally:
+            release(key)
+    return key
+"
+        );
+        assert_matches_cpython(&source, "handler_return_before_finally.py", &LEVELS);
+    }
+}
+
+#[test]
+fn large_percent_formats_observe_the_joined_string_stack_limit() {
+    let arguments = ["value"; 15].join(", ");
+    for suffix in ["", "!"] {
+        let format = format!("{}{suffix}", "|%r".repeat(15));
+        let source = format!("def render(value):\n    return '{format}' % ({arguments})\n");
+        assert_matches_cpython(&source, "render.py", &LEVELS);
+    }
+}
+
+#[test]
+fn percent_formatting_uses_strings_folded_by_the_ast_optimizer() {
+    let source = r#"def format_values(x, y):
+    ("left %s " + "right %r") % (x, y)
+    return ("%s" * 2) % (x, y)
+"#;
+    assert_matches_cpython(source, "folded_formats.py", &LEVELS);
+}
+
+#[test]
+fn copied_nested_try_exits_keep_the_outer_handler() {
+    let source = r"def recover(key, fallback):
+    try:
+        value = read(key)
+    except LookupError:
+        try:
+            if key:
+                value = key
+            else:
+                value = fallback
+        except ValueError:
+            if fallback:
+                value = fallback
+            else:
+                raise
+    return value
+";
+    assert_matches_cpython(source, "nested_recovery_jump.py", &LEVELS);
+}
+
+#[test]
+fn chained_comparison_markers_use_the_compacted_try_entry() {
+    for calls in [7, 8] {
+        let source = format!(
+            "def bounded(item):\n{}    try:\n        if 0 < item.size < 10:\n            return True\n    except ValueError:\n        raise\n    return False\n",
+            "    inspect(item)\n".repeat(calls)
+        );
+        assert_matches_cpython_versions(&source, "bounded.py", &LEVELS, &[PythonVersion::Py314]);
+    }
+}
+
+#[test]
+fn protected_for_else_keeps_the_inner_condition_fallthrough() {
+    let source = r"def scan(values, selected):
+    for value in values:
+        if selected(value):
+            if ready(value):
+                break
+        else:
+            break
+    else:
+        yield value
+";
+    assert_matches_cpython(source, "scan.py", &LEVELS);
+}
+
+#[test]
+fn nested_handlers_share_the_fallthrough_cleanup_position() {
+    let source = r"def recover(value, use_first):
+    try:
+        value = read()
+    except ValueError as error:
+        try:
+            value = retry(value)
+        except LookupError:
+            if use_first:
+                value = first
+            else:
+                value = second
+    return value
+";
+    assert_matches_cpython(source, "recover.py", &LEVELS);
+}
+
+#[test]
+fn the_last_conditional_arm_shares_its_boolean_discard() {
+    let source = r"def record(value, first, enabled):
+    if first:
+        enabled and visit(value)
+    else:
+        enabled and finish(value)
+
+def record_if_ready(value, ready, logger):
+    if ready:
+        logger.enabled and logger.record(value)
+";
+    assert_matches_cpython(source, "record.py", &LEVELS);
+}
+
+#[test]
+fn protected_boolean_discards_use_their_copied_operand_lines() {
+    let source = r"def check(items, enabled, emit):
+    for item in items:
+        try:
+            enabled and emit(item)
+        except ValueError as error:
+            enabled and emit(error)
+";
+    assert_matches_cpython(source, "protected_boolean_calls.py", &LEVELS);
+}
+
+#[test]
+fn finally_guard_reuses_the_protected_prefix_of_a_constant_return() {
+    let source = r"def write(record):
+    try:
+        begin(record)
+        append(record)
+        flush(record)
+        commit(record)
+        return 0
+    finally:
+        if record is not None:
+            record.close()
+";
+    assert_matches_cpython(source, "return_guard.py", &LEVELS);
+}
+
+#[test]
+fn an_iterator_break_keeps_the_finalizer_call_line_on_its_jump() {
+    let source = r"def advance(values, active):
+    try:
+        for value in values:
+            try:
+                break
+            except:
+                pass
+            finally:
+                if active:
+                    finish(value)
+    except ValueError:
+        pass
+    try:
+        pass
+    except TypeError:
+        pass
+";
+    assert_matches_cpython(source, "iterator_break_finalizer_call.py", &LEVELS);
+}
+
+#[test]
+fn async_iterator_restarts_before_an_inner_while_handler() {
+    let source = r"async def read(stream, key):
+    async for chunk in stream:
+        while key in chunk:
+            try:
+                if ready():
+                    consume(chunk)
+            except ValueError:
+                continue
+";
+    assert_matches_cpython(source, "async_iterator_while_handler.py", &LEVELS);
+}
+
+#[test]
+fn a_named_inner_handler_return_leaves_the_outer_pop_unprotected() {
+    let source = r"async def collect(item):
+    try:
+        try:
+            check()
+        except KeyError:
+            try:
+                fetch()
+            except ValueError as cause:
+                try:
+                    save(cause)
+                except OSError:
+                    pass
+                return 7
+    finally:
+        if item is None:
+            close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_handler_clear.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn protected_match_conditions_copy_each_short_circuit_exit() {
+    let source = r"async def sample(items, flag):
+    async for value in items:
+        try:
+            match value:
+                case 1:
+                    if flag and ready(value):
+                        await work(value)
+                case 2:
+                    await finish()
+        except RuntimeError as err:
+            pass
+";
+    assert_matches_cpython(source, "protected_loop_case_exits.py", &LEVELS);
+}
+
+#[test]
+fn short_circuited_operands_keep_constants_reused_after_the_expression() {
+    let source = "def check(value):
+    assert value == (True or False)
+    record('middle', False)
+    result = False and lookup('unused')
+    return result, 'later', 'unused'
+";
+    assert_matches_cpython(source, "short_circuit_constants.py", &LEVELS);
+}
+
+#[test]
+fn uncompacted_source_calls_leave_the_following_truth_marker_unprotected() {
+    let source = r"def choose(value, enabled):
+    try:
+        while enabled:
+            try:
+                while True:
+                    found = value.find(1)
+                    if found or enabled:
+                        return value
+                    break
+            except ValueError:
+                pass
+    except LookupError:
+        pass
+
+
+async def wait(value, manager):
+    while True:
+        with manager:
+            try:
+                read()
+            except KeyError:
+                continue
+            value.close()
+            if available:
+                return value
+";
+    assert_matches_cpython_versions(
+        source,
+        "source_call_truth.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
+fn named_handler_in_a_break_finalizer_copies_the_result_return() {
+    let source = r"def dispatch(ready, value):
+    while ready:
+        try:
+            break
+        except KeyError:
+            pass
+        finally:
+            try:
+                clean()
+            except RuntimeError as error:
+                value = error
+    return value
+";
+    assert_matches_cpython(source, "break_handler_result.py", &LEVELS);
+}
+
+#[test]
+fn protected_match_fallthrough_locates_the_following_local_return() {
+    let value_case = r#"def choose(value, kind):
+    try:
+        match kind:
+            case "yes":
+                pass
+    except LookupError:
+        pass
+    return value
+"#;
+    let wildcard = r"def choose(value, kind, active):
+    try:
+        match kind:
+            case Choice.YES:
+                pass
+            case _:
+                if active:
+                    pass
+                else:
+                    from colors import red as value
+    except ValueError as error:
+        pass
+    return value
+";
+    for source in [value_case, wildcard] {
+        assert_matches_cpython(source, "match_fallthrough.py", &LEVELS);
+    }
+}
+
+#[test]
+fn normal_finalizer_entry_keeps_a_single_guard_line() {
+    let nested = r"def sample(items, ready, failed):
+    try:
+        try:
+            pass
+        finally:
+            for item in items:
+                if item is ready:
+                    pass
+            if failed:
+                raise Error
+    finally:
+        if ready:
+            pass
+";
+    let returning = r"def run(source, ready):
+    while active():
+        try:
+            value = (yield next_item(source))
+        except Error as error:
+            raise
+        else:
+            if ready(value):
+                return
+        finally:
+            source.close()
+";
+    for source in [nested, returning] {
+        assert_matches_cpython(source, "normal_finalizer_guard.py", &LEVELS);
+    }
+}
+
+#[test]
+fn constant_return_discards_iterators_at_their_enclosing_try_depth() {
+    let source = r"def search(groups):
+    for group in groups:
+        try:
+            for item in group:
+                try:
+                    return 1
+                finally:
+                    close(item)
+        except ValueError:
+            pass
+";
+    assert_matches_cpython(source, "iterator_cleanup_owners.py", &LEVELS);
+}
+
+#[test]
+fn loop_exhaustion_on_a_try_else_exit_keeps_its_condition_location() {
+    let suite = r"    try:
+        prepare()
+    except LookupError:
+        raise
+    else:
+        while len(items) < limit:
+            items.append(next_item())
+";
+    for manager in [false, true] {
+        let mut source = String::from("def collect(items, limit, resource):\n");
+        if manager {
+            source.push_str("    with resource:\n");
+            for line in suite.lines() {
+                writeln!(source, "    {line}").unwrap();
+            }
+        } else {
+            source.push_str(suite);
+        }
+        source.push_str("    return items\n");
+        assert_matches_cpython(&source, "try_else_while_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn compacted_exception_type_expressions_keep_the_handler_owner() {
+    let source = "def recover():\n    try:\n        work()\n    except KeyError:\n        raise\n    except TYPES:\n        return\n";
+    for types in [
+        "(ValueError,) + extra_errors()",
+        "(ValueError, *extra_errors())",
+        "extra_errors() + other_errors()",
+        "extra_errors(*arguments)",
+        "[KeyError, ValueError, IndexError][1 + 1]",
+    ] {
+        assert_matches_cpython(
+            &source.replace("TYPES", types),
+            "compacted_exception_types.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn a_leading_finally_none_test_keeps_the_async_manager_handler() {
+    let source = r"async def run(manager, item, value):
+    async with manager:
+        try:
+            pass
+        finally:
+            if item.active is not None:
+                consume(value)
+            finish()
+";
+    assert_matches_cpython_versions(source, "case.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
+fn pass_before_a_protected_loop_tail_test_keeps_its_line() {
+    let source = "def scan(ready, value):\n    try:\n        while True:\n            if ready:\n                pass\n                if value:\n                    consume(value)\n    finally:\n        finish()\n";
+    assert_matches_cpython(source, "loop_tail_test.py", &LEVELS);
+}
+
+#[test]
+fn manager_returns_restore_the_outer_exit_on_an_attribute_comparison() {
+    for managers in [
+        "first, second",
+        "first, second, third, fourth, fifth, sixth",
+    ] {
+        let source = format!(
+            "def run(flag, state):\n    try:\n        with {managers}:\n            try:\n                perform()\n            except LookupError as error:\n                if flag:\n                    prepare()\n                result = next_value()\n                return result\n            finally:\n                note(flag)\n    except RuntimeError:\n        repair()\n    finally:\n        if state != Status.ACTIVE:\n            finish()\n"
+        );
+        assert_matches_cpython(&source, "manager_comparison_guard.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_nested_match_leaves_its_outer_guard_line_on_the_return() {
+    let source = r"def choose(item, value):
+    match item:
+        case Entry(field=data):
+            if data is not None:
+                match data:
+                    case Known():
+                        observe(data)
+                    case _:
+                        raise Error(data)
+    return value
+";
+    let capture = source.replace("case _:", "case fallback:");
+    for source in [source, &capture] {
+        assert_matches_cpython(source, "nested_match_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn assertion_success_locates_the_normal_exit_after_cold_handlers_move() {
+    for guard in ["item", "item and ready", "item or ready"] {
+        let source = format!(
+            "def walk(items, ready):\n    for item in items:\n        try:\n            inspect(item)\n            assert {guard}\n        except ValueError as error:\n            try:\n                recover(error)\n            except TypeError:\n                continue\n        consume(item)\n"
+        );
+        assert_matches_cpython(&source, "assertion_handler_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn terminal_async_break_retains_original_borrow_boundary() {
+    let source = r"async def run(stream, ready, stop, resource):
+    try:
+        async for item in stream:
+            if ready:
+                pass
+            elif stop:
+                break
+    finally:
+        await resource.close()
+
+async def collect(stream, ready, stop, value):
+    async for item in stream:
+        if ready:
+            continue
+        elif stop:
+            break
+    return value, ready
+";
+    assert_matches_cpython(source, "terminal_async_break.py", &LEVELS);
+}
+
+#[test]
+fn copied_integer_returns_keep_the_original_try_fallthrough() {
+    for value in [0, 255, 256] {
+        let source = format!(
+            "def run(ready, first, second):\n    try:\n        if ready:\n            first()\n        else:\n            second()\n    except ValueError:\n        pass\n    else:\n        return {value}\n"
+        );
+        assert_matches_cpython(&source, "integer_try_fallthrough.py", &LEVELS);
+    }
+}
+
+#[test]
+fn guarded_finalizer_leaves_a_protected_marker_before_manager_exit() {
+    let source = r"def load(manager, ready):
+    try:
+        with manager:
+            try:
+                if ready:
+                    try:
+                        pass
+                    except LookupError:
+                        recover()
+                    finally:
+                        close()
+            except ValueError:
+                pass
+    except OSError:
+        pass
+    return False
+";
+    assert_matches_cpython_versions(
+        source,
+        "guarded_manager_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn a_handler_exit_inherits_the_restored_comprehension_local_after_erased_assertions() {
+    let source = r"def collect(values):
+    try:
+        run()
+    except LookupError:
+        result = [convert(item) for item in values]
+        assert result
+";
+    assert_matches_cpython(source, "handler_comprehension_result.py", &LEVELS);
+}
+
+#[test]
+fn break_after_manager_threads_a_terminal_normal_try_exit() {
+    for successor in ["", "        observe()\n"] {
+        let source = format!(
+            "def sample(manager, value, ready):
+    try:
+        while True:
+            if value:
+                with manager:
+                    walk(value)
+                break
+            with manager:
+                if ready:
+                    break
+{successor}    except Error:
+        raise
+    finally:
+        done()
+"
+        );
+        assert_matches_cpython(&source, "manager_break_try_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn shared_try_exit_respects_the_original_return_width() {
+    for argument in ["", "first"] {
+        let source = format!(
+            "def choose(group, first, second, target):\n    try:\n        if group:\n            if first: pass\n            elif second: pass\n        else:\n            if first: return second\n    except Failure:\n        pass\n    return target.finish({argument})\n"
+        );
+        assert_matches_cpython(&source, "shared_try_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn loop_backedges_keep_each_boolean_finalizer_discard() {
+    let source = r"def repeat(ready, predicate, first, second):
+    while ready():
+        try:
+            if predicate():
+                consume()
+        finally:
+            first() and second()
+    return result()
+
+
+def visit(items, first, second):
+    for item in items:
+        try:
+            consume(item)
+        finally:
+            first(item) or second(item)
+";
+    assert_matches_cpython(source, "boolean_finalizer_backedges.py", &LEVELS);
+}
+
+#[test]
+fn a_guard_locates_the_tuple_return_after_a_try_exit() {
+    let source = r"def choose(active, left, right):
+    if active:
+        if ready():
+            prepare()
+        else:
+            if right:
+                try:
+                    use(right)
+                except LookupError:
+                    raise ValueError
+    else:
+        prepare()
+    return left, right
+";
+    for tail in ["left, right", "left, right, active"] {
+        assert_matches_cpython(
+            &source.replace("return left, right", &format!("return {tail}")),
+            "guarded_try_tuple_return.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn nested_handlers_share_a_returned_call_without_inheriting_one_handler_line() {
+    let source = "def sample(flag, fallback):
+    if flag:
+        try:
+            value = first()
+        except KeyError:
+            try:
+                value = second()
+            except ValueError:
+                value = fallback
+            except TypeError:
+                value = third()
+    else:
+        value = fallback
+    return value()
+";
+    assert_matches_cpython(source, "nested_handler_call.py", &LEVELS);
+}
+
+#[test]
+fn removed_try_exit_stops_borrowing_before_a_cleanup_loop() {
+    for (body, test) in [
+        ("await prepare(value)", "ready"),
+        ("await prepare(value)", "True"),
+        ("raise Error(value)", "ready"),
+    ] {
+        let source = format!(
+            "async def run(value, ready):\n    try:\n        if ready:\n            {body}\n    finally:\n        while {test}:\n            consume(value)\n"
+        );
+        assert_matches_cpython(&source, "finalizer_loop.py", &LEVELS);
+    }
+}
+
+#[test]
+fn paired_while_exhaustion_edges_keep_their_own_return_locations() {
+    let source = r"def consume(flag, left, right, value):
+    try:
+        if flag:
+            while left < value:
+                left += 1
+        else:
+            while right < value:
+                right += 1
+    except LookupError:
+        raise
+    return value
+";
+    assert_matches_cpython(source, "while_exhaustion_return.py", &LEVELS);
+}
+
+#[test]
+fn break_keeps_its_line_when_a_loop_arm_copies_a_try_return() {
+    let source = r"def collect(flag, value):
+    try:
+        if flag:
+            while True:
+                value = advance(value)
+                if done(value):
+                    break
+        else:
+            while True:
+                value = reset(value)
+                if done(value):
+                    break
+    except LookupError:
+        raise
+    return value
+";
+    assert_matches_cpython(source, "copied_loop_break.py", &LEVELS);
+}
+
+#[test]
+fn nested_try_return_keeps_its_guard_location_after_copying() {
+    let source = r"def choose(enabled, test, value):
+    try:
+        if enabled:
+            try:
+                if test is not None:
+                    return process(test)
+            except LookupError:
+                pass
+        else:
+            step()
+    except ValueError:
+        pass
+    return value
+";
+    assert_matches_cpython(source, "guarded_nested_try_return.py", &LEVELS);
+}
+
+#[test]
+fn recovery_copies_the_local_assignment_before_a_bare_raise() {
+    for recovery in [
+        "with manager:\n            work()",
+        "try:\n            work()\n        except LookupError as error:\n            record(error)",
+    ] {
+        let source = format!(
+            "def run(manager):\n    try:\n        start()\n    except ValueError:\n        {recovery}\n        failed = True\n        raise\n    finally:\n        finish()\n"
+        );
+        assert_matches_cpython(&source, "store_before_reraise.py", &LEVELS);
+    }
+}
+
+#[test]
+fn consecutive_handler_returns_keep_the_nearest_exception_cleanup() {
+    let source = r"def scan(items):
+    for item in items:
+        try:
+            first(item)
+        except LookupError as error:
+            try:
+                second(error)
+            except ValueError:
+                try:
+                    third(item)
+                except TypeError:
+                    return False
+";
+    assert_matches_cpython(source, "consecutive_handler_return.py", &LEVELS);
+}
+
+#[test]
+fn a_managed_handler_chain_retains_the_try_around_its_finally() {
+    let source = r"def read(key):
+    with lock():
+        try:
+            try:
+                primary(key)
+            except KeyError:
+                try:
+                    secondary(key)
+                except ValueError as error:
+                    return 1
+        except OSError:
+            record(key)
+        finally:
+            release(key)
+    return key
+";
+    assert_matches_cpython(source, "managed_handler_chain_return.py", &LEVELS);
+}
+
+#[test]
+fn handler_returns_keep_the_enclosing_try_until_iterator_or_finally_cleanup() {
+    let source = r"def scan(items):
+    try:
+        for item in items:
+            try:
+                try:
+                    visit(item)
+                except KeyError:
+                    return recover(item)
+            except ValueError:
+                record(item)
+    finally:
+        finish()
+
+def nested(value):
+    try:
+        try:
+            try:
+                visit(value)
+            except KeyError:
+                return value
+        except ValueError:
+            record(value)
+        finally:
+            release(value)
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "handler_return_through_finally.py", &LEVELS);
+}
+
+#[test]
+fn iterator_returns_inside_a_handler_keep_the_surrounding_finally() {
+    let source = r"async def read(items):
+    try:
+        start()
+    except KeyError:
+        async with lock():
+            try:
+                for item in items:
+                    try:
+                        return await fetch(item)
+                    except ValueError:
+                        continue
+            finally:
+                release()
+";
+    assert_matches_cpython(source, "handler_finally_iterator_return.py", &LEVELS);
+}
+
+#[test]
+fn compacted_pass_preserves_its_borrow_boundary() {
+    let source = r"def select(value, first, second, third):
+    if first:
+        if second:
+            pass
+        else:
+            pass
+    elif third:
+        pass
+    return value.attr
+";
+    for tail in ["pass", "consume(value)\n            pass"] {
+        let source = source.replace("pass\n    elif third", &format!("{tail}\n    elif third"));
+        assert_matches_cpython(&source, "compacted_pass.py", &LEVELS);
+    }
+}
+
+#[test]
+fn local_fusions_before_a_try_keep_the_original_source_block_owner() {
+    for count in [5, 6, 7] {
+        let stores = "    target.field = value\n".repeat(count);
+        let source = format!(
+            "def update(target, value, flag):
+    if flag:
+        prepare()
+{stores}    try:
+        target.result = value if flag else None
+    except ValueError:
+        pass
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "fused_try_prefix.py",
+            &LEVELS,
+            &VERSIONS.map(|(version, _, _)| version),
+        );
+    }
+}
+
+#[test]
+fn deleting_finalizer_counts_try_unwinds_before_copying_conditional_returns() {
+    let source = r"def choose(ready, first, second):
+    try:
+        while ready:
+            try:
+                return load(first) if ready else load(second)
+            except LookupError:
+                continue
+    finally:
+        del first
+        del second
+";
+    assert_matches_cpython_versions(
+        source,
+        "conditional_cleanup_return.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
+fn folded_conditional_arms_preserve_the_normal_finally_join() {
+    let source = r"def run(obj):
+    try:
+        if False:
+            skip()
+        else:
+            obj.wait()
+    finally:
+        obj.finished = True
+";
+    assert_matches_cpython(source, "folded_conditional_finally_join.py", &LEVELS);
+}
+
+#[test]
+fn folded_while_break_preserves_try_else_borrow_boundary() {
+    let source = r"def run(value, ready):
+    try:
+        prepare(value)
+    except ValueError:
+        pass
+    else:
+        while True:
+            if ready:
+                break
+    consume(value)
+";
+    for continuation in ["consume(value)", "return consume(value)"] {
+        assert_matches_cpython(
+            &source.replace("consume(value)", continuation),
+            "folded_while_else.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn terminal_while_break_in_recovery_keeps_normal_borrow_boundary() {
+    let source = r"def run(items, value, ready):
+    try:
+        value, = items
+    except LookupError:
+        for item in items:
+            while True:
+                if ready:
+                    break
+    consume(value)
+";
+    for body in ["break", "consume(item)"] {
+        assert_matches_cpython(
+            &source.replace("break", body),
+            "recovery_while_break.py",
+            &LEVELS,
+        );
+    }
+    let fallthrough = r"def run(items, value, ready):
+    try:
+        value, = items
+    except LookupError:
+        if ready:
+            while ready:
+                if value:
+                    break
+        recover(value)
+    consume(value)
+";
+    assert_matches_cpython(fallthrough, "recovery_loop_fallthrough.py", &LEVELS);
+}
+
+#[test]
+fn nested_protected_recovery_copies_the_shared_return_bridge() {
+    for body in ["read()", "pass"] {
+        let source = format!(
+            "def run(ready, value):
+    if ready:
+        try:
+            {body}
+        except OSError:
+            try:
+                try:
+                    pass
+                except ValueError:
+                    try:
+                        pass
+                    except RuntimeError:
+                        pass
+            except LookupError:
+                pass
+    else:
+        pass
+    return value
+"
+        );
+        assert_matches_cpython(&source, "nested_protected_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn enclosing_managers_preserve_the_original_pop_slots_on_a_copied_guard() {
+    for (function, managers) in [("def", "with lock"), ("async def", "async with lock, lock")] {
+        let source = format!(
+            r"{function} run(lock, item, ready):
+    {managers}:
+        try:
+            if ready:
+                pass
+            observe(item)
+            return item
+        except LookupError as error:
+            recover()
+        finally:
+            if item is not None:
+                finish()
+"
+        );
+        assert_matches_cpython(&source, "retained_manager_guard.py", &LEVELS);
+    }
+}
+
+#[test]
+fn generator_iterator_return_keeps_the_copied_none_guard_unprotected() {
+    for (declaration, exit) in [
+        ("def", "return"),
+        ("def", "return 1"),
+        ("async def", "return"),
+    ] {
+        let source = format!(
+            "{declaration} consume(items, pool, finished):
+    try:
+        for item in items:
+            yield item
+            if finished:
+                {exit}
+    except ValueError:
+        pass
+    finally:
+        if pool is not None:
+            pool.close()
+    finish()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "generator_iterator_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn saved_returns_unwind_the_ordinary_try_inside_a_retained_manager() {
+    let iterator = r"def collect(items, item, value, ready):
+    with manager():
+        try:
+            for item in items:
+                return build(item)
+        except KeyError:
+            retry()
+        finally:
+            if value is not None:
+                clean()
+";
+    let nested = r"def collect(items, item, value, ready):
+    with manager():
+        try:
+            try:
+                if ready:
+                    return item
+                return item
+            finally:
+                value.close()
+        except KeyError:
+            retry()
+        finally:
+            if value is not None:
+                clean()
+";
+    for source in [iterator, nested] {
+        assert_matches_cpython_versions(
+            source,
+            "manager_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn continuing_through_finalizer_work_leaves_the_next_setup_unowned() {
+    let source = r"def run(items, flag):
+    for item in items:
+        try:
+            if check():
+                continue
+            handle()
+        except ValueError:
+            pass
+        finally:
+            value = get()
+            try:
+                if flag is not None:
+                    sink()
+            finally:
+                close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "continue_setup.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn straight_line_finalizer_work_keeps_the_following_setup_outside_its_own_handler() {
+    let source = r"def close(items, value):
+    try:
+        for item in items:
+            if item:
+                return
+    except LookupError:
+        recover()
+    finally:
+        value.close()
+        try:
+            if value is not None:
+                release(value)
+        finally:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "finalizer_work_before_setup.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
+fn a_captured_local_keeps_the_unowned_setup_in_a_returned_finalizer() {
+    let source = r"def visit(value, manager, ready):
+    try:
+        with manager:
+            if ready:
+                return
+    except LookupError:
+        recover()
+    finally:
+        try:
+            if value is not None:
+                defer(lambda: value)
+        finally:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "captured_finalizer_guard.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
+fn handler_cleanup_after_for_else_inherits_the_break_location() {
+    let source = r"def lookup(items):
+    try:
+        result = cached()
+    except LookupError:
+        for item in items:
+            if item:
+                result = item
+                break
+        else:
+            result = None
+    return result
+";
+    assert_matches_cpython(source, "handler_for_else_break.py", &LEVELS);
+}
+
+#[test]
+fn managed_finally_boolean_arguments_consume_the_freed_condition_slot() {
+    for operator in ["and", "or"] {
+        let source = format!(
+            "def run(value):
+    with acquire():
+        try:
+            if value:
+                raise LookupError
+        finally:
+            if not check(value {operator} {{}}):
+                raise ValueError
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_finally_boolean_argument.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn nested_try_exits_keep_their_named_handler_cleanup() {
+    for otherwise in [
+        "",
+        "            else:\n                if ready:\n                    finish()\n",
+    ] {
+        let source = format!(
+            "def run(enabled, ready):
+    try:
+        work()
+    except OSError as error:
+        if enabled:
+            try:
+                read()
+            except KeyError:
+                recover(error)
+{otherwise}"
+        );
+        assert_matches_cpython(&source, "nested_named_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_nested_handler_arm_keeps_its_line_before_a_bare_raise() {
+    let source = r"def report():
+    try:
+        start()
+    except LookupError as error:
+        if active():
+            if ready():
+                if done():
+                    pass
+                else:
+                    record(error)
+            else:
+                pass
+        else:
+            clear(error)
+        raise
+";
+    assert_matches_cpython(source, "handler_arm_reraise.py", &LEVELS);
+}
+
+#[test]
+fn protected_while_break_keeps_the_enclosing_cleanup_unlocated() {
+    let body = r"        try:
+            while True:
+                if active:
+                    break
+                step()
+        except ValueError:
+            raise";
+    let managed = format!(
+        "        with manager:\n    {}",
+        body.replace('\n', "\n    ")
+    );
+    for nested in [body, &managed] {
+        let source = format!(
+            "def sample(active, manager):\n    try:\n{nested}\n    finally:\n        release()\n"
+        );
+        assert_matches_cpython(&source, "nested_loop_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
+fn class_footer_inherits_the_final_literal_in_a_conditional_arm() {
+    let source = r#"from __future__ import annotations
+class Entry:
+    if enabled:
+        label: str = get_label()
+        "Display name"
+    else:
+        label: str = fallback()
+"#;
+    assert_matches_cpython(source, "class_branch_literal.py", &LEVELS);
+}
+
+#[test]
+fn loop_control_pops_the_inner_try_before_leaving_its_manager() {
+    for exit in ["break", "continue"] {
+        let source = format!(
+            "async def scan(items, manager):\n    try:\n        for item in items:\n            async with manager:\n                try:\n                    {exit}\n                except ValueError:\n                    recover()\n    finally:\n        finish()\n"
+        );
+        assert_matches_cpython(&source, "loop_manager_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn raising_handler_manager_keeps_the_normal_exit_owned() {
+    for body in ["raise error", "if value:\n                    raise error"] {
+        let source = format!(
+            "def run(value, ready, manager):\n    try:\n        prepare()\n    except ValueError as error:\n        if ready:\n            with manager:\n                {body}\n    consume(value)\n"
+        );
+        assert_matches_cpython(&source, "manager_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn compact_try_break_keeps_the_guards_fallthrough_line() {
+    let source = "def scan(text, pos):\n    while active:\n        try:\n            if text[pos]: break\n        except IndexError: pass\n        pos += 1\n    return pos\n";
+    assert_matches_cpython(source, "compact_try_break.py", &LEVELS);
+}
+
+#[test]
+fn guarded_recovery_reaches_the_borrowed_load_after_a_pass_handler() {
+    let source = r"def read(retry, value):
+    try:
+        value = fetch()
+    except ValueError:
+        if retry:
+            try:
+                recover()
+            except OSError:
+                log()
+    except TypeError:
+        pass
+    consume(value)
+";
+    assert_matches_cpython(source, "recovery_borrow.py", &LEVELS);
+}
+
+#[test]
+fn terminal_else_guard_reaches_normal_finally() {
+    for arm in [
+        "raise Error()",
+        "return data\n        else:\n            value = data.read()",
+    ] {
+        let source = format!(
+            "def run(data, flag):\n    try:\n        value = work(data)\n    except Error:\n        pass\n    else:\n        prepare()\n        if flag:\n            {arm}\n    finally:\n        data.close()\n"
+        );
+        assert_matches_cpython(&source, "else_finally.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_surviving_normal_jump_keeps_the_enclosing_exception_handler() {
+    let source = r"def run(value):
+    try:
+        work()
+    except KeyError as error:
+        try:
+            assert value
+        except ValueError:
+            pass
+        value += 1
+
+    try:
+        try:
+            assert value
+        except ValueError:
+            pass
+    finally:
+        finish(value)
+";
+    assert_matches_cpython_versions(
+        source,
+        "empty_nested_try_jump.py",
+        &[OptimizationLevel::One, OptimizationLevel::Two],
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn returning_from_a_handler_preserves_the_iterators_enclosing_try() {
+    let source = r"def collect(items):
+    try:
+        for item in items:
+            try:
+                try:
+                    visit(item)
+                except ValueError as error:
+                    return False
+            except LookupError:
+                pass
+    except TypeError:
+        pass
+";
+    assert_matches_cpython(source, "handler_iterator_return.py", &LEVELS);
+}
+
+#[test]
+fn restored_handler_exits_its_manager_before_the_enclosing_iterator() {
+    let source = r"async def run(groups, stream, manager):
+    try:
+        for group in groups:
+            try:
+                async with manager:
+                    async for item in stream:
+                        try:
+                            await inspect(item)
+                        except ValueError:
+                            return result(item)
+            except LookupError:
+                recover(group)
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "manager_iterator_return.py", &LEVELS);
+}
+
+#[test]
+fn restored_handler_exits_its_manager_before_discarding_the_iterator() {
+    let source = r"async def visit(items):
+    try:
+        async for item in items:
+            with item:
+                try:
+                    await work(item)
+                except ValueError:
+                    return
+    finally:
+        await finish()
+";
+    assert_matches_cpython(source, "restored_handler_iterator.py", &LEVELS);
+}
+
+#[test]
+fn guarded_handler_iterator_break_copies_cleanup_without_an_enclosing_loop() {
+    let source = r"def scan(items, ready):
+    try:
+        start()
+    except ValueError:
+        if ready:
+            for item in items:
+                if skip(item):
+                    continue
+                record(item)
+                break
+    finish()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("                break", "                continue"),
+    ] {
+        assert_matches_cpython(&source, "guarded_handler_iterator.py", &LEVELS);
+    }
+}
+
+#[test]
+fn chained_comparison_copies_a_return_after_a_line_only_statement() {
+    let source = r#"def classify(value):
+    if value is None:
+        return True
+    elif 10 <= value < 20:
+        "accepted"
+        return True
+    elif 20 <= value < 30:
+        pass
+        pass
+        return False
+    return value
+"#;
+    assert_matches_cpython(source, "chained_comparison_returns.py", &LEVELS);
+}
+
+#[test]
+fn copied_coroutine_finalizer_continues_after_a_pass_handler() {
+    for body in ["await item.close()", "pass"] {
+        let source = format!(
+            "async def run(items):
+    for item in items:
+        try:
+            continue
+        except LookupError:
+            recover()
+        finally:
+            if item is not None:
+                try:
+                    {body}
+                except ValueError:
+                    pass
+"
+        );
+        assert_matches_cpython(&source, "copied_coroutine_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
+fn copied_match_return_keeps_the_final_value_pattern_on_failure() {
+    let source = "def choose(value, enabled, ready):\n    if enabled:\n        if value is None:\n            pass\n        else:\n            match value:\n                case Color.red:\n                    pass\n    elif ready or check(value):\n        pass\n    return value\n";
+    assert_matches_cpython(source, "case.py", &LEVELS);
+}
+
+#[test]
+fn terminal_named_handler_cleanup_uses_the_guard_that_fell_through() {
+    let source = r"def recover(error, retry):
+    try:
+        work()
+    except OSError as caught:
+        if retry(caught):
+            if error is None:
+                raise
+";
+    assert_matches_cpython(source, "guarded_handler_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn nested_for_else_guard_branches_to_the_outer_loop_header() {
+    let source = r"def scan(rows, skip, enabled):
+    for row in rows:
+        if skip:
+            process(row)
+        else:
+            for value in row:
+                if value:
+                    break
+            else:
+                if enabled or row:
+                    process(row)
+";
+    assert_matches_cpython(source, "nested_for_else_backedge.py", &LEVELS);
+}
+
+#[test]
+fn wildcard_capture_keeps_its_original_exit_size() {
+    for action in ["raise LookupError", "return item"] {
+        let source = format!(
+            "def select(item):\n    match item:\n        case [1, _] | [2, 3]:\n            use(item)\n        case _ as other:\n            {action}\n"
+        );
+        assert_matches_cpython(&source, "wildcard_capture_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn guard_locates_the_exit_after_a_break_in_a_constant_loop() {
+    let source = r"def visit(outer, ready, stop):
+    if outer:
+        if ready:
+            while True:
+                work()
+                if stop():
+                    break
+                advance()
+    else:
+        alternate()
+    finish()
+";
+    assert_matches_cpython(source, "guarded_loop_exit.py", &LEVELS);
+}
+
+#[test]
+fn protected_loop_else_pass_keeps_the_exhaustion_line_and_owner() {
+    let source = r"def release(value, ready):
+    try:
+        while ready:
+            if stop():
+                break
+        else:
+            pass
+    finally:
+        finish(value)
+    return value
+
+async def consume(value, items, skip):
+    try:
+        for value in items:
+            if skip:
+                continue
+        else:
+            pass
+    except ValueError:
+        recover(value)
+    return value
+";
+    assert_matches_cpython(source, "loop_else_pass.py", &LEVELS);
+}
+
+#[test]
+fn exhausted_for_else_guard_supplies_terminal_branch_return_location() {
+    let source = r"def find(values, enabled, required):
+    if enabled:
+        for value in values:
+            if value:
+                return value
+        else:
+            if required:
+                raise LookupError()
+    else:
+        return required
+
+def check(values, enabled, required):
+    if enabled:
+        return enabled
+    else:
+        for value in values:
+            pass
+        else:
+            if required:
+                raise LookupError()
+";
+    assert_matches_cpython(source, "for_else_branch_return.py", &LEVELS);
+}
+
+#[test]
+fn handler_exits_copy_a_short_return_from_the_finalizer() {
+    for (body, returned) in [
+        ("raise error", "value"),
+        ("value = request()", "value"),
+        ("value = request()", "value.field"),
+        ("value = request()", "value.field.next"),
+    ] {
+        let source = format!(
+            "def resolve(error, value):
+    try:
+        {body}
+    except ValueError as caught:
+        value = convert(caught)
+    except TypeError:
+        value = recover()
+    finally:
+        return {returned}
+"
+        );
+        assert_matches_cpython(&source, "handler_finalizer_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_guard_after_a_value_boolean_appends_an_unowned_marker() {
+    let source = r"def outer(value):
+    def choose(first):
+        try:
+            work()
+        finally:
+            try:
+                picked = first or (value.item if value else None)
+                consume(picked)
+            except (ValueError, TypeError):
+                fail()
+    return choose
+";
+    for source in [
+        source.to_owned(),
+        source.replace("if value else", "if value.ready else"),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "boolean_fallthrough.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn nested_handlers_protect_saved_return_values_after_iterator_cleanup() {
+    let source = r"def choose(value, items):
+    try:
+        first()
+    except ValueError:
+        try:
+            second()
+        except LookupError:
+            try:
+                for item in items:
+                    return value
+            except TypeError:
+                pass
+";
+    assert_matches_cpython(source, "nested_handlers_iterator_return.py", &LEVELS);
+}
+
+#[test]
+fn unnamed_handler_return_preserves_the_copied_finalizer_guard() {
+    let source = r"async def recover(value):
+    try:
+        try:
+            read()
+        except LookupError:
+            return fallback()
+    except ValueError:
+        pass
+    finally:
+        if value is None:
+            pass
+";
+    assert_matches_cpython(source, "handler_return_finalizer_guard.py", &LEVELS);
+}
+
+#[test]
+fn resumed_handler_return_preserves_a_copied_finalizer_guard() {
+    let source = r"async def recover(value):
+    try:
+        read()
+    except ValueError:
+        try:
+            retry()
+        except LookupError:
+            return value
+    finally:
+        if value is not None:
+            pass
+";
+    assert_matches_cpython(source, "resumed_handler_finalizer_guard.py", &LEVELS);
+}
+
+#[test]
+fn nested_handler_value_returns_protect_the_resumed_handler_swap() {
+    let source = r"def read(key):
+    try:
+        return first(key)
+    except LookupError:
+        try:
+            return second(key)
+        except KeyError as middle:
+            try:
+                return third(middle)
+            except ValueError as last:
+                return recover(last)
+";
+    assert_matches_cpython(source, "nested_handler_value_swap.py", &LEVELS);
+}
+
+#[test]
+fn return_from_a_nested_handler_keeps_an_intervening_manager() {
+    let source = r"def read(key):
+    try:
+        return fetch(key)
+    except LookupError:
+        with lock():
+            try:
+                return fetch(key)
+            except ValueError:
+                return recover(key)
+";
+    assert_matches_cpython(source, "handler_return_inside_manager.py", &LEVELS);
+}
+
+#[test]
+fn a_raising_finalizer_guard_locates_the_next_cleanup_on_return() {
+    let source = r"def run(state, items):
+    try:
+        while state.active:
+            try:
+                if state.done:
+                    return
+            finally:
+                if state.failed:
+                    raise ValueError()
+    finally:
+        for item in items:
+            release(item)
+";
+    assert_matches_cpython(source, "guarded_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn terminal_named_handler_cleanup_keeps_each_conditions_false_edge() {
+    for condition in [
+        "enabled and any(value for value in values)",
+        "enabled and accept([value for value in values])",
+        "enabled or any(value for value in values)",
+    ] {
+        let source = format!(
+            "def run(enabled, values, accept):\n    try:\n        yield\n    except LookupError as error:\n        if {condition}:\n            accept(error)\n"
+        );
+        assert_matches_cpython(&source, "named_handler_false_edges.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_branches_keep_the_copy_limit_for_binary_returns() {
+    for expression in ["left + right", "left ^ right", "left[right]"] {
+        let source = format!(
+            "def sample(outer, middle, inner, left, right):
+    if outer:
+        if middle:
+            if inner:
+                left = first()
+            else:
+                left = second()
+        else:
+            left = third()
+    else:
+        raise ValueError
+    return {expression}
+"
+        );
+        assert_matches_cpython(&source, "nested_binary_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn copied_finally_none_guards_keep_the_iterator_disposal_owner() {
+    for condition in ["item is None", "state is not None and ready is not None"] {
+        let source = format!(
+            r"def run(items, manager, ready):
+    try:
+        for item in items:
+            try:
+                work(item)
+            except ValueError as error:
+                with manager:
+                    if ready:
+                        return
+    except LookupError:
+        recover()
+    finally:
+        if {condition}:
+            finish()
+"
+        );
+        assert_matches_cpython(&source, "managed_iterator_guard.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_handler_return_inside_a_manager_restores_the_handler_before_its_iterator() {
+    let source = r"def run(items, manager):
+    try:
+        for item in items:
+            try:
+                work(item)
+            except KeyError as error:
+                with manager:
+                    return
+    except ValueError:
+        recover()
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "managed_handler_iterator.py", &LEVELS);
+}
+
+#[test]
+fn named_handler_cleanup_is_copied_before_its_explicit_return() {
+    let source = r"def resolve(active, enabled):
+    try:
+        if active:
+            if enabled:
+                pass
+        else:
+            return 1
+    except ValueError as error:
+        if active:
+            try:
+                pass
+            except LookupError:
+                pass
+    return None
+";
+    assert_matches_cpython(source, "named_cleanup_return.py", &LEVELS);
+}
+
+#[test]
+fn handler_returns_keep_each_enclosing_try_protected() {
+    for (scope, prefix) in [("def", ""), ("async def", ""), ("def", "    yield key\n")] {
+        let source = format!(
+            r"{scope} read(key):
+{prefix}    try:
+        try:
+            try:
+                fetch(key)
+            except KeyError as error:
+                return 1
+        except ValueError:
+            recover()
+    except OSError:
+        release()
+"
+        );
+        assert_matches_cpython(&source, "handler_return_under_tries.py", &LEVELS);
+    }
+}
+
+#[test]
+fn copied_finalizers_finish_before_their_loops_enclosing_tries() {
+    let source = r"def run(item, items, active):
+    try:
+        for item in items:
+            try:
+                try:
+                    work(item)
+                except LookupError:
+                    if active:
+                        return
+                finally:
+                    release(item)
+            except ValueError:
+                recover()
+    except OSError:
+        recover()
+";
+    let while_loop = source.replace("for item in items:", "while active:");
+    for source in [source, &while_loop] {
+        assert_matches_cpython(source, "loop_recovery.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_handlers_copied_finalizer_stays_inside_the_try_around_its_loop() {
+    let source = r"def run(value, ready):
+    try:
+        while ready:
+            try:
+                work(value)
+            except ValueError as error:
+                return
+            finally:
+                if value is not None:
+                    finish(value)
+    except LookupError:
+        pass
+";
+    for source in [source.to_owned(), source.replace(" as error", "")] {
+        assert_matches_cpython(&source, "loop_handler_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_handlers_conditional_reraise_keeps_the_manager_on_the_finally_join() {
+    let source = r"def run(manager, value, enabled):
+    with manager:
+        try:
+            work(value)
+        finally:
+            if enabled:
+                try:
+                    release(value)
+                except ValueError:
+                    if retry(value):
+                        report(value)
+                    else:
+                        raise
+";
+    assert_matches_cpython(source, "guarded_recovery.py", &LEVELS);
+}
+
+#[test]
+fn break_keeps_its_line_before_a_small_attribute_return() {
+    for tail in ["obj.finish()", "Outcome.done", "obj.finish(value)"] {
+        let source = format!(
+            "def finish(enabled, active, obj, value):
+    if enabled:
+        while active:
+            if done():
+                obj.last = value
+                break
+            step()
+    else:
+        reset()
+    return {tail}
+"
+        );
+        assert_matches_cpython(&source, "break_attribute_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn copied_returns_keep_a_break_that_unwinds_a_try() {
+    let simple = r"def run(active, obj):
+    if active:
+        while True:
+            try:
+                obj.first = read()
+                break
+            except LookupError:
+                pass
+            obj.second = retry()
+            break
+    else:
+        wait()
+    return True
+";
+    let nested = r"def run(mode, value):
+    if mode:
+        try:
+            if enabled():
+                while True:
+                    try:
+                        if not ready():
+                            raise ValueError
+                        consume(value)
+                        break
+                    except ValueError:
+                        pass
+                    retry(value)
+                    break
+            else:
+                wait()
+        except LookupError:
+            pass
+    else:
+        stop()
+    return value
+";
+    assert_matches_cpython(simple, "break_unwinds_try.py", &LEVELS);
+    for exit in ["value", "value, mode", "finish(value)"] {
+        assert_matches_cpython(
+            &nested.replace("return value", &format!("return {exit}")),
+            "break_unwinds_nested_try.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
+fn folded_loop_breaks_keep_their_shared_return_location() {
+    let conditional = r"def choose(flag, value):
+    if flag:
+        while True:
+            value = step(value)
+            if keep(value):
+                continue
+            else:
+                break
+    elif enabled():
+        while value:
+            value -= 1
+    return value
+";
+    let cleanup = r"def finish():
+    try:
+        work()
+    finally:
+        while True:
+            try:
+                close()
+            except LookupError:
+                pass
+            else:
+                break
+    return True
+";
+    assert_matches_cpython(conditional, "conditional_loop_break.py", &LEVELS);
+    assert_matches_cpython(cleanup, "cleanup_loop_break.py", &LEVELS);
+}
+
+#[test]
+fn the_while_else_edge_locates_its_manager_cleanup() {
+    let source = r"def wait(resource):
+    with resource:
+        while ready():
+            work()
+        else:
+            stop()
+";
+    assert_matches_cpython(source, "while_else_manager.py", &LEVELS);
+}
+
+#[test]
+fn protected_capture_rotations_preserve_pattern_lines() {
+    for pattern in [
+        r#"{"name": str() as key} as record"#,
+        r#"{"loc": (*_, key)}"#,
+        "[key, _, item, _, _, tail]",
+        "[key,\n                  _, item, _, _, tail]",
+    ] {
+        let source = format!(
+            "def read(obj):\n    try:\n        match obj:\n            case {pattern} if key:\n                consume(key)\n    except LookupError:\n        recover()\n"
+        );
+        assert_matches_cpython(&source, "protected_capture.py", &LEVELS);
+    }
+}
+
+#[test]
+fn single_line_patterns_exchange_discarded_captures() {
+    let source = r#"
+def classify(item):
+    0 < item < 10
+    match item:
+        case [first, _, middle, _, _, last]:
+            return first, middle, last
+        case {"meta": {"value": int() | str() as token}} if token:
+            return token
+"#;
+    assert_matches_cpython(source, "single_line_pattern_discards.py", &LEVELS);
+}
+
+#[test]
+fn returning_a_multiline_conditional_keeps_the_try_pop_on_the_return_line() {
+    let source = r"def choose(value, flag):
+    try:
+        return (value if flag else
+                transform(value))
+    except LookupError:
+        return None
+";
+    assert_matches_cpython_versions(
+        source,
+        "conditional_return_pop.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
+fn manager_pop_follows_the_shared_exit_of_a_conditional_finalizer() {
+    let source = r"def run(manager, ready, value):
+    with manager:
+        try:
+            work()
+        finally:
+            if ready:
+                if value is None:
+                    pass
+                else:
+                    finish(value)
+            else:
+                raise ValueError
+";
+    assert_matches_cpython(source, "manager_finalizer_exit.py", &LEVELS);
+}
+
+#[test]
+fn a_break_after_a_managed_async_loop_keeps_its_own_line() {
+    for prefix in ["", "async "] {
+        let source = format!(
+            "async def drain(items, ready, manager, finish):\n    while ready:\n        {prefix}with manager:\n            async for item in items:\n                use(item)\n        break\n    return finish(ready)\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_loop_break.py",
+            &LEVELS,
+            &[
+                PythonVersion::Py313,
+                PythonVersion::Py314,
+                PythonVersion::Py315,
+            ],
+        );
+    }
+}
+
+#[test]
+fn manager_exit_uses_the_sole_false_operand_of_a_return_guard() {
+    for guard in ["first and second", "'ready' and second", "first or second"] {
+        let source = format!(
+            r"def guarded(manager, first, second):
+    with manager:
+        if {guard}:
+            return first
+
+def recovered(manager, first, second):
+    with manager:
+        try:
+            return second
+        except LookupError as error:
+            if {guard}:
+                return first
+"
+        );
+        assert_matches_cpython(&source, "guarded_manager_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn discarded_await_preserves_the_manager_return_pop_before_a_none_guard() {
+    let source = r"async def run(task, manager, flag):
+    try:
+        with manager:
+            if flag:
+                await task()
+                return
+    except ValueError:
+        pass
+    finally:
+        if flag is not None:
+            finish()
+
+async def inner_try(manager, flag):
+    try:
+        with manager:
+            try:
+                if flag:
+                    return
+            except ValueError:
+                pass
+    finally:
+        if flag is not None:
+            finish()
+";
+    assert_matches_cpython_versions(source, "await_manager.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
+fn copied_handler_cleanup_preserves_exclusions_across_sibling_ranges() {
+    let source = r"def lookup(read):
+    try:
+        result = read(0)
+    except LookupError:
+        try:
+            result = read(1)
+        except LookupError:
+            try:
+                result = read(2)
+            except LookupError:
+                try:
+                    result = read(3)
+                except LookupError:
+                    return None
+    use(result)
+    return result
+";
+    assert_matches_cpython(source, "nested_handler_fallthrough.py", &LEVELS);
+}
+
+#[test]
+fn class_pattern_captures_keep_legacy_iterator_widths() {
+    for pattern in ["Pair(left=a, right=b)", "Pair(a, _) as pair"] {
+        for assignments in [119, 120, 121] {
+            let body = "        value = flag\n".repeat(assignments);
+            let source = format!(
+                "def scan(items, flag, obj):\n    match obj:\n        case {pattern}:\n            visit(obj)\n        case _:\n            pass\n    for item in items:\n{body}        visit(item)\n    return flag\n"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "class_pattern_iterator_width.py",
+                &LEVELS,
+                &[PythonVersion::Py312],
+            );
+        }
+    }
+}
+
+#[test]
+fn coroutine_finalizer_tests_reuse_the_try_exit_or_its_protected_prefix() {
+    let saved = r"async def collect(active, flag, items):
+    try:
+        for left, right in items:
+            pass
+    except ValueError:
+        pass
+    else:
+        return finish(value=flag, result=result(data=make(value=None)))
+    finally:
+        if active:
+            touch()
+";
+    let nested = r"async def collect(value, active):
+    global count
+    try:
+        try:
+            try:
+                check()
+            except ValueError:
+                return build(key=value)
+        finally:
+            count += 1
+    finally:
+        if active:
+            complete()
+";
+    for source in [saved, nested] {
+        assert_matches_cpython_versions(
+            source,
+            "coroutine_finalizer_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn attribute_tests_at_named_handler_entry_keep_the_cleanup() {
+    let source = r"def check(item, active, skip):
+    try:
+        if skip:
+            pass
+        elif active:
+            try:
+                work()
+            except ValueError as error:
+                if item.state.ready:
+                    visit(error)
+    except KeyError:
+        pass
+";
+    assert_matches_cpython_versions(source, "case.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
+fn a_wildcard_pass_locates_the_manager_pop_block() {
+    let source = r"def parse(value, flag, manager):
+    with manager:
+        match value:
+            case [1 | 2, item] if flag:
+                return item
+            case _:
+                pass
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "wildcard_manager_pass.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn erased_elif_comparison_keeps_each_implicit_return() {
+    let source = r"def sample(flag, lower, value, upper):
+    if flag:
+        pass
+    elif lower < value < upper:
+        assert value
+    assert upper
+";
+    assert_matches_cpython(source, "erased_elif_comparison.py", &LEVELS);
+}
+
+#[test]
+fn an_erased_try_else_suffix_keeps_each_conditional_return() {
+    for (test, body) in [
+        ("flag", "value = update(value)"),
+        ("any(value)", "use(value)"),
+        ("any(item for item in value)", "assert flag"),
+    ] {
+        let source = format!(
+            "def choose(flag, value):\n    try:\n        work()\n    except IndexError:\n        pass\n    else:\n        if {test}:\n            {body}\n        assert value\n"
+        );
+        assert_matches_cpython(&source, "terminal_try_else_condition.py", &LEVELS);
+    }
+}
+
+#[test]
+fn conditional_arm_supplies_the_manager_exit_line() {
+    let lookup = r"def lookup(manager, ready, value):
+    with manager:
+        if ready:
+            return value
+        else:
+            try:
+                return fetch(value)
+            except LookupError:
+                pass
+";
+    let shared_exit = r"def observe(manager, ready, value):
+    with manager:
+        if True:
+            if ready:
+                visit(value)
+        else:
+            raise LookupError(value)
+";
+    for source in [lookup, shared_exit] {
+        assert_matches_cpython(source, "manager_conditional_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn continuing_handler_supplies_the_manager_exit_line() {
+    for handler in ["except LookupError:", "except LookupError as error:"] {
+        let source = format!(
+            "def lookup(manager, value):\n    with manager:\n        try:\n            return value\n        {handler}\n            from fallback import default\n"
+        );
+        assert_matches_cpython(&source, "manager_handler_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn assertion_edges_locate_normal_exception_cleanup() {
+    let source = r"def check(value, retry):
+    try:
+        use(value)
+    except LookupError as error:
+        if retry:
+            raise error
+        else:
+            assert not value
+
+def reject(value):
+    try:
+        use(value)
+    except ValueError as error:
+        if value:
+            assert False, error
+    finish()
+";
+    assert_matches_cpython(source, "handler_assertion_edges.py", &LEVELS);
+}
+
+#[test]
+fn copied_handler_returns_locate_while_break_and_exhaustion_separately() {
+    let source = r"def seek(items, value, index, limit):
+    try:
+        prepare()
+    except TypeError:
+        while index < limit:
+            if items[index] == value or items[index] > value:
+                break
+            index += 1
+    return index
+";
+    assert_matches_cpython(source, "handler_while_break_return.py", &LEVELS);
+}
+
+#[test]
+fn conditional_attribute_stores_share_the_normal_finally_exit() {
+    for setup in ["work()", "yield key"] {
+        for value in ["key.value", "measure(key)"] {
+            let source = format!(
+                "def update(target, key):\n    try:\n        {setup}\n    finally:\n        target.value = {value} if key.ready else -1\n"
+            );
+            assert_matches_cpython(&source, "finalizer_attribute_store.py", &LEVELS);
+        }
+    }
+}
+
+#[test]
+fn nested_iterators_keep_the_try_owner_on_copied_discards() {
+    let source = r"def probe(table):
+    for kind in ('first', 'second'):
+        for key, value in table.rows:
+            try:
+                value.process(kind) if value is not None else value
+            except ValueError:
+                pass
+";
+    assert_matches_cpython(source, "nested_iterator_try_discard.py", &LEVELS);
+}
+
+#[test]
+fn conditional_nested_finalizers_keep_the_guard_false_exit() {
+    let source = r"def clean(flag, finish):
+    try:
+        if flag:
+            try:
+                pass
+            finally:
+                finish()
+    except ValueError:
+        pass
+    finally:
+        pass
+";
+    assert_matches_cpython(source, "nested_finalizer_guard_exit.py", &LEVELS);
+}
+
+#[test]
+fn folded_assertion_threads_to_a_long_branch_continuation() {
+    let source = r"
+def long_footer(ready, item, items):
+    if ready:
+        assert 'present' or 'item' in items
+    else:
+        emit()
+    return item, {}, items
+
+def short_footer(ready, item, items):
+    if ready:
+        assert 'present' or 'item' in items
+    else:
+        emit()
+    return item
+";
+    assert_matches_cpython(source, "folded_assertion_branch.py", &LEVELS);
+}
+
+#[test]
+fn folded_assertion_arm_skips_a_large_message_before_its_return() {
+    let source = r"
+def with_message(ready, item, values):
+    saved = [value for value in values]
+    assert item if ready else 0.5, f'bad {saved} at {item if ready else 0}'
+
+def without_message(ready, item):
+    assert item if ready else 0.5
+";
+    assert_matches_cpython(source, "assertion_message_return.py", &LEVELS);
+}
+
+#[test]
+fn loop_value_discards_follow_the_original_branch_exit() {
+    let source = r"def visit(items, flag):
+    for item in items:
+        if item:
+            first(item) if flag else second(item)
+        else:
+            flag and consume(item)
+
+
+async def drain(items, flag):
+    async for item in items:
+        first(item) if flag else second(item)
+    while True:
+        flag or finish()
+";
+    assert_matches_cpython(source, "loop_branch_value_discards.py", &LEVELS);
+}
+
+#[test]
+fn loop_exits_preserve_the_backedge_of_an_erased_else() {
+    for exit in [
+        "return item",
+        "raise LookupError(item)",
+        "break",
+        "continue",
+    ] {
+        let source = format!(
+            "def scan(items, ready):\n    try:\n        for item in items:\n            if ready:\n                visit(item)\n                {exit}\n            else:\n                assert item\n    except LookupError:\n        recover()\n"
+        );
+        assert_matches_cpython(&source, "erased_loop_else.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_or_pattern_in_a_protected_loop_keeps_its_subject_pop_unlocated() {
+    let source = r"def scan(items, flag):
+    for value in items:
+        try:
+            match value:
+                case (
+                    1
+                    | 2
+                ):
+                    assert flag
+                case captured if flag:
+                    pass
+        except ValueError:
+            pass
+";
+    assert_matches_cpython(source, "erased_or_loop.py", &LEVELS);
+}
+
+#[test]
+fn guarded_empty_match_cases_thread_to_the_loop_backedge() {
+    let source = r"def visit(items, value):
+    for item in items:
+        match item:
+            case 1 if value == 2:
+                pass
+            case _:
+                pass
+
+def consume(items, ready):
+    for item in items:
+        match item:
+            case Entry(flag=True) if ready:
+                pass
+";
+    assert_matches_cpython(source, "guarded_empty_match.py", &LEVELS);
+}
+
+#[test]
+fn folded_conditional_keeps_a_shared_return_jump_unlocated() {
+    for test in ["True", "__debug__"] {
+        let source = format!(
+            "def choose(value, worker):\n    if value:\n        if {test}:\n            worker.send(value)\n    else:\n        worker.wait()\n    return value\n"
+        );
+        assert_matches_cpython(&source, "folded_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn loop_exhaustion_keeps_its_line_before_a_copied_return() {
+    let guarded = r"def sample(values, ready):
+    answer = None
+    if ready:
+        for value in values:
+            if value in [item.name for item in values]:
+                break
+        assert answer
+    else:
+        answer = values[0]
+    return answer
+";
+    let otherwise = r"def sample(values, key, other):
+    try:
+        answer = None
+        if key is not None:
+            if values:
+                for value in values:
+                    if value == key:
+                        break
+                else:
+                    report(reason=other)
+            else:
+                report(other)
+        else:
+            report(key)
+        return answer
+    except Error as error:
+        pass
+";
+    for source in [guarded, otherwise] {
+        assert_matches_cpython(source, "loop_exhaustion_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_folded_handler_guard_keeps_its_cleanup_join_unlocated() {
+    let source = "def run(value):\n    try:\n        work()\n    except LookupError:\n        if __debug__:\n            recover(value)\n    finish()\n";
+    assert_matches_cpython(source, "folded_handler_guard.py", &LEVELS);
+    assert_matches_cpython_versions(
+        &source.replace("recover(value)", "assert value"),
+        "erased_handler_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py313],
+    );
+}
+
+#[test]
+fn a_format_prefix_keeps_the_folded_guard_at_its_original_join() {
+    for action in ["check(value)", "return value"] {
+        let source = format!(
+            "def render(value):\n    if __debug__:\n        {action}\n    return 'item %s' % (str(value),)\n"
+        );
+        assert_matches_cpython(&source, "guarded_format.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_try_else_assertions_keep_their_conditional_return_donors() {
+    let source = r"def sample(choose, ready):
+    try:
+        value = read()
+    except LookupError:
+        pass
+    else:
+        if choose:
+            if ready:
+                assert value
+            else:
+                assert choose
+        else:
+            if ready:
+                assert choose
+            else:
+                assert value
+        assert value
+";
+    assert_matches_cpython(source, "erased_try_else_returns.py", &LEVELS);
+}
+
+#[test]
+fn guarded_finally_keeps_async_iterator_exhaustion_before_erased_assertions() {
+    for body in ["yield item", "consume(item)"] {
+        let source = format!(
+            "async def stream(source, enabled):\n    try:\n        async for item in source:\n            {body}\n        assert item\n    finally:\n        if enabled:\n            finish()\n"
+        );
+        assert_matches_cpython(&source, "guarded_iterator_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
+fn terminal_conditional_stores_keep_their_original_value_join() {
+    for (target, value) in [
+        (
+            "out",
+            "item if ready else build({} if item is None else item)",
+        ),
+        (
+            "owner.result",
+            "item if ready else 1 + (item if active else 2)",
+        ),
+        (
+            "out",
+            "(item if active else (2 if ready else 3)) if ready else item",
+        ),
+    ] {
+        let source =
+            format!("def run(owner, item, ready, active, build):\n    {target} = {value}\n");
+        assert_matches_cpython_versions(
+            &source,
+            "conditional_store.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
+fn copied_conditional_exits_keep_a_separate_noop_line() {
+    let source = r#"def choose(flag, value):
+    if flag:
+        ...
+    else:
+        pass
+    return value
+
+
+def select(flag, value, fallback):
+    if flag:
+        value = fallback
+        "finished"
+    else:
+        fallback = value
+    return value
+
+
+def checked(flag, value):
+    if flag:
+        inspect(value)
+        pass
+    else:
+        recover()
+    raise LookupError
+
+
+def same_line(flag, value):
+    if flag:
+        inspect(value); ...
+    else:
+        recover()
+    return value
+"#;
+    assert_matches_cpython(source, "conditional_literal_exit.py", &LEVELS);
+}
+
+#[test]
+fn copied_normal_try_exits_keep_their_trailing_pass() {
+    let source = r"def finalized(value):
+    try:
+        value = receive()
+    finally:
+        close()
+        pass
+    return value
+
+
+def selected(value):
+    try:
+        check(value)
+    except LookupError:
+        return value
+    else:
+        pass
+    return value
+
+
+def recovered(value):
+    try:
+        value = receive()
+    finally:
+        try:
+            pass
+        except LookupError:
+            recover()
+    return value
+
+
+def same_line(value):
+    try:
+        check(value)
+    finally:
+        close(); pass
+    return value
+";
+    assert_matches_cpython(source, "copied_pass_return.py", &LEVELS);
+}
+
+#[test]
+fn a_module_keeps_each_terminal_guard_exit_before_erased_assertions() {
+    let source = "if enabled:\n    if ready:\n        work()\n    assert ready\n";
+    assert_matches_cpython(source, "module_guard_footer.py", &LEVELS);
+}
+
+#[test]
+fn a_generator_keeps_each_terminal_guard_exit_before_erased_assertions() {
+    let source = r"def visit(enabled, ready, value):
+    if enabled:
+        yield value
+        if ready:
+            yield value
+        assert ready
+    else:
+        finish()
+";
+    assert_matches_cpython(source, "generator_guard_footer.py", &LEVELS);
+}
+
+#[test]
+fn final_else_keeps_a_shared_value_discard_before_its_implicit_return() {
+    for expression in ["first() if enabled else second()", "enabled and first()"] {
+        let source = format!(
+            "def sample(mode, enabled):
+    if mode is None:
+        update()
+    else:
+        {expression}
+"
+        );
+        assert_matches_cpython(&source, "final_else_discard.py", &LEVELS);
+    }
+}
+
+#[test]
+fn loop_else_fallthrough_locates_the_normal_finalizer() {
+    let source = r"def drain(values):
+    try:
+        while ready():
+            work()
+        else:
+            del values[:]
+    finally:
+        finish()
+
+async def wait():
+    try:
+        while ready():
+            await step()
+        else:
+            pass
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "loop_else_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn folded_conditional_arms_keep_their_call_return_target() {
+    let source = r"def choose(ready, value):
+    if ready or (check(value) if value else False):
+        return finish(value)
+    return fallback()
+
+
+def select(ready, value, defaults):
+    if ready or (check(value) if value else False):
+        return finish(value)
+    return defaults.choose()
+";
+    assert_matches_cpython(source, "conditional_arm_call_returns.py", &LEVELS);
+}
+
+#[test]
+fn discarded_bare_returns_preserve_none_admission_order() {
+    let source = r#"def simple(flag):
+    "doc"
+    if False:
+        return
+    call(flag=True)
+    return None
+
+def protected(flag):
+    "doc"
+    try:
+        if flag:
+            raise ValueError("before")
+            note("inside")
+            return
+    finally:
+        note("closing")
+    if flag:
+        return None
+    return "closing"
+"#;
+    assert_matches_cpython(source, "discarded_bare_return.py", &LEVELS);
+}
+
+#[test]
+fn conditional_raise_fuses_the_exception_and_cause_inside_a_handler() {
+    for fallback in ["ValueError()", "other if ready else ValueError()"] {
+        let source = format!(
+            "def report(flag, ready, other):\n    try:\n        work()\n    except OSError as error:\n        raise (error if flag else {fallback}) from error\n"
+        );
+        assert_matches_cpython(&source, "conditional_raise_with_cause.py", &LEVELS);
+    }
+}
+
+#[test]
+fn exceptional_finally_returns_restore_the_outer_owner_after_the_stack_swaps() {
+    for (body, cleanup, outer) in [
+        (
+            "work(value)",
+            "if ready:\n                return value",
+            "except ValueError:\n        failed()",
+        ),
+        ("return value", "return value", "finally:\n        finish()"),
+    ] {
+        let source = format!(
+            r"def run(value, ready):
+    try:
+        try:
+            {body}
+        except KeyError as error:
+            recover()
+        finally:
+            {cleanup}
+    {outer}
+"
+        );
+        assert_matches_cpython(&source, "exceptional_finally_stack.py", &LEVELS);
+    }
+}
+
+#[test]
+fn handler_returns_unwind_iterators_before_the_enclosing_finalizer() {
+    for returned in ["1", "result(item)"] {
+        let source = format!(
+            "async def run(groups, stream):\n    for group in groups:\n        try:\n            use(group)\n        finally:\n            async for item in stream:\n                try:\n                    inspect(item)\n                except Error as caught:\n                    report(caught)\n                    return {returned}\n"
+        );
+        assert_matches_cpython(&source, "handler_finally_iterators.py", &LEVELS);
+    }
+}
+
+#[test]
+fn legacy_pass_finalizer_retains_its_enclosing_try_and_handler() {
+    let source = r"def guarded(values):
+    for value in values:
+        try:
+            if selected(value):
+                try:
+                    work(value)
+                finally:
+                    pass
+        except KeyError:
+            pass
+
+def handled(value):
+    while ready():
+        try:
+            handle(value)
+        except KeyError:
+            try:
+                work(value)
+            finally:
+                pass
+    done()
+";
+    assert_matches_cpython(source, "guarded_pass_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn empty_legacy_generator_try_exits_keep_their_unprotected_pop() {
+    for prefix in [
+        "async def run(value):\n",
+        "def run(value):\n    yield value\n",
+    ] {
+        let source = format!(
+            "{prefix}    try:\n        visit()\n    finally:\n        try:\n            pass\n        except LookupError:\n            recover()\n    return value\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "empty_generator_try.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+        for (body, handler) in [
+            ("pass", "except LookupError:"),
+            ("assert value", "except LookupError as error:"),
+        ] {
+            let source = format!(
+                "{prefix}    try:\n        {body}\n    {handler}\n        raise RuntimeError(value)\n    notify(value)\n"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "empty_generator_try_fallthrough.py",
+                &LEVELS,
+                &[PythonVersion::Py312],
+            );
+        }
+    }
+}
+
+#[test]
+fn nested_class_captures_the_enclosing_conditional_annotation_cell() {
+    let body = "class Outer:\n    class Inner:\n        if enabled:\n            value: Kind\n";
+    for future in ["", "from __future__ import annotations\n"] {
+        assert_matches_cpython(&format!("{future}{body}"), "nested_annotation.py", &LEVELS);
+    }
+}
+
+#[test]
+fn awaited_return_restores_the_outer_guard_pop_after_inner_cleanup() {
+    let source = r"async def run(task, flag, owner):
+    try:
+        try:
+            return await task()
+        except ValueError:
+            pass
+        finally:
+            owner.inner.close(flag)
+    finally:
+        if flag is not None:
+            finish()
+";
+    assert_matches_cpython_versions(source, "await_cleanup.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
+fn manager_setups_reuse_the_function_definition_before_a_guard() {
+    let source = r"def run(manager, value, active):
+    if active:
+        return
+    with manager, manager, manager, manager, manager:
+        def worker():
+            return value, active
+        try:
+            if value is not None and active:
+                consume()
+        except ValueError:
+            pass
+";
+    assert_matches_cpython_versions(source, "case.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
+fn sole_handler_locates_finally_after_an_unreachable_loop_exit() {
+    for handler in ["await recover(value)", "value = recover(value)", "pass"] {
+        let source = format!(
+            "async def run(value, recover, release):\n    try:\n        while True:\n            pass\n        return value\n    except KeyError:\n        raise\n    except ValueError as error:\n        {handler}\n    finally:\n        release(value)\n"
+        );
+        assert_matches_cpython(&source, "handler_finally_line.py", &LEVELS);
+    }
+}
+
+#[test]
+fn erased_assertion_keeps_its_try_setup_outside_the_outer_handler() {
+    let source = r"def read(value, ready):
+    try:
+        try:
+            assert ready
+        except ValueError:
+            pass
+        result = convert(value=value)
+    except LookupError:
+        pass
+";
+    assert_matches_cpython(source, "erased_try_setup.py", &LEVELS);
+}
+
+#[test]
+fn unreachable_suites_reserve_the_first_generated_constant() {
+    for source in [
+        "def f():\n    raise Error\n    return collect(lambda item: item)\n",
+        "def f(xs):\n    return xs\n    observe()\n    items = (item for item in xs)\n",
+        "def f(flag):\n    return flag\n    if flag: return\n    observe(17)\n",
+    ] {
+        assert_matches_cpython(source, "unreachable_first_constant.py", &LEVELS);
+    }
+}
+
+#[test]
+fn unreachable_literal_statements_leave_the_first_constant_slot_free() {
+    for source in [
+        "def lookup(obj):\n    return obj.value\n    'field documentation'\n",
+        "def check():\n    raise Error\n    'unused'\n    report(17)\n",
+    ] {
+        assert_matches_cpython(source, "unreachable_literal_statement.py", &LEVELS);
+    }
+}
+
+#[test]
+fn conditional_match_exit_uses_the_original_final_tuple_store() {
+    for (targets, values) in [
+        ("first, last", "get(), (value,)"),
+        ("first, middle, last", "get(), (value,), get()"),
+    ] {
+        let source = format!(
+            "def sample(value, flag):\n    match value:\n        case Color.red:\n            if flag:\n                {targets} = {values}\n    return process(first, last)\n"
+        );
+        assert_matches_cpython(&source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_retained_try_entry_leaves_the_next_conditional_marker_unprotected() {
+    let source = r"def dispatch():
+    try:
+        while True:
+            value = current
+            try:
+                if enabled:
+                    consume(value)
+            except ValueError:
+                pass
+            finish(value)
+    except KeyError:
+        pass
+";
+    assert_matches_cpython(source, "retained_try_entry.py", &LEVELS);
+}
+
+#[test]
+fn nested_try_exits_copy_a_shared_tuple_return_once() {
+    let source = r"def run(value, flag, option):
+    try:
+        if flag:
+            try:
+                work()
+            except LookupError:
+                recover()
+        else:
+            if option:
+                pass
+            else:
+                return 1
+    except ValueError:
+        pass
+    return True, value
+";
+    assert_matches_cpython(source, "nested_try_tuple_return.py", &LEVELS);
+
+    // A second handler leaves one incoming jump unlocated. Its surviving
+    // marker inherits the peer handler's call span.
+    let nested = source.replace(
+        "                work()",
+        "                try:\n                    work()\n                except IndexError:\n                    fallback()",
+    );
+    assert_matches_cpython(&nested, "nested_handler_tuple_return.py", &LEVELS);
+}
+
+#[test]
+fn guarded_case_shares_the_constant_return_after_a_try() {
+    let source = r"def run(value, flag):
+    try:
+        match value:
+            case 'first':
+                prepare()
+                if flag:
+                    call()
+            case 'last':
+                finish()
+    except ValueError:
+        return 1
+    return 0
+";
+    assert_matches_cpython(source, "guarded_case_return.py", &LEVELS);
+}
+
+#[test]
+fn nested_try_exits_keep_the_owner_of_their_continuation() {
+    let source = r"def before_guard(value, ready, later):
+    try:
+        if ready:
+            try:
+                pass
+            except Exception as error:
+                report(value)
+                release(value)
+            if later:
+                finish()
+    except LookupError:
+        recover()
+
+def inside_manager(value, manager):
+    with manager:
+        try:
+            try:
+                pass
+            except Exception as error:
+                report(value)
+                release(value)
+        except LookupError:
+            recover()
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_try_continuation.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
+fn protected_conditional_discards_leave_an_unlocated_normal_exit() {
+    for expression in [
+        "await fetch(value) if active else read(value)",
+        "active and read(value)",
+    ] {
+        let source = format!(
+            "async def sample(value, ordinary, active):
+    try:
+        if ordinary:
+            await update(value)
+        else:
+            {expression}
+    except LookupError:
+        raise
+    finish(value)
+"
+        );
+        assert_matches_cpython(&source, "conditional_discard_exit.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_guarded_raise_donates_its_false_edge_to_enclosing_branches() {
+    let source = r"def choose(first, second, third, keep):
+    if first:
+        pass
+    elif second:
+        if third:
+            pass
+        else:
+            if keep:
+                if accept():
+                    pass
+                else:
+                    raise ValueError
+    else:
+        pass
+    finish()
+";
+    assert_matches_cpython(source, "nested_guarded_raise_exit.py", &LEVELS);
+}
+
+#[test]
+fn a_nested_elided_else_leaves_its_condition_on_the_outer_jump() {
+    let source = r"def select(enabled, ready, first, value):
+    if enabled:
+        if ready:
+            pass
+        else:
+            if first:
+                pass
+            elif value is None or value == first:
+                pass
+            else:
+                assert False
+    else:
+        fallback()
+    finish()
+";
+    assert_matches_cpython(source, "nested_elided_else_jump.py", &LEVELS);
+}
+
+#[test]
+fn a_pass_finalizer_at_an_iterator_tail_keeps_its_enclosing_handler() {
+    let source = r"def scan(items):
+    try:
+        prepare()
+    finally:
+        for item in items:
+            try:
+                visit(item)
+            finally:
+                pass
+";
+    assert_matches_cpython(source, "pass_finalizer_backedge.py", &LEVELS);
+}
+
+#[test]
+fn pass_finalizer_keeps_the_normal_try_exit_after_a_terminal_handler() {
+    let source = r"def check(value):
+    try:
+        inspect(value)
+    except ValueError:
+        raise
+    finally:
+        pass
+    return value
+";
+    for handler in ["raise", "recover(value)"] {
+        let source = source.replace("raise", handler);
+        assert_matches_cpython(&source, "terminal_handler_pass_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
+fn a_managed_iterator_preserves_pass_lines_in_its_body_and_after_its_exit() {
+    let source = r"def run(items, manager, skip):
+    try:
+        with manager:
+            for item in items:
+                if skip:
+                    continue
+                pass
+                inspect(item)
+            pass
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "managed_iterator_pass.py", &LEVELS);
+}
+
+#[test]
+fn nested_handler_return_uses_the_original_outer_finalizer_marker_slot() {
+    for tail in ["del flag", "done()"] {
+        let source = format!(
+            r"def choose(value):
+    try:
+        return read(value)
+    except ValueError as first:
+        prior = saved()
+        try:
+            try:
+                return retry(first)
+            except RuntimeError as second:
+                flag = saved()
+                try:
+                    return fallback(second)
+                finally:
+                    if flag is not None:
+                        restore(flag)
+                    else:
+                        purge(flag)
+                    {tail}
+        finally:
+            if prior is not None:
+                restore(prior)
+            else:
+                purge(prior)
+            del prior
+"
+        );
+        assert_matches_cpython(&source, "outer_finalizer_marker.py", &LEVELS);
+    }
+}
+
+#[test]
+fn trailing_literal_keeps_the_original_implicit_return_copy_budget() {
+    let source = r#"if enabled:
+    if value is not None:
+        value = 1
+else:
+    value = None
+result = value
+"description"
+"#;
+    assert_matches_cpython_versions(
+        source,
+        "literal_return_target.py",
+        &LEVELS,
+        &[PythonVersion::Py312],
+    );
+}
+
+#[test]
+fn python312_bounded_for_tests_preserve_backedge_widths() {
+    for guards_before in [false, true] {
+        for padding in [123, 124, 125] {
+            let guards = "    if active:\n        value = ready\n".repeat(258);
+            let mut source =
+                String::from("def run(items, active, ready, state):\n    state.value: int = 0\n");
+            source.push_str(&"    value = active\n".repeat(141));
+            if guards_before {
+                source.push_str(&guards);
+            }
+            source.push_str("    for item in items:\n");
+            source.push_str(&"        value = active\n".repeat(padding));
+            source.push_str("        if active:\n            check(item)\n");
+            if !guards_before {
+                source.push_str(&guards);
+            }
+            source.push_str("    return value\n");
+            assert_matches_cpython_versions(
+                &source,
+                "bounded_for_widths.py",
+                &LEVELS,
+                &[PythonVersion::Py312],
+            );
+        }
+    }
+}
+
+#[test]
+fn guards_on_assigned_comprehensions_append_an_unowned_marker() {
+    for capture in ["", "    def read_result(): return found\n"] {
+        let source = format!(
+            "async def collect(values):\n{capture}    try:\n        work()\n    finally:\n        if found := [item for item in values]:\n            use(found)\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "assigned_comprehension.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
+fn unpacked_keyword_calls_leave_the_next_finalizer_guard_unowned() {
+    let source = r"def dispatch(client, state, ready):
+    try:
+        run()
+    except ValueError:
+        raise
+    finally:
+        try:
+            client.send(**state.options)
+            if ready:
+                finish()
+        finally:
+            close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "unpacked_call_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn manager_returns_keep_a_nested_handler_setup_outside_its_own_range() {
+    let source = r"def close(manager, flag, active):
+    try:
+        with manager:
+            if active:
+                update()
+            return True
+    except ValueError:
+        pass
+    finally:
+        try:
+            if flag is not None:
+                finish()
+            else:
+                release()
+        except KeyError:
+            pass
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_handler_setup.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn loop_exit_keeps_the_manager_on_a_finalizer_call_condition() {
+    let source = r"async def collect(manager, item):
+    async with manager:
+        try:
+            while item:
+                item = await take()
+        finally:
+            if not ready(item):
+                close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "managed_call_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
+fn named_cleanup_continuation_inherits_the_remaining_handler_arm() {
+    let source = r"async def run(manager, enabled, flag, item):
+    async with manager:
+        try:
+            if enabled:
+                try:
+                    work()
+                except ValueError as error:
+                    if flag or item:
+                        work()
+                    else:
+                        recover(
+                            error,
+                        )
+        except OSError:
+            raise
+        except Exception as outer:
+            raise Failure() from outer
+";
+    assert_matches_cpython(source, "guarded_handler_continuation.py", &LEVELS);
+}
+
+#[test]
+fn unpacked_boolean_patterns_leave_their_branch_markers_unprotected() {
+    let source = r#"async def visit(value, guard, enabled):
+    with guard:
+        if enabled:
+            match value:
+                case Entry(ready=True) | {"ready": True} | [False | None, _]:
+                    observe(value)
+                case _:
+                    pass
+    return value
+
+
+def cleanup(value, enabled):
+    try:
+        if enabled:
+            match value:
+                case Entry(ready=True) | Entry(done=False):
+                    observe(value)
+    finally:
+        finish()
+"#;
+    assert_matches_cpython_versions(
+        source,
+        "unpacked_boolean_patterns.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
+fn copied_boolean_pattern_subjects_keep_their_fresh_branch_markers() {
+    let source = r"async def choose(value):
+    match value:
+        case True:
+            return 1
+        case False:
+            return 2
+        case None:
+            return 3
+
+
+def visit():
+    try:
+        read()
+    except LookupError as error:
+        match error:
+            case False:
+                first()
+            case True:
+                second()
+            case None:
+                third()
+";
+    assert_matches_cpython_versions(
+        source,
+        "copied_boolean_patterns.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
+fn named_handler_loop_exit_copies_each_false_operands_position() {
+    let source = r"def retry(pending, ready, enabled):
+    while pending and ready:
+        try:
+            run()
+        except LookupError as error:
+            while enabled and ready:
+                handle(error)
+
+def scan(start, stop, ready):
+    while start < stop:
+        try:
+            start = advance(start)
+        except ValueError as error:
+            while start < stop and ready:
+                start += 1
+    return start
+";
+    assert_matches_cpython(source, "named_handler_loop_exit.py", &LEVELS);
+}
+
+#[test]
+fn match_assertions_locate_the_manager_exit() {
+    let source = r"def check(subject):
+    with acquire():
+        match subject:
+            case [first, second]:
+                assert first
+                assert second
+            case _:
+                raise ValueError
+
+def alternatives(subject, enabled):
+    with acquire():
+        match subject:
+            case [item]:
+                assert (item
+                        or enabled)
+            case _:
+                return
+
+def shared_exit(subject):
+    with acquire():
+        match subject:
+            case [item]:
+                assert item
+            case _:
+                recover()
+";
+    assert_matches_cpython(source, "match_assertion_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn guard_exits_locate_manager_cleanup() {
+    let source = r"def check(manager, ready, value):
+    with manager:
+        if ready:
+            try:
+                return value
+            except ValueError:
+                return
+
+def nested(manager, first, second):
+    with manager:
+        if first:
+            raise ValueError
+        else:
+            if not second:
+                return
+
+def first_arm(manager, first, second):
+    with manager:
+        if first:
+            if second:
+                return
+        else:
+            try:
+                return first
+            except ValueError:
+                raise
+
+def shared(manager, first, second):
+    with manager:
+        if first and second:
+            try:
+                return first
+            except ValueError:
+                return
+";
+    assert_matches_cpython(source, "guard_manager_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn a_fallthrough_handler_locates_manager_cleanup() {
+    let source = r"def update(manager, value):
+    with manager:
+        try:
+            return lookup()
+        except LookupError:
+            value.count += 1
+
+def split(manager, flag, value):
+    with manager:
+        try:
+            if flag:
+                return value
+            else:
+                raise ValueError
+        except ValueError:
+            recover(value)
+
+def shared(manager, flag, value):
+    with manager:
+        try:
+            if flag:
+                return value
+        except ValueError:
+            value.count += 1
+";
+    assert_matches_cpython(source, "handler_manager_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn a_branch_pass_keeps_its_line_before_a_copied_exit() {
+    let source = r"def sample(flag, value):
+    if flag:
+        inspect(value)
+        pass
+    else:
+        record(value)
+    return value
+
+def joined(flag, second, value):
+    try:
+        if flag:
+            if second:
+                inspect(value)
+            else:
+                record(value)
+            pass
+        else:
+            recover()
+    finally:
+        cleanup()
+    return value
+
+def same_line(flag, value):
+    if flag:
+        inspect(value); pass
+    else:
+        record(value)
+    return value
+
+def longer_tail(flag, value):
+    if flag:
+        inspect(value)
+        pass
+    else:
+        record(value)
+    prepare(value)
+    commit(value)
+    return value
+";
+    assert_matches_cpython(source, "branch_pass.py", &LEVELS);
+}
+
+#[test]
+fn a_pass_finalizer_keeps_its_line_after_a_conditional() {
+    let source = r"def verify(flag, value):
+    try:
+        if flag:
+            inspect(value)
+    finally:
+        pass
+    return value
+
+def iterate(values):
+    try:
+        for value in values:
+            inspect(value)
+    finally:
+        pass
+    return values
+";
+    assert_matches_cpython(source, "pass_finalizer.py", &LEVELS);
+}
+
+#[test]
+fn nested_conditional_call_locates_the_manager_exit() {
+    let source = r"def check(manager, first, second, value):
+    with manager:
+        if first:
+            return value
+        else:
+            prepare()
+            if second:
+                return value
+            else:
+                visit(value)
+    return value
+
+async def poll(manager, ready, value):
+    while ready():
+        with manager:
+            if value:
+                await visit(value)
+            else:
+                break
+";
+    assert_matches_cpython(source, "nested_manager_call.py", &LEVELS);
+}
+
+#[test]
+fn handler_cleanup_follows_suppression_and_nested_recovery() {
+    let source = r"def suppressed(flag):
+    try:
+        work()
+    except OSError as error:
+        if flag:
+            return
+        else:
+            with resource():
+                raise ValueError()
+    except ValueError as second:
+        pass
+
+def load(path):
+    try:
+        work()
+    except IOError:
+        try:
+            work()
+        except IOError:
+            path = fallback or path
+            with resource(path) as stream:
+                return stream.read()
+
+async def process(flag):
+    try:
+        await work()
+    except OSError as error:
+        if flag:
+            try:
+                await retry(error)
+            except:
+                record()
+        else:
+            record()
+";
+    assert_matches_cpython(source, "recovery_exit.py", &LEVELS);
+}
+
+#[test]
+fn nested_returns_clear_the_enclosing_exception_name() {
+    let source = r"def recover(flag, ready, value):
+    try:
+        work()
+    except OSError as error:
+        if flag:
+            if ready:
+                with resource():
+                    return value
+            else:
+                return value
+        else:
+            record(error)
+";
+    assert_matches_cpython(source, "nested_handler_return.py", &LEVELS);
+}
+
+#[test]
+fn manager_suppression_copies_the_handler_exit_before_a_return() {
+    for binding in ["", " as error"] {
+        let source = format!(
+            "def remove(flag):
+    try:
+        work()
+    except OSError{binding}:
+        if flag:
+            return False
+        else:
+            with resource():
+                raise ValueError()
+    return True
+"
+        );
+        assert_matches_cpython(&source, "suppressed_handler_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn async_manager_none_guard_keeps_its_inner_handler() {
+    let source = r"async def receive(manager, stopped):
+    try:
+        async with manager:
+            while not stopped:
+                frame = await read()
+                try:
+                    if frame is not None:
+                        await handle(frame)
+                except LookupError as error:
+                    record(error)
+    except OSError:
+        pass
+";
+    assert_matches_cpython(source, "managed_frame_guard.py", &LEVELS);
+}
+
+#[test]
+fn nested_conditional_stores_reach_the_borrowed_continuation() {
+    let source = r"def body(flag, value):
+    try:
+        try:
+            if flag:
+                pass
+            else:
+                saved = value
+        except LookupError:
+            pass
+    except OSError:
+        pass
+    if value is not None:
+        return value
+
+async def recovered(flag, value):
+    try:
+        await work()
+    except OSError:
+        saved = value
+    else:
+        try:
+            saved = initial()
+            if flag:
+                saved = transform(value)
+            else:
+                saved = value
+        except LookupError:
+            saved = value
+    if value is not None:
+        return value
+";
+    assert_matches_cpython(source, "nested_conditional_store.py", &LEVELS);
+}
+
+#[test]
+fn nested_handler_exits_copy_the_shared_constant_finalizer_return() {
+    let source = r"def recover():
+    try:
+        work()
+    except ValueError as error:
+        report(error)
+    else:
+        try:
+            commit()
+        except KeyError as error:
+            report(error)
+    finally:
+        return None
+";
+    assert_matches_cpython(source, "nested_handler_finalizer_return.py", &LEVELS);
+}
+
+#[test]
+fn unwound_handler_continue_copies_each_finalizer_guard_edge() {
+    let source = r"def scan(flag):
+    while True:
+        try:
+            try:
+                work()
+                return True
+            except Retry:
+                continue
+            finally:
+                if flag is not None:
+                    close()
+        except Error:
+            return False
+";
+    assert_matches_cpython(source, "handler_continue_guard.py", &LEVELS);
+}
+
+#[test]
+fn chained_comparison_uses_its_own_handler_cleanup_exit() {
+    for handler in ["Error", "Error as error"] {
+        let source = format!(
+            "def transform(value):
+    try:
+        work()
+    except {handler}:
+        if 0 <= value <= 9:
+            value = convert(value)
+    finish()
+"
+        );
+        assert_matches_cpython(&source, "handler_comparison_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
+fn handler_copies_the_unlocated_jump_before_its_return_expands() {
+    for arguments in ["", "alternate"] {
+        let source = format!(
+            "def read(source, enabled, alternate, manager):
+    if enabled:
+        try:
+            with manager:
+                pass
+        except ValueError:
+            handle()
+    elif alternate:
+        handle()
+    return source.result({arguments})
+"
+        );
+        assert_matches_cpython(&source, "handler_return_bridge.py", &LEVELS);
+    }
+}
+
+#[test]
+fn protected_handlers_copy_a_zero_argument_constructor_raise() {
+    for arguments in ["", "7"] {
+        let source = format!(
+            "def run():
+    try:
+        try:
+            work()
+        except KeyError:
+            pass
+        raise Stop({arguments})
+    except ValueError as error:
+        return None
+    finally:
+        finish()
+"
+        );
+        assert_matches_cpython(&source, "handler_constructor_raise.py", &LEVELS);
+    }
+}
+
+#[test]
+fn finalizer_locations_reach_handler_returns_after_iterator_cleanup() {
+    for finalizer in ["state.current = value", "release(value)"] {
+        let source = format!(
+            "def take(values, state, value):
+    try:
+        prepare()
+    except ValueError:
+        for item in values:
+            try:
+                return item
+            except KeyError:
+                continue
+            finally:
+                {finalizer}
+"
+        );
+        assert_matches_cpython(&source, "iterator_handler_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_loop_guard_keeps_the_boolean_discard_unlocated() {
+    let source = r"def scan(values, enabled, alternate):
+    for item in values:
+        if enabled:
+            if not ready(item) or alternate:
+                item and accept(item)
+        else:
+            item and reject(item)
+";
+    assert_matches_cpython(source, "nested_loop_value_discard.py", &LEVELS);
+}
+
+#[test]
+fn guarded_iterator_exhaustion_keeps_the_outer_branch_and_try() {
+    let source = r"def scan(items, enabled, ready, retry, manager):
+    with manager:
+        try:
+            if enabled:
+                if ready:
+                    use()
+                else:
+                    for first in items:
+                        pass
+                    else:
+                        if retry:
+                            for second in items:
+                                break
+            else:
+                skip()
+            finish()
+        except ValueError:
+            recover()
+";
+    assert_matches_cpython(source, "guarded_iterator_exhaustion.py", &LEVELS);
+}
+
+#[test]
+fn terminal_nested_handlers_copy_their_implicit_return() {
+    for inner in [
+        "        if ready:\n            use_result()\n        else:\n            raise\n",
+        "        try:\n            try:\n                use_result()\n            except KeyError:\n                pass\n        except ValueError:\n            pass\n",
+    ] {
+        let source = format!(
+            "try:\n    first()\nexcept LookupError:\n    try:\n        second()\n    except OSError:\n{inner}"
+        );
+        assert_matches_cpython(&source, "nested_handler_return.py", &LEVELS);
+    }
+}
+
+#[test]
+fn nested_handler_guards_copy_the_shared_return() {
+    let source = r"def run(first, second, third):
+    try:
+        load()
+    except OSError:
+        try:
+            recover()
+        except ValueError:
+            if first and (second or third):
+                raise LookupError
+";
+    assert_matches_cpython(source, "shared_handler_return.py", &LEVELS);
+}
+
+#[test]
+fn handler_guards_copy_the_return_past_an_outer_try() {
+    let source = r"def run(first, left, right):
+    try:
+        if first:
+            begin()
+        else:
+            try:
+                load()
+            except KeyError:
+                if left and right:
+                    work()
+    except OSError as error:
+        recover(error)
+";
+    assert_matches_cpython(source, "guarded_outer_try.py", &LEVELS);
+}
+
+#[test]
+fn inner_while_exit_copies_the_handler_cleanup_before_the_outer_backedge() {
+    let source = r"def run(items, ready, stop):
+    while items:
+        try:
+            work()
+        except KeyError:
+            while ready:
+                if stop:
+                    break
+                update()
+";
+    assert_matches_cpython(source, "nested_loop_handler.py", &LEVELS);
+}
+
+#[test]
+fn a_copied_handler_backedge_unwinds_one_handler_at_each_pop() {
+    for guard in [
+        "left",
+        "left and right",
+        "left or right",
+        "left and right and other",
+    ] {
+        let source = format!(
+            r"def process(items, left, right, other):
+    try:
+        for item in items:
+            try:
+                work()
+            except LookupError:
+                try:
+                    recover()
+                except OSError:
+                    try:
+                        if {guard}:
+                            break
+                    except ValueError:
+                        pass
+    except ArithmeticError:
+        fallback()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "handler.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn while_else_breaks_copy_the_enclosing_handler_exit() {
+    for exhaustion in ["", "        else:\n            finish()\n"] {
+        let source = format!(
+            r"def process(ready, value):
+    try:
+        work()
+    except LookupError:
+        while ready:
+            try:
+                work()
+            except ValueError:
+                recover()
+            else:
+                break
+{exhaustion}    use(value)
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "while_else.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
+fn a_try_else_break_stops_borrowing_after_the_enclosing_handler() {
+    let source = r"def process(ready, value):
+    try:
+        begin()
+    except LookupError:
+        while ready:
+            try:
+                work()
+            except ValueError:
+                recover()
+            else:
+                break
+            advance()
+        else:
+            finish()
+    use(value)
+";
+    assert_matches_cpython(source, "handler_borrow.py", &LEVELS);
+}
+
+#[test]
+fn async_iterator_exhaustion_falls_through_a_suspending_alternative() {
+    let source = r"async def stream(manager, items, enabled):
+    async with manager:
+        if enabled:
+            async for item in items:
+                yield item
+        else:
+            error = await failure()
+            raise error
+";
+    assert_matches_cpython(source, "suspending_iterator_alternative.py", &LEVELS);
+}
+
+#[test]
+fn managed_none_guard_counts_slots_released_before_its_try() {
+    for calls in [2, 3] {
+        let prefix = "        work()\n".repeat(calls);
+        let source = format!(
+            "async def run(ready):
+    async with manager() as value:
+        if ready:
+            return
+{prefix}        try:
+            if value is None:
+                await send()
+            else:
+                await save()
+        except LookupError:
+            pass
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_guard_prefix.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
 }

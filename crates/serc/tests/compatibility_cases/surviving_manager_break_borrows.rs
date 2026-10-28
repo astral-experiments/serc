@@ -86,3 +86,26 @@ fn borrows_through_surviving_breaks_into_structured_manager_cleanup() {
         }
     }
 }
+
+#[test]
+fn borrows_through_surviving_breaks_into_guarded_cleanup() {
+    for (scope, work) in [("", "yield item"), ("with manager:\n", "use(item)")] {
+        for cleanup in [
+            "if flag:\n    close(item)\n",
+            "if flag and item.name == key:\n    close(item)\nelse:\n    save(key)\nnotify(item)\n",
+            "if flag:\n    saved = item\n    if saved is not None:\n        try:\n            close(saved)\n        except Error:\n            pass\nnotify(key)\n",
+        ] {
+            let body = format!(
+                "try:\n    while True:\n        item = get(key)\n        if item is None:\n            break\n        elif retry(item):\n            break\n        else:\n            {work}\nfinally:\n{}",
+                indent(cleanup)
+            );
+            let body = if scope.is_empty() {
+                body
+            } else {
+                format!("{scope}{}", indent(&body))
+            };
+            let source = format!("def visit(manager, key, flag):\n{}", indent(&body));
+            common::assert_matches_cpython_marshal(&source, "guarded_break_cleanup.py");
+        }
+    }
+}

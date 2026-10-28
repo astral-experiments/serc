@@ -66,9 +66,9 @@ use super::source::{
     statement_execution_range, strip_expression_comments, synthetic_condition_exit_range,
 };
 use super::statement::{
-    NestedIfExitLocation, condition_jump_target_count, final_chained_comparison_jump,
-    final_terminating_arm_fallthrough_test, is_wildcard_pattern, nested_if_exit_location,
-    suite_has_linear_borrow_fallthrough, suite_terminates,
+    NestedIfExitLocation, condition_jump_target_count, expression_contains_inline_branch,
+    final_chained_comparison_jump, final_terminating_arm_fallthrough_test, is_wildcard_pattern,
+    nested_if_exit_location, suite_has_linear_borrow_fallthrough, suite_terminates,
     terminal_for_break_exit_inherits_predecessor, unique_condition_jump_target,
 };
 use super::symbol::{
@@ -97,6 +97,7 @@ struct MatchContext {
     fail_pop: Vec<Option<Label>>,
     // Case or OR-alternative source identity; fail-pop indices belong to this context.
     native_fail_owner: ruff_text_size::TextRange,
+    single_line_pattern: bool,
     direct_loop_failure: Option<Label>,
     on_top: usize,
     ownerless_markers_after_specialized_none: bool,
@@ -639,6 +640,7 @@ impl Compiler<'_> {
         let matched_cases = statement.cases.len() - usize::from(has_default);
         let erased_final_value_case =
             self.control.statements.match_tail_before_if_exit == Some(statement.range);
+        let ends_try_body = self.control.exceptions.active_try_body_tail == Some(statement.range());
         let guarded_try_tail = !has_default
             && matched_cases > 1
             && self.control.exceptions.active_try_body_tail == Some(statement.range)
@@ -688,9 +690,9 @@ impl Compiler<'_> {
                 failure_reaches_end = true;
                 continue;
             }
+            let pattern_location = self.source_location(case.pattern.range());
             if copied_subject {
-                self.assembler
-                    .set_location(self.source_location(case.pattern.range()));
+                self.assembler.set_location(pattern_location);
                 self.emit(COPY, 1, 1)?;
             }
             let failure_depth = base_depth + i32::from(copied_subject);
@@ -698,6 +700,7 @@ impl Compiler<'_> {
                 stores: Vec::new(),
                 fail_pop: Vec::new(),
                 native_fail_owner: case.pattern.range(),
+                single_line_pattern: pattern_location.line == pattern_location.end_line,
                 direct_loop_failure: (!copied_subject
                     && !has_default
                     && case.guard.is_none()
@@ -722,7 +725,7 @@ impl Compiler<'_> {
                     .set_location(self.source_location(case.pattern.range()));
                 self.store_name_id(name)?;
             }
-            let mut guard_always_false = false;
+            let mut skip_case_body = false;
             let mut irrefutable_true_guard = false;
             if let Some(guard) = &case.guard {
                 if let Some(truthiness) = early_condition_truthiness(guard) {
@@ -836,7 +839,7 @@ impl Compiler<'_> {
                             // CPython's edge is still conditional during small-exit copying.
                             self.assembler.prevent_jump_inlining(failure);
                         }
-                        guard_always_false = true;
+                        skip_case_body = true;
                     }
                 } else {
                     let failure = self.ensure_match_fail_pop(&mut context, 0);
@@ -856,7 +859,41 @@ impl Compiler<'_> {
                             .set_location(self.source_location(case.pattern.range()));
                         self.emit(NOP, 0, 0)?;
                     }
-                    if !copied_subject
+                    if self.context.python_version >= PythonVersion::Py314
+                        && !copied_subject
+                        && !has_default
+                        && !context.stores.is_empty()
+                        && context.fail_pop.len() > 1
+                        && self.control.loops.non_final_match_tail != Some(statement.range)
+                        && self.control.generators.generator_region_start.is_none()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && self.control.withs.active_with_region_exclusions.is_empty()
+                        && let [body @ (Stmt::Return(_) | Stmt::Pass(_))] = case.body.as_slice()
+                        && !expression_contains_inline_branch(guard)
+                        && let Some(restart) = self.control.terminal_loop_continue_label()
+                    {
+                        // Captures have already been stored. A failed guard skips the
+                        // pattern's stack cleanup and returns directly to the loop.
+                        let success = self.assembler.label();
+                        self.compile_jump_if(guard, true, success)?;
+                        self.emit_jump_backward_with_exception_policy(
+                            JUMP_BACKWARD,
+                            restart,
+                            0,
+                            ExceptionPolicy::EXCLUDE_ALWAYS,
+                        )?;
+                        self.assembler.mark(success);
+                        if matches!(body, Stmt::Pass(_)) {
+                            self.assembler
+                                .set_location(self.source_location(body.range()));
+                            self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+                            skip_case_body = true;
+                        }
+                    } else if !copied_subject
                         || self.can_copy_match_guard_subject_return(
                             &case.pattern,
                             guard,
@@ -871,7 +908,7 @@ impl Compiler<'_> {
                     }
                 }
             }
-            if !guard_always_false {
+            if !skip_case_body {
                 let body_is_elided = case
                     .body
                     .iter()
@@ -904,7 +941,8 @@ impl Compiler<'_> {
                                 .control
                                 .statements
                                 .context
-                                .followed_by_small_match_return
+                                .following_return_records
+                                .is_some_and(|records| records <= 4)
                             && case.guard.as_ref().is_some_and(|guard| {
                                 early_condition_truthiness(guard) == Some(true)
                             })))
@@ -921,7 +959,16 @@ impl Compiler<'_> {
                     && self.control.withs.active_with_region_exclusions.is_empty()
                     && !self.control.in_exception_handler()
                     && self.control.finally.is_inactive_for_return_unwind();
-                let unlocated_subject_exit = elided_case_body || unlocated_pattern_exit;
+                // The OR success block pops the matched alternative, then the copied
+                // subject. At a loop tail an erased body leaves the second pop with
+                // no following line, including when an intervening try exit is copied.
+                let unlocated_subject_exit = elided_case_body
+                    || unlocated_pattern_exit
+                    || (erased_subject
+                        && case.guard.is_none()
+                        && matches!(case.pattern, Pattern::MatchOr(_))
+                        && self.control.in_loop()
+                        && !match_has_following);
                 if copied_subject {
                     let location = if self.context.python_version <= PythonVersion::Py313 {
                         self.source_location(case.pattern.range())
@@ -977,9 +1024,14 @@ impl Compiler<'_> {
                         end,
                         loop_tail,
                         index + 1 == matched_cases && !context.fail_pop.is_empty(),
-                        guarded_try_tail
+                        (guarded_try_tail
                             && case.guard.is_some()
-                            && matches!(case.pattern, Pattern::MatchValue(_)),
+                            && matches!(case.pattern, Pattern::MatchValue(_)))
+                            // Each false operand reaches this case's protected exit.
+                            // Copy it before the shared jump threads to the loop header.
+                            || (ends_try_body
+                                && self.control.in_loop()
+                                && condition_jump_target_count(&statement.test, false) > 1),
                     )?;
                     true
                 } else {
@@ -1199,6 +1251,7 @@ impl Compiler<'_> {
                                 self.assembler.at_original_unconditional_join()
                                     || self.assembler.original_return_guard_has_false_donor(
                                         self.source_location(test.range()),
+                                        0,
                                     )
                             });
                         if let Some(test) = final_condition_join {
@@ -1213,7 +1266,14 @@ impl Compiler<'_> {
                         // match continuation before cold blocks move. Its surviving bridge
                         // represents that fallthrough, not an interruptible case-success jump.
                         // On 3.13, pattern-failure cleanup still requires the original jump.
-                        let final_async_exhaustion = match_has_following
+                        // A surrounding with or finally also supplies a continuation
+                        // after the last source statement. Exhaustion falls into that
+                        // cleanup before cold relocation materializes the jump.
+                        let pending_cleanup = self.context.python_version >= PythonVersion::Py314
+                            && !self.control.in_loop()
+                            && (self.control.active_with_count() != 0
+                                || !self.control.finally.is_inactive_for_return_unwind());
+                        let final_async_exhaustion = (match_has_following || pending_cleanup)
                             && (self.context.python_version != PythonVersion::Py313
                                 || context.fail_pop.is_empty())
                             && index + 1 == matched_cases
@@ -1222,6 +1282,15 @@ impl Compiler<'_> {
                                 .assembler
                                 .instruction_opcode_at(self.assembler.instruction_count() - 1)
                                 == Some(END_ASYNC_FOR);
+                        let final_iterator_break_join = match_has_following
+                            && self.context.python_version >= PythonVersion::Py314
+                            && index + 1 == matched_cases
+                            && !has_default
+                            && self
+                                .assembler
+                                .instruction_opcode_at(self.assembler.instruction_count() - 1)
+                                == Some(POP_ITER)
+                            && self.assembler.at_original_authored_break_join();
                         let success_exit = self
                             .emit_jump_forward_instruction_with_exception_policy(
                                 JUMP_FORWARD,
@@ -1238,6 +1307,12 @@ impl Compiler<'_> {
                             )?;
                         self.assembler
                             .record_original_match_success(success_exit, original_empty_join);
+                        if final_iterator_break_join {
+                            // Breaks copy the case's jump over the iterator cleanup. The
+                            // original jump keeps the exhaustion line when it becomes a NOP.
+                            self.assembler
+                                .preserve_redundant_jump_nop_after_threading(success_exit);
+                        }
                         if original_unlocated_head
                             && self.can_descend_match_tail_wrappers()
                             && self
@@ -1313,10 +1388,11 @@ impl Compiler<'_> {
                             .is_some();
                         // An erased final capture body leaves its unlocated success jump
                         // directly after the capture store. That store already supplies
-                        // the pattern line when the jump to the live successor is removed.
+                        // the pattern line to the successor or the loop backedge.
                         let erased_capture_fallthrough = self.context.python_version
                             >= PythonVersion::Py314
-                            && match_has_following
+                            && (match_has_following
+                                || self.control.falls_through_to_loop_backedge())
                             && !copied_subject
                             && !has_default
                             && case.guard.is_none()
@@ -1350,6 +1426,21 @@ impl Compiler<'_> {
                                         && location.line
                                             == self.source_location(case.pattern.range()).line)
                             });
+                        // A guard or pattern failure gives the empty case-success jump
+                        // its own edge. At a loop tail it can thread to the backedge.
+                        let empty_case_loops = (matches!(case.body.as_slice(), [Stmt::Pass(_)])
+                            || body_is_elided)
+                            && self.control.falls_through_to_loop_backedge()
+                            && match &case.guard {
+                                Some(guard) => {
+                                    self.context.python_version >= PythonVersion::Py314
+                                        && early_condition_truthiness(guard).is_none()
+                                }
+                                None => {
+                                    (has_default && matches!(case.pattern, Pattern::MatchValue(_)))
+                                        || !context.fail_pop.is_empty()
+                                }
+                            };
                         if irrefutable_true_guard {
                             self.assembler.preserve_inlined_jump_nop(success_exit);
                         } else if authored_pass_exit && case.body.len() > 1 {
@@ -1360,16 +1451,7 @@ impl Compiler<'_> {
                             && !previous_instruction_covers_branch
                             && !erased_subject_fallthrough
                             && !matches!(self.unit.scope, Scope::Class { .. })
-                            // A pass or erased body still owns its case-success JUMP.
-                            // With original failure cleanup at a loop tail, it must thread
-                            // to the backedge instead of retaining a removed-jump NOP.
-                            && !(case.guard.is_none()
-                                && (matches!(case.body.as_slice(), [Stmt::Pass(_)])
-                                    || body_is_elided)
-                                && self.control.falls_through_to_loop_backedge()
-                                && ((has_default
-                                    && matches!(case.pattern, Pattern::MatchValue(_)))
-                                    || !context.fail_pop.is_empty()))
+                            && !empty_case_loops
                         {
                             if (erased_final_value_case
                                 || (authored_pass_exit
@@ -1421,16 +1503,24 @@ impl Compiler<'_> {
                             } else {
                                 self.assembler.preserve_inlined_jump_nop(success_exit);
                             }
-                            // CPython keeps this retained success-exit NOP on the physical
-                            // fallthrough for irrefutable explicit-global captures. Refutable
-                            // and local captures keep the ordinary borrowed-load barrier.
+                            // The capture store and the pass both occupy the success block.
+                            // A final irrefutable local capture reached from an earlier case
+                            // can still fall through when its jump becomes a line NOP.
                             if context.fail_pop.is_empty()
                                 && !context.stores.is_empty()
-                                && matches!(
+                                && (matches!(
                                     &self.unit.scope,
                                     Scope::Function { globals, .. }
                                         if context.stores.iter().all(|name| globals.contains(*name))
-                                )
+                                ) || self.context.python_version == PythonVersion::Py314
+                                    && (match_has_following
+                                        || self.control.loops.split_loop_tail_prefix_end
+                                            == Some(statement.range))
+                                    && index > 0
+                                    && case.guard.is_none()
+                                    && matches!(&case.pattern, Pattern::MatchAs(capture)
+                                        if capture.pattern.is_none() && capture.name.is_some())
+                                    && matches!(case.body.as_slice(), [Stmt::Pass(_)]))
                             {
                                 self.assembler
                                     .mark_retained_nop_borrow_fallthrough(success_exit);
@@ -1448,7 +1538,9 @@ impl Compiler<'_> {
                                 );
                             }
                         }
-                        if self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        if (self.context.python_version == PythonVersion::Py314
+                            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                                == 0)
                             && has_default
                             && index + 1 == matched_cases
                             && case.guard.is_none()
@@ -1551,7 +1643,9 @@ impl Compiler<'_> {
             if let Some(success_offset) = or_default_success_exit
                 && case.guard.is_none()
                 && matches!(case.body.as_slice(), [Stmt::Return(return_)]
-                    if return_.value.as_deref().is_none_or(|value| matches!(value, Expr::NoneLiteral(_))))
+                    if return_.value.as_deref().is_none_or(|value| matches!(value, Expr::NoneLiteral(_)))
+                        || self.context.python_version == PythonVersion::Py314
+                            && self.assembler.is_small_linear_scope_exit_since(default_start))
                 && self
                     .assembler
                     .pre_fusion_instruction_count_since(default_start)
@@ -1580,7 +1674,18 @@ impl Compiler<'_> {
                 // instruction separately from the wildcard pattern's line event.
                 self.assembler
                     .set_location(self.source_location(pass.range));
-                self.emit(NOP, 0, 0)?;
+                if self.context.python_version >= PythonVersion::Py314
+                    && case.guard.is_none()
+                    && self.control.ends_synchronous_with_body(statement.range)
+                    && statement.cases[..matched_cases]
+                        .iter()
+                        .all(|case| suite_terminates(&case.body))
+                {
+                    // Only the wildcard reaches the manager's normal POP_BLOCK.
+                    self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+                } else {
+                    self.emit(NOP, 0, 0)?;
+                }
             }
             if terminal && !suite_terminates(&case.body) && !emitted_fallthrough {
                 self.set_branch_end_location(&case.body, body_start);
@@ -1701,6 +1806,16 @@ impl Compiler<'_> {
             // The body and false edge share CPython's case-exit block. Small return exits
             // replace its jump before conditional threading is considered.
             let terminating_body = suite_terminates(&statement.body);
+            // Successful inner cases copy the exit before its line is assigned.
+            // A terminal irrefutable case leaves the outer condition as the only donor.
+            let nested_match_exit = self.context.python_version >= PythonVersion::Py314
+                && self.assembler.at_original_match_join()
+                && matches!(statement.body.last(), Some(Stmt::Match(nested))
+                    if nested.cases.split_last().is_some_and(|(last, earlier)|
+                        last.guard.is_none() && last.pattern.irrefutable_pattern().is_some()
+                            && suite_terminates(&last.body)
+                            && earlier.iter().all(|case| suite_terminates(&case.body)
+                                || suite_has_linear_borrow_fallthrough(&case.body))));
             // An ordinary try's normal and handled exits also leave this join by
             // unconditional jumps. Early small-return copying removes those edges
             // before the false condition donates its line to the original jump slot.
@@ -1711,7 +1826,7 @@ impl Compiler<'_> {
                     nested_if_exit_location(statement, false),
                     Some(NestedIfExitLocation::Located(_))
                 );
-            let unique_false_edge = (terminating_body || cleanup_exit)
+            let unique_false_edge = (terminating_body || nested_match_exit || cleanup_exit)
                 .then(|| unique_condition_jump_target(&statement.test, false))
                 .flatten();
             // 3.12 copies the following small return before resolving lines.
@@ -1742,7 +1857,20 @@ impl Compiler<'_> {
                     .active_exception_region_exclusions
                     .is_empty()
                 && original_unlocated_head;
-            let location = protected_case_exit
+            // The case-success jump is an unlocated block shared by each failing
+            // operand. Its private copies inherit the specific operand's span unless
+            // a small return replaces the jump before locations are assigned.
+            let copied_case_exit = protected_case_exit
+                || (self.context.python_version >= PythonVersion::Py314
+                    && original_unlocated_head
+                    && self
+                        .control
+                        .statements
+                        .context
+                        .following_return_records
+                        .is_none_or(|records| records > 4)
+                    && condition_jump_target_count(&statement.test, false) > 1);
+            let location = copied_case_exit
                 .then(|| {
                     self.assembler
                         .last_condition_location_to(false_exit, condition_start)
@@ -1754,7 +1882,7 @@ impl Compiler<'_> {
             self.assembler
                 .mark_conditional_threading_target(false_exit, location);
             let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, match_end)?;
-            if protected_case_exit {
+            if copied_case_exit {
                 self.assembler
                     .prepare_no_location_block_for_inlining(success_exit);
                 self.assembler.mark_as_artificial_eval_break(success_exit);
@@ -1763,8 +1891,11 @@ impl Compiler<'_> {
                 // The final case crosses an empty pattern failure; cleanup predecessors
                 // also need the original empty-join slot after threading. Record it before
                 // small-return copying, while keeping a surviving case JUMP interruptible.
-                self.assembler
-                    .preserve_redundant_jump_nop_after_threading(success_exit);
+                self.assembler.preserve_match_case_join_nop_after_threading(
+                    success_exit,
+                    false_exit,
+                    condition_start,
+                );
             }
             if unique_false_edge.is_some()
                 && !cleanup_exit
@@ -2001,12 +2132,12 @@ impl Compiler<'_> {
             }
             Pattern::MatchAs(pattern) => {
                 if let Some(inner) = &pattern.pattern {
-                    if !is_wildcard_pattern(inner) {
-                        context.on_top += 1;
-                        self.emit(COPY, 1, 1)?;
-                        self.compile_stack_pattern(inner, context)?;
-                        context.on_top -= 1;
-                    }
+                    // The wildcard's POP_TOP and this COPY still count when copying the
+                    // capture's exit block. Adjacent-instruction optimization removes them.
+                    context.on_top += 1;
+                    self.emit(COPY, 1, 1)?;
+                    self.compile_stack_pattern(inner, context)?;
+                    context.on_top -= 1;
                 }
                 self.assembler
                     .set_location(self.source_location(pattern.range));
@@ -2032,19 +2163,27 @@ impl Compiler<'_> {
         let Some(name) = name else {
             return self.emit(POP_TOP, 0, -1);
         };
-        let mut rotations = context.on_top + context.stores.len() + 1;
-        while rotations > 1 {
-            self.emit(SWAP, to_u32(rotations, "pattern capture rotation")?, 0)?;
-            rotations -= 1;
-        }
+        self.rotate_match_stack(
+            context.on_top + context.stores.len() + 1,
+            context.single_line_pattern,
+        )?;
         context.stores.push(self.required_name_id(name));
         Ok(())
     }
 
-    fn rotate_match_stack(&mut self, mut count: usize) -> Result<(), CompileError> {
-        while count > 1 {
-            self.emit(SWAP, to_u32(count, "pattern capture rotation")?, 0)?;
-            count -= 1;
+    fn rotate_match_stack(
+        &mut self,
+        count: usize,
+        single_line_pattern: bool,
+    ) -> Result<(), CompileError> {
+        if count > 1 {
+            let count = to_u32(count, "pattern capture rotation")?;
+            self.apply_compiler_stack_effect(SWAP, count, 0)?;
+            self.assembler.emit_pattern_capture_rotation(
+                count,
+                self.control.stack.depth.cast_unsigned(),
+                single_line_pattern,
+            );
         }
         Ok(())
     }
@@ -2070,6 +2209,7 @@ impl Compiler<'_> {
                 stores: Vec::new(),
                 fail_pop: Vec::new(),
                 native_fail_owner: alternative.range(),
+                single_line_pattern: context.single_line_pattern,
                 direct_loop_failure: None,
                 on_top: 0,
                 ownerless_markers_after_specialized_none: context
@@ -2122,7 +2262,10 @@ impl Compiler<'_> {
                             rotated,
                         );
                         for _ in 0..rotations {
-                            self.rotate_match_stack(control_index + 1)?;
+                            self.rotate_match_stack(
+                                control_index + 1,
+                                context.single_line_pattern,
+                            )?;
                         }
                     }
                 }
@@ -2211,7 +2354,7 @@ impl Compiler<'_> {
             .set_location(self.source_location(pattern.range));
         let rotations = control.len() + 1 + context.on_top + context.stores.len();
         for name in control {
-            self.rotate_match_stack(rotations)?;
+            self.rotate_match_stack(rotations, context.single_line_pattern)?;
             if context.stores.contains(&name) {
                 return Err(CompileError::InvalidPattern {
                     message: format!(
@@ -2660,13 +2803,27 @@ impl Compiler<'_> {
             && let Some(constant) = self.source_aware_fold_constant(origin)
         {
             self.pre_register_expression_names(expression)?;
-            // Code generation reserves preceding operands before the flowgraph folds
-            // their jumps. A later use can keep those original constant slots alive.
-            for value in &boolean.values {
+            // Code generation visits the operands in order before the flowgraph
+            // folds their jumps. A later use can keep a discarded operand's slot.
+            let mut operands = boolean.values.iter();
+            for value in operands.by_ref() {
                 if value.range() == origin.range() {
                     break;
                 }
                 self.record_folded_value(value)?;
+            }
+            if self.context.python_version == PythonVersion::Py314
+                && boolean
+                    .values
+                    .first()
+                    .is_some_and(|first| first.range() != origin.range())
+            {
+                // Folding a nondecisive short-circuit jump leaves the selected operand
+                // in its own block. Pending operands must remain owned across that edge.
+                let selected = self.assembler.label();
+                self.assembler
+                    .record_borrow_analysis_block_boundary(selected);
+                self.assembler.mark(selected);
             }
             let expression_location = self.source_location(expression.range());
             let origin_location = self.source_location(origin.range());
@@ -2678,6 +2835,9 @@ impl Compiler<'_> {
             }
             self.assembler.set_location(origin_location);
             self.emit_folded_constant(origin, constant)?;
+            for value in operands {
+                self.pre_register_short_circuited_operand(value)?;
+            }
             if boolean.values.len() > 1
                 && (boolean.values.len() > 2
                     || boolean
@@ -2986,15 +3146,8 @@ impl Compiler<'_> {
         if let [InterpolatedStringComponent::Literal(literal)] = components.as_mut_slice() {
             literal.range = self.fstring_result_range(fstring);
         }
-        let large = value_count > 30;
         let outer_location = self.source_location(fstring.range);
-        if large {
-            self.assembler.set_location(outer_location);
-            self.load_string_constant("")?;
-            let join = self.name_index("join")?;
-            self.emit(LOAD_ATTR, (join << 1) | 1, 1)?;
-            self.emit(BUILD_LIST, 0, 1)?;
-        }
+        let large = self.begin_joined_string(value_count, outer_location)?;
         for component in components {
             match component {
                 InterpolatedStringComponent::Literal(literal) => literal.load(self)?,
@@ -3272,15 +3425,14 @@ impl Compiler<'_> {
             // percent formatting, so it no longer has the required Tuple AST node.
             return Ok(SpecializedLowering::NotApplicable);
         }
-        let Some(parts) =
-            optimized_percent_format(expression, |literal| self.string_literal_constant(literal))
-        else {
+        let Some(parts) = optimized_percent_format(expression, self) else {
             return Ok(SpecializedLowering::NotApplicable);
         };
 
         let expression_location = self.source_location(expression.range);
         let part_count = parts.len();
-        for part in parts {
+        let large = self.begin_joined_string(part_count, expression_location)?;
+        for (index, part) in parts.into_iter().enumerate() {
             match part {
                 PercentFormatPart::Literal(value) => {
                     if matches!(&value, Constant::String(value) if value == "%") {
@@ -3291,8 +3443,15 @@ impl Compiler<'_> {
                     self.assembler.set_location(SourceLocation::NONE);
                     let constant = self.add_constant(value)?;
                     self.emit(LOAD_CONST, constant, 1)?;
-                    self.assembler
-                        .inherit_percent_target_location_for_last_instruction();
+                    if index == 0
+                        && self.control.statements.context.shared_format_prefix
+                            == Some(expression.range)
+                    {
+                        self.assembler.preserve_last_no_location();
+                    } else {
+                        self.assembler
+                            .inherit_percent_target_location_for_last_instruction();
+                    }
                 }
                 PercentFormatPart::Formatted {
                     expression,
@@ -3319,23 +3478,28 @@ impl Compiler<'_> {
                             argument |= FormatValue::HAVE_SPEC.argument();
                         }
                         self.emit(FORMAT_VALUE, argument, -i32::from(has_spec))?;
-                        continue;
-                    }
-                    self.emit_conversion(conversion)?;
-                    if let Some(format_spec) = format_spec {
-                        self.assembler.set_location(SourceLocation::NONE);
-                        self.load_string_constant(&format_spec)?;
-                        self.assembler.set_location(location);
-                        self.emit(FORMAT_WITH_SPEC, 0, -1)?;
                     } else {
-                        self.emit(FORMAT_SIMPLE, 0, 0)?;
+                        self.emit_conversion(conversion)?;
+                        if let Some(format_spec) = format_spec {
+                            self.assembler.set_location(SourceLocation::NONE);
+                            self.load_string_constant(&format_spec)?;
+                            self.assembler.set_location(location);
+                            self.emit(FORMAT_WITH_SPEC, 0, -1)?;
+                        } else {
+                            self.emit(FORMAT_SIMPLE, 0, 0)?;
+                        }
                     }
                 }
+            }
+            if large {
+                self.assembler.set_location(expression_location);
+                self.emit(LIST_APPEND, 1, -1)?;
             }
         }
 
         self.assembler.set_location(expression_location);
         match part_count {
+            _ if large => self.emit(CALL, 1, -2)?,
             0 => self.load_string_constant("")?,
             1 => {}
             count => self.emit(
@@ -3345,6 +3509,23 @@ impl Compiler<'_> {
             )?,
         }
         Ok(SpecializedLowering::Applied)
+    }
+
+    /// Starts a list for `str.join` when the formatted parts would exceed CPython's stack guideline.
+    fn begin_joined_string(
+        &mut self,
+        part_count: usize,
+        location: SourceLocation,
+    ) -> Result<bool, CompileError> {
+        let large = part_count > CPYTHON_STACK_USE_GUIDELINE;
+        if large {
+            self.assembler.set_location(location);
+            self.load_string_constant("")?;
+            let join = self.name_index("join")?;
+            self.emit(LOAD_ATTR, (join << 1) | 1, 1)?;
+            self.emit(BUILD_LIST, 0, 1)?;
+        }
+        Ok(large)
     }
 
     pub(super) fn load_string_constant(&mut self, value: &str) -> Result<(), CompileError> {
@@ -3416,7 +3597,7 @@ impl Compiler<'_> {
             use super::legacy_native_labels::NativeRole;
             if let NativeRole::AwaitExit(range) | NativeRole::WithAwaitExit(range, _) = exit_role
                 && self.context.python_version == PythonVersion::Py312
-                && range.end() <= self.legacy_short_label_prefix
+                && range.end() <= self.legacy_short_label_prefix.suspension_end
             {
                 self.assembler.record_legacy_short_await_labels(send, end);
             }
@@ -3538,7 +3719,7 @@ impl Compiler<'_> {
             self.emit(PUSH_NULL, 0, 1)?;
         }
         let call_location =
-            self.call_opcode_location_with_method(call, shape.direct_method, call_location);
+            self.call_opcode_location_with_method(shape.direct_method, call_location);
         self.assembler.set_location(call_location);
 
         if !shape.has_starred
@@ -3664,7 +3845,7 @@ impl Compiler<'_> {
             }
         }
         let call_location =
-            self.call_opcode_location_with_method(call, shape.direct_method, call_location);
+            self.call_opcode_location_with_method(shape.direct_method, call_location);
         if !shape.has_starred
             && !shape.has_keyword_unpack
             && (direct_method || shape.positional_count + shape.keyword_count * 2 <= 30)
@@ -4874,7 +5055,7 @@ impl Compiler<'_> {
         let mut removed_module_globals = Vec::new();
         let mut added_module_globals = Vec::new();
         if matches!(self.unit.scope, Scope::Module) {
-            let facts = comprehension_scope_facts(generators, key, value);
+            let mut facts = comprehension_scope_facts(generators, key, value);
             // A nested `global` declaration also marks the module symbol explicit.
             // The comprehension's own reads are implicit globals instead, except
             // for its assignment-expression targets. Save the effective outer flags
@@ -4897,6 +5078,9 @@ impl Compiler<'_> {
                 .map(|name| self.symbol_analysis_name_id(name))
                 .filter(|name| !self.symbols.module_globals.contains(*name))
                 .collect();
+            if !self.symbols.imported_scope_names.is_empty() {
+                facts.include_inlined_reads();
+            }
             for name in facts.names {
                 let name_id = self.symbol_analysis_name_id(&name);
                 if !self.symbols.imported_scope_names.contains(name_id)
@@ -5114,7 +5298,11 @@ impl Compiler<'_> {
                 self.assembler.set_location(SourceLocation::NONE);
                 self.emit(POP_TOP, 0, -1)?;
             }
-            if !discard_result {
+            if !discard_result
+                || self.context.python_version == crate::PythonVersion::Py314
+                    && temporary_restores.len() == 1
+                    && generators.iter().all(|generator| !generator.is_async)
+            {
                 self.assembler
                     .record_original_comprehension_normal_restores(normal_cleanup);
             }
@@ -5990,11 +6178,18 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    fn emit_multiline_none_filter_nops(
+    fn prepare_none_filter_jump(
         &mut self,
         comparison: &ruff_python_ast::ExprCompare,
         element_location: SourceLocation,
+        accepted: Label,
     ) -> Result<(), CompileError> {
+        if self.context.has_percent_format_expression {
+            self.assembler.record_none_filter_comparison_location(
+                accepted,
+                self.source_location(comparison.range),
+            );
+        }
         let left_location = self.source_location(comparison.first_operand().range());
         let none_location = self.source_location(comparison.comparators()[0].range());
         if left_location.line == none_location.line {
@@ -6133,9 +6328,10 @@ impl Compiler<'_> {
         {
             self.compile_expression(comparison.first_operand())?;
             self.add_constant(Constant::None)?;
-            self.emit_multiline_none_filter_nops(
+            self.prepare_none_filter_jump(
                 comparison,
                 self.source_location(element.range()),
+                accepted,
             )?;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
@@ -6357,7 +6553,7 @@ impl Compiler<'_> {
         {
             self.compile_expression(comparison.first_operand())?;
             self.add_constant(Constant::None)?;
-            self.emit_multiline_none_filter_nops(comparison, element_location)?;
+            self.prepare_none_filter_jump(comparison, element_location, accepted)?;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.assembler.set_location(element_location);
@@ -6582,9 +6778,12 @@ impl Compiler<'_> {
         self.assembler.preserve_block_boundary(body_accepted);
         self.assembler.preserve_block_boundary(accepted);
         self.compile_jump_if(&conditional.test, false, otherwise)?;
+        let body_start = self.assembler.item_count();
         compile_arm(self, &conditional.body, body_accepted)?;
         self.assembler.mark(body_accepted);
-        let shared_body_exit = self.assembler.has_multiple_jump_sources(body_accepted);
+        let shared_body_exit = self
+            .assembler
+            .has_multiple_jump_sources(body_accepted, body_start);
         let exit_location = if shared_body_exit {
             SourceLocation::NONE
         } else {
@@ -6811,7 +7010,7 @@ impl Compiler<'_> {
         {
             self.compile_expression(comparison.first_operand())?;
             self.add_constant(Constant::None)?;
-            self.emit_multiline_none_filter_nops(comparison, element_location)?;
+            self.prepare_none_filter_jump(comparison, element_location, accepted)?;
             let exclusion_start = self.assembler.label();
             self.assembler.mark(exclusion_start);
             self.assembler.set_location(element_location);
@@ -7658,21 +7857,19 @@ impl Compiler<'_> {
                     ));
                 // This membership container folds one literal load per element
                 // into its survivor, with no intervening source or cleanup record.
-                if set.elts.len() >= 4
-                    && set.elts.iter().all(|element| {
-                        matches!(
-                            element,
-                            Expr::NoneLiteral(_)
-                                | Expr::BooleanLiteral(_)
-                                | Expr::NumberLiteral(_)
-                                | Expr::StringLiteral(_)
-                                | Expr::BytesLiteral(_)
-                                | Expr::EllipsisLiteral(_)
-                        )
-                    })
-                {
+                if set.elts.iter().all(|element| {
+                    matches!(
+                        element,
+                        Expr::NoneLiteral(_)
+                            | Expr::BooleanLiteral(_)
+                            | Expr::NumberLiteral(_)
+                            | Expr::StringLiteral(_)
+                            | Expr::BytesLiteral(_)
+                            | Expr::EllipsisLiteral(_)
+                    )
+                }) {
                     self.assembler
-                        .record_last_uniform_fold_owner_slots(set.elts.len());
+                        .record_literal_membership_fold(set.elts.len());
                 }
                 Ok(())
             }
@@ -7834,14 +8031,6 @@ impl Compiler<'_> {
                 && !self.control.in_exception_handler()
                 && self.control.exceptions.active_exception_group_handlers == 0
                 && self.control.finally.is_inactive_for_return_unwind()
-                && matches!(expression.body.as_ref(), Expr::Attribute(attribute)
-                    if matches!(attribute.value.as_ref(), Expr::Name(name)
-                        if name.id.as_str() != "__debug__")
-                        || matches!(attribute.value.as_ref(), Expr::Attribute(receiver)
-                            if matches!(receiver.value.as_ref(), Expr::Name(name)
-                                if name.id.as_str() != "__debug__")))
-                && matches!(expression.orelse.as_ref(), Expr::Name(name)
-                    if name.id.as_str() != "__debug__")
                 && self.source_location(expression.test.range()).line
                     == self.source_location(expression.body.range()).line
                 && self.assembler.at_empty_borrow_block()
@@ -8116,7 +8305,30 @@ impl Compiler<'_> {
             self.assembler.set_location(location);
             shared
         } else {
-            self.assembler.set_location(SourceLocation::NONE);
+            // The removed outer NOT can donate its span to an unlocated jump.
+            // A folded Boolean prefix leaves the selected operand as its donor,
+            // unless that operand still ends in a shared short-circuit join.
+            let location = match expression.body.as_ref() {
+                Expr::UnaryOp(outer)
+                    if self.context.python_version >= PythonVersion::Py314
+                        && outer.op == UnaryOp::Not
+                        && matches!(outer.operand.as_ref(), Expr::UnaryOp(inner) if inner.op == UnaryOp::Not) =>
+                {
+                    self.source_location(outer.range)
+                }
+                Expr::BoolOp(group)
+                    if self.context.python_version >= PythonVersion::Py314
+                        && group.values.split_last().is_some_and(|(last, leading)| {
+                            !matches!(last, Expr::BoolOp(_))
+                                && !matches!(last, Expr::If(nested) if conditional_expression_has_shared_fallthrough(nested))
+                                && leading.iter().all(|value| jump_constant_truthiness(value).is_some())
+                        }) =>
+                {
+                    self.assembler.last_instruction_location().unwrap_or(SourceLocation::NONE)
+                }
+                _ => SourceLocation::NONE,
+            };
+            self.assembler.set_location(location);
             false
         };
         let optimized_tuple_join = matches!(expression.body.as_ref(), Expr::Call(call)
@@ -8423,7 +8635,7 @@ impl Compiler<'_> {
             self.assembler.mark(end);
             Ok(())
         } else {
-            self.compile_bool_expression_at(expression, continuation, false, &[])
+            self.compile_bool_expression_at(expression, continuation, false, false, &[])
         }
     }
 
@@ -8432,6 +8644,7 @@ impl Compiler<'_> {
         expression: &ruff_python_ast::ExprBoolOp,
         continuation: Option<(BoolOp, SourceLocation)>,
         nested_leading_group: bool,
+        after_folded_operand: bool,
         threaded_lines: &[SourceLocation],
     ) -> Result<(), CompileError> {
         // Threading a value-preserving boolean jump into an enclosing test gives it that
@@ -8482,14 +8695,17 @@ impl Compiler<'_> {
         };
         self.assembler.set_location(location);
         if folded_prefix {
-            // CPython folds the leading constant load and its boolean jump, but retains the
-            // jump as a source-position NOP when the next operand starts on another line.
+            // Folding the constant and its value-preserving jump empties their original
+            // block. A line NOP on the following operand comes from its separate POP_TOP.
+            if after_folded_operand {
+                // The outer jump's POP_TOP starts this block. It survives as a NOP
+                // if the two folded groups begin on different lines.
+                self.assembler.mark_last_nop_borrow_barrier_if_removed();
+            }
             let empty_folded_block = self.assembler.at_empty_borrow_block();
             self.emit(NOP, 0, 0)?;
             if empty_folded_block {
-                // Removing the sole folded value test empties its original array.
-                // A retained line NOP still permits borrowing through that array.
-                self.assembler.mark_last_nop_borrow_barrier_if_removed();
+                self.assembler.mark_last_borrow_fallthrough_barrier();
             }
         }
         let base_depth = self.control.stack.depth;
@@ -8516,6 +8732,9 @@ impl Compiler<'_> {
                     inner,
                     Some((expression.op, location)),
                     inner.op == expression.op,
+                    self.context.python_version == PythonVersion::Py314
+                        && folded_prefix
+                        && operand_index == 0,
                     &jump_lines,
                 )?;
             } else {
@@ -8840,7 +9059,6 @@ impl Compiler<'_> {
                 && !exception_group_handler
                 && nested_leading_group
                 && operand_index == 0
-                && original_location.line != location.line
                 && !marker_reuses_exception_owner;
             let exclude_from_all_owners = exclude_exception_type_owner
                 || exclude_inlined_comprehension_owner
@@ -8927,7 +9145,15 @@ impl Compiler<'_> {
             && (inner.op == expression.op
                 || folded_bool_operand(last, self.context.python_version).is_none())
         {
-            self.compile_bool_expression_at(inner, continuation, false, threaded_lines)?;
+            self.compile_bool_expression_at(
+                inner,
+                continuation,
+                false,
+                self.context.python_version == PythonVersion::Py314
+                    && folded_prefix
+                    && leading.is_empty(),
+                threaded_lines,
+            )?;
         } else {
             self.compile_expression_with_boolean_continuation(last, continuation)?;
         }
@@ -8969,7 +9195,24 @@ impl Compiler<'_> {
             self.emit(COPY, 2, 1)?;
             self.emit_boolean_comparison(*operator)?;
             self.emit_jump_forward(POP_JUMP_IF_FALSE, cleanup, -1)?;
-            self.emit(NOT_TAKEN, 0, 0)?;
+            // Earlier compaction can move this marker into an instruction-array slot
+            // from before the try. Resolve its owner after the array is assembled.
+            let policy = if self.context.python_version == PythonVersion::Py314
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.generators.generator_region_start.is_none()
+                && self.control.withs.active_with_region_exclusions.is_empty()
+                && !self.control.in_exception_handler()
+            {
+                ExceptionPolicy::NoneDynamicConditionStrict
+            } else {
+                ExceptionPolicy::default()
+            };
+            self.emit_with_exception_policy(NOT_TAKEN, 0, 0, policy)?;
         }
         Ok(())
     }
@@ -9095,6 +9338,10 @@ impl Compiler<'_> {
             && !self.control.withs.force_terminal_with_marker_ownerless
             && let Some(owns_slot) = self.assembler.current_normal_finally_condition_slot_owner(
                 &self.control.withs.active_with_region_exclusions,
+                matches!(
+                    self.control.withs.normal_finally_with_markers,
+                    super::statement::NormalFinallyWithMarkers::SoleTryExit
+                ),
             )
         {
             // The loop exit's excluded NOP does not split the original array.
@@ -9133,7 +9380,8 @@ impl Compiler<'_> {
             self.control.finally.active_normal_finally_bodies > 0
                 && !self.control.withs.active_with_region_exclusions.is_empty()
                 && match self.control.withs.normal_finally_with_markers {
-                    super::statement::NormalFinallyWithMarkers::Exclude => true,
+                    super::statement::NormalFinallyWithMarkers::Exclude
+                    | super::statement::NormalFinallyWithMarkers::SoleTryExit => true,
                     super::statement::NormalFinallyWithMarkers::Include => false,
                     super::statement::NormalFinallyWithMarkers::Condition(location) => {
                         self.assembler.location() != location
@@ -9760,7 +10008,7 @@ impl Compiler<'_> {
                     // blocks. Stop borrowing at their destination while preserving the
                     // constant NOP and any earlier edge that could alias this entry.
                     if jump_constant_truthiness(value) == Some(matches!(boolean.op, BoolOp::Or)) {
-                        self.assembler.record_folded_condition_borrow_entry(label);
+                        self.assembler.record_folded_short_circuit_exit(label);
                     }
                     if preserve_leading_protected_loop_owner && operand_index == 0 {
                         self.assembler.preserve_last_not_taken_exception_owner();
@@ -9798,7 +10046,7 @@ impl Compiler<'_> {
                         }
                         if jump_constant_truthiness(value) == Some(matches!(boolean.op, BoolOp::Or))
                         {
-                            compiler.assembler.record_folded_condition_borrow_entry(end);
+                            compiler.assembler.record_folded_short_circuit_exit(end);
                         }
                         if preserve_leading_protected_loop_owner && operand_index == 0 {
                             compiler.assembler.preserve_last_not_taken_exception_owner();

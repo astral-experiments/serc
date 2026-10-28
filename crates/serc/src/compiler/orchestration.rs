@@ -1,11 +1,11 @@
 use std::cell::Cell;
-use std::collections::VecDeque;
 use std::rc::Rc;
 
 use ruff_python_ast::token::Tokens;
 use ruff_python_ast::{Expr, Stmt, Suite};
-use ruff_text_size::{Ranged, TextRange, TextSize};
+use ruff_text_size::{Ranged, TextRange};
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use super::{
     BUILD_SET, COPY, COPY_FREE_VARS, GET_AITER, GET_ITER, LOAD_CONST, LOAD_FAST, LOAD_LOCALS,
@@ -132,7 +132,7 @@ pub(super) struct CodeUnit {
     pub(super) class_scope_is_nested: bool,
     pub(super) module_annotation_index: u32,
     pub(super) module_annotation_indices: FxHashMap<TextRange, u32>,
-    pub(super) class_conditional_annotations: VecDeque<TextRange>,
+    pub(super) class_conditional_annotation_indices: FxHashMap<TextRange, SmallVec<[u32; 2]>>,
     pub(super) annotation_classdict_index: Option<u32>,
     name: String,
     pub(super) qualified_name: String,
@@ -256,7 +256,7 @@ impl<'source> Compiler<'source> {
                 control: ControlFlowState::default(),
                 assembler,
                 native_label_plan: None,
-                legacy_short_label_prefix: TextSize::default(),
+                legacy_short_label_prefix: super::legacy_native_seed_bound::SourcePrefix::default(),
             },
         )
     }
@@ -1006,10 +1006,15 @@ impl<'source> Compiler<'source> {
         if has_conditional_annotations && self.unit.flags & CO_FUTURE_ANNOTATIONS == 0 {
             let mut annotations = Vec::new();
             collect_conditional_simple_annotations(body, &mut annotations);
-            self.unit.class_conditional_annotations = annotations
-                .into_iter()
-                .map(|annotation| annotation.range)
-                .collect();
+            // The annotation function reserves indices even for unreachable suites.
+            // A finally suite can have separate indices for its normal and exceptional copies.
+            for (index, annotation) in annotations.into_iter().enumerate().rev() {
+                self.unit
+                    .class_conditional_annotation_indices
+                    .entry(annotation.range)
+                    .or_default()
+                    .push(to_u32(index, "class annotation index")?);
+            }
         }
         self.assembler.set_location(SourceLocation::NONE);
         if !self.symbols.free_names.is_empty() {
@@ -1127,7 +1132,6 @@ impl<'source> Compiler<'source> {
         let body_start = self.assembler.instruction_count();
         let mut footer_location = SourceLocation::NONE;
         self.compile_scope_suite(body, false, has_docstring)?;
-        debug_assert!(self.unit.class_conditional_annotations.is_empty());
         if let Some(Stmt::Expr(expression)) = body.last()
             && (fold_constant(&expression.value).is_some()
                 || self.context.fold_constant(&expression.value).is_some())
@@ -1618,10 +1622,12 @@ impl<'source> Compiler<'source> {
             code.marshal_provenance.constant_hashes =
                 crate::marshal::constant_hashes_for_code(&code);
             code.marshal_provenance.interning_events = self.context.take_interning_events();
-            code.marshal_provenance.interned_metadata_tuples =
-                self.context.take_interned_metadata_tuples();
             code.marshal_provenance.metadata_alias_scan_unnecessary =
                 metadata_alias_scan_unnecessary(&code, &self.context.scopes.names);
+            if !code.marshal_provenance.metadata_alias_scan_unnecessary {
+                code.marshal_provenance.interned_metadata_tuples =
+                    self.context.take_interned_metadata_tuples();
+            }
             let context = Rc::get_mut(&mut self.context)
                 .expect("completed module exclusively owns its compilation context");
             code.marshal_provenance.metadata_name_lookup = Some(std::sync::Arc::new(
@@ -1718,7 +1724,7 @@ impl CodeUnit {
             class_scope_is_nested: false,
             module_annotation_index: 0,
             module_annotation_indices: FxHashMap::default(),
-            class_conditional_annotations: VecDeque::new(),
+            class_conditional_annotation_indices: FxHashMap::default(),
             annotation_classdict_index: None,
             name: spec.name,
             qualified_name: spec.qualified_name,

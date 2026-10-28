@@ -357,6 +357,29 @@ fn opcode_locations_preserve_multiline_attribute_and_call_ranges() {
 }
 
 #[test]
+fn grouped_method_calls_start_at_the_attribute_name() {
+    for (source, expected) in [
+        ("(\n obj.method\n)(1)", SourceLocation::new(2, 3, 5, 4)),
+        ("(\n obj.method\n)(x=1)", SourceLocation::new(2, 3, 5, 6)),
+        ("(\n obj.method\n)(*args)", SourceLocation::new(1, 3, 0, 8)),
+        ("(\n obj.abc_É\n)()", SourceLocation::new(2, 3, 6, 3)),
+        ("obj.method(\n 1)", SourceLocation::new(1, 2, 0, 3)),
+    ] {
+        let parsed = parse_module(source).unwrap();
+        let [Stmt::Expr(statement)] = parsed.suite().as_slice() else {
+            panic!("expected an expression statement");
+        };
+        let Expr::Call(call) = statement.value.as_ref() else {
+            panic!("expected a call");
+        };
+        assert_eq!(
+            module_compiler(source, &parsed).call_opcode_location(call),
+            expected
+        );
+    }
+}
+
+#[test]
 fn call_lowering_preserves_opcode_and_enclosing_locations() {
     for source in [
         "outer(inner(value))",

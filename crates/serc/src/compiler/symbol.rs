@@ -15,7 +15,7 @@ use super::{
     LOAD_LOCALS, LOAD_NAME, LOAD_SPECIAL, RERAISE, RESUME, SET_FUNCTION_ATTRIBUTE, STORE_DEREF,
     STORE_FAST, STORE_GLOBAL, STORE_NAME, YIELD_VALUE,
 };
-use crate::assembler::{EmittedInstruction, EmittedJump, ExceptionPolicy, Label, SourceLocation};
+use crate::assembler::{EmittedInstruction, EmittedJump, ExceptionPolicy, Label, RemovedNop};
 use crate::code_object::Constant;
 use crate::target::code_flags::{CO_ASYNC_GENERATOR, CO_COROUTINE, CO_FUTURE_ANNOTATIONS};
 use crate::target::operands::{
@@ -109,6 +109,37 @@ impl ReraiseStackState {
             Self::WithHandler => (2, -5),
         }
     }
+}
+
+/// Whether lowering this definition or a nested definition can assemble annotation locals.
+fn definition_contains_annotation_scope(statement: &Stmt) -> bool {
+    struct AnnotationScope(bool);
+    impl<'ast> Visitor<'ast> for AnnotationScope {
+        fn visit_stmt(&mut self, statement: &'ast Stmt) {
+            if crate::stack_growth_required() {
+                return crate::grow_stack(|| self.visit_stmt(statement));
+            }
+            if matches!(statement, Stmt::TypeAlias(_)) {
+                self.0 = true;
+            } else if !self.0 {
+                walk_stmt(self, statement);
+            }
+        }
+
+        fn visit_annotation(&mut self, _annotation: &'ast Expr) {
+            self.0 = true;
+        }
+
+        fn visit_type_params(&mut self, _params: &'ast ruff_python_ast::TypeParams) {
+            self.0 = true;
+        }
+
+        fn visit_expr(&mut self, _expression: &'ast Expr) {}
+    }
+
+    let mut annotations = AnnotationScope(false);
+    annotations.visit_stmt(statement);
+    annotations.0
 }
 
 impl Compiler<'_> {
@@ -942,7 +973,7 @@ impl Compiler<'_> {
         &mut self,
         body: &[Stmt],
         register_literals: bool,
-        first_expression: Option<&Expr>,
+        first_expression: Option<(usize, &Expr)>,
     ) -> Result<(), CompileError> {
         self.pre_register_suite_names_with_folds(
             body,
@@ -951,6 +982,15 @@ impl Compiler<'_> {
             first_expression,
             None,
         )
+    }
+
+    /// Short-circuit edges disappear before graph folding. Only the original
+    /// operands reserve constants, with nested scopes retaining their own pools.
+    pub(super) fn pre_register_short_circuited_operand(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<(), CompileError> {
+        self.pre_register_suite_names_with_folds(&[], true, false, None, Some(expression))
     }
 
     pub(super) fn pre_register_discarded_expression(
@@ -989,7 +1029,7 @@ impl Compiler<'_> {
         body: &[Stmt],
         register_literals: bool,
         register_folds: bool,
-        first_expression: Option<&Expr>,
+        first_expression: Option<(usize, &Expr)>,
         expression_only: Option<&Expr>,
     ) -> Result<(), CompileError> {
         // Run cache admissions and real child builders in source order. Each child action owns
@@ -1003,18 +1043,34 @@ impl Compiler<'_> {
         }
 
         #[derive(Default)]
-        struct UnwindExitDetector(bool);
+        struct UnwindExitDetector {
+            has_pending_finalizer: bool,
+            found: bool,
+        }
 
         impl<'ast> Visitor<'ast> for UnwindExitDetector {
             fn visit_stmt(&mut self, statement: &'ast Stmt) {
-                if self.0 || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
+                if self.found || matches!(statement, Stmt::FunctionDef(_) | Stmt::ClassDef(_)) {
                     return;
                 }
-                if matches!(
-                    statement,
-                    Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_)
-                ) {
-                    self.0 = true;
+                if self.has_pending_finalizer
+                    && matches!(
+                        statement,
+                        Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_)
+                    )
+                {
+                    self.found = true;
+                } else if let Stmt::Try(statement) = statement
+                    && !statement.finalbody.is_empty()
+                {
+                    let enclosing = std::mem::replace(&mut self.has_pending_finalizer, true);
+                    self.visit_body(&statement.body);
+                    for handler in &statement.handlers {
+                        self.visit_except_handler(handler);
+                    }
+                    self.visit_body(&statement.orelse);
+                    self.has_pending_finalizer = enclosing;
+                    self.visit_body(&statement.finalbody);
                 } else {
                     walk_stmt(self, statement);
                 }
@@ -1030,6 +1086,7 @@ impl Compiler<'_> {
             folded_expressions: Vec<&'ast Expr>,
             has_untracked_collection: bool,
             reorder_try_suites: bool,
+            inside_return_finally: bool,
             register_literals: bool,
             register_folds: bool,
             string_origin_constants: Vec<(Constant, bool)>,
@@ -1044,6 +1101,14 @@ impl Compiler<'_> {
         }
 
         impl<'ast> Collector<'_, '_, 'ast> {
+            /// Discarded annotation scopes intern their locals before the code is removed.
+            fn needs_discarded_definition(&self, statement: &Stmt) -> bool {
+                self.record_string_origins
+                    && (self.build_discarded
+                        || self.python_version >= PythonVersion::Py314
+                            && definition_contains_annotation_scope(statement))
+            }
+
             fn legacy_folded_constant(&self, expression: &Expr) -> Option<Constant> {
                 let compiler = self.legacy_compiler?;
                 if matches!(
@@ -1258,6 +1323,15 @@ impl Compiler<'_> {
                 }
 
                 match statement {
+                    Stmt::Return(return_)
+                        if self.register_literals
+                            && self.python_version < PythonVersion::Py315
+                            && !self.inside_return_finally
+                            && return_.value.is_none() =>
+                    {
+                        self.constants.push(Constant::None);
+                        return;
+                    }
                     Stmt::Expr(expression)
                         if literal_constant(&expression.value).is_some()
                             || self.legacy_folded_constant(&expression.value).is_some() =>
@@ -1348,6 +1422,14 @@ impl Compiler<'_> {
                         self.visit_body(&statement.orelse);
                         return;
                     }
+                    Stmt::Try(try_) if !self.reorder_try_suites && !try_.finalbody.is_empty() => {
+                        // A return loads None after its copied finalizer. Its AST position
+                        // alone cannot order that load against the finalizer's constants.
+                        let outer = std::mem::replace(&mut self.inside_return_finally, true);
+                        walk_stmt(self, statement);
+                        self.inside_return_finally = outer;
+                        return;
+                    }
                     Stmt::Try(statement) if self.reorder_try_suites && !statement.is_star => {
                         // Ordinary try codegen visits the else suite before handlers.
                         // Except-star keeps the AST order: handlers before else.
@@ -1360,7 +1442,7 @@ impl Compiler<'_> {
                         return;
                     }
                     Stmt::FunctionDef(definition) => {
-                        let build = self.build_discarded && self.record_string_origins;
+                        let build = self.needs_discarded_definition(statement);
                         if build {
                             self.flush_origins();
                             self.actions.push(SkippedAction::Statement(statement));
@@ -1458,7 +1540,7 @@ impl Compiler<'_> {
                         return;
                     }
                     Stmt::ClassDef(definition) => {
-                        let build = self.build_discarded && self.record_string_origins;
+                        let build = self.needs_discarded_definition(statement);
                         if build {
                             self.flush_origins();
                             self.actions.push(SkippedAction::Statement(statement));
@@ -1508,9 +1590,7 @@ impl Compiler<'_> {
                         self.constants.push(Constant::None);
                         return;
                     }
-                    Stmt::TypeAlias(alias)
-                        if self.build_discarded && self.record_string_origins =>
-                    {
+                    Stmt::TypeAlias(alias) if self.needs_discarded_definition(statement) => {
                         self.flush_origins();
                         self.actions.push(SkippedAction::Statement(statement));
                         if let Expr::Name(name) = alias.name.as_ref() {
@@ -1563,9 +1643,7 @@ impl Compiler<'_> {
                         return;
                     }
                     Stmt::ImportFrom(import) => {
-                        let register_legacy_literals =
-                            self.legacy_compiler.is_some() && self.register_literals;
-                        if self.record_string_origins || register_legacy_literals {
+                        if self.record_string_origins || self.register_literals {
                             let names = Constant::Tuple(
                                 import
                                     .names
@@ -1573,8 +1651,10 @@ impl Compiler<'_> {
                                     .map(|alias| Constant::String(alias.name.to_string()))
                                     .collect(),
                             );
-                            if register_legacy_literals {
-                                self.constants.push(Constant::Int(u64::from(import.level)));
+                            if self.register_literals {
+                                if self.legacy_compiler.is_some() {
+                                    self.constants.push(Constant::Int(u64::from(import.level)));
+                                }
                                 self.constants.push(names.clone());
                             }
                             if self.record_string_origins {
@@ -1663,10 +1743,18 @@ impl Compiler<'_> {
                     self.has_untracked_collection = true;
                 }
                 if let Expr::Slice(slice) = expression
-                    && self.legacy_compiler.is_some()
+                    && self.legacy_compiler.is_none()
+                    && let Some(constant) = constant_slice(slice)
                 {
-                    // Legacy targets load each bound before building the slice. Reused
-                    // bounds keep this admission even when the surrounding code is removed.
+                    // CPython constructs literal slices before flowgraph folding.
+                    self.record_interpolated_constant(constant);
+                    return;
+                }
+                if let Expr::Slice(slice) = expression
+                    && self.python_version < PythonVersion::Py315
+                {
+                    // Missing bounds load None before BUILD_SLICE or BINARY_SLICE.
+                    // A later use keeps that index even if the slice is discarded.
                     for bound in [&slice.lower, &slice.upper] {
                         if let Some(bound) = bound {
                             self.visit_expr(bound);
@@ -1676,19 +1764,6 @@ impl Compiler<'_> {
                     }
                     if let Some(step) = &slice.step {
                         self.visit_expr(step);
-                    }
-                    return;
-                }
-                if let Expr::Slice(slice) = expression
-                    && let Some(constant) = constant_slice(slice)
-                {
-                    // CPython constructs literal slices during code generation, before
-                    // flowgraph folds and before constants in later discarded statements.
-                    if self.record_string_origins {
-                        self.string_origin_constants.push((constant.clone(), false));
-                    }
-                    if self.register_literals {
-                        self.constants.push(constant);
                     }
                     return;
                 }
@@ -1932,13 +2007,13 @@ impl Compiler<'_> {
             }
         }
 
-        // Returns and loop exits can compile an enclosing finalizer before later
-        // suites. Preserve the existing admission traversal until those copies are
-        // replayed; raises do not inline finalizers during code generation.
+        // An exit can compile a pending finalizer before the next suite. Exits
+        // elsewhere leave the ordinary try body's name-admission order intact.
         let mut unwind_exits = UnwindExitDetector::default();
         unwind_exits.visit_body(body);
         let mut collector = Collector {
-            reorder_try_suites: !unwind_exits.0,
+            reorder_try_suites: !unwind_exits.found,
+            inside_return_finally: !self.control.finally.is_inactive_for_return_unwind(),
             register_literals,
             register_folds,
             build_discarded: self.context.requires_discarded_builders()
@@ -1956,7 +2031,9 @@ impl Compiler<'_> {
         };
         if let Some(expression) = expression_only {
             collector.visit_expr(expression);
-        } else if let Some(expression) = first_expression {
+        } else if let Some((index, expression)) = first_expression {
+            collector.visit_body(&body[..index]);
+            collector.flush_origins();
             // Compile this whole expression once: its first constant may come from a
             // lambda default, or from a generator child before its outer iterable.
             collector
@@ -1964,24 +2041,22 @@ impl Compiler<'_> {
                 .push(SkippedAction::FirstExpression(expression));
             let record_string_origins = collector.record_string_origins;
             collector.record_string_origins = false;
-            collector.visit_stmt(&body[0]);
+            collector.visit_stmt(&body[index]);
             collector.record_string_origins = record_string_origins;
-            collector.visit_body(&body[1..]);
+            collector.visit_body(&body[index + 1..]);
         } else {
             collector.visit_body(body);
         }
         collector.flush_origins();
         let Collector {
             actions,
-            build_discarded,
             has_untracked_collection,
             constants,
             folded_expressions,
             names,
             ..
         } = collector;
-        let mut builder =
-            (build_discarded || first_expression.is_some()).then(|| self.discarded_builder());
+        let mut builder = None;
         for action in actions {
             match action {
                 SkippedAction::StaticAttribute(name) => {
@@ -1998,7 +2073,7 @@ impl Compiler<'_> {
                     }
                 }
                 SkippedAction::Statement(statement) => {
-                    let builder = builder.as_mut().unwrap();
+                    let builder = builder.get_or_insert_with(|| self.discarded_builder());
                     match statement {
                         Stmt::FunctionDef(definition) => {
                             builder.compile_function_definition(definition)?;
@@ -2014,12 +2089,12 @@ impl Compiler<'_> {
                     }
                 }
                 SkippedAction::Expression(expression) => {
-                    let builder = builder.as_mut().unwrap();
+                    let builder = builder.get_or_insert_with(|| self.discarded_builder());
                     builder.compile_expression(expression)?;
                     builder.emit(super::POP_TOP, 0, -1)?;
                 }
                 SkippedAction::FirstExpression(expression) => {
-                    let builder = builder.as_mut().unwrap();
+                    let builder = builder.get_or_insert_with(|| self.discarded_builder());
                     builder.compile_expression(expression)?;
                     self.retain_discarded_first_constant(builder)?;
                     builder.emit(super::POP_TOP, 0, -1)?;
@@ -2612,13 +2687,18 @@ impl Compiler<'_> {
             && is_unconditional_jump(opcode))
         .then(|| self.take_trailing_nop_location())
         .flatten();
-        if !preserve_location && let Some((location, _)) = removed_nop {
-            self.assembler.set_location(location);
+        if !preserve_location && let Some(removed) = &removed_nop {
+            if self.context.python_version == crate::PythonVersion::Py314
+                && opcode == crate::target::opcodes::JUMP_FORWARD
+            {
+                self.assembler.record_compacted_nop_borrow_entry(removed);
+            }
+            self.assembler.set_location(removed.location);
         }
-        removed_nop.map_or(0, |(_, slots)| slots)
+        removed_nop.map_or(0, |removed| removed.original_slots)
     }
 
-    pub(super) fn take_trailing_nop_location(&mut self) -> Option<(SourceLocation, usize)> {
+    pub(super) fn take_trailing_nop_location(&mut self) -> Option<RemovedNop> {
         let removed = self.assembler.take_trailing_nop_location()?;
         if let Some(exclusion) = removed.exclusion {
             self.control
@@ -2639,7 +2719,7 @@ impl Compiler<'_> {
                 exclusions.retain(|candidate| *candidate != exclusion);
             }
         }
-        Some((removed.location, removed.original_slots))
+        Some(removed)
     }
 
     pub(super) fn apply_compiler_stack_effect(

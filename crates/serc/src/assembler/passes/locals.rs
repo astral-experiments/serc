@@ -28,8 +28,8 @@ use crate::assembler::legacy_native_labels::LegacyInstructionArrays;
 use crate::target::{
     is_conditional_jump, is_unconditional_jump,
     opcodes::{
-        CALL, CALL_KW, END_FOR, GET_AWAITABLE, GET_ITER, LOAD_GLOBAL, POP_JUMP_IF_FALSE,
-        POP_JUMP_IF_NONE, STORE_ATTR, TO_BOOL,
+        CALL, CALL_KW, END_FOR, GET_AWAITABLE, GET_ITER, JUMP_FORWARD, LOAD_GLOBAL,
+        POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, STORE_ATTR, TO_BOOL,
     },
 };
 
@@ -1999,6 +1999,7 @@ impl OptimizationPipeline {
         graph: &crate::assembler::block_graph::BlockGraph,
         original_block_boundaries: &FxHashSet<Label>,
         nonempty_targets: &FxHashSet<Label>,
+        compound_exits: &[(Label, Label)],
     ) -> FxHashMap<Label, Label> {
         let mut links = FxHashMap::default();
         let mut pending = Vec::new();
@@ -2023,8 +2024,14 @@ impl OptimizationPipeline {
                         && instruction.jump_policy.allows_threading_target()
                         && instruction.jump_policy.allows_borrow_threading_target()
                         && !instruction.jump_policy.always_retains_nop()
-                        && !instruction.jump_policy.borrow_empty_block()
                         && let Some(target) = instruction.forward_target()
+                        // A compound try's normal jump can forward an original break
+                        // before its own empty block is removed.
+                        && (!instruction.jump_policy.borrow_empty_block()
+                            || (instruction.location == crate::assembler::SourceLocation::NONE
+                                && compound_exits.iter().any(|(entry, exit)| {
+                                    *exit == target && pending.contains(entry)
+                                })))
                     {
                         for label in &pending {
                             links.insert(*label, target);
@@ -2090,6 +2097,7 @@ impl OptimizationPipeline {
             graph,
             original_block_boundaries,
             &nonempty_targets,
+            &[],
         );
         let mut has_prefix = false;
         for position in graph.item_positions() {
@@ -2204,6 +2212,7 @@ impl OptimizationPipeline {
     pub(in crate::assembler) fn snapshot_threaded_borrow_entries(
         graph: &crate::assembler::block_graph::BlockGraph,
         eligible_global_instructions: &FxHashSet<usize>,
+        original_boundaries: Option<&FxHashSet<Label>>,
     ) -> ThreadedBorrowEntries {
         let mut entries = ThreadedBorrowEntries::default();
         if eligible_global_instructions.is_empty() {
@@ -2222,13 +2231,31 @@ impl OptimizationPipeline {
                 })
                 .collect::<FxHashSet<_>>();
             global_instruction += count;
-            if !eligible_jumps.is_empty()
-                && let Some(Item::Label(anchor)) = contents.items().first()
-            {
+            if eligible_jumps.is_empty() {
+                continue;
+            }
+            let mut labels = contents
+                .items()
+                .iter()
+                .map_while(|item| match item {
+                    Item::Label(label) => Some(*label),
+                    Item::Instruction(_) => None,
+                })
+                .enumerate();
+            // A break can start with exception-range aliases or empty guard arrays.
+            // The last original label before its first instruction owns the break.
+            let anchor = if let Some(boundaries) = original_boundaries {
+                labels
+                    .filter(|(_, label)| boundaries.contains(label))
+                    .last()
+            } else {
+                labels.next()
+            };
+            if let Some((start, label)) = anchor {
                 entries.insert(
-                    *anchor,
+                    label,
                     ThreadedBorrowSnapshot {
-                        items: contents.items().to_vec(),
+                        items: contents.items()[start..].to_vec(),
                         eligible_jumps,
                     },
                 );
@@ -2385,6 +2412,7 @@ impl OptimizationPipeline {
         graph: &crate::assembler::block_graph::BlockGraph,
         original_boundaries: &FxHashSet<Label>,
         origins: &mut AuthoredFinallyBreakOrigins,
+        compound_exits: &[(Label, Label)],
     ) -> AuthoredFinallyBreakEntries {
         let origins = std::mem::take(origins);
         let verified = Self::verified_threaded_borrow_positions(graph, &origins.snapshots);
@@ -2417,6 +2445,9 @@ impl OptimizationPipeline {
                             AuthoredFinallyBreakEntry {
                                 original_source,
                                 target,
+                                compound_exit: compound_exits
+                                    .iter()
+                                    .any(|(_, exit)| *exit == target),
                             },
                         );
                     }
@@ -3260,8 +3291,6 @@ impl OptimizationPipeline {
             // including any preceding statements. Its explicit finally route is checked
             // after cleanup-call capture and again after actual threading.
             if borrowed[block.index()]
-                && matches!(items.first(), Some(Item::Label(label))
-                    if self.exception_owner_provenance.block_boundaries.contains(label))
                 && last.opcode == crate::target::opcodes::JUMP_FORWARD
                 && last.fusion_policy.is_authored_break()
                 && last.location.line >= 0
@@ -3289,7 +3318,11 @@ impl OptimizationPipeline {
         }
         self.borrow_finally_jump_sources = sources;
         self.borrow_authored_finally_break_origins.snapshots =
-            Self::snapshot_threaded_borrow_entries(&self.graph, &authored_breaks);
+            Self::snapshot_threaded_borrow_entries(
+                &self.graph,
+                &authored_breaks,
+                Some(&self.exception_owner_provenance.block_boundaries),
+            );
     }
 
     /// Records nonempty cleanup targets before optimizer passes can merge their labels.
@@ -3557,9 +3590,21 @@ impl OptimizationPipeline {
                     entry.map_or((None, vec![label]), |(call, aliases)| (Some(call), aliases));
                 for alias in aliases {
                     // An independent unreachable marker keeps its own barrier even when
-                    // it shares this original physical block with normal cleanup.
+                    // it shares this original physical block with normal cleanup. A
+                    // recorded compound try exit, however, targets the cleanup itself.
+                    let compound_break_target = call.is_some()
+                        && !self
+                            .borrow_authored_finally_break_origins
+                            .snapshots
+                            .is_empty()
+                        && self
+                            .exception_owner_provenance
+                            .compound_try_owner_exits
+                            .iter()
+                            .any(|(_, exit)| *exit == alias);
                     if self.borrow_unreachable_blocks.contains(&alias)
                         && !self.borrow_finally_entries.contains_key(&alias)
+                        && !compound_break_target
                     {
                         continue;
                     }
@@ -3595,6 +3640,7 @@ impl OptimizationPipeline {
                     &self.graph,
                     &self.exception_owner_provenance.block_boundaries,
                     &nonempty,
+                    &self.exception_owner_provenance.compound_try_owner_exits,
                 );
         }
         origins
@@ -4113,6 +4159,57 @@ impl OptimizationPipeline {
                     {
                         pending.push((finally_block, true));
                     }
+                    // Awaiting a manager's exit ends in a populated END_SEND/POP_TOP
+                    // array. Its jump skips the emptied ordinary try exit. An adjacent
+                    // label for the outer finalizer still denotes the same instruction.
+                    let completed_await = python_version == crate::PythonVersion::Py314
+                        && last.opcode == crate::target::opcodes::JUMP_FORWARD
+                        && last.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Barrier
+                        && target > block + 1
+                        && last.location.line >= 0
+                        && items[blocks[block].clone()]
+                            .iter()
+                            .filter_map(Item::as_instruction)
+                            .map(|op| (op.opcode, op.location))
+                            .eq([
+                                (END_SEND, last.location),
+                                (POP_TOP, last.location),
+                                (last.opcode, last.location),
+                            ]);
+                    if completed_await
+                        && target + 1 < blocks.len()
+                        && !borrow_unreachable_blocks[target]
+                        && borrow_unreachable_blocks[target + 1]
+                        && jump_entry_blocks.get(target + 1).copied().unwrap_or(false)
+                        && items[blocks[target].clone()]
+                            .iter()
+                            .all(|item| matches!(item, Item::Label(_)))
+                    {
+                        pending.push((target + 1, true));
+                    }
+                    // A completed call can jump to the ordinary try join that now
+                    // shares a physical entry with the outer finalizer. Its own
+                    // label and located CALL/POP_TOP still prove that route.
+                    let call_exits_inner_try = python_version == crate::PythonVersion::Py314
+                        && last.opcode == crate::target::opcodes::JUMP_FORWARD
+                        && last.location.line >= 0
+                        && target > block + 1
+                        && borrow_unreachable_blocks[target]
+                        && !borrow_unreachable_labels.contains(&label)
+                        && original_block_boundaries.contains(&label)
+                        && jump_entry_blocks.get(target).copied().unwrap_or(false)
+                        && last.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Barrier
+                        && {
+                            let mut ops = items[blocks[block].clone()]
+                                .iter()
+                                .filter_map(Item::as_instruction)
+                                .rev();
+                            matches!((ops.nth(1), ops.next()), (Some(pop), Some(call))
+                                if pop.opcode == POP_TOP && call.opcode == crate::target::opcodes::CALL
+                                    && pop.location == last.location && call.location == last.location)
+                        };
                     let for_cleanup_entry = for_iter_enters_original_cleanup(
                         last,
                         label,
@@ -4263,9 +4360,9 @@ impl OptimizationPipeline {
                         && last.no_location_policy.borrow_fallthrough()
                             == BorrowFallthrough::Reachable
                         && !last.jump_policy.borrow_empty_block()
-                        && (jump_entry_blocks.get(target).copied().unwrap_or(false)
+                        && (((jump_entry_blocks.get(target).copied().unwrap_or(false)
                             || explicit_break_entry)
-                        && (!pre_copy_jump_entries.is_empty()
+                            && !pre_copy_jump_entries.is_empty())
                             || (last.fusion_policy.is_authored_break()
                                 && !authored_finally_break_entries.is_empty()))
                         && surviving_instruction_offsets
@@ -4341,7 +4438,7 @@ impl OptimizationPipeline {
                                             _ => None,
                                         }
                                     }) == Some(entry.original_source)
-                                    && jump_entry_blocks.get(target).copied().unwrap_or(false)
+                                    && (jump_entry_blocks.get(target).copied().unwrap_or(false) || entry.compound_exit)
                                     && borrow_finally_entries
                                         .get(&label)
                                         .copied()
@@ -4395,9 +4492,70 @@ impl OptimizationPipeline {
                                                 }
                                         })
                             });
+                    // A located first arm can jump straight past the alternate arm and
+                    // the later empty handler exits. Its surviving edge reaches the
+                    // join even when the ordinary fallthrough stops at those exits.
+                    let direct_arm = python_version == crate::PythonVersion::Py314
+                        && last.opcode == crate::target::opcodes::JUMP_FORWARD
+                        && last.jump_policy.retained_nop()
+                            == crate::assembler::ir::RetainedJumpNop::DirectTarget
+                        && target > block + 1
+                        && borrow_unreachable_blocks[target]
+                        && {
+                            let mut target_ops = items[blocks[target].clone()]
+                                .iter()
+                                .filter_map(Item::as_instruction);
+                            matches!((target_ops.next(), target_ops.next()), (Some(receiver),Some(attr))
+                                if receiver.opcode == LOAD_FAST && attr.opcode == LOAD_ATTR
+                                    && receiver.location.line == attr.location.line)
+                        }
+                        && !last.jump_policy.borrow_empty_block()
+                        && block.checked_sub(1).is_some_and(|preceding| {
+                            items[blocks[preceding].clone()]
+                                .iter()
+                                .filter_map(Item::as_instruction)
+                                .map(|op| op.opcode)
+                                .eq([NOT_TAKEN])
+                        })
+                        && items[blocks[block].clone()]
+                            .iter()
+                            .filter_map(Item::as_instruction)
+                            .map(|op| op.opcode)
+                            .eq([crate::target::opcodes::JUMP_FORWARD]);
+                    // A removed normal exit stops fallthrough from the preceding array.
+                    // A surviving arm jump can still enter the continuation directly.
+                    // Marked cleanup entries use the original jump checks above.
+                    let surviving_protected_arm = borrow_unreachable_blocks[target]
+                        && last.opcode == JUMP_FORWARD
+                        && target > block + 1
+                        && !exception_regions.is_empty()
+                        && !jump_entry_blocks.get(target).copied().unwrap_or(false)
+                        && last.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Barrier
+                        && !last.jump_policy.borrow_empty_block()
+                        && items[blocks[target - 1].clone()]
+                            .iter()
+                            .rev()
+                            .filter_map(Item::as_instruction)
+                            .find(|record| {
+                                // A synthetic empty array has no native instruction.
+                                !(record.opcode == NOP
+                                    && record.location.line < 0
+                                    && record.jump_policy.borrow_empty_block())
+                            })
+                            .is_none_or(|record| {
+                                record.opcode == NOP
+                                    && record.jump_policy.always_retains_nop()
+                                    && record.no_location_policy.borrow_fallthrough()
+                                        == BorrowFallthrough::Barrier
+                            });
                     pending.push((
                         target,
-                        for_cleanup_entry
+                        surviving_protected_arm
+                            || direct_arm
+                            || completed_await
+                            || call_exits_inner_try
+                            || for_cleanup_entry
                             || conditional_entry
                             || shared_break
                             || independent_loop_entry
@@ -7213,6 +7371,7 @@ mod tests {
                 &pipeline.graph,
                 &pipeline.exception_owner_provenance.block_boundaries,
                 &mut pipeline.borrow_authored_finally_break_origins,
+                &[],
             );
             assert_eq!(entries[&Label::from_u32(1)].target, Label::from_u32(3));
             let mut items = pipeline.graph.into_items();
@@ -7312,6 +7471,7 @@ mod tests {
                 &pipeline.graph,
                 &pipeline.exception_owner_provenance.block_boundaries,
                 &mut pipeline.borrow_authored_finally_break_origins,
+                &[],
             );
             assert_eq!(entries.contains_key(&Label::from_u32(1)), reachable);
             assert!(
@@ -7380,6 +7540,7 @@ mod tests {
                 &pipeline.graph,
                 &pipeline.exception_owner_provenance.block_boundaries,
                 &mut pipeline.borrow_authored_finally_break_origins,
+                &[],
             );
             if new_original_boundary {
                 assert!(entries.is_empty());
@@ -7427,6 +7588,7 @@ mod tests {
                         &pipeline.graph,
                         &pipeline.exception_owner_provenance.block_boundaries,
                         &mut pipeline.borrow_authored_finally_break_origins,
+                        &[],
                     );
                 assert!(entries.is_empty());
                 assert!(
@@ -7465,6 +7627,7 @@ mod tests {
                 &pipeline.graph,
                 &pipeline.exception_owner_provenance.block_boundaries,
                 &mut pipeline.borrow_authored_finally_break_origins,
+                &[],
             );
             assert!(entries.is_empty());
         }
@@ -7482,6 +7645,7 @@ mod tests {
                     &pipeline.graph,
                     &pipeline.exception_owner_provenance.block_boundaries,
                     &mut pipeline.borrow_authored_finally_break_origins,
+                    &[],
                 );
             assert!(entries.contains_key(&Label::from_u32(1)));
             let mut items = pipeline.graph.into_items();

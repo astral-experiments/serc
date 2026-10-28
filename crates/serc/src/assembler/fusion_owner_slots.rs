@@ -578,6 +578,7 @@ struct FallbackCertificate {
     interval: Certificate,
     removed_slots: usize,
     observed_local_fusion: bool,
+    incoming_jump_block: Option<Label>,
 }
 
 /// An authored singleton's entire original fallthrough array, with no vacant-slot reuse.
@@ -598,15 +599,27 @@ impl FreshSingletonCertificate {
                 Item::Label(_) => None,
             })
             .collect::<Vec<_>>();
-        let tail = match instructions.as_slice() {
-            [constant, identity, condition, marker] => [*constant, *identity, *condition, *marker],
-            [unpack, constant, identity, condition, marker]
-                if unpack.opcode == crate::target::opcodes::UNPACK_SEQUENCE =>
-            {
-                [*constant, *identity, *condition, *marker]
-            }
-            _ => return None,
+        let (prefix, tail) = instructions.split_last_chunk::<4>()?;
+        // A non-final case preserves its subject for the following pattern.
+        let copied_subject = |copy: &Instruction| {
+            copy.opcode == crate::target::opcodes::COPY && copy.value_argument() == Some(1)
         };
+        match prefix {
+            [] => {}
+            [unpack] if unpack.opcode == crate::target::opcodes::UNPACK_SEQUENCE => {}
+            [copy] if copied_subject(copy) => {}
+            [unpack, copy]
+                if unpack.opcode == crate::target::opcodes::UNPACK_SEQUENCE
+                    && copied_subject(copy) => {}
+            [subject, copy]
+                if copied_subject(copy)
+                    && (matches!(
+                        subject.opcode,
+                        LOAD_FAST | crate::target::opcodes::LOAD_DEREF
+                    ) || (subject.opcode == crate::target::opcodes::LOAD_GLOBAL
+                        && subject.value_argument().is_some_and(|arg| arg & 1 == 0))) => {}
+            _ => return None,
+        }
         if tail[0].opcode != crate::target::opcodes::LOAD_CONST
             || !matches!(tail[0].operand(), Operand::Value(_))
             || tail[1].opcode != crate::target::opcodes::IS_OP
@@ -622,26 +635,7 @@ impl FreshSingletonCertificate {
             .regions
             .iter()
             .copied()
-            .filter(|region| {
-                !region.is_scope_fallback
-                    && region.depth > 0
-                    && view.regions.iter().any(|original| {
-                        if !view
-                            .provenance
-                            .synchronous_with_setups
-                            .contains(&original.start)
-                        {
-                            return false;
-                        }
-                        // Source exclusions retain the original setup range in priority.
-                        // Match that origin and every owner field; only the split's
-                        // physical endpoints may differ from the registered manager.
-                        let mut same_origin = *region;
-                        same_origin.start = original.start;
-                        same_origin.end = original.end;
-                        same_manager_region(&same_origin, original)
-                    })
-            })
+            .filter(|region| view.is_synchronous_manager_region(region))
             .collect::<Vec<_>>();
         let (owner, removed, handler_target) = if let Some((owner, removed)) =
             view.uniform_owned_interval(start, condition, false, Some(&manager_regions), false)
@@ -758,7 +752,8 @@ impl FallbackCertificate {
             return None;
         };
         key(condition, marker)?;
-        let owner = before.post_try_fusion_array(start, condition_index, marker_index, false)?;
+        let (owner, prior_removed) =
+            before.post_try_fusion_array(start, condition_index, marker_index, false, None)?;
         let Item::Label(anchor) = before.items[start] else {
             return None;
         };
@@ -784,8 +779,13 @@ impl FallbackCertificate {
         if !matches!(&before.items[start + prefix..start + prefix + 2],
             [Item::Instruction(first), Item::Instruction(second)]
                 if first.opcode == LOAD_FAST && second.opcode == LOAD_FAST)
-            || after.post_try_fusion_array(after_start, after_condition, after_marker, true)?
-                != owner
+            || after.post_try_fusion_array(
+                after_start,
+                after_condition,
+                after_marker,
+                true,
+                None,
+            )? != (owner, prior_removed + 1)
         {
             return None;
         }
@@ -802,7 +802,8 @@ impl FallbackCertificate {
                 boundaries,
                 setups: before.provenance.setups.clone(),
             },
-            removed_slots: 1,
+            incoming_jump_block: None,
+            removed_slots: prior_removed + 1,
             observed_local_fusion: true,
         };
         result.valid(after, false)?;
@@ -840,7 +841,7 @@ impl FallbackCertificate {
             == ExceptionPolicy::AlwaysAbsentPostTryCondition
             && matches!(anchor, Anchor::Label(_))
         {
-            before.post_try_fold_array(start, condition_index, marker_index)?
+            before.post_try_fold_array(start, condition_index, marker_index, None)?
         } else {
             if marker.exception_policy().exclusion() != ExceptionExclusion::None
                 || !matches!(
@@ -867,6 +868,7 @@ impl FallbackCertificate {
             },
             removed_slots,
             observed_local_fusion: false,
+            incoming_jump_block: None,
         };
         Some(result)
     }
@@ -960,13 +962,35 @@ impl FallbackCertificate {
         Some(())
     }
 
+    /// Cold layout can place a complete, unlocated jump block directly before
+    /// the certified array. Remember the edge before the jump is erased.
+    fn record_incoming_jump(&mut self, view: &View<'_>) {
+        if self.incoming_jump_block.is_some()
+            || self.interval.marker.exception_policy()
+                != ExceptionPolicy::AlwaysAbsentPostTryCondition
+        {
+            return;
+        }
+        if let Anchor::Label(anchor) = self.interval.anchor
+            && let Some(&index) = view.label_index(anchor)
+            && let Some([Item::Label(source), Item::Instruction(jump)]) =
+                view.items.get(index.saturating_sub(2)..index)
+            && view.provenance.block_boundaries.contains(source)
+            && view.provenance.source_boundaries.contains(source)
+            && jump.opcode == crate::target::opcodes::JUMP_FORWARD
+            && jump.location.line < 0
+            && jump.forward_target() == Some(anchor)
+        {
+            self.incoming_jump_block = Some(*source);
+        }
+    }
+
     fn valid(&self, view: &View<'_>, borrow: bool) -> Option<(usize, Owner)> {
         let marker = self.interval.valid(view, borrow)?;
         let (start, condition, _) = self.interval.range(view, borrow)?;
         let (owner, removed) = match self.interval.anchor {
             Anchor::Label(_) => {
                 let folded_try_entry = borrow
-                    && self.observed_local_fusion
                     && self.interval.marker.exception_policy()
                         == ExceptionPolicy::AlwaysAbsentPostTryCondition;
                 if !folded_try_entry && view.original_array_start(start)? != start {
@@ -975,13 +999,11 @@ impl FallbackCertificate {
                 if self.interval.marker.exception_policy()
                     == ExceptionPolicy::AlwaysAbsentPostTryCondition
                 {
+                    let incoming = borrow.then_some(self.incoming_jump_block).flatten();
                     if self.observed_local_fusion {
-                        (
-                            view.post_try_fusion_array(start, condition, marker, true)?,
-                            1,
-                        )
+                        view.post_try_fusion_array(start, condition, marker, true, incoming)?
                     } else {
-                        view.post_try_fold_array(start, condition, marker)?
+                        view.post_try_fold_array(start, condition, marker, incoming)?
                     }
                 } else {
                     view.uniform_fallback_slots(start, condition)?
@@ -1007,7 +1029,8 @@ impl View<'_> {
         condition: usize,
         marker: usize,
         fused: bool,
-    ) -> Option<Owner> {
+        incoming_jump_block: Option<Label>,
+    ) -> Option<(Owner, usize)> {
         if start > condition || condition >= marker || marker >= self.items.len() {
             return None;
         }
@@ -1015,7 +1038,7 @@ impl View<'_> {
             return None;
         };
         if (self.original_array_start(start) != Some(start)
-            && !(fused && self.has_adjacent_ordinary_try_end(start, anchor)))
+            && !self.has_adjacent_post_try_entry(start, anchor, incoming_jump_block, fused))
             || !self.provenance.source_boundaries.contains(&anchor)
             || self.items[start + 1..=marker].iter().any(|item| {
                 matches!(item,
@@ -1026,13 +1049,18 @@ impl View<'_> {
         {
             return None;
         }
-        let (owner, removed) = self.uniform_fallback_interval(start, condition, fused)?;
-        (removed == usize::from(fused)).then_some(owner)
+        self.uniform_fallback_interval(start, condition, fused)
     }
 
-    /// Jump removal can leave the end of the preceding ordinary try directly
-    /// before a source entry that was distinct when local-load fusion occurred.
-    fn has_adjacent_ordinary_try_end(&self, start: usize, anchor: Label) -> bool {
+    /// Removing the recorded fallthrough jump can make its source label and the
+    /// captured array entry adjacent without changing any cell in that array.
+    fn has_adjacent_post_try_entry(
+        &self,
+        start: usize,
+        anchor: Label,
+        incoming: Option<Label>,
+        fused: bool,
+    ) -> bool {
         if !self.provenance.block_boundaries.contains(&anchor) {
             return false;
         }
@@ -1047,7 +1075,12 @@ impl View<'_> {
         let (Some(end), None) = (boundaries.next(), boundaries.next()) else {
             return false;
         };
-        self.provenance.source_boundaries.contains(&end)
+        if Some(end) == incoming {
+            return true;
+        }
+        // The end of the preceding ordinary try may also join a local-load fusion.
+        fused
+            && self.provenance.source_boundaries.contains(&end)
             && self.regions.iter().any(|region| {
                 region.end == end
                     && !region.is_scope_fallback
@@ -1066,6 +1099,7 @@ impl View<'_> {
         start: usize,
         condition: usize,
         marker: usize,
+        incoming_jump_block: Option<Label>,
     ) -> Option<(Owner, usize)> {
         if start > condition || condition >= marker || marker >= self.items.len() {
             return None;
@@ -1075,7 +1109,8 @@ impl View<'_> {
         else {
             return None;
         };
-        if self.original_array_start(start)? != start
+        if (self.original_array_start(start) != Some(start)
+            && !self.has_adjacent_post_try_entry(start, anchor, incoming_jump_block, false))
             || !self.provenance.source_boundaries.contains(&anchor)
             || self.items[start + 1..=marker].iter().any(|item| {
                 matches!(item,
@@ -1173,6 +1208,25 @@ impl View<'_> {
         self.uniform_owned_interval(start, condition, observed_local_fusion, None, false)
     }
 
+    /// Recognizes an original synchronous manager or a split of that same range.
+    fn is_synchronous_manager_region(&self, region: &ExceptionRegion) -> bool {
+        !region.is_scope_fallback
+            && region.depth > 0
+            && self.regions.iter().any(|original| {
+                self.provenance
+                    .synchronous_with_setups
+                    .contains(&original.start)
+                    && same_manager_region(
+                        &ExceptionRegion {
+                            start: original.start,
+                            end: original.end,
+                            ..*region
+                        },
+                        original,
+                    )
+            })
+    }
+
     /// Proves a literal singleton array under one source-authored handler target.
     /// No owner is copied: the marker is appended beyond every original live cell.
     fn fresh_handler_singleton_regions(
@@ -1223,6 +1277,11 @@ impl View<'_> {
                 || !matches!(
                     instruction.opcode,
                     crate::target::opcodes::UNPACK_SEQUENCE
+                        | crate::target::opcodes::COPY
+                        | LOAD_FAST
+                        | LOAD_FAST_BORROW
+                        | crate::target::opcodes::LOAD_DEREF
+                        | crate::target::opcodes::LOAD_GLOBAL
                         | crate::target::opcodes::LOAD_CONST
                         | crate::target::opcodes::IS_OP
                         | POP_JUMP_IF_FALSE
@@ -1270,10 +1329,19 @@ impl View<'_> {
                     .contains(&region.target)
         };
         // In a named handler, the cleanup owns the pattern even when an outer try
-        // also covers it. Only use an ordinary try to identify a pattern outside one.
+        // also covers it. Otherwise the pattern may belong to the enclosing try.
         let in_named_handler = regions.iter().any(is_named_cleanup);
+        // A generator's fallback also covers the manager, but neither populates
+        // the fresh slot at the end of this unchanged pattern array.
+        let in_fallback = regions.len() == 2
+            && regions.iter().any(|region| {
+                region.is_scope_fallback && region.depth == 0 && region.preserve_lasti
+            });
         let mut handlers = regions.iter().filter(|region| {
             is_named_cleanup(region)
+                || (pattern_fallthrough
+                    && in_fallback
+                    && self.is_synchronous_manager_region(region))
                 || (!in_named_handler
                     && pattern_fallthrough
                     && !region.is_scope_fallback
@@ -1282,6 +1350,7 @@ impl View<'_> {
                         .provenance
                         .ordinary_try_setups
                         .values()
+                        .chain(self.provenance.guarded_finally_setups.values())
                         .any(|target| *target == region.target))
         });
         let target = handlers.next()?.target;
@@ -1344,10 +1413,11 @@ impl View<'_> {
                     && literal_fold_slots.is_none()
                 || instruction.no_location_policy.borrow_fallthrough()
                     == super::BorrowFallthrough::Barrier
+                || (instruction.opcode == crate::target::opcodes::COPY
+                    && (manager_regions.is_none() || instruction.value_argument() != Some(1)))
                 || matches!(
                     instruction.opcode,
                     NOP | NOT_TAKEN
-                        | crate::target::opcodes::COPY
                         | COPY_FREE_VARS
                         | MAKE_CELL
                         | RETURN_GENERATOR
@@ -1647,7 +1717,7 @@ impl ManagerSetupCertificate {
     }
 }
 
-/// One uniformly owned original dispatch with at most one accounted-for compaction.
+/// One uniformly owned original dispatch with verified compactions.
 struct HandlerDispatchCertificate {
     interval: Certificate,
     region: ExceptionRegion,
@@ -1788,25 +1858,26 @@ impl HandlerDispatchCertificate {
             .then_some(())
     }
 
-    /// Accounts only for a global-call NULL fold or an observed pair of local loads.
+    /// Counts compacted cells in an unchanged, uniformly protected dispatch.
     fn slots(&self, view: &View<'_>, start: usize, condition: usize) -> Option<usize> {
         use crate::target::opcodes::{
-            BUILD_TUPLE, CALL, CHECK_EXC_MATCH, LOAD_ATTR, LOAD_CONST, LOAD_FAST_CHECK, LOAD_GLOBAL,
+            BINARY_OP, BUILD_LIST, BUILD_TUPLE, CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1,
+            CHECK_EXC_MATCH, LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_CONST, LOAD_FAST_CHECK,
+            LOAD_GLOBAL, LOAD_SMALL_INT, PUSH_NULL,
         };
+        use crate::target::operands::UnaryIntrinsic;
 
-        if !view.no_late_insertions_or_setups(start, condition)
-            || view.provenance.setups.iter().any(|(label, _)| {
+        if view.provenance.setups.iter().any(|(label, _)| {
+            view.label_index(*label)
+                .is_none_or(|position| start <= *position && *position <= condition)
+        }) || view
+            .provenance
+            .removed_pop_block_boundaries
+            .iter()
+            .any(|label| {
                 view.label_index(*label)
                     .is_none_or(|position| start <= *position && *position <= condition)
             })
-            || view
-                .provenance
-                .removed_pop_block_boundaries
-                .iter()
-                .any(|label| {
-                    view.label_index(*label)
-                        .is_none_or(|position| start <= *position && *position <= condition)
-                })
         {
             return None;
         }
@@ -1824,15 +1895,19 @@ impl HandlerDispatchCertificate {
                 }
                 Item::Instruction(instruction) => instruction,
             };
+            let folded = instruction.local_policy.hidden_exception_owner_slots();
             if instruction.exception_policy() != ExceptionPolicy::NoneUnchanged
-                || instruction.pre_fold_extra_instructions() != 0
-                || instruction.local_policy.hidden_exception_owner_slots() != 0
+                || folded == super::LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS
+                || usize::from(instruction.pre_fold_extra_instructions())
+                    != usize::from(folded).min(4)
+                || (folded != 0 && !matches!(instruction.opcode, LOAD_CONST | LOAD_SMALL_INT))
                 || instruction.only_allows_unconditional_inlining()
                 || instruction.no_location_policy.borrow_fallthrough()
                     == super::BorrowFallthrough::Barrier
             {
                 return None;
             }
+            removed += usize::from(folded);
             match instruction.opcode {
                 LOAD_GLOBAL => {
                     let argument = instruction.value_argument()?;
@@ -1845,22 +1920,26 @@ impl HandlerDispatchCertificate {
                     removed += 1;
                 }
                 LOAD_FAST | LOAD_FAST_BORROW | LOAD_FAST_CHECK | LOAD_CONST | BUILD_TUPLE
-                | CHECK_EXC_MATCH => {}
+                | LOAD_SMALL_INT | BUILD_LIST | LIST_APPEND | LIST_EXTEND | BINARY_OP
+                | PUSH_NULL | CHECK_EXC_MATCH => {}
+                CALL_INTRINSIC_1
+                    if instruction.value_argument()
+                        == Some(UnaryIntrinsic::LIST_TO_TUPLE.argument()) => {}
                 LOAD_ATTR if matches!(instruction.operand(), Operand::Value(argument) if argument & 1 == 0) =>
                     {}
                 // Code generation emits a zero-argument method lookup as one LOAD_ATTR
                 // record followed by CALL. Unlike a global call, it has no PUSH_NULL
-                // record to compact, so the existing one-slot certificate is unchanged.
+                // record to compact.
                 LOAD_ATTR
                     if matches!(instruction.operand(), Operand::Value(argument) if argument & 1 != 0)
                         && matches!(view.items.get(index + 1), Some(Item::Instruction(next))
                             if next.opcode == CALL && next.value_argument() == Some(0)) => {}
-                CALL => call = true,
+                CALL | CALL_FUNCTION_EX => call = true,
                 POP_JUMP_IF_FALSE if index == condition => {}
                 _ => return None,
             }
         }
-        if removed > 1 || (global_call && !call) {
+        if global_call && !call {
             return None;
         }
         Self::owns_interval(
@@ -1878,7 +1957,7 @@ impl HandlerDispatchCertificate {
     }
 
     fn rebind_one_fusion(&mut self, before: &View<'_>, after: &View<'_>) -> Option<()> {
-        if self.observed_fusion || self.removed != 0 {
+        if self.observed_fusion {
             return None;
         }
         self.valid(before, false)?;
@@ -1890,7 +1969,7 @@ impl HandlerDispatchCertificate {
         self.interval.items = items;
         self.interval.labels = labels_in(&self.interval.items);
         self.observed_fusion = true;
-        self.removed = 1;
+        self.removed += 1;
         self.valid(after, false)?;
         Some(())
     }
@@ -2686,8 +2765,13 @@ impl FusionOwnerCertificates {
             .retain(|c| c.valid(view, false).is_some());
         self.manager_setup_certificates
             .retain(|certificate| certificate.valid(view, false).is_some());
-        self.fallback_certificates
-            .retain(|c| c.valid(view, false).is_some());
+        self.fallback_certificates.retain_mut(|certificate| {
+            if certificate.valid(view, false).is_none() {
+                return false;
+            }
+            certificate.record_incoming_jump(view);
+            true
+        });
         self.fresh_singleton_certificates
             .retain(|certificate| certificate.valid(view, false).is_some());
         self.folded_assert_success_certificates
@@ -2750,7 +2834,7 @@ impl FusionOwnerCertificates {
         let dispatch_markers = self
             .handler_dispatch_certificates
             .iter()
-            .filter(|certificate| certificate.removed == 1)
+            .filter(|certificate| certificate.removed > 0)
             .filter_map(|certificate| certificate.valid(&view, true))
             .collect::<Vec<_>>();
         for (index, owner) in changes {

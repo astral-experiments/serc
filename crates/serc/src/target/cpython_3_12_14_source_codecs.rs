@@ -4,9 +4,11 @@
 // Lib/encodings/ascii.py: sha256 578aa1173f7cc60dad2895071287fe6182bd14787b3fbf47a6c7983dfe3675e3
 // Lib/encodings/latin_1.py: sha256 b75503e532a27c636477396c855209ff5f3036536d2a4bede0a576c89382b60c
 // Lib/encodings/cp1251.py: sha256 d57f8cfa34494c5acb6692ddb31f616ae2dd89a075d2af6d36b0b7ec2ffe7af1
+// Lib/encodings/cp1252.py: sha256 19aa5bee667f5fb387924a813aec9fa1dda47769d09e8483a748bdb202be6a84
 // Lib/encodings/iso8859_15.py: sha256 01976a81811873dc9a0c79db9fc00d1c30103487f3c6bc3a6d81b4043cd48e02
 // Lib/encodings/koi8_r.py: sha256 4d4e353aee8039bb71e2145a6e68fe1e6833a1b4250b70ee0ac5ec70bbb8c51d
 // Lib/encodings/euc_jp.py: sha256 b453a439787b0efa031e43416a7d852a6be705c985e1200693eb96d87ea79cdc
+// Lib/encodings/big5.py: sha256 98fac6f86a20dd05da197e2058176ebfd47edee7074c3248f5f48fe0fb672d7c
 // Objects/codeobject.c: sha256 60365e71ac9fc8411c546f86de3a1f49b6190ebb40b893ed31c6ff0b2cb5493f
 // Objects/dictobject.c: sha256 2139caefe57c6659db766fdda5e53c57f0e42e9335227875756307acfcdb51dd
 // Objects/descrobject.c: sha256 f71bce9414284ed2af0ac860b777e6afffa83fad9a3e2e3e9ef9e8909a956d8f
@@ -14,6 +16,7 @@
 // Python/codecs.c: sha256 a99f3f3280fbe995872e29058ad3bed82b444d9f11e8b8a9f97adfcb6bee095d
 // Python/modsupport.c: sha256 02d048a3612d7807a5ef5e1bb57f72d1b5f4a88489a976c4a360568fda28e918
 // Modules/cjkcodecs/_codecs_jp.c: sha256 e41484049adac46605165e00d5ea22b7ff9eac76519331913526f228b3112696
+// Modules/cjkcodecs/_codecs_tw.c: sha256 bd156987b58714a877453fcc67f81cc569e46a2c29a33caebbd6aaa71ad10ede
 // Modules/cjkcodecs/cjkcodecs.h: sha256 79b8d3dd8c18a18377d6bc72524bf6e53cdedf5e7e108b6a403a476a8cde862b
 // Modules/cjkcodecs/multibytecodec.c: sha256 a9c7f911452929fc6991ffbbeff1993a6755e37238d90ee73b8bbdbfbeec1754
 // Modules/cjkcodecs/clinic/multibytecodec.c.h: sha256 df1af786d018a16e34c574fb1fc8cff15bc33a69fcb6ff19175bf6b26102b2fb
@@ -93,6 +96,38 @@ pub(super) const CP1251: &[&str] = &[
     "charmap_encode",
     "codecs",
     "cp1251",
+    "decode",
+    "decoding_table",
+    "encode",
+    "encoding_table",
+    "errors",
+    "final",
+    "getregentry",
+    "incrementaldecoder",
+    "incrementalencoder",
+    "input",
+    "name",
+    "self",
+    "streamreader",
+    "streamwriter",
+];
+
+pub(super) const CP1252: &[&str] = &[
+    "Codec",
+    "CodecInfo",
+    "IncrementalDecoder",
+    "IncrementalEncoder",
+    "StreamReader",
+    "StreamWriter",
+    "__doc__",
+    "__module__",
+    "__name__",
+    "__qualname__",
+    "charmap_build",
+    "charmap_decode",
+    "charmap_encode",
+    "codecs",
+    "cp1252",
     "decode",
     "decoding_table",
     "encode",
@@ -205,6 +240,50 @@ pub(super) const EUC_JP: &[&str] = &[
     "encode",
     "errors",
     "euc_jp",
+    "getcodec",
+    "getregentry",
+    "getstate",
+    "incrementaldecoder",
+    "incrementalencoder",
+    "mbc",
+    "name",
+    "read",
+    "readline",
+    "readlines",
+    "reset",
+    "setstate",
+    "stream",
+    "streamreader",
+    "streamwriter",
+    "write",
+    "writelines",
+];
+
+pub(super) const BIG5: &[&str] = &[
+    "Codec",
+    "CodecInfo",
+    "IncrementalDecoder",
+    "IncrementalEncoder",
+    "MultibyteIncrementalDecoder",
+    "MultibyteIncrementalEncoder",
+    "MultibyteStreamReader",
+    "MultibyteStreamWriter",
+    "StreamReader",
+    "StreamWriter",
+    "__create_codec",
+    "__map_big5",
+    "__map_cp950ext",
+    "__module__",
+    "__name__",
+    "__qualname__",
+    "_codecs_tw",
+    "_multibytecodec",
+    "big5",
+    "codec",
+    "codecs",
+    "decode",
+    "encode",
+    "errors",
     "getcodec",
     "getregentry",
     "getstate",

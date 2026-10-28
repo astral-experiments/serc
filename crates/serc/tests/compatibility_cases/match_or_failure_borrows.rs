@@ -180,3 +180,15 @@ fn matches_cpython_borrow_aliased_or_pattern_fallback_copy_boundaries() {
         common::assert_matches_cpython_marshal(&source, "aliased_or_pattern_fallback.py");
     }
 }
+
+#[test]
+fn matches_cpython_borrows_after_copied_wildcard_returns() {
+    for (scope, leading) in [("", ""), ("async ", ""), ("", "    yield value\n")] {
+        for fallback in ["False", "value.a", "value.a.b"] {
+            let source = format!(
+                "{scope}def f(value, key):\n{leading}    match key:\n        case A(item=item) | B(item=item):\n            result = lookup(item)\n        case _:\n            return {fallback}\n    if result is None:\n        return False\n    return use(result, value)\n"
+            );
+            common::assert_matches_cpython_marshal(&source, "copied_wildcard.py");
+        }
+    }
+}

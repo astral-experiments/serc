@@ -9,6 +9,13 @@ use super::exception_owners::LazyExceptionOwnerProvenance;
 use crate::PythonVersion;
 use crate::target::Opcode;
 
+/// Original conditional whose destination is resolved after lowering.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum FoldedGuardExit {
+    ConditionalArm,
+    BooleanOperand,
+}
+
 pub(crate) struct AssembledCode {
     pub(crate) bytecode: Vec<u8>,
     pub(crate) line_table: Vec<u8>,
@@ -242,7 +249,6 @@ struct NoLocationBlockPolicy(u8);
 
 impl NoLocationBlockPolicy {
     const ALLOW_INLINING: u8 = 1 << 0;
-    const FIRST_COPY_INTERRUPTIBLE: u8 = 1 << 1;
     const ARTIFICIAL_EVAL_BREAK: u8 = 1 << 2;
     const COPY_INHERITS_SHARED_PREDECESSOR: u8 = 1 << 3;
     const COPY_SPLIT_RETURN_EXIT: u8 = 1 << 4;
@@ -287,13 +293,6 @@ impl NoLocationPolicy {
             .contains(NoLocationBlockPolicy::ALLOW_INLINING)
     }
 
-    /// Whether a copied forward exit becomes an interruptible backward jump after cold-block
-    /// ordering. The original cleanup edge remains non-interruptible.
-    pub(super) const fn first_copy_is_interruptible_backward(self) -> bool {
-        self.block_policy
-            .contains(NoLocationBlockPolicy::FIRST_COPY_INTERRUPTIBLE)
-    }
-
     /// Whether this eval-break instruction was emitted with CPython's `NO_LOCATION`.
     pub(super) const fn is_artificial_eval_break(self) -> bool {
         self.block_policy
@@ -321,12 +320,6 @@ impl NoLocationPolicy {
     pub(super) fn prevent_block_inlining(&mut self) {
         self.block_policy
             .remove(NoLocationBlockPolicy::ALLOW_INLINING);
-    }
-
-    pub(super) fn make_first_copy_interruptible(&mut self) {
-        debug_assert!(self.allows_block_inlining());
-        self.block_policy
-            .insert(NoLocationBlockPolicy::FIRST_COPY_INTERRUPTIBLE);
     }
 
     pub(super) fn mark_artificial_eval_break(&mut self) {
@@ -1260,6 +1253,8 @@ pub(super) struct Instruction {
     metadata: InstructionMetadata,
     pub(super) early_boolean_admissions: EarlyBooleanAdmissions,
     pub(super) folded_constant_admissions: Option<FoldAdmissionId>,
+    // Capture rotations carry the line span of the whole case pattern.
+    pub(super) single_line_capture_swap: Option<bool>,
 }
 
 impl Instruction {
@@ -1296,6 +1291,7 @@ impl Instruction {
             metadata: InstructionMetadata::default(),
             early_boolean_admissions: EarlyBooleanAdmissions::default(),
             folded_constant_admissions: None,
+            single_line_capture_swap: None,
         }
     }
 
@@ -1317,6 +1313,7 @@ impl Instruction {
             metadata: InstructionMetadata::default(),
             early_boolean_admissions: EarlyBooleanAdmissions::default(),
             folded_constant_admissions: None,
+            single_line_capture_swap: None,
         }
     }
 
@@ -1598,6 +1595,7 @@ impl Instruction {
                 .followed_by(second.early_boolean_admissions),
             // Constant admissions are consumed before superinstruction fusion.
             folded_constant_admissions: None,
+            single_line_capture_swap: None,
         }
     }
 }
@@ -1675,7 +1673,7 @@ pub(crate) struct Assembler {
     /// Existing source marker, target, and marker location of an original folded edge.
     pub(super) folded_predecessor_sources: Vec<(Label, Label, SourceLocation)>,
     /// Exact folded arm jumps awaiting the complete original return destination.
-    pub(super) folded_arm_exit_origins: Vec<(Label, Instruction)>,
+    pub(super) folded_arm_exit_origins: Vec<(Label, Instruction, FoldedGuardExit)>,
     /// Empty original anchors before folded constant-while exits without else suites.
     pub(super) folded_loop_exit_anchors: FxHashSet<Label>,
     pub(super) operand_patches: Vec<OperandPatch>,
@@ -1714,7 +1712,7 @@ pub(crate) struct Assembler {
     /// Exact materialized POP records after return-unwind region boundaries.
     pub(super) name_return_materialized_pops: Vec<super::exception_owners::OriginalPopBlockSpan>,
     /// Ordinary-return `POP_BLOCK` records needed by the legacy CFG copy phases.
-    pub(super) legacy_return_pop_blocks: FxHashMap<Label, usize>,
+    pub(super) legacy_return_pop_blocks: FxHashMap<Label, (usize, SourceLocation)>,
     /// Iterator-region aliases immediately following an ordinary-return POP boundary.
     pub(super) name_return_iterator_region_aliases: FxHashMap<Label, Label>,
     /// Disconnected loop exits and the normal entries that remain reachable.
@@ -1724,6 +1722,7 @@ pub(crate) struct Assembler {
     pub(super) borrow_block_aliases: FxHashSet<Label>,
     /// Original ordinary jump blocks that can thread conditional predecessors after exit copying.
     pub(super) conditional_threading_targets: FxHashMap<Label, SourceLocation>,
+    pub(super) none_filter_locations: FxHashMap<Label, SourceLocation>,
     /// Exact pre-swap comprehension assignment arrays and their shared match exits.
     pub(super) comprehension_assignment_exits: FxHashMap<Label, (Vec<Label>, Vec<Instruction>)>,
     /// Original match fallthrough arrays ending in an ordinary two-store exchange.
@@ -1789,6 +1788,8 @@ pub(super) struct AuthoredFinallyBreakOrigins {
 pub(super) struct AuthoredFinallyBreakEntry {
     pub(super) original_source: Label,
     pub(super) target: Label,
+    /// The destination is the original normal exit of a compound try.
+    pub(super) compound_exit: bool,
 }
 
 pub(super) type AuthoredFinallyBreakEntries = FxHashMap<Label, AuthoredFinallyBreakEntry>;
@@ -1842,6 +1843,7 @@ pub(super) struct OptimizationPipeline {
     pub(super) borrow_block_aliases: FxHashSet<Label>,
     /// Original ordinary jump blocks that can thread conditional predecessors after exit copying.
     pub(super) conditional_threading_targets: FxHashMap<Label, SourceLocation>,
+    pub(super) none_filter_locations: FxHashMap<Label, SourceLocation>,
     /// Exact pre-swap comprehension assignment arrays and their shared match exits.
     pub(super) comprehension_assignment_exits: FxHashMap<Label, (Vec<Label>, Vec<Instruction>)>,
     /// Original match fallthrough arrays ending in an ordinary two-store exchange.
@@ -1981,6 +1983,7 @@ impl Default for Assembler {
             borrow_finally_entries: FxHashMap::default(),
             borrow_block_aliases: FxHashSet::default(),
             conditional_threading_targets: FxHashMap::default(),
+            none_filter_locations: FxHashMap::default(),
             comprehension_assignment_exits: FxHashMap::default(),
             match_join_store_origins: FxHashMap::default(),
             original_nop_targets: FxHashSet::default(),

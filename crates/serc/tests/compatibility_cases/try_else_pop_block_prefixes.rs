@@ -1,6 +1,26 @@
 use crate::common::assert_matches_cpython_marshal;
 
 #[test]
+fn matches_try_else_loop_exits_after_iterator_exhaustion() {
+    assert_matches_cpython_marshal(
+        "def entries(rows):\n    while True:\n        for item in rows:\n            if item:\n                break\n        else:\n            try:\n                item = read()\n            except Empty:\n                return\n            else:\n                if item is not None:\n                    yield item\n",
+        "try_else_after_iterator_exhaustion.py",
+    );
+}
+
+#[test]
+fn matches_terminal_while_try_else_backedges() {
+    for header in ["while True:", "while ready():"] {
+        for prefix in ["", "async "] {
+            let source = format!(
+                "{prefix}def entries():\n    {header}\n        try:\n            item = read()\n        except Empty:\n            break\n        else:\n            if item is not None:\n                yield item\n"
+            );
+            assert_matches_cpython_marshal(&source, "terminal_while_try_else_backedges.py");
+        }
+    }
+}
+
+#[test]
 fn matches_cpython_try_else_pop_block_prefixes() {
     for condition in [
         "value",
@@ -275,5 +295,20 @@ fn excludes_retained_conditional_pop_blocks_from_enclosing_tries() {
             "{prefix}def f(condition, work):\n    try:\n        try:\n            if condition:\n                {action}\n            else:\n                {action}\n        except Error:\n            pass\n        else:\n            raise Failed\n    except Other:\n        recover()\n"
         );
         assert_matches_cpython_marshal(&source, "conditional_pop_block_enclosing_owner.py");
+    }
+}
+
+#[test]
+fn borrows_at_guarded_try_else_after_a_managed_break() {
+    for (scope, work) in [("with", "work(key)"), ("async with", "await work(key)")] {
+        for branch in [
+            "if flag:\n                    break\n                ",
+            "break\n                ",
+        ] {
+            let source = format!(
+                "async def choose(key, flag, manager):\n    {scope} manager:\n        try:\n            while True:\n                {branch}{work}\n        except Error:\n            raise\n        else:\n            if flag:\n                use(key)\n"
+            );
+            assert_matches_cpython_marshal(&source, "managed_break_to_else.py");
+        }
     }
 }

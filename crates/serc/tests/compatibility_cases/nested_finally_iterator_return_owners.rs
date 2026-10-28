@@ -69,3 +69,19 @@ fn exceptional_finally_iterator_return_preserves_older_and_interleaved_loop_orde
         );
     }
 }
+
+#[test]
+fn completed_inner_managers_preserve_the_finalizer_line_on_iterator_returns() {
+    let source = r"def select(items, resource):
+    try:
+        for item in items:
+            try:
+                with resource:
+                    return item
+            finally:
+                release()
+    except OSError:
+        recover()
+";
+    common::assert_matches_cpython_marshal(source, "managed_finalizer_return.py");
+}
