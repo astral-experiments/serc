@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn a_copied_exception_cleanup_keeps_its_backedge_line() {
+    let source = r"def scan(items, ready, active):
+    for item in items:
+        try:
+            if active:
+                try:
+                    read(item)
+                except ValueError as error:
+                    try:
+                        if ready:
+                            pass
+                    except LookupError:
+                        pass
+        except TypeError:
+            pass
+";
+    assert_matches_cpython(source, "copied_cleanup_backedge.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

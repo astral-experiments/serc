@@ -7841,9 +7841,14 @@ impl OptimizationPipeline {
             let copied_inline_entry_labels = copied_labels
                 .iter()
                 .filter_map(|(original, copied)| {
-                    copied_exit_or_eval_entry_labels
-                        .contains(original)
-                        .then_some(*copied)
+                    // An unlocated cleanup and its backedge are one native array.
+                    // A copied exception split still inherits the line when another
+                    // edge enters the copy before its predecessor has a location.
+                    (copied_exit_or_eval_entry_labels.contains(original)
+                        || (inline_no_location_block
+                            && target_has_unlocated_jump_eval_check
+                            && exception_split_labels.contains(original)))
+                    .then_some(*copied)
                 })
                 .collect::<FxHashSet<_>>();
             if inherit_copied_locations && !planned_copy {
