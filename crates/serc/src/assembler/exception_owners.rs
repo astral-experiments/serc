@@ -11082,10 +11082,30 @@ impl LayoutAssembler {
                     if threaded_conditions.get(&instruction_index)
                         == Some(&NormalizedExceptionOwner::DynamicConditionStrict)
                         && owner_history_exact
-                        && has_uninterrupted_fusion
                         && tail.post_compaction_fusions == 1
                         && tail.insertions == 0
                         && tail.late_removals == 0
+                        // A retained cleanup NOP can clear the running fusion flag inside
+                        // a single source block. Recover its earlier fusion from that block.
+                        && (has_uninterrupted_fusion
+                            || (tail.early_removals == 1
+                                && instruction_index >= original_array_start + 4
+                                && matches!(&indexed_instructions[instruction_index - 3..instruction_index], [nop, local, truth]
+                                    if nop.opcode == NOP
+                                && nop.exception_policy() == super::ExceptionPolicy::AlwaysUnchanged
+                                && !nop.fusion_policy.is_converted_pop_block()
+                                && matches!(local.opcode, crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_FAST_BORROW)
+                                && truth.opcode == crate::target::opcodes::TO_BOOL
+                                && truth.location == instruction.location
+                                && local.location == truth.location)
+                                && indexed_instructions[original_array_start..instruction_index - 3].iter().any(|x| is_local_fusion(x))
+                                && provenance.source_boundaries.iter().any(|label| {
+                                    provenance.block_boundaries.contains(label)
+                                        && label_positions.get(label)==Some(&original_array_start)
+                                })
+                                && !jump_targets.iter().chain(&provenance.source_boundaries)
+                                    .chain(&provenance.block_boundaries).any(|label|label_positions.get(label)
+                                        .is_some_and(|&p| original_array_start<p && p<=instruction_index))))
                     {
                         pending_threaded_null_append = Some(instruction_index + 1);
                     }
