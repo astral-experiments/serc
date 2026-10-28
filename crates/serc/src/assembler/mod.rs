@@ -3761,7 +3761,7 @@ impl Assembler {
     /// A final assertion may also enter through a conditional success edge. Every edge
     /// must retain its original source boundary and have no omitted instruction slots.
     pub(crate) fn at_original_shared_handler_join(&self) -> bool {
-        self.original_shared_handler_join(&[], false)
+        self.original_shared_handler_join(&[], false, false)
     }
 
     /// Checks that a handler cleanup cannot fall through into a shared original jump.
@@ -3778,12 +3778,17 @@ impl Assembler {
 
     /// Certifies a guarded finalizer join with one recorded same-line None comparison.
     pub(crate) fn at_original_guarded_finally_handler_join(&self) -> bool {
-        self.original_shared_handler_join(&[POP_JUMP_IF_NONE], false)
+        self.original_shared_handler_join(&[POP_JUMP_IF_NONE], false, false)
     }
 
     /// Certifies a normal coroutine finalizer join with either recorded None-test polarity.
     pub(crate) fn at_original_coroutine_guarded_finally_handler_join(&self) -> bool {
-        self.original_shared_handler_join(&[POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE], false)
+        self.original_shared_handler_join(&[POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE], false, false)
+    }
+
+    /// Checks the then jump and final elif test that meet at an iterator discard.
+    pub(crate) fn at_original_branched_finally_iterator_join(&self) -> bool {
+        self.original_shared_handler_join(&[POP_JUMP_IF_NONE, POP_JUMP_IF_NOT_NONE], false, true)
     }
 
     /// Certifies a copied finalizer join before its iterator discard is appended.
@@ -3792,7 +3797,7 @@ impl Assembler {
         unwind_start: usize,
         named_handler: bool,
     ) -> bool {
-        self.original_shared_handler_join(&[], true)
+        self.original_shared_handler_join(&[], true, false)
             || (!named_handler && self.original_guarded_handler_iterator_join(unwind_start))
     }
 
@@ -3930,6 +3935,7 @@ impl Assembler {
         &self,
         recorded_none_opcodes: &[Opcode],
         allow_recorded_cleanup: bool,
+        allow_same_target: bool,
     ) -> bool {
         let items = self.linear_items();
         let labels = trailing_labels(items).collect::<Vec<_>>();
@@ -4026,11 +4032,11 @@ impl Assembler {
             let Some(cleanup) = unconditional_edge else {
                 return false;
             };
-            // The outer guard and inner then arm enter distinct original aliases;
-            // the else arm physically falls through at the same stack depth.
+            // The else arm falls through at the same stack depth. A copied iterator
+            // discard can receive both jumps at the same original label.
             return incoming_edges == 2
                 && falls_through
-                && guard.operand() != cleanup.operand()
+                && (allow_same_target || guard.operand() != cleanup.operand())
                 && previous.location.line >= 0
                 && previous.depth_after().is_some()
                 && [guard, cleanup, previous].iter().all(|instruction| {
@@ -18762,6 +18768,30 @@ impl Assembler {
             UnoptimizedCode::Prepared { graph, .. } => graph.for_each_instruction_mut(remap),
         }
         drop(unique_uniform_folds);
+        let remap_source_constant = |record: &mut Instruction| {
+            let Some(index) = record.value_argument() else {
+                return false;
+            };
+            let index = if index == u32::MAX {
+                deferred_none
+            } else {
+                Some(index)
+            };
+            let Some(remapped) = index.and_then(|index| *index_map.get(index as usize)?) else {
+                return false;
+            };
+            record.set_operand(Operand::Value(remapped));
+            true
+        };
+        // The captured cleanup may load constants that move when unused slots are pruned.
+        self.shared_finally_iterator_break_origins
+            .retain_mut(|origin| {
+                origin
+                    .iter_mut()
+                    .filter_map(Item::as_instruction_mut)
+                    .filter(|record| uses_constant_index(record.opcode))
+                    .all(remap_source_constant)
+            });
         let Some(provenance) = self.exception_owner_provenance.as_mut_if_present() else {
             return;
         };
@@ -18808,23 +18838,7 @@ impl Assembler {
                             .flat_map(|prefix| &mut prefix.instructions),
                     )
                     .filter(|record| record.opcode == LOAD_CONST)
-                    .all(|record| {
-                        let Some(index) = record.value_argument() else {
-                            return false;
-                        };
-                        let index = if index == u32::MAX {
-                            deferred_none
-                        } else {
-                            Some(index)
-                        };
-                        let Some(remapped) =
-                            index.and_then(|index| *index_map.get(index as usize)?)
-                        else {
-                            return false;
-                        };
-                        record.set_operand(Operand::Value(remapped));
-                        true
-                    })
+                    .all(remap_source_constant)
             });
         provenance.copied_return_pop_prefixes.retain_mut(|origin| {
             let load = &mut origin.records[2];
