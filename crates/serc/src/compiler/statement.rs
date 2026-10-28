@@ -21395,13 +21395,8 @@ impl<'source> Compiler<'source> {
         }
         let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, restart)?;
         if self.context.python_version >= crate::PythonVersion::Py314
-            && (matches!(body, [Stmt::Pass(_)])
-                || matches!(body, [.., Stmt::Match(statement), Stmt::Pass(_)]
-                if statement.cases.len() == 1
-                    && matches!(statement.cases[0].pattern, Pattern::MatchOr(_)))
-                || matches!(body, [.., Stmt::If(_), last]
-                    if matches!(last, Stmt::Pass(_))
-                        || matches!(last, Stmt::Expr(expr) if is_literal_constant(&expr.value))))
+            && (matches!(body.last(), Some(Stmt::Pass(_)))
+                || matches!(body, [.., Stmt::If(_), Stmt::Expr(expr)] if is_literal_constant(&expr.value)))
         {
             // The authored trailing NOP heads the shared block when CPython threads
             // incoming branch exits. Keep its backedge as a target through that pass.
