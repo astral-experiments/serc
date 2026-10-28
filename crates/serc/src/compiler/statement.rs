@@ -29375,6 +29375,21 @@ impl<'source> Compiler<'source> {
                         && condition_jump_target_count(&branch.test, false) > 1
                         && suite_terminates_before_constant_folding(&branch.body))
                 && self.assembler.at_original_jump_only_conditional_join();
+            // The normal finalizer copies the enclosing try exits before line
+            // propagation. Only the failed guards reach the original else exit;
+            // multiple conditional predecessors cannot donate a unique location.
+            let shared_else_finalizer = self.context.python_version >= crate::PythonVersion::Py314
+                && self.control.finally.active_finally_try_bodies > 0
+                && statement.finalbody.is_empty()
+                && matches!(statement.orelse.last(), Some(Stmt::If(branch))
+                    if branch.elif_else_clauses.is_empty()
+                        && condition_has_only_runtime_tests(&branch.test)
+                        && condition_jump_target_count(&branch.test, false) > 1
+                        && matches!(branch.body.last(), Some(Stmt::Try(cleanup))
+                            if cleanup.handlers.is_empty() && !cleanup.finalbody.is_empty()
+                                && !suite_terminates(&cleanup.body)
+                                && !suite_terminates(&cleanup.finalbody)))
+                && self.assembler.current_original_block_location().is_none();
             let shared_conditional_exit = (guarded_loop_try
                 && shared_guard(&statement.orelse)
                 && self.assembler.at_original_shared_cleanup_join())
@@ -30448,7 +30463,11 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .prepare_no_location_block_for_inlining(normal_exit);
             }
-            if shared_conditional_exit || unlocated_false_yield_exit || shared_loop_condition_exit {
+            if shared_conditional_exit
+                || unlocated_false_yield_exit
+                || shared_loop_condition_exit
+                || shared_else_finalizer
+            {
                 // Preserve the original shared jump's missing location while allowing
                 // copied exits to inherit the location of their own predecessor.
                 self.assembler.preserve_shared_jump_no_location(normal_exit);

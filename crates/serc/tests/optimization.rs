@@ -15755,6 +15755,33 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn try_else_exits_after_a_finalizer_need_a_unique_guard_donor() {
+    for guard in ["active", "record is not None and active"] {
+        let source = format!(
+            "def process(records, active, result):
+    for record in records:
+        try:
+            try:
+                prepare()
+            except LookupError:
+                raise
+            else:
+                if {guard}:
+                    try:
+                        consume(record)
+                    finally:
+                        record = None
+        except ValueError:
+            raise
+        finally:
+            finish(result)
+"
+        );
+        assert_matches_cpython(&source, "shared_try_else_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
