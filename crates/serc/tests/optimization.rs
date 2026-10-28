@@ -15755,6 +15755,41 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn terminal_comparison_cleanup_copies_a_short_else_return() {
+    let source = r"
+def nested(ready, low, value, high, box):
+    if ready:
+        if low <= value < high:
+            return 1
+        else:
+            return box.attribute
+    elif high:
+        pass
+
+
+def following(ready, low, value, high):
+    if ready:
+        if low <= value < high:
+            return
+        global result
+        result = value
+    else:
+        consume()
+
+
+def long_exit(ready, low, value, high, box):
+    if ready:
+        if low <= value < high:
+            return 1
+        else:
+            return box.attribute(value, high)
+    elif high:
+        pass
+";
+    assert_matches_cpython(source, "comparison_cleanup_return.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
