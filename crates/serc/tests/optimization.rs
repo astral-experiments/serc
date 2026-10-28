@@ -25936,6 +25936,21 @@ fn specialized_comparison_keeps_its_try_else_guard_handler() {
 }
 
 #[test]
+fn module_pass_join_precedes_the_enclosing_guard_return() {
+    let source = r"if enabled:
+    if ready:
+        for item in items:
+            work(item)
+    else:
+        finish()
+    pass
+";
+    for source in [source.to_owned(), source.replace("    pass\n", "")] {
+        assert_matches_cpython(&source, "module_pass_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertions_keep_the_finally_call_argument_guard_protected() {
     let source = r"def check(manager, handle, data, ok):
     with manager:

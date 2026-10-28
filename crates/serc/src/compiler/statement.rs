@@ -3885,6 +3885,11 @@ impl<'source> Compiler<'source> {
             || terminal_assignment
             // Erased assertions do not join a call's original block to the return.
             || elided_terminal_call
+            // A Pass after a module conditional has its own original join.
+            // The enclosing guard's implicit return starts in the following block.
+            || (!has_later_arm
+                && matches!(self.unit.scope, Scope::Module)
+                && matches!(body, [.., Stmt::If(_), Stmt::Pass(_)]))
             // Nonfinal deletion arms have an authored end jump. A one-slot Name
             // delete plus that replaced jump and the return can still fit a copy.
             || (!has_later_arm && matches!(body.last(), Some(Stmt::Delete(_))))
