@@ -15755,6 +15755,33 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn nested_negated_comparison_keeps_its_forward_loop_exit() {
+    assert_matches_cpython(
+        r"
+def nested(items, ready, low, high):
+    for item in items:
+        if True:
+            if ready:
+                pass
+            elif not low <= item < high:
+                pass
+        else:
+            pass
+
+
+def direct(items, ready, low, high):
+    for item in items:
+        if ready:
+            pass
+        elif not low <= item < high:
+            pass
+",
+        "nested_comparison_backedge.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:

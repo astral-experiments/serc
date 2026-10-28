@@ -23145,18 +23145,23 @@ impl<'source> Compiler<'source> {
                     self.assembler.record_last_original_loop_backedge();
                     return Ok(LoopBackedge::Emitted);
                 }
+                let (comparison_test, negated) = if let Expr::UnaryOp(unary) = test
+                    && unary.op == UnaryOp::Not
+                {
+                    (unary.operand.as_ref(), true)
+                } else {
+                    (test, false)
+                };
                 let copied_loop_branch_exit = non_final_branch
                     && self.control.in_loop_tail_without_nested_cleanup()
                     && (!expression_contains_chained_comparison(test)
-                        // A direct runtime chain has two false paths into this original
-                        // exit: its comparison edge and the intermediate-value cleanup.
-                        // Keep both forward until the existing exit-copy pass runs.
-                        // The same protected exit begins with the replaced arm-jump
-                        // NOP, which still blocks threading before NOP cleanup.
+                        // The original arm jump becomes a NOP before the loop backedge.
+                        // A chain and its negation keep their comparison and cleanup
+                        // edges forward because neither can thread through that NOP.
                         || ((!self.has_active_control_flow_region()
                             || (!expression_suspends_current_scope(test)
                                 && !expression_yields_in_current_scope(test)))
-                            && matches!(test, Expr::Compare(comparison) if comparison.ops.len() > 1)
+                            && matches!(comparison_test, Expr::Compare(comparison) if comparison.ops.len() > 1)
                             && condition_has_only_runtime_tests(test)));
                 if copied_loop_branch_exit
                     || (non_final_branch
@@ -23197,13 +23202,6 @@ impl<'source> Compiler<'source> {
                     return Ok(LoopBackedge::Emitted);
                 }
                 let body_label = self.assembler.label();
-                let (comparison_test, negated) = if let Expr::UnaryOp(unary) = test
-                    && unary.op == UnaryOp::Not
-                {
-                    (unary.operand.as_ref(), true)
-                } else {
-                    (test, false)
-                };
                 let split_final_boolean_chain = !non_final_branch
                     && !self.has_active_control_flow_region()
                     && matches!(comparison_test, Expr::BoolOp(_))
