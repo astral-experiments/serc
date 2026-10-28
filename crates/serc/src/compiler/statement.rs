@@ -29398,6 +29398,33 @@ impl<'source> Compiler<'source> {
                                 Some(NestedIfExitLocation::Unlocated)
                             )
                     );
+            // A guard beside a returning finalizer or terminating loop else can be the
+            // only edge left after exit copying. A following call or try is its own
+            // block. A short return can be copied onto the original jump.
+            let detached_guard_exit = shared_conditional_exit
+                && self.context.python_version >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && statement.finalbody.is_empty()
+                && (self.control.statements.context.followed_by_try
+                    || self.control.statements.context.followed_by_call_expression
+                    || self
+                        .control
+                        .statements
+                        .context
+                        .followed_by_attribute_or_call_assignment)
+                && matches!(normal_exit_join_suite.last(), Some(Stmt::If(branch))
+                if branch.elif_else_clauses.is_empty()
+                    && original_condition_has_unique_jump_target(&branch.test, false)
+                    && match branch.body.last() {
+                        Some(Stmt::Try(cleanup)) => cleanup.handlers.is_empty()
+                            && cleanup.orelse.is_empty() && !cleanup.finalbody.is_empty()
+                            && matches!(cleanup.body.last(), Some(Stmt::Return(_))),
+                        Some(Stmt::For(iterator)) => !iterator.is_async
+                            && suite_terminates_before_constant_folding(&iterator.orelse)
+                            && suite_contains_loop_break(&iterator.body),
+                        _ => false,
+                    })
+                && self.assembler.try_exit_condition_donor().is_some();
             let shared_guarded_match_exit = self.control.loops.guarded_match_try_loop_tail
                 == Some(statement.range)
                 && self.control.in_loop_tail_without_nested_cleanup()
@@ -30448,7 +30475,10 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .prepare_no_location_block_for_inlining(normal_exit);
             }
-            if shared_conditional_exit || unlocated_false_yield_exit || shared_loop_condition_exit {
+            if (shared_conditional_exit && !detached_guard_exit)
+                || unlocated_false_yield_exit
+                || shared_loop_condition_exit
+            {
                 // Preserve the original shared jump's missing location while allowing
                 // copied exits to inherit the location of their own predecessor.
                 self.assembler.preserve_shared_jump_no_location(normal_exit);
