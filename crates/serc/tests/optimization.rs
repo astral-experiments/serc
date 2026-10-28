@@ -15755,6 +15755,31 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn manager_suppression_replays_nested_normal_try_exits() {
+    let source = r"
+def choose(manager):
+    try:
+        try:
+            with manager as value:
+                return 1
+        except ValueError:
+            pass
+    except RuntimeError:
+        pass
+    return None
+
+def one_cleanup(manager):
+    try:
+        with manager as value:
+            return 1
+    except ValueError:
+        pass
+    return None
+";
+    assert_matches_cpython(source, "manager_suppression_nested_exits.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
