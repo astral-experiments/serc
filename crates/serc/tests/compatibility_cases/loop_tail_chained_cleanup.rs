@@ -1,6 +1,18 @@
 use crate::common;
 
 #[test]
+fn comparison_cleanup_keeps_its_forward_jump_to_a_while_else_pass() {
+    let source = r"def scan(items, value):
+    while items:
+        if 0 <= value < 10:
+            record(value)
+        else:
+            pass
+";
+    common::assert_matches_cpython_marshal(source, "while_comparison_else_pass.py");
+}
+
+#[test]
 fn matches_cpython_loop_tail_negated_chained_cleanup() {
     for header in ["for value in items:", "while ready():"] {
         for condition in [
