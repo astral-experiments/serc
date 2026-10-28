@@ -15,6 +15,47 @@ use serc::{
 };
 
 #[test]
+fn a_guard_can_locate_a_surviving_normal_try_exit() {
+    for continuation in ["notify()", "return ready"] {
+        let source = format!(
+            "async def receive(ready):
+    try:
+        if ready:
+            try:
+                return await read()
+            finally:
+                await release()
+    except ValueError:
+        pass
+    try:
+        notify()
+    except ValueError:
+        pass
+
+def scan(ready, items):
+    try:
+        prepare()
+    except ValueError:
+        pass
+    else:
+        if ready:
+            for item in items:
+                try:
+                    consume(item)
+                except LookupError:
+                    pass
+                else:
+                    break
+            else:
+                raise KeyError(ready)
+    {continuation}
+"
+        );
+        assert_matches_cpython(&source, "guarded_try_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
