@@ -15,6 +15,18 @@ use serc::{
 };
 
 #[test]
+fn a_returning_finalizer_copies_the_call_after_a_conditional_argument() {
+    let source = r"def run(enabled, saved, value, flag):
+    if enabled:
+        try:
+            return saved
+        finally:
+            finish(arg=value if flag else None)
+";
+    assert_matches_cpython(source, "returning_finalizer_call.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
