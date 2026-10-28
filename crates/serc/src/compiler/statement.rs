@@ -42627,19 +42627,17 @@ impl<'source> Compiler<'source> {
             (self.context.python_version <= crate::PythonVersion::Py313
                 || (remaining.is_empty()
                     && cleanup_join.is_some()
-                    && body.last().is_some_and(|part| {
-                        let inner = match part {
-                            Stmt::Try(statement)
-                                if !statement.is_star && statement.finalbody.is_empty() =>
-                            {
-                                &statement.body
-                            }
-                            Stmt::With(manager) => &manager.body,
-                            _ => return false,
-                        };
-                        // Line resolution still sees the normal edge of a loop
-                        // that becomes infinite only after constant folding.
-                        !suite_terminates(inner) || suite_terminates_before_constant_folding(inner)
+                    && body.last().is_some_and(|part| match part {
+                        Stmt::Try(statement)
+                            if !statement.is_star && statement.finalbody.is_empty() =>
+                        {
+                            !manager_fallthrough_removed_by_folding(&statement.body)
+                                && !manager_fallthrough_removed_by_folding(&statement.orelse)
+                        }
+                        Stmt::With(manager) => {
+                            !manager_fallthrough_removed_by_folding(&manager.body)
+                        }
+                        _ => false,
                     })))
             .then_some(WithBodyExitNoop::ConvertedPopBlock)
         });
@@ -45236,6 +45234,32 @@ fn with_chained_manager_exit_location(
         }
     }
     location
+}
+
+// A cold handler or suppression edge cannot donate a line to the manager POP
+// if a second normal edge was present until branch folding.
+fn manager_fallthrough_removed_by_folding(body: &[Stmt]) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| manager_fallthrough_removed_by_folding(body));
+    }
+    (suite_terminates(body) && !suite_terminates_before_constant_folding(body))
+        || body.iter().any(|part| match part {
+            Stmt::Assert(assertion) => early_condition_truthiness(&assertion.test) == Some(false),
+            Stmt::Try(statement)
+                if !statement.is_star
+                    && !suite_any_statement(&statement.finalbody, |part| {
+                        matches!(part, Stmt::Return(_) | Stmt::Break(_) | Stmt::Continue(_))
+                    }) =>
+            {
+                statement.handlers.iter().all(|handler| {
+                    handler.as_except_handler().is_some_and(|handler| {
+                        suite_terminates_before_constant_folding(&handler.body)
+                    })
+                }) && (manager_fallthrough_removed_by_folding(&statement.body)
+                    || manager_fallthrough_removed_by_folding(&statement.orelse))
+            }
+            _ => false,
+        })
 }
 
 // These source exits reach a distinct manager POP after the cold COPY/POP_EXCEPT/
