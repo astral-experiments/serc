@@ -32524,6 +32524,16 @@ impl<'source> Compiler<'source> {
                                 && suite_contains_loop_break(&loop_.body)
                                 && !suite_contains_loop_break_with_finally(&loop_.body)))
                 && self.assembler.at_original_authored_break_join();
+            // An exhausted while-else falls through to the same unlocated cleanup
+            // that each authored break can copy with its own source position.
+            let handler_has_loop_else_break_cleanup = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && handler.name.is_none()
+                && !terminal
+                && matches!(handler.body.last(), Some(Stmt::While(tail)) if !tail.orelse.is_empty())
+                && self
+                    .assembler
+                    .at_original_while_else_handler_break_join((base_depth + 1).cast_unsigned());
             let handler_ends_with_runtime_while_break_cleanup =
                 handler_has_runtime_while_break_cleanup
                     && handler.name.is_none()
@@ -32706,6 +32716,7 @@ impl<'source> Compiler<'source> {
                 || handler_has_raising_while_break_cleanup
                 || handler_has_original_conditional_loop_join
                 || handler_has_guarded_for_break_join
+                || handler_has_loop_else_break_cleanup
                 || handler_has_nested_else_loop_cleanup
                 || handler_ends_with_named_conditional_cleanup
                 || handler_ends_with_loop_tail_join

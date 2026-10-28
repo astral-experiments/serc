@@ -25977,3 +25977,30 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn while_else_breaks_copy_the_enclosing_handler_exit() {
+    for exhaustion in ["", "        else:\n            finish()\n"] {
+        let source = format!(
+            r"def process(ready, value):
+    try:
+        work()
+    except LookupError:
+        while ready:
+            try:
+                work()
+            except ValueError:
+                recover()
+            else:
+                break
+{exhaustion}    use(value)
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "while_else.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}

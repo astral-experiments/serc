@@ -2302,6 +2302,40 @@ impl Assembler {
         })
     }
 
+    /// A while-else footer can fall through beside one or more authored break exits.
+    pub(crate) fn at_original_while_else_handler_break_join(&self, depth: u32) -> bool {
+        let items = self.linear_items();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
+        if labels.is_empty() || self.join_labels_have_authored_location(&labels) {
+            return false;
+        }
+        let mut has_break = false;
+        for jump in items
+            .iter()
+            .filter_map(Item::as_instruction)
+            .filter(|record| {
+                record
+                    .jump_target()
+                    .is_some_and(|target| labels.contains(&target))
+            })
+        {
+            if jump.opcode != JUMP_FORWARD
+                || !jump.fusion_policy.is_authored_break()
+                || jump.jump_policy.retained_nop() != ir::RetainedJumpNop::DirectTarget
+                || !jump.jump_policy.inline_small_exit()
+                || jump.pre_fold_extra_instructions() != 1
+                || jump.local_policy.hidden_exception_owner_slots() != 0
+                || jump.no_location_policy.preserves_location()
+                || jump.location.line < 0
+                || jump.depth_after() != Some(depth)
+            {
+                return false;
+            }
+            has_break = true;
+        }
+        has_break
+    }
+
     /// Certifies the empty footer shared by a while break and its final else condition.
     ///
     /// The break owns one original NOP slot; the separate false edge owns none. Keeping
