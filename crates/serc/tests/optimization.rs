@@ -15755,6 +15755,23 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn final_else_supplies_the_normal_finalizer_jump_before_manager_cleanup() {
+    let source = r"def finish(manager, first, second):
+    with manager as resource:
+        try:
+            work(resource)
+        finally:
+            if first:
+                pass
+            elif second:
+                other()
+            else:
+                from .helpers import done
+";
+    assert_matches_cpython(source, "manager_final_else.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
