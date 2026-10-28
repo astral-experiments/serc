@@ -35,6 +35,22 @@ fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
 }
 
 #[test]
+fn finally_guard_reuses_the_protected_prefix_of_a_constant_return() {
+    let source = r"def write(record):
+    try:
+        begin(record)
+        append(record)
+        flush(record)
+        commit(record)
+        return 0
+    finally:
+        if record is not None:
+            record.close()
+";
+    assert_matches_cpython(source, "return_guard.py", &LEVELS);
+}
+
+#[test]
 fn nested_finally_guard_inherits_the_preceding_calls_handler() {
     let source = r"def run(group):
     try:
