@@ -2365,12 +2365,22 @@ impl Assembler {
     /// An iterator's exhaustion arm may fall through here as well. It does not locate
     /// the artificial handler cleanup before that cleanup is copied onto break edges.
     pub(crate) fn at_original_authored_break_join(&self) -> bool {
+        self.at_original_break_join(false)
+    }
+
+    /// A folded outer guard may alias the live iterator exit without removing
+    /// the authored break that independently targets that exit.
+    pub(crate) fn at_original_break_join(&self, folded_guard: bool) -> bool {
         let items = self.linear_items();
         let labels = trailing_labels(items).collect::<Vec<_>>();
+        let folded_guard_label = match labels.as_slice() {
+            [guard, _] if folded_guard => Some(*guard),
+            _ => None,
+        };
         if labels.is_empty()
             || self.join_labels_have_authored_location(&labels)
             || labels.iter().any(|label| {
-                self.folded_away_condition_targets.contains(label)
+                (Some(*label) != folded_guard_label && self.folded_away_condition_targets.contains(label))
                     || self.folded_away_loop_else_targets.contains(label)
             })
         {
@@ -2387,6 +2397,7 @@ impl Assembler {
                     && instruction.local_policy.hidden_exception_owner_slots() == 0
                     && matches!(instruction.operand(), Operand::Forward(label)
                         if labels.contains(&label)
+                            && !self.folded_away_condition_targets.contains(&label)
                             && self.exception_owner_provenance.source_boundaries.contains(&label)
                             && self.exception_owner_provenance.block_boundaries.contains(&label)))
         })

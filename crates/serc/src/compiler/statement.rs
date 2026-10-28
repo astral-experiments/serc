@@ -34551,8 +34551,8 @@ impl<'source> Compiler<'source> {
                             if !loop_.is_async
                                 && loop_.orelse.is_empty()
                                 && suite_contains_loop_break(&loop_.body)
-                                && !suite_contains_loop_break_with_finally(&loop_.body)))
-                && self.assembler.at_original_authored_break_join();
+                                && !suite_contains_loop_break_with_finally(&loop_.body))
+                        && self.assembler.at_original_break_join(early_condition_truthiness(&tail.test) == Some(true)));
             // Exit copying gives the handler's POP_EXCEPT the span of the break or
             // of the loop condition, depending on which edge entered the cleanup.
             let copied_while_break_return = self.context.python_version
