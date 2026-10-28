@@ -1254,6 +1254,27 @@ fn async_iterator_exhaustion_keeps_copied_branch_exit() {
 }
 
 #[test]
+fn a_break_through_nested_try_exits_reaches_the_finalizer() {
+    let source = r"def drain(stream, items, ready):
+    try:
+        try:
+            while True:
+                if ready:
+                    break
+                for item in items:
+                    pass
+        except ValueError:
+            raise
+    except RuntimeError as error:
+        pass
+    finally:
+        stream.close()
+    stream.flush()
+";
+    assert_matches_cpython(source, "compound_try_break_exit.py", &LEVELS);
+}
+
+#[test]
 fn an_authored_loop_break_reaches_the_normal_finalizer_load() {
     let source = "async def poll(ready):\n    local = open_resource()\n    try:\n        if first():\n            while True:\n                if ready:\n                    break\n        elif second():\n            pass\n    except ValueError:\n        pass\n    finally:\n        await local.finish()\n";
     for source in [

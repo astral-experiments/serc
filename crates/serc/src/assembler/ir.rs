@@ -1789,6 +1789,8 @@ pub(super) struct AuthoredFinallyBreakOrigins {
 pub(super) struct AuthoredFinallyBreakEntry {
     pub(super) original_source: Label,
     pub(super) target: Label,
+    /// The destination is the original normal exit of a compound try.
+    pub(super) compound_exit: bool,
 }
 
 pub(super) type AuthoredFinallyBreakEntries = FxHashMap<Label, AuthoredFinallyBreakEntry>;

@@ -5245,6 +5245,7 @@ impl OptimizationPipeline {
                     graph,
                     &self.exception_owner_provenance.block_boundaries,
                     &mut self.borrow_authored_finally_break_origins,
+                    &self.exception_owner_provenance.compound_try_owner_exits,
                 );
             if !self.borrow_unreachable_blocks.is_empty() {
                 self.borrow_pre_copy_jump_entries =
@@ -5338,6 +5339,7 @@ impl OptimizationPipeline {
                 graph,
                 &self.exception_owner_provenance.block_boundaries,
                 &mut self.borrow_authored_finally_break_origins,
+                &self.exception_owner_provenance.compound_try_owner_exits,
             );
         if !self.borrow_unreachable_blocks.is_empty() {
             // These are still the pre-copy blocks, including labels just assigned to
