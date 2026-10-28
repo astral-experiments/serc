@@ -14195,13 +14195,38 @@ impl Assembler {
         self.record_copied_guard_cleanup(pop_item, ordinary_pops, nested_named_handler, None);
     }
 
+    /// Captures the saved-value manager cleanup before a copied attribute comparison.
+    pub(crate) fn record_manager_comparison_guard(
+        &mut self,
+        pop: usize,
+        managers: usize,
+        ordinary: usize,
+        handler_pops: usize,
+    ) {
+        let Some(records) = Self::saved_manager_cleanups(&self.linear_items()[..pop], managers)
+        else {
+            return;
+        };
+        let cleanup = exception_owners::ReturnGuardManagers {
+            records,
+            following_pops: ordinary,
+            named_handler: handler_pops != 0,
+        };
+        self.record_copied_guard_cleanup(
+            pop,
+            managers + ordinary + handler_pops,
+            false,
+            Some(cleanup),
+        );
+    }
+
     /// Captures a copied return guard and its optional manager exit call.
     fn record_copied_guard_cleanup(
         &mut self,
         pop_item: usize,
         ordinary_pops: usize,
         nested_named_handler: bool,
-        manager_call: Option<Instruction>,
+        manager_cleanup: Option<exception_owners::ReturnGuardManagers>,
     ) {
         let items = self.linear_items();
         let mut preceding = items[..pop_item]
@@ -14254,7 +14279,7 @@ impl Assembler {
             return;
         }
         let mut guard = Vec::new();
-        for record in records.take(5) {
+        for record in records.take(6) {
             guard.push(record);
             if record.opcode == NOT_TAKEN {
                 break;
@@ -14263,8 +14288,16 @@ impl Assembler {
         let [load, operands @ .., condition, marker] = guard.as_slice() else {
             return;
         };
-        if !(matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
-            || (manager_call.is_some() && load.opcode == LOAD_GLOBAL))
+        let compared_attribute = matches!(operands, [namespace, attr, compare]
+            if namespace.opcode == LOAD_GLOBAL && namespace.value_argument().is_some_and(|arg| arg & 1 == 0)
+                && attr.opcode == crate::target::opcodes::LOAD_ATTR && attr.value_argument().is_some_and(|arg| arg & 1 == 0)
+                && compare.opcode == COMPARE_OP && compare.value_argument().is_some_and(|arg| arg & 16 != 0));
+        if manager_cleanup
+            .as_ref()
+            .is_some_and(|cleanup| cleanup.records.len() > 7)
+            != compared_attribute
+            || !(matches!(load.opcode, LOAD_FAST | crate::target::opcodes::LOAD_DEREF)
+                || (manager_cleanup.is_some() && load.opcode == LOAD_GLOBAL))
             || load.local_policy.hidden_exception_owner_slots() != 0
             || marker.opcode != NOT_TAKEN
             || condition.forward_target().is_none()
@@ -14272,7 +14305,8 @@ impl Assembler {
             || !(matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
                 && operands.is_empty()
                 || matches!(condition.opcode, POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE)
-                    && (matches!(operands, [to_bool] if to_bool.opcode==TO_BOOL)
+                    && (compared_attribute
+                        || matches!(operands, [to_bool] if to_bool.opcode==TO_BOOL)
                         || matches!(operands, [value, compare] if matches!(value.opcode, LOAD_CONST | crate::target::opcodes::LOAD_SMALL_INT)
                             && compare.opcode==COMPARE_OP && compare.value_argument().is_some_and(|arg| arg & 16!=0))))
         {
@@ -14284,7 +14318,7 @@ impl Assembler {
         self.exception_owner_provenance.copied_return_guards.push(
             exception_owners::CopiedReturnGuard {
                 cleanup,
-                manager_call,
+                manager_cleanup,
                 operands: guard,
                 condition,
                 marker,
@@ -14342,6 +14376,36 @@ impl Assembler {
             .insert(entry, try_pops);
     }
 
+    /// Collects complete synchronous manager cleanups that preserve a return value.
+    fn saved_manager_cleanups(before: &[Item], count: usize) -> Option<Vec<Instruction>> {
+        use crate::target::opcodes::{CALL, LOAD_CONST, SWAP};
+        let mut records: Vec<_> = before
+            .iter()
+            .rev()
+            .filter_map(Item::as_instruction)
+            .take(7 * count)
+            .copied()
+            .collect();
+        records.reverse();
+        (count > 0
+            && records.len() == 7 * count
+            && records.as_chunks::<7>().0.iter().all(|cleanup| {
+                cleanup.iter().map(|record| record.opcode).eq([
+                    SWAP, SWAP, LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP,
+                ]) && cleanup[0].value_argument() == Some(3)
+                    && cleanup[1].value_argument() == Some(2)
+                    && cleanup[2].operand() == cleanup[3].operand()
+                    && cleanup[3].operand() == cleanup[4].operand()
+                    && cleanup[5].value_argument() == Some(3)
+                    && cleanup.iter().all(|record| {
+                        record.local_policy.hidden_exception_owner_slots() == 0
+                            && record.pre_fold_extra_instructions() == 0
+                            && record.exception_policy() == ExceptionPolicy::NoneUnchanged
+                    })
+            }))
+        .then_some(records)
+    }
+
     /// Captures the actual manager unwind and first None test of its copied finally.
     pub(crate) fn record_copied_manager_return_compaction(
         &mut self,
@@ -14351,43 +14415,15 @@ impl Assembler {
         retained_outer_handler: Option<Label>,
         named_handler: bool,
     ) {
-        use crate::target::opcodes::{CALL, DELETE_FAST, LOAD_CONST, LOAD_DEREF, STORE_FAST, SWAP};
+        use crate::target::opcodes::{DELETE_FAST, LOAD_CONST, LOAD_DEREF, STORE_FAST, SWAP};
 
         let items = self.linear_items();
         let Some(before) = items.get(..pop_item) else {
             return;
         };
-        if manager_count == 0 {
+        let Some(records) = Self::saved_manager_cleanups(before, manager_count) else {
             return;
-        }
-        let mut records = before
-            .iter()
-            .rev()
-            .filter_map(|item| match item {
-                Item::Instruction(instruction) => Some(*instruction),
-                Item::Label(_) => None,
-            })
-            .take(7 * manager_count)
-            .collect::<Vec<_>>();
-        records.reverse();
-        if records.len() != 7 * manager_count
-            || records.as_chunks::<7>().0.iter().any(|cleanup| {
-                cleanup.iter().map(|instruction| instruction.opcode).ne([
-                    SWAP, SWAP, LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP,
-                ]) || cleanup[0].value_argument() != Some(3)
-                    || cleanup[1].value_argument() != Some(2)
-                    || cleanup[2].operand() != cleanup[3].operand()
-                    || cleanup[3].operand() != cleanup[4].operand()
-                    || cleanup[5].value_argument() != Some(3)
-                    || cleanup.iter().any(|instruction| {
-                        instruction.local_policy.hidden_exception_owner_slots() != 0
-                            || instruction.pre_fold_extra_instructions() != 0
-                            || instruction.exception_policy() != ExceptionPolicy::NoneUnchanged
-                    })
-            })
-        {
-            return;
-        }
+        };
         let (cleanup, earlier_cleanups) = records
             .as_chunks::<7>()
             .0
@@ -14462,7 +14498,16 @@ impl Assembler {
             && !named_handler
         {
             // The manager POP precedes all seven records of the saved-return unwind.
-            self.record_copied_guard_cleanup(pop_item, 1, false, Some(cleanup[5]));
+            self.record_copied_guard_cleanup(
+                pop_item,
+                1,
+                false,
+                Some(exception_owners::ReturnGuardManagers {
+                    records: cleanup.to_vec(),
+                    following_pops: 0,
+                    named_handler: false,
+                }),
+            );
             return;
         }
         let (to_bool, condition) = if condition.opcode == TO_BOOL {
