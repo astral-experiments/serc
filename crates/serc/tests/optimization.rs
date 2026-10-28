@@ -25995,3 +25995,17 @@ fn async_iterator_exhaustion_keeps_its_line_before_an_async_with_exit() {
         &[PythonVersion::Py314, PythonVersion::Py315],
     );
 }
+
+#[test]
+fn async_iterator_exhaustion_falls_through_a_suspending_alternative() {
+    let source = r"async def stream(manager, items, enabled):
+    async with manager:
+        if enabled:
+            async for item in items:
+                yield item
+        else:
+            error = await failure()
+            raise error
+";
+    assert_matches_cpython(source, "suspending_iterator_alternative.py", &LEVELS);
+}

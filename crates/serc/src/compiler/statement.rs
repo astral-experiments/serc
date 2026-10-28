@@ -44922,14 +44922,18 @@ fn async_with_iterator_exit_location(body: &[Stmt]) -> Option<TextRange> {
     if otherwise.test.is_some() || !suite_has_linear_raise_exit(&otherwise.body) {
         return None;
     }
-    let mut continuing = if_suites(branch).filter(|arm| !suite_has_linear_raise_exit(arm));
-    let Stmt::For(iterator) = continuing.next()?.last()? else {
+    let mut arms = if_suites(branch);
+    let Stmt::For(iterator) = arms.find(|arm| !suite_has_linear_raise_exit(arm))?.last()? else {
         return None;
     };
     (iterator.is_async
         && iterator.orelse.is_empty()
         && !suite_contains_loop_break(&iterator.body)
-        && continuing.next().is_none())
+        // A later suspension leaves the raising continuation in place. The
+        // exhausted iterator then falls through directly to the manager exit.
+        && arms.all(|arm| {
+            suite_has_linear_raise_exit(arm) && !suite_contains_suspending_expression(arm)
+        }))
     .then(|| iterator.iter.range())
 }
 
