@@ -677,6 +677,14 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
         };
         first = local;
     }
+    instructions_raise_local(first, instructions)
+}
+
+/// Checks the load of a local exception, its optional cause and the matching raise operand.
+fn instructions_raise_local<'a>(
+    first: &Instruction,
+    mut instructions: impl Iterator<Item = &'a Instruction>,
+) -> bool {
     let visible = |instruction: &Instruction| {
         instruction.pre_fold_extra_instructions() == 0
             && instruction.local_policy.hidden_exception_owner_slots() == 0
@@ -985,8 +993,15 @@ fn represented_setup_nops(
             let mut expected =
                 Instruction::new(NOP, Operand::Value(0), location, Some(nop.depth_after()?));
             expected.set_exception_policy(ExceptionPolicy::EXCLUDE_ALWAYS);
+            // A try/finally can also start and end in one short local raise.
+            // Its retained NOP represents the SETUP before those loads.
+            let raises_local = blocks.len() == 2
+                && index == 1
+                && instructions[index..]
+                    .split_first()
+                    .is_some_and(|(first, rest)| instructions_raise_local(first, rest.iter()));
             if location.line < 0
-                || !provenance.ordinary_try_setups.contains_key(&setup)
+                || !(provenance.ordinary_try_setups.contains_key(&setup) || raises_local)
                 || *nop != expected
                 || provenance
                     .setups

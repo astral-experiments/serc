@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn branch_copies_the_setup_for_a_protected_raise_with_a_cause() {
+    let source = r"def dispatch(err, cause, replacement, flag):
+    if flag:
+        err = ValueError
+    else:
+        err = replacement
+    try:
+        raise err from cause
+    finally:
+        cleanup()
+";
+    assert_matches_cpython(source, "protected_raise.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
