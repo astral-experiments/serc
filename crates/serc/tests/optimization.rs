@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn captured_handler_names_keep_the_cleanup_copy_order() {
+    let source = r"def inspect(flag, other):
+    try:
+        start()
+    except ValueError as error:
+        if matches(lambda: error):
+            if flag:
+                work()
+            else:
+                pass
+        elif other:
+            recover()
+        else:
+            raise
+    return True
+";
+    assert_matches_cpython(source, "captured_handler_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
