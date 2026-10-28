@@ -15,6 +15,27 @@ use serc::{
 };
 
 #[test]
+fn a_completed_call_enters_the_finalizer_at_the_inner_join() {
+    let source = r"def process(value, owner, ready):
+    try:
+        try:
+            if ready:
+                if done():
+                    return
+                owner.send(value)
+            else:
+                state = {}
+        except KeyError as error:
+            recover(error)
+    except OSError:
+        report()
+    finally:
+        consume(value)
+";
+    assert_matches_cpython(source, "completed_call_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
