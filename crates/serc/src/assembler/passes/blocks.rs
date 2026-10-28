@@ -6352,22 +6352,34 @@ impl OptimizationPipeline {
                 };
             let copy_iterator_return = copied_iterators >= 2
                 || (copied_iterators == 1 && self.python_version == crate::PythonVersion::Py314);
-            // The handler's POP_BLOCK splits SWAP from POP_EXCEPT and RETURN.
-            // The unlocated return array can still be copied onto a finalizer guard.
+            // A handler's POP_BLOCK can split a saved return value or separate two
+            // handler pops. Each guard entering the unlocated exit supplies a copy.
             let split_handler_return = self.python_version == crate::PythonVersion::Py314
                 && target_chain_end > target_position
                 && target_has_no_location
                 && target_terminal_opcode == Some(RETURN_VALUE)
-                && target_blocks
-                    .iter()
-                    .flat_map(|block| graph[*block].items())
-                    .filter_map(Item::as_instruction)
-                    .map(|record| (record.opcode, record.operand()))
-                    .eq([
-                        (SWAP, Operand::Value(2)),
-                        (POP_EXCEPT, Operand::Value(0)),
-                        (RETURN_VALUE, Operand::Value(0)),
-                    ]);
+                && {
+                    let operations = target_blocks
+                        .iter()
+                        .flat_map(|block| graph[*block].items())
+                        .filter_map(Item::as_instruction);
+                    let saved_value = operations
+                        .clone()
+                        .map(|record| (record.opcode, record.operand()))
+                        .eq([
+                            (SWAP, Operand::Value(2)),
+                            (POP_EXCEPT, Operand::Value(0)),
+                            (RETURN_VALUE, Operand::Value(0)),
+                        ]);
+                    let mut opcodes = operations.map(|record| record.opcode);
+                    saved_value
+                        || (source_has_fallthrough
+                            && opcodes.next() == Some(POP_EXCEPT)
+                            && opcodes.next() == Some(POP_EXCEPT)
+                            && opcodes
+                                .skip_while(|&opcode| opcode == POP_EXCEPT)
+                                .eq([LOAD_CONST, RETURN_VALUE]))
+                };
             let target_allows_no_location_block_inlining = copy_iterator_return
                 || split_handler_return
                 || graph[target_exit]

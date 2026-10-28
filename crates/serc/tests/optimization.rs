@@ -25977,3 +25977,18 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn nested_handler_guards_copy_the_shared_return() {
+    let source = r"def run(first, second, third):
+    try:
+        load()
+    except OSError:
+        try:
+            recover()
+        except ValueError:
+            if first and (second or third):
+                raise LookupError
+";
+    assert_matches_cpython(source, "shared_handler_return.py", &LEVELS);
+}
