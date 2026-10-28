@@ -25977,3 +25977,21 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn nested_handler_exits_copy_the_shared_constant_finalizer_return() {
+    let source = r"def recover():
+    try:
+        work()
+    except ValueError as error:
+        report(error)
+    else:
+        try:
+            commit()
+        except KeyError as error:
+            report(error)
+    finally:
+        return None
+";
+    assert_matches_cpython(source, "nested_handler_finalizer_return.py", &LEVELS);
+}
