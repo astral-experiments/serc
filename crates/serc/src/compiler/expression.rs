@@ -2660,9 +2660,10 @@ impl Compiler<'_> {
             && let Some(constant) = self.source_aware_fold_constant(origin)
         {
             self.pre_register_expression_names(expression)?;
-            // Code generation reserves preceding operands before the flowgraph folds
-            // their jumps. A later use can keep those original constant slots alive.
-            for value in &boolean.values {
+            // Code generation visits the operands in order before the flowgraph
+            // folds their jumps. A later use can keep a discarded operand's slot.
+            let mut operands = boolean.values.iter();
+            for value in operands.by_ref() {
                 if value.range() == origin.range() {
                     break;
                 }
@@ -2678,6 +2679,9 @@ impl Compiler<'_> {
             }
             self.assembler.set_location(origin_location);
             self.emit_folded_constant(origin, constant)?;
+            for value in operands {
+                self.pre_register_discarded_expression(value, None)?;
+            }
             if boolean.values.len() > 1
                 && (boolean.values.len() > 2
                     || boolean
