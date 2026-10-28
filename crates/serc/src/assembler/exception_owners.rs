@@ -746,8 +746,8 @@ impl ExceptionOwnerProvenance {
             visit(&mut record.2);
         }
         for origin in &mut self.copied_handler_cleanups {
-            visit(&mut origin.return_nop);
-            if let Some(instruction) = origin.return_iterator.as_mut() {
+            visit(&mut origin.return_start);
+            for instruction in origin.return_iterator.iter_mut().flatten() {
                 visit(instruction);
             }
             for instruction in &mut origin.instructions {
@@ -1382,13 +1382,13 @@ pub(super) struct CopiedNamedBreakTruthPrefix {
     pub(super) original_condition: Instruction,
 }
 
-/// Original constant-return cleanup, including NULL records omitted under a manager.
+/// Original return cleanup, including omitted POPs before the handler exit.
 #[derive(Debug)]
 pub(super) struct CopiedHandlerCleanup {
     pub(super) start: Label,
     pub(super) end: Label,
-    pub(super) return_nop: Instruction,
-    pub(super) return_iterator: Option<Instruction>,
+    pub(super) return_start: Instruction,
+    pub(super) return_iterator: Option<Vec<Instruction>>,
     pub(super) instructions: Vec<Instruction>,
     pub(super) missing_null_pops: usize,
     pub(super) removed_prefix_slots: u16,
@@ -5835,8 +5835,8 @@ impl LayoutAssembler {
             || origin.assignment_pop.is_some()
             || origin.continued_call.is_some()
             || origin.continued_attribute_none.is_some()
-            || origin.return_nop.opcode != NOP
-            || origin.return_nop.location != origin.instructions[0].location
+            || origin.return_start.opcode != NOP
+            || origin.return_start.location != origin.instructions[0].location
             || [origin.start, origin.end].into_iter().any(|label| {
                 provenance.retired_normal_try_copy_labels.contains(&label)
                     || provenance.normal_try_copy_blocks.contains(&label)
@@ -7328,18 +7328,21 @@ impl LayoutAssembler {
                             || tail.insertions != 0
                             || tail.late_removals != 0
                             || tail.post_compaction_fusions != 0
-                            || original.return_nop.opcode != NOP
-                            || original.return_nop.location != original.instructions[0].location
+                            || (original.return_start.opcode != NOP
+                                && original.return_iterator.is_none())
+                            || original.return_start.location != original.instructions[0].location
                         {
                             continue;
                         }
-                        if let Some(mut iterator) = original.return_iterator {
-                            // Only the authored NOP disappears into this exact iterator
-                            // POP_TOP. The captured name-clear records remain unchanged.
-                            iterator.local_policy.add_hidden_exception_owner_slots(1);
-                            if start == 0
-                                || original_array_start > start - 1
-                                || *indexed_instructions[start - 1] != iterator
+                        if let Some(iterator) = &original.return_iterator {
+                            let Some(dispose) = start.checked_sub(iterator.len()) else {
+                                continue;
+                            };
+                            if original_array_start > dispose
+                                || !indexed_instructions[dispose..start]
+                                    .iter()
+                                    .zip(iterator)
+                                    .all(|(actual, expected)| **actual == *expected)
                                 || original.removed_prefix_slots != 0
                                 || original.missing_null_pops != 3
                                 || jump_targets
@@ -7348,7 +7351,7 @@ impl LayoutAssembler {
                                     .chain(&self.exception_owner_provenance.block_boundaries)
                                     .any(|label| {
                                         label_positions.get(label).is_some_and(|position| {
-                                            start - 1 < *position && *position < instruction_index
+                                            dispose < *position && *position < instruction_index
                                         })
                                     })
                             {
@@ -12034,9 +12037,9 @@ impl LayoutAssembler {
                             && instruction_index == end + 2
                             && origin.instructions[0].opcode == crate::target::opcodes::POP_EXCEPT
                             && origin.removed_prefix_slots == 2
-                            && origin.return_nop.exception_policy()
+                            && origin.return_start.exception_policy()
                                 == super::ExceptionPolicy::NoneUnchanged
-                            && !origin.return_nop.fusion_policy.is_converted_pop_block()
+                            && !origin.return_start.fusion_policy.is_converted_pop_block()
                             && let Some((pop_end, pop_tail, width @ (1 | 2))) = ended_pop_slot
                             && pop_end == end
                             && pop_tail.early_removals == end_removed
@@ -12202,8 +12205,8 @@ impl LayoutAssembler {
                                     // Both handler forms retain an authenticated cleanup prefix.
                                     // A named handler also contributes two omitted NULL POPs;
                                     // its name cleanup remains four distinct live records.
-                                    // An inner iterator consumes the authored return NOP,
-                                    // while its ordinary try and the named handler contribute
+                                    // The inner iterator is discarded before the name clear.
+                                    // Its ordinary try and the named handler contribute
                                     // three omitted NULL POPs before the unchanged name cleanup.
                                     // The original capture already revalidated that iterator and
                                     // every cleanup record at this exact start/end pair.
@@ -12449,7 +12452,7 @@ impl LayoutAssembler {
                                 && copied_handler_origin.return_iterator.is_none()
                                 && copied_handler_origin.assignment_pop.is_none()
                                 && indexed_instructions[end].location
-                                    == copied_handler_origin.return_nop.location
+                                    == copied_handler_origin.return_start.location
                                 && self
                                     .exception_owner_provenance
                                     .copied_handler_cleanups

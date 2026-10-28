@@ -17172,13 +17172,6 @@ impl Assembler {
         let named = named_handlers != 0;
         let copied_assignment = assignment_pop_boundary.is_some();
         let items = self.linear_items();
-        let Some(Item::Instruction(return_nop)) = items.get(return_item) else {
-            return;
-        };
-        if return_nop.opcode != NOP {
-            return;
-        }
-        let return_nop = *return_nop;
         let Some(start_at) = items.iter().position(|item| *item == Item::Label(start)) else {
             return;
         };
@@ -17192,30 +17185,57 @@ impl Assembler {
             .iter()
             .filter_map(Item::as_instruction)
             .collect::<Vec<_>>();
+        let Some(&&return_start) = prefix.first() else {
+            return;
+        };
+        if !(return_start.opcode == NOP
+            && (inner_iterator || items.get(return_item) == Some(&Item::Instruction(return_start)))
+            || inner_iterator && return_start.opcode == SWAP)
+        {
+            return;
+        }
         let return_iterator = if inner_iterator {
-            let [authored, iterator] = prefix.as_slice() else {
+            let [first, discard, rest @ ..] = prefix.as_slice() else {
                 return;
+            };
+            if discard.opcode != POP_TOP
+                || discard.value_argument() != Some(0)
+                || first.depth_after().and_then(|depth| depth.checked_sub(1))
+                    != discard.depth_after()
+            {
+                return;
+            }
+            let retained = match rest {
+                [] if first.opcode == NOP && !first.fusion_policy.is_converted_pop_block() => {
+                    // The authored return NOP compacts into the iterator discard.
+                    let mut retained = **discard;
+                    retained.local_policy.add_hidden_exception_owner_slots(1);
+                    vec![retained]
+                }
+                [restore]
+                    if first.opcode == SWAP
+                        && first.value_argument() == Some(2)
+                        && restore.opcode == SWAP
+                        && restore.value_argument() == Some(2)
+                        && restore.depth_after() == discard.depth_after() =>
+                {
+                    vec![**first, **discard, **restore]
+                }
+                _ => return,
             };
             if !named
                 || copied_assignment
-                || authored.fusion_policy.is_converted_pop_block()
-                || authored.location.line < 0
-                || iterator.opcode != POP_TOP
-                || iterator.value_argument() != Some(0)
-                || iterator.location != authored.location
-                || authored
-                    .depth_after()
-                    .and_then(|depth| depth.checked_sub(1))
-                    != iterator.depth_after()
-                || [authored, iterator].into_iter().any(|record| {
-                    record.exception_policy() != ExceptionPolicy::NoneUnchanged
+                || return_start.location.line < 0
+                || prefix.iter().any(|record| {
+                    record.location != return_start.location
+                        || record.exception_policy() != ExceptionPolicy::NoneUnchanged
                         || record.local_policy.hidden_exception_owner_slots() != 0
                         || record.pre_fold_extra_instructions() != 0
                 })
             {
                 return;
             }
-            Some(**iterator)
+            Some(retained)
         } else {
             None
         };
@@ -17227,9 +17247,9 @@ impl Assembler {
             match (named, prefix.as_slice()) {
                 (true, [_]) => (2 * named_handlers, 1),
                 (true, [_, first, second])
-                    if return_nop.exception_policy() == ExceptionPolicy::NoneUnchanged
-                        && return_nop.local_policy.hidden_exception_owner_slots() == 0
-                        && return_nop.pre_fold_extra_instructions() == 0
+                    if return_start.exception_policy() == ExceptionPolicy::NoneUnchanged
+                        && return_start.local_policy.hidden_exception_owner_slots() == 0
+                        && return_start.pre_fold_extra_instructions() == 0
                         && [first, second].into_iter().all(|pop| {
                             pop.opcode == NOP
                                 && pop.value_argument() == Some(0)
@@ -17237,7 +17257,7 @@ impl Assembler {
                                 && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
                                 && pop.local_policy.hidden_exception_owner_slots() == 0
                                 && pop.pre_fold_extra_instructions() == 0
-                                && pop.location == return_nop.location
+                                && pop.location == return_start.location
                         }) =>
                 {
                     (0, 3)
@@ -17275,9 +17295,9 @@ impl Assembler {
                 return;
             };
             if named
-                || return_nop.exception_policy() != ExceptionPolicy::NoneUnchanged
-                || return_nop.local_policy.hidden_exception_owner_slots() != 0
-                || return_nop.pre_fold_extra_instructions() != 0
+                || return_start.exception_policy() != ExceptionPolicy::NoneUnchanged
+                || return_start.local_policy.hidden_exception_owner_slots() != 0
+                || return_start.pre_fold_extra_instructions() != 0
                 || pop.opcode != NOP
                 || pop.value_argument() != Some(0)
                 || !pop.fusion_policy.is_converted_pop_block()
@@ -17323,7 +17343,7 @@ impl Assembler {
             .push(exception_owners::CopiedHandlerCleanup {
                 start,
                 end,
-                return_nop,
+                return_start,
                 return_iterator,
                 instructions,
                 missing_null_pops,

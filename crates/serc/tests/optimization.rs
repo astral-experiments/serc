@@ -13337,6 +13337,29 @@ fn python312_async_iteration_preserves_repeated_conditional_return() {
 }
 
 #[test]
+fn saved_iterator_returns_keep_the_named_cleanup_on_the_finally_guard() {
+    let source = r"def process(items, flag):
+    try:
+        start()
+    except ValueError as error:
+        for item in items:
+            try:
+                return item.close()
+            except KeyError:
+                pass
+    finally:
+        if flag:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "iterator_handler.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn synchronous_iterator_return_keeps_enclosing_try_pop_before_finally() {
     let source = r"async def drain(stream, state):
     try:
