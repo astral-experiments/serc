@@ -25756,6 +25756,33 @@ fn threaded_boolean_siblings_reuse_an_ownerless_jump() {
 }
 
 #[test]
+fn manager_returns_keep_a_nested_handler_setup_outside_its_own_range() {
+    let source = r"def close(manager, flag, active):
+    try:
+        with manager:
+            if active:
+                update()
+            return True
+    except ValueError:
+        pass
+    finally:
+        try:
+            if flag is not None:
+                finish()
+            else:
+                release()
+        except KeyError:
+            pass
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_handler_setup.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn copied_return_guard_reuses_original_call_discard() {
     let source = r"def handle_result(state):
     handle = state

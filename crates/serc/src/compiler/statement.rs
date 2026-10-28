@@ -13184,10 +13184,12 @@ impl<'source> Compiler<'source> {
                                 && handler.finally_end_depth == 0
                                 && handler.try_body_depth == ordinary_pops
                                 && handler.exception_region_depth == ordinary_pops + 1);
+                    // A try with both handlers and a finalizer enters two SETUPs.
+                    // Replay this guard only when it follows a single SETUP.
                     let nested_setup_return = self.context.python_version
                         == crate::PythonVersion::Py314
                         && matches!(finally_context.body.first(), Some(Stmt::Try(inner))
-                            if !inner.is_star && inner.handlers.is_empty() && !inner.finalbody.is_empty()
+                            if !inner.is_star && (inner.handlers.is_empty() || inner.finalbody.is_empty())
                                 && matches!(inner.body.first(),Some(Stmt::If(_))))
                         && !return_is_overridden
                         && context_index == 0
