@@ -19318,6 +19318,32 @@ impl<'source> Compiler<'source> {
                     .iter()
                     .all(|part| self.context.is_elided_statement(part))
         };
+        // A guard in a non-final arm reaches the outer conditional's forward
+        // exit. Keep that exit available to copy onto the guard's false edge
+        // when the arm contains another conditional or a branching expression.
+        let non_final_guard_before_erased_suffix = |outer: &ruff_python_ast::StmtIf| {
+            let is_elided = |part: &Stmt| self.context.is_elided_statement(part);
+            if outer.elif_else_clauses.is_empty() || !outer.body.last().is_some_and(is_elided) {
+                return false;
+            }
+            let Some(Stmt::If(inner)) = outer.body.iter().rev().find(|part| !is_elided(part))
+            else {
+                return false;
+            };
+            inner.elif_else_clauses.is_empty()
+                && !suite_terminates(&inner.body)
+                && inner.body.iter().any(|part| {
+                    !is_elided(part)
+                        && match part {
+                            Stmt::If(_) => true,
+                            Stmt::Assign(assign) => {
+                                expression_contains_inline_branch(&assign.value)
+                            }
+                            Stmt::Expr(expr) => expression_contains_inline_branch(&expr.value),
+                            _ => false,
+                        }
+                })
+        };
         let erased_elif_else = |tail: &ruff_python_ast::StmtIf| {
             !mode.non_final_branch
                 && self.control.in_loop_tail_without_nested_cleanup()
@@ -19346,7 +19372,9 @@ impl<'source> Compiler<'source> {
                 .iter()
                 .any(|statement| self.context.is_elided_statement(statement))
             && ((mode == LoopTailMode::default()
-                && matches!(&body[end], Stmt::If(tail) if !shared_erased_condition_exit(tail))
+                && matches!(&body[end], Stmt::If(tail)
+                    if !shared_erased_condition_exit(tail)
+                        && !non_final_guard_before_erased_suffix(tail))
                 && self.control.reaches_loop_header(restart))
                 || matches!(&body[end], Stmt::While(statement)
                 if statement.orelse.is_empty()
