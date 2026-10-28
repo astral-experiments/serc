@@ -6889,6 +6889,26 @@ impl OptimizationPipeline {
                     Item::Label(_) => item,
                 })
                 .collect::<Vec<_>>();
+            // Once the exit is copied, the predecessor's constant and the copy's
+            // POP_TOP occupy one original instruction array.
+            if self.python_version >= crate::PythonVersion::Py314
+                && inline_small_exit
+                && target_chain_end == target_position
+                && let Some(pop) = copied.iter_mut().find_map(Item::as_instruction_mut)
+                && pop.opcode == POP_TOP
+                && let Some(load) = graph.instructions_mut(source).rev().nth(1)
+                && matches!(
+                    load.opcode,
+                    LOAD_CONST | LOAD_SMALL_INT | LOAD_COMMON_CONSTANT
+                )
+            {
+                let depth = pop.depth_after();
+                for (location, slot) in [(load.location, load), (SourceLocation::NONE, pop)] {
+                    let policy = slot.exception_policy();
+                    *slot = Instruction::new(NOP, Operand::Value(0), location, depth);
+                    slot.set_exception_policy(policy);
+                }
+            }
             if inline_small_exit && let Some(constants) = constants.as_deref_mut() {
                 // Native small-exit copying precedes arithmetic folding. Other
                 // copies reuse already allocated constants; code objects always do.
