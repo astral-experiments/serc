@@ -2500,12 +2500,16 @@ impl<'source> Compiler<'source> {
                 && body[index + 1..]
                     .iter()
                     .all(|part| self.context.is_elided_statement(part));
-            // Erased assertions leave the generator's false edge and the end of
-            // its taken arm as separate implicit returns.
-            let terminal_generator_if_before_elided = has_elided_tail
+            // After trailing assertions disappear, a guard at the end of a
+            // scope branch can still have separate implicit return sites.
+            let copies_erased_guard_returns = (self.context.python_version
+                != crate::PythonVersion::Py313
+                && matches!(self.unit.scope, Scope::Module))
+                || (self.context.python_version >= crate::PythonVersion::Py313
+                    && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == CO_GENERATOR);
+            let terminal_scope_if_before_elided = has_elided_tail
                 && final_expression_becomes_return
-                && self.context.python_version >= crate::PythonVersion::Py313
-                && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == CO_GENERATOR
+                && copies_erased_guard_returns
                 && self.control.statements.in_terminal_if_branch_suite
                 && !inherited_statement_has_following
                 && self.control.loops.contexts.is_empty()
@@ -2532,7 +2536,7 @@ impl<'source> Compiler<'source> {
                 || unprotected_if_before_elided
                 || linear_protected_if_before_elided
                 || finally_if_before_elided
-                || terminal_generator_if_before_elided;
+                || terminal_scope_if_before_elided;
             // An assignment with an inlined comprehension becomes terminal when
             // only removed assertions follow it; retain its target's return span.
             let terminal_assignment_before_elided = has_elided_tail
