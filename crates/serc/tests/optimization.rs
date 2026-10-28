@@ -15755,6 +15755,35 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn nested_match_keeps_a_return_guards_original_success_jump() {
+    for (test, otherwise, continuation) in [
+        ("item", "pass", "return values, fallback, item"),
+        (
+            "item is None",
+            "return None",
+            "try:\n        answer = values[fallback]\n    except IndexError:\n        return None\n    return answer",
+        ),
+    ] {
+        let source = format!(
+            "def choose(values, fallback):
+    match values:
+        case [outer]:
+            match outer:
+                case [item]:
+                    if {test}:
+                        return fallback
+                case _:
+                    {otherwise}
+        case _:
+            {otherwise}
+    {continuation}
+"
+        );
+        assert_matches_cpython(&source, "nested_match_return_guard.py", &LEVELS);
+    }
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
