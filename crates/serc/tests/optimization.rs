@@ -8564,6 +8564,22 @@ fn a_finalizer_guard_keeps_the_following_local_load_owned() {
 }
 
 #[test]
+fn nested_guard_keeps_its_backedge_before_a_discarded_assertion() {
+    let source = r"
+def collect(items, enabled, ready):
+    for item in items:
+        if enabled:
+            if ready:
+                item = (value for value in items)
+            assert item
+        else:
+            item = fallback()
+        assert item
+";
+    assert_matches_cpython(source, "nested_guard_backedge.py", &LEVELS);
+}
+
+#[test]
 fn erased_short_circuit_condition_keeps_the_shared_loop_backedge() {
     let source = r"
 def process(items, left, right):
