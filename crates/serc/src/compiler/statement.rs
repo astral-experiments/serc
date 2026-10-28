@@ -38131,6 +38131,26 @@ impl<'source> Compiler<'source> {
                             && context.finally_end_depth == 0
                             && context.exception_region_depth == 0))
                     && managed_guarded_raise_has_finally_route(statement)));
+        // The inner try can jump directly to the outer finalizer on normal exit,
+        // bypassing the empty block on the guard's false edge.
+        let guarded_cleanup_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && !self.has_active_control_flow_region()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && matches!(statement.body.last(), Some(Stmt::If(guard))
+                if guard.elif_else_clauses.is_empty()
+                    && condition_has_only_runtime_tests(&guard.test)
+                    && !expression_contains_inline_branch(&guard.test)
+                    && matches!(guard.body.last(), Some(Stmt::Try(_)))
+                    && suite_has_fallthrough(&guard.body, false))
+            && (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                || matches!(statement.finalbody.first(), Some(Stmt::If(guard))
+                    if condition_has_only_runtime_tests(&guard.test)
+                        && !expression_contains_inline_branch(&guard.test)));
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -38138,6 +38158,7 @@ impl<'source> Compiler<'source> {
             || managed_runtime_while_return_reaches_finally
             || runtime_retry_break_reaches_finally
             || conditional_body_reaches_finally
+            || guarded_cleanup_reaches_finally
             || coroutine_conditional_store_reaches_finally
             || coroutine_await_recovery_reaches_finally
             || coroutine_guarded_nested_cleanup_entry
