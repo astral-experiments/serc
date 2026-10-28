@@ -385,6 +385,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) borrow_normal_try_exits: Vec<(Label, Instruction)>,
     pub(super) initial_borrow_normal_try_exits: Vec<NormalTryBorrowExit>,
     pub(super) retired_normal_try_exits: Vec<RetiredNormalTryExit>,
+    // Exact excluded jump intervals at the end of a conditional iterator arm.
+    pub(super) conditional_iterator_breaks: Vec<(Label, Label)>,
     // Sole authored break, retired ordinary-try bridge, and intact normal-finally array.
     pub(super) normal_try_break_pop_owners: Vec<NormalTryBreakPopOwner>,
     // Exact final wildcard call/discard or class-pattern failure pops at a normal try exit.
@@ -6723,6 +6725,62 @@ impl LayoutAssembler {
             return None;
         }
         Some(())
+    }
+
+    /// Restores the protected arm jump copied onto a break before its try exit grows.
+    fn restore_conditional_iterator_break_owners(
+        &self,
+        positions: &OwnerLabelPositions,
+        instructions: &[&Instruction],
+        owners: &mut DynamicExceptionOwners,
+    ) {
+        use crate::target::opcodes::{
+            JUMP_FORWARD, LOAD_ATTR, LOAD_DEREF, LOAD_FAST, LOAD_FAST_BORROW, RETURN_VALUE,
+        };
+        for &(start, end) in &self.exception_owner_provenance.conditional_iterator_breaks {
+            let Some(&index) = positions.get(&start) else {
+                continue;
+            };
+            let Some(jump) = instructions.get(index) else {
+                continue;
+            };
+            let Some(&target) = jump
+                .forward_target()
+                .and_then(|label| positions.get(&label))
+            else {
+                continue;
+            };
+            // The normal try exit has a POP_BLOCK and a jump. Copying a three-record
+            // attribute return into it takes it past the four-instruction limit,
+            // leaving the previous arm's protected jump as the break's last record.
+            if positions.get(&end) != Some(&(index + 1))
+                || target <= index
+                || jump.opcode != JUMP_FORWARD
+                || !index.checked_sub(1).is_some_and(|i| {
+                    instructions[i].opcode == POP_TOP && instructions[i].location == jump.location
+                })
+                || !matches!(instructions.get(target..target + 3), Some([load, attr, ret])
+                    if matches!(load.opcode, LOAD_FAST | LOAD_FAST_BORROW | LOAD_DEREF | LOAD_GLOBAL)
+                        && attr.opcode == LOAD_ATTR && ret.opcode == RETURN_VALUE)
+            {
+                continue;
+            }
+            let mut regions = self
+                .exception_regions
+                .iter()
+                .enumerate()
+                .filter(|(_, region)| {
+                    region.end == start && !region.is_scope_fallback && !region.preserve_lasti
+                });
+            if let Some((region, _)) = regions.next()
+                && regions.next().is_none()
+            {
+                owners.insert(
+                    index,
+                    ExceptionOwnerDecision::override_with_region(Some(region)),
+                );
+            }
+        }
     }
 
     /// Replays a retired original try-exit JUMP on its unchanged normal-finally NOP.
@@ -13188,6 +13246,11 @@ impl LayoutAssembler {
                 owners.insert(marker, ExceptionOwnerDecision::override_with_region(None));
             }
         }
+        self.restore_conditional_iterator_break_owners(
+            &label_positions,
+            &indexed_instructions,
+            &mut owners,
+        );
         owners.extend(self.normal_try_break_pop_owners(&label_positions, &jump_targets));
         // The generic fresh-array rule cannot see this pair of omitted POPs.
         // Replay the exact source certificate after all generic NULL conclusions.
