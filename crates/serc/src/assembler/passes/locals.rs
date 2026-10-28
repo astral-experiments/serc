@@ -4135,7 +4135,7 @@ impl OptimizationPipeline {
                         && target + 1 < blocks.len()
                         && !borrow_unreachable_blocks[target]
                         && borrow_unreachable_blocks[target + 1]
-                        && jump_entry_blocks[target + 1]
+                        && jump_entry_blocks.get(target + 1).copied().unwrap_or(false)
                         && items[blocks[target].clone()]
                             .iter()
                             .all(|item| matches!(item, Item::Label(_)))
