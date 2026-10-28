@@ -25937,7 +25937,7 @@ fn specialized_comparison_keeps_its_try_else_guard_handler() {
 
 #[test]
 fn elided_inner_try_setup_compacts_before_a_located_handler_pop() {
-    let source = r#"def compare(values):
+    let source = r"def compare(values):
     for item in values:
         try:
             work()
@@ -25946,7 +25946,7 @@ fn elided_inner_try_setup_compacts_before_a_located_handler_pop() {
                 assert is_valid(item)
             except ValueError:
                 assert other(item)
-"#;
+";
     assert_matches_cpython(source, "empty_handler_setup.py", &LEVELS);
 }
 
