@@ -25977,3 +25977,48 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn async_manager_none_guard_keeps_its_inner_handler() {
+    let source = r"async def receive(manager, stopped):
+    try:
+        async with manager:
+            while not stopped:
+                frame = await read()
+                try:
+                    if frame is not None:
+                        await handle(frame)
+                except LookupError as error:
+                    record(error)
+    except OSError:
+        pass
+";
+    assert_matches_cpython(source, "managed_frame_guard.py", &LEVELS);
+}
+
+#[test]
+fn managed_none_guard_counts_slots_released_before_its_try() {
+    for calls in [2, 3] {
+        let prefix = "        work()\n".repeat(calls);
+        let source = format!(
+            "async def run(ready):
+    async with manager() as value:
+        if ready:
+            return
+{prefix}        try:
+            if value is None:
+                await send()
+            else:
+                await save()
+        except LookupError:
+            pass
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_guard_prefix.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}

@@ -15207,6 +15207,31 @@ impl<'source> Compiler<'source> {
     }
 
     fn compile_if(&mut self, statement: &ruff_python_ast::StmtIf) -> Result<(), CompileError> {
+        let managed_try_none_guard = self.context.python_version
+            == crate::PythonVersion::Py314
+            && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                == CO_COROUTINE
+            && self.control.exceptions.active_try_body_tail == Some(statement.range)
+            && self
+                .control
+                .withs
+                .active_with_exits
+                .last()
+                .is_some_and(|manager| {
+                    manager.is_async
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .len()
+                            > manager.exception_region_depth
+                })
+            // The specialized guard's marker follows a load and a jump. Three
+            // earlier removals put its physical slot before the inner try.
+            && self.control.exceptions.active_try_body_start.is_none_or(|(start, _)| {
+                start != self.assembler.item_count()
+                    || self.assembler.fallthrough_dynamic_exception_owner_slots() < 3
+            });
         if self.context.python_version == crate::PythonVersion::Py314 {
             // Only names evaluated before any other part of the authored test.
             // A name selected by a folded conditional expression is not enough.
@@ -16595,9 +16620,13 @@ impl<'source> Compiler<'source> {
                     // each normalized condition marker.
                     self.assembler.preserve_last_not_taken_exception_owner();
                 }
-                if preserve_generator_with_conditional_body_owner {
-                    // A post-yield marker needs the innermost owner even when an overlapping
-                    // outer inclusion already covers its final instruction range.
+                if preserve_generator_with_conditional_body_owner
+                    || (managed_try_none_guard
+                        && branch_index == 0
+                        && is_specialized_none_condition(test))
+                {
+                    // The removed comparison or resumed yield supplies the inner owner,
+                    // even when an outer region already covers the normalized marker.
                     self.assembler.override_last_not_taken_exception_owner();
                 }
                 let copy_optimized_tuple_branch_exit = branch_index == 0
