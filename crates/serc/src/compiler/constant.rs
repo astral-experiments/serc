@@ -747,10 +747,10 @@ impl Compiler<'_> {
             && ((self.source_location(expression.range()).line
                 == self.source_location(expression.range()).end_line
                 && is_literal_binary_tree(expression))
-                || is_string_addition_chain(expression))
+                || is_string_addition_chain(expression)
+                || is_integer_bitwise_tree(expression))
         {
-            // Single-line literal operations have no intervening line NOPs. A chain
-            // of string additions also retains one owner across its source lines.
+            // These literal folds retain one exception owner across every erased cell.
             self.assembler
                 .record_last_uniform_fold_owner_slots(hidden_owner_slots);
         }
@@ -1357,6 +1357,28 @@ fn is_string_addition_chain(mut expression: &Expr) -> bool {
         expression = &binary.left;
     }
     matches!(expression, Expr::StringLiteral(_))
+}
+
+/// Bitwise operations on integer literals fold without introducing line jumps.
+fn is_integer_bitwise_tree(expression: &Expr) -> bool {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| is_integer_bitwise_tree(expression));
+    }
+    match expression {
+        Expr::BinOp(binary) => {
+            matches!(
+                binary.op,
+                Operator::BitOr
+                    | Operator::BitXor
+                    | Operator::BitAnd
+                    | Operator::LShift
+                    | Operator::RShift
+            ) && is_integer_bitwise_tree(&binary.left)
+                && is_integer_bitwise_tree(&binary.right)
+        }
+        Expr::NumberLiteral(number) => matches!(number.value, Number::Int(_)),
+        _ => false,
+    }
 }
 
 /// Returns whether a binary-expression tree has only primitive or small tuple literal leaves.
