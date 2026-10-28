@@ -9136,6 +9136,20 @@ impl LayoutAssembler {
                         {
                             let before = late_setup_positions
                                 .partition_point(|position| *position < instruction_index);
+                            if let Some(region) = self.managed_function_setup_owner(
+                                instruction_index,
+                                original_array_start,
+                                &late_setup_positions,
+                                &indexed_instructions,
+                                &label_positions,
+                                &retained_setup_nops,
+                            ) {
+                                owners.insert(
+                                    instruction_index,
+                                    ExceptionOwnerDecision::override_with_region(Some(region)),
+                                );
+                            }
+
                             // The append slot is either the removed setup or its
                             // predecessor, the retained NOP at the same try entry.
                             if let Some(&erased) = late_setup_positions.get(before)
@@ -13378,6 +13392,82 @@ impl LayoutAssembler {
             );
         }
         owners
+    }
+
+    /// Recovers the managed function-definition record left by late setup compaction.
+    fn managed_function_setup_owner(
+        &self,
+        marker: usize,
+        array: usize,
+        removed: &[usize],
+        instructions: &[&Instruction],
+        positions: &OwnerLabelPositions,
+        retained: &FxHashSet<usize>,
+    ) -> Option<usize> {
+        use crate::target::opcodes::{
+            LOAD_CONST, MAKE_FUNCTION, SET_FUNCTION_ATTRIBUTE, STORE_FAST,
+        };
+        let removed_before = removed.binary_search(&marker).err()?;
+        let setup = (marker.saturating_sub(4).max(array)..marker)
+            .rev()
+            .find(|i| retained.contains(i))?;
+        let store = setup.checked_sub(1).filter(|store| *store >= array)?;
+        if instructions[store].opcode != STORE_FAST {
+            return None;
+        }
+        let attributes = instructions[array..store]
+            .iter()
+            .rev()
+            .take_while(|op| {
+                op.opcode == SET_FUNCTION_ATTRIBUTE && matches!(op.value_argument(), Some(8 | 16))
+            })
+            .count();
+        let code = store.checked_sub(attributes + 2)?;
+        let source = marker.checked_sub(removed_before)?;
+        if code < array
+            || !(code..=store).contains(&source)
+            || instructions[code].opcode != LOAD_CONST
+            || instructions[code + 1].opcode != MAKE_FUNCTION
+            || instructions[code..=store].iter().any(|part| {
+                part.location != instructions[store].location
+                    || part.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+                    || part.local_policy.hidden_exception_owner_slots() != 0
+                    || part.pre_fold_extra_instructions() != 0
+            })
+        {
+            return None;
+        }
+        // Each removed record belongs either to a surrounding manager or to
+        // the ordinary try sharing the retained setup after the definition.
+        let provenance = &self.exception_owner_provenance;
+        let mut setups = Vec::new();
+        for (label, location) in &provenance.setups {
+            let at = *positions.get(label)?;
+            if location.is_some() || at < array || at > marker {
+                continue;
+            }
+            if !provenance.synchronous_with_setups.contains(label)
+                && !(at == setup + 1 && provenance.ordinary_try_setups.contains_key(label))
+            {
+                return None;
+            }
+            setups.push(at);
+        }
+        setups.sort_unstable();
+        if setups
+            .iter()
+            .enumerate()
+            .map(|(n, at)| *at + n)
+            .ne(removed.iter().copied())
+        {
+            return None;
+        }
+        let region = self.uniform_exception_owner(code, store + 1, positions)?;
+        let owner = self.exception_regions[region];
+        (owner.preserve_lasti
+            && !owner.is_scope_fallback
+            && provenance.synchronous_with_setups.contains(&owner.start))
+        .then_some(region)
     }
 
     /// Replays the retained break NOP reused after exactly three local-load fusions.
