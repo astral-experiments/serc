@@ -25977,3 +25977,24 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn finalizer_locations_reach_handler_returns_after_iterator_cleanup() {
+    for finalizer in ["state.current = value", "release(value)"] {
+        let source = format!(
+            "def take(values, state, value):
+    try:
+        prepare()
+    except ValueError:
+        for item in values:
+            try:
+                return item
+            except KeyError:
+                continue
+            finally:
+                {finalizer}
+"
+        );
+        assert_matches_cpython(&source, "iterator_handler_finalizer.py", &LEVELS);
+    }
+}

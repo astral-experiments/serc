@@ -10102,6 +10102,7 @@ impl<'source> Compiler<'source> {
                 let mut copied_handler_assignment_span = None;
                 let mut copied_finally_iterator_location = None;
                 let mut copied_finally_return_location = None;
+                let mut copied_finally_handler_location = None;
                 let mut copied_finally_iterator_join_location = None;
                 let mut copied_finally_iterator_region_unwind = false;
                 let mut copied_finally_handler_join = None;
@@ -10473,6 +10474,9 @@ impl<'source> Compiler<'source> {
                                     self.assembler.mark(start);
                                     start
                                 });
+                            if let Some(location) = copied_finally_handler_location {
+                                self.assembler.set_location(location);
+                            }
                             self.emit(SWAP, 2, 0)?;
                             if shared_manager_return_cleanup {
                                 self.assembler.preserve_last_no_location();
@@ -14282,6 +14286,32 @@ impl<'source> Compiler<'source> {
                     {
                         copied_finally_handler_join =
                             Some((self.assembler.item_count(), handler.common_cleanup));
+                    }
+                    // A handler outside the iterator restores its exception in the
+                    // same original block as the copied finalizer and iterator pops.
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        && preserve_tos
+                        && return_finally_contexts.len() == 1
+                        && finally_context.handler_depth == 1
+                        && finally_context.with_depth == 0
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && let [handler] =
+                            self.control.exceptions.active_exception_handlers.as_slice()
+                        && handler.name.is_none()
+                        && finally_context.loop_depth == self.control.loops.contexts.len()
+                        && handler.loop_depth < finally_context.loop_depth
+                        && self.control.loops.contexts
+                            [handler.loop_depth..finally_context.loop_depth]
+                            .iter()
+                            .any(|context| context.iterator_cleanup != IteratorCleanup::None)
+                        && suite_has_nonsuspending_linear_fallthrough(finally_context.body)
+                    {
+                        copied_finally_handler_location =
+                            self.assembler.last_instruction_location();
+                        copied_finally_return_location = copied_finally_handler_location;
                     }
                     // The copied finally body has its own source locations. CPython makes
                     // the resumed unwind artificial so each incoming branch can supply its
