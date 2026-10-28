@@ -5896,20 +5896,31 @@ impl OptimizationPipeline {
             if predecessors[block.index()] <= 1 {
                 continue;
             }
-            // The 3.15 iterator cleanup can exceed the small-copy limit. Classify
-            // its complete original array, as the early copy analysis does, even
-            // when an outer try splits the cleanup from RETURN_VALUE.
-            let exit_blocks = if self.python_version == crate::PythonVersion::Py315 {
-                metadata_split_exit_chain(
-                    graph,
-                    &order,
-                    positions[block.index()],
-                    &predecessors,
-                    &exception_split_labels,
-                )
-            } else {
-                std::slice::from_ref(&block)
-            };
+            // An exception-table boundary can separate a Boolean discard from
+            // POP_EXCEPT. CPython duplicates the complete unlocated return array.
+            let boolean_handler_discard = self.python_version == crate::PythonVersion::Py314
+                && matches!(graph[block].items(), [Item::Label(_), Item::Instruction(pop)]
+                    if pop.opcode == POP_TOP && pop.no_location_policy.copy_inherits_shared_predecessor())
+                && order.get(positions[block.index()] + 1).is_some_and(|next| {
+                    graph[*next]
+                        .items()
+                        .iter()
+                        .find_map(Item::as_instruction)
+                        .is_some_and(|first| first.opcode == POP_EXCEPT)
+                });
+            // The 3.15 iterator cleanup also spans these exception-table splits.
+            let exit_blocks =
+                if self.python_version == crate::PythonVersion::Py315 || boolean_handler_discard {
+                    metadata_split_exit_chain(
+                        graph,
+                        &order,
+                        positions[block.index()],
+                        &predecessors,
+                        &exception_split_labels,
+                    )
+                } else {
+                    std::slice::from_ref(&block)
+                };
             let unlocated_scope_exit = graph[*exit_blocks.last().expect("nonempty exit array")]
                 .last_instruction()
                 .is_some_and(|instruction| {

@@ -6808,9 +6808,10 @@ impl<'source> Compiler<'source> {
                         && matches!(expression.value.as_ref(), Expr::BoolOp(_))
                         && (self.control.finally.active_normal_finally_bodies > 0
                             || self.control.finally.active_copied_finally_bodies > 0
-                            || self.control.finally.active_finally_end_blocks > 0)
+                            || self.control.finally.active_finally_end_blocks > 0
+                            || !self.control.exceptions.active_exception_handlers.is_empty())
                     {
-                        // A finalizer's discard joins the return/reraise cleanup.
+                        // A handler or finalizer discard joins its return or reraise cleanup.
                         // Its private exit copies inherit each Boolean value's donor;
                         // only the original shared POP_TOP remains unlocated.
                         self.assembler
