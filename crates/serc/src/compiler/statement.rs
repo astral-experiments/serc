@@ -5733,8 +5733,13 @@ impl<'source> Compiler<'source> {
 
     /// Recovers the original return donor hidden by removed branch-tail assertions.
     fn elided_branch_return_location(&self, body: &[Stmt]) -> Option<SourceLocation> {
-        if let Some(test) = self.elided_terminating_if_fallthrough(body) {
-            return Some(self.source_location(condition_fallthrough_range(test)));
+        if let Some(test) = self.elided_terminating_if_test(body) {
+            // A shared return starts unlocated so each false edge supplies its own span.
+            return Some(if original_condition_has_unique_jump_target(test, false) {
+                self.source_location(condition_fallthrough_range(test))
+            } else {
+                SourceLocation::NONE
+            });
         }
         match self
             .elided_branch_fallthrough_tail(body, true)
@@ -18752,16 +18757,29 @@ impl<'source> Compiler<'source> {
         }
     }
 
-    /// Finds the false-edge location after a terminating guard and erased assertions.
-    /// The guard must have one false target and no enclosing cleanup or loop backedge.
+    /// Finds a single false-edge donor after a terminating guard and erased assertions.
     fn elided_terminating_if_fallthrough<'a>(&self, body: &'a [Stmt]) -> Option<&'a Expr> {
+        if self.unit.flags & CO_COROUTINE != 0 {
+            return None;
+        }
+        self.elided_terminating_if_test(body)
+            .filter(|test| original_condition_has_unique_jump_target(test, false))
+    }
+
+    /// Finds the final guard reaching an erased suffix outside cleanup and loop regions.
+    fn elided_terminating_if_test<'a>(&self, body: &'a [Stmt]) -> Option<&'a Expr> {
         if self.context.python_version < crate::PythonVersion::Py314
             || !matches!(self.unit.scope, Scope::Function { .. })
-            || self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) != 0
+            || self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
             || !self.control.loops.contexts.is_empty()
             || self.control.loops.suite_fallthrough_to_loop_backedge
             || !self.control.withs.active_with_exits.is_empty()
-            || self.has_active_control_flow_region()
+            || !self.control.withs.active_with_region_exclusions.is_empty()
+            || !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty()
             || self.control.in_exception_handler()
             || self.control.exceptions.active_exception_group_handlers != 0
             || !self.control.finally.is_inactive_for_return_unwind()
@@ -18776,14 +18794,15 @@ impl<'source> Compiler<'source> {
             return None;
         };
         // After every populated arm terminates, only the final test's false
-        // edge reaches the return originally following the erased statements.
+        // edges reach the return following the erased statements.
         let test = terminating_if_fallthrough_test(statement)?;
         (if_suites(statement)
             .all(|suite| matches!(suite.last(), Some(Stmt::Return(_) | Stmt::Raise(_))))
             && condition_has_linear_runtime_leaves(test)
             && !expression_suspends_current_scope(test)
-            && original_condition_has_unique_jump_target(test, false))
-        .then_some(test)
+            && (original_condition_has_unique_jump_target(test, false)
+                || condition_jump_target_count(test, false) > 1))
+            .then_some(test)
     }
 
     /// Keeps a raising guard's sole false-edge location after removed assertions.
