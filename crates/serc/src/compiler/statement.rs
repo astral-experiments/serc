@@ -39993,6 +39993,28 @@ impl<'source> Compiler<'source> {
                             .or_else(|| self.elided_else_exit_location(statement)),
                         _ => None,
                     });
+            // The false edge and the populated assignment arm reached this exit before
+            // condition folding. Their shared original jump cannot inherit the store.
+            let shared_finalizer_store = self.context.python_version == crate::PythonVersion::Py314
+                && self.control.finally.active_finally_try_bodies > 0
+                && matches!(statement.finalbody.last(), Some(Stmt::If(tail))
+                    if tail.elif_else_clauses.is_empty()
+                        && early_condition_truthiness(&tail.test) != Some(false)
+                        && !suite_terminates_before_constant_folding(&tail.body)
+                        && matches!(tail.body.last(), Some(Stmt::Assign(assignment))
+                            if matches!(assignment.targets.as_slice(), [Expr::Name(_)])))
+                && self
+                    .control
+                    .finally
+                    .active_return_finally_contexts
+                    .last()
+                    .is_some_and(|outer| {
+                        matches!(outer.body.first(), Some(Stmt::Assign(assignment))
+                        if matches!(assignment.targets.as_slice(), [Expr::Name(_)]))
+                    });
+            if shared_finalizer_store {
+                conditional_exit = Some(NestedIfExitLocation::Unlocated);
+            }
             // An awaited guard can be the sole donor after nested cleanup jumps
             // past this empty normal exit. Require both original incoming edges.
             if self.context.python_version >= crate::PythonVersion::Py314
@@ -40849,7 +40871,7 @@ impl<'source> Compiler<'source> {
                 captured_manager_pop = Some(SourceLocation::NONE);
             }
             if matches!(conditional_exit, Some(NestedIfExitLocation::Unlocated))
-                && (self.control.loops.contexts.is_empty()
+                && (shared_finalizer_store || self.control.loops.contexts.is_empty()
                     || self.control.statements.context.has_following
                     || self.control.statements.context.inherited_has_following
                     // The manager's exit call still separates this shared join from a
