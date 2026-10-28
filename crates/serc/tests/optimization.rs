@@ -35,6 +35,16 @@ fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
 }
 
 #[test]
+fn a_saved_try_else_return_can_supply_the_finalizer_guard_owner() {
+    for returned in ["value", "default"] {
+        let source = format!(
+            "def run(value):\n    try:\n        if value:\n            pass\n        state = prepare(key=lookup(key=value))\n        try:\n            value.check()\n        except OSError:\n            pass\n        else:\n            done = False\n            return {returned}\n    except OSError:\n        pass\n    finally:\n        if state is not None and not done:\n            pass\n"
+        );
+        assert_matches_cpython(&source, "saved_try_else_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_finally_guard_inherits_the_preceding_calls_handler() {
     let source = r"def run(group):
     try:
