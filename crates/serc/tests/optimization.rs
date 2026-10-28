@@ -147,6 +147,12 @@ def factory(cell):
 }
 
 #[test]
+fn final_case_keeps_a_broken_iterators_exhaustion_line() {
+    let source = "def read(items, tokens):\n    for item in items:\n        match item:\n            case 0:\n                for token in tokens:\n                    if token:\n                        break\n        consume(item)\n";
+    assert_matches_cpython(source, "case_iterator_exit.py", &LEVELS);
+}
+
+#[test]
 fn nested_case_guards_keep_each_loop_exit() {
     for tail in [
         "if first(item) and second(item):\n    return item",
