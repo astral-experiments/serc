@@ -23763,7 +23763,7 @@ impl<'source> Compiler<'source> {
                         // A terminating guard can leave several forward edges at the same
                         // empty exit when its following assertions emit no instructions.
                         || (!self.assembler.emitted_region_has_final_fallthrough(arm_start)
-                            && self.assembler.at_original_shared_conditional_join()))
+                            && self.has_original_unlocated_loop_tail_join()))
                     && statement.elif_else_clauses.iter().all(|clause| {
                         clause.test.as_ref().is_none_or(|test| {
                             condition_has_only_runtime_tests(test)
