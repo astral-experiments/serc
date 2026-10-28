@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn finalizer_branches_copy_the_iterator_discard_after_a_break() {
+    let source = r#"def scan(items, ready, target):
+    if False:
+        use("unused")
+    for item in items:
+        try:
+            break
+        finally:
+            if ready:
+                use(item)
+            elif target is None:
+                use("fallback")
+    finish()
+"#;
+    assert_matches_cpython(source, "branched_finalizer_break.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
