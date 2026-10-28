@@ -3989,6 +3989,23 @@ fn folded_while_breaks_copy_unnamed_handler_cleanup() {
 }
 
 #[test]
+fn break_after_a_manager_exit_does_not_repeat_its_line() {
+    for (declaration, manager) in [("def", "with"), ("async def", "async with")] {
+        let source = format!(
+            "{declaration} run(outer, inner):
+    while True:
+        {manager} outer:
+            with inner:
+                pass
+            break
+    finish()
+"
+        );
+        assert_matches_cpython(&source, "break_after_manager_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_none_while_break_copies_cleanup() {
     for prefix in ["", "async "] {
         for condition in ["value", "value is None", "value is not None"] {
