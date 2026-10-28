@@ -15,6 +15,7 @@ mod initial_intern_state;
 mod marshal;
 mod paramspec_default;
 mod python_312_starred_defaults;
+mod semicolon_syntax;
 mod source;
 mod stack;
 mod target;
@@ -670,14 +671,49 @@ fn with_stack_reentry_bypass<T>(callback: impl FnOnce() -> T) -> T {
 }
 
 /// Owns the parser output while allowing deeply nested expressions to be dropped safely.
-struct ParsedModule(Option<ruff_python_parser::Parsed<ruff_python_ast::ModModule>>);
+struct ParsedModule {
+    parsed: Option<ruff_python_parser::Parsed<ruff_python_ast::ModModule>>,
+    recovered: Option<(ruff_python_ast::Suite, ruff_python_ast::token::Tokens)>,
+}
 
 impl ParsedModule {
+    fn new(parsed: ruff_python_parser::Parsed<ruff_python_ast::ModModule>) -> Self {
+        Self {
+            parsed: Some(parsed),
+            recovered: None,
+        }
+    }
+
+    fn suite(&self) -> &ruff_python_ast::Suite {
+        self.recovered.as_ref().map_or_else(
+            || self.parsed.as_ref().expect("module is present").suite(),
+            |(suite, _)| suite,
+        )
+    }
+
+    fn tokens(&self) -> &ruff_python_ast::token::Tokens {
+        self.recovered.as_ref().map_or_else(
+            || self.parsed.as_ref().expect("module is present").tokens(),
+            |(_, tokens)| tokens,
+        )
+    }
+
+    fn recover_bare_raises(&mut self, raises: &semicolon_syntax::BareRaises) {
+        use ruff_python_ast::visitor::transformer::Transformer;
+        if !raises.is_empty() {
+            let parsed = self.parsed.take().expect("original module is present");
+            let tokens = parsed.tokens().clone();
+            let mut suite = parsed.into_suite();
+            raises.visit_body(&mut suite);
+            self.recovered = Some((suite, tokens));
+        }
+    }
+
     fn take_suite(&mut self) -> ruff_python_ast::Suite {
-        self.0
-            .take()
-            .expect("parsed module is present")
-            .into_suite()
+        self.recovered.take().map_or_else(
+            || self.parsed.take().expect("module is present").into_suite(),
+            |(suite, _)| suite,
+        )
     }
 }
 
@@ -722,11 +758,14 @@ impl Drop for ParsedModule {
             }
         }
 
-        if let Some(parsed) = self.0.take() {
-            let shallow_drop = parsed.errors().is_empty()
+        if self.parsed.is_some() || self.recovered.is_some() {
+            let shallow_drop = self
+                .parsed
+                .as_ref()
+                .is_some_and(|parsed| parsed.errors().is_empty())
                 && stacker::remaining_stack()
                     .is_some_and(|remaining| remaining >= STACK_SEGMENT_SIZE);
-            let mut suite = parsed.into_suite();
+            let mut suite = self.take_suite();
             ClearExpressions { shallow_drop }.visit_body(&mut suite);
         }
     }
@@ -794,6 +833,7 @@ fn has_large_decimal_token(source: &str, tokens: &ruff_python_ast::token::Tokens
 fn invalid_singleton_identifier(
     source: &str,
     parsed: &ruff_python_parser::Parsed<ruff_python_ast::ModModule>,
+    errors: &[ruff_python_parser::ParseError],
     version: PythonVersion,
 ) -> Option<CompileError> {
     use ruff_python_ast::token::TokenKind;
@@ -818,7 +858,7 @@ fn invalid_singleton_identifier(
                 }
                 // Invalid assignment and deletion targets are diagnosed after parsing
                 // the expressions in their statement. Other earlier errors stop parsing.
-                if parsed.errors().iter().any(|error| {
+                if errors.iter().any(|error| {
                     error.location.start() < token.start()
                         && (error.location.start() < statement_start
                             || !matches!(
@@ -888,8 +928,11 @@ fn compile_normalized(
     let parsed = ruff_python_parser::parse_unchecked(source, parse_options.clone())
         .try_into_module()
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
-    let mut parsed_module = ParsedModule(Some(parsed));
-    let parsed = parsed_module.0.as_ref().expect("parsed module is present");
+    let mut parsed_module = ParsedModule::new(parsed);
+    let parsed = parsed_module
+        .parsed
+        .as_ref()
+        .expect("parsed module is present");
     // Ruff grows its parser stack for deeply nested expressions. Successful parses can
     // reuse its tokens; malformed input still uses the independent tokenizer before diagnostics.
     if let Err(error) =
@@ -901,7 +944,8 @@ fn compile_normalized(
             error
         });
     }
-    let parse_error = parsed.errors().first();
+    let (errors, bare_raises) = semicolon_syntax::recover(source, &parse_options, parsed);
+    let parse_error = errors.first();
     if let Some(range) = indentation::first_excess(parsed.tokens())
         && parse_error.is_none_or(|error| range.start() <= error.location.start())
     {
@@ -920,14 +964,16 @@ fn compile_normalized(
             source,
             parsed.suite(),
             parsed.tokens(),
-            parsed.errors(),
+            &errors,
             parsed.unsupported_syntax_errors(),
             options.python_version,
             &error,
         )
         .unwrap_or(error)
     };
-    if let Some(error) = invalid_singleton_identifier(source, parsed, options.python_version) {
+    if let Some(error) =
+        invalid_singleton_identifier(source, parsed, &errors, options.python_version)
+    {
         return Err(error);
     }
     if let Some(error) = parse_error {
@@ -937,12 +983,12 @@ fn compile_normalized(
         let error = if let Some(yield_error) = yield_syntax::before_parse_error(
             source,
             parsed.tokens(),
-            parsed.errors(),
+            &errors,
             parsed.unsupported_syntax_errors(),
             options.python_version,
         ) {
             yield_error
-        } else if parsed.errors().len() == 1
+        } else if errors.len() == 1
             && parsed.unsupported_syntax_errors().is_empty()
             && matches!(
                 error.error,
@@ -954,7 +1000,9 @@ fn compile_normalized(
                 "cannot use assignment expressions with attribute",
                 error.location,
             )
-        } else if let Some((message, range)) = yield_from_syntax::invalid_tuple_diagnostic(parsed) {
+        } else if let Some((message, range)) =
+            yield_from_syntax::invalid_tuple_diagnostic(parsed, &errors)
+        {
             CompileError::invalid_syntax(message, range)
         } else {
             CompileError::Parse(error.clone())
@@ -1014,6 +1062,8 @@ fn compile_normalized(
             error.range,
         )));
     }
+    parsed_module.recover_bare_raises(&bare_raises);
+    let parsed = &parsed_module;
     if may_depend_on_decimal_parse
         && has_large_decimal_token(source, parsed.tokens())
         && compiler::syntax::may_have_duplicate_mapping_key(parsed.suite())
@@ -1053,14 +1103,11 @@ fn compile_normalized(
     } else {
         (None, None)
     };
-    let parsed = parsed_module.0.as_ref();
-    let body = optimized_body.as_ref().map_or_else(
-        || parsed.expect("unoptimized module is present").suite(),
-        |optimized| &optimized.body,
-    );
-    let tokens = owned_tokens
+    let parsed = &parsed_module;
+    let body = optimized_body
         .as_ref()
-        .unwrap_or_else(|| parsed.expect("unoptimized module is present").tokens());
+        .map_or_else(|| parsed.suite(), |optimized| &optimized.body);
+    let tokens = owned_tokens.as_ref().unwrap_or_else(|| parsed.tokens());
     let code = Compiler::module_with_scopes(
         filename,
         source,

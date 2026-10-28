@@ -58,13 +58,14 @@ pub(crate) fn before_indentation_error(
         return None;
     }
     let parsed = ruff_python_parser::parse_unchecked(prefix, options.clone()).try_into_module()?;
-    let parsed = crate::ParsedModule(Some(parsed));
-    let parsed = parsed.0.as_ref().expect("parsed module is present");
-    let yield_error = if !parsed.errors().is_empty() {
+    let parsed = crate::ParsedModule::new(parsed);
+    let parsed = parsed.parsed.as_ref().expect("parsed module is present");
+    let (errors, _) = crate::semicolon_syntax::recover(prefix, options, parsed);
+    let yield_error = if !errors.is_empty() {
         before_parse_error(
             prefix,
             parsed.tokens(),
-            parsed.errors(),
+            &errors,
             parsed.unsupported_syntax_errors(),
             version,
         )
@@ -86,8 +87,7 @@ pub(crate) fn before_indentation_error(
     // Preserve the earlier version error already selected by the parser.
     let error = parsed.unsupported_syntax_errors().first()?;
     if error.range.end() > indentation.start()
-        || parsed
-            .errors()
+        || errors
             .first()
             .is_some_and(|prior| prior.location.start() <= error.range.start())
     {

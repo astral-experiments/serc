@@ -196,8 +196,8 @@ fn bitwise_prefix_end(source: &str, tokens: &Tokens, param: TextRange) -> Option
         ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module),
     )
     .try_into_module()?;
-    let parsed = crate::ParsedModule(Some(parsed));
-    let parsed = parsed.0.as_ref()?;
+    let parsed = crate::ParsedModule::new(parsed);
+    let parsed = parsed.parsed.as_ref()?;
     if !parsed.errors().is_empty() {
         return None;
     }
