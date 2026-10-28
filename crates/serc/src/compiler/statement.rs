@@ -16978,16 +16978,27 @@ impl<'source> Compiler<'source> {
                     if protected_shared_join {
                         self.assembler.set_location(SourceLocation::NONE);
                     }
-                    let branch_exit = if exclude_direct_try_body_exit
-                        && self.control.in_iterator_loop()
-                        && self
-                            .control
-                            .exceptions
-                            .active_exception_region_exclusions
-                            .len()
-                            == 1
-                        && self.control.generators.generator_region_start.is_none()
-                        && self.control.withs.active_with_region_exclusions.is_empty()
+                    // Folding this guard threads its false edge through the branch exit.
+                    // CPython appends the new jump after the original instruction array,
+                    // where it has no exception handler.
+                    let late_folded_try_exit = self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && self.control.finally.active_finally_try_bodies != 0
+                        && matches!(body.last(), Some(Stmt::If(guard))
+                            if guard.elif_else_clauses.is_empty()
+                                && self.context.fold_constant(&guard.test).is_some_and(|constant| !constant.is_truthy())
+                                && !suite_terminates(&guard.body));
+                    let branch_exit = if late_folded_try_exit
+                        || (exclude_direct_try_body_exit
+                            && self.control.in_iterator_loop()
+                            && self
+                                .control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len()
+                                == 1
+                            && self.control.generators.generator_region_start.is_none()
+                            && self.control.withs.active_with_region_exclusions.is_empty())
                     {
                         self.emit_jump_forward_instruction_with_exception_policy(
                             JUMP_FORWARD,
