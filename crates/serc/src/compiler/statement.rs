@@ -28708,7 +28708,7 @@ impl<'source> Compiler<'source> {
             && statement.finalbody.is_empty()
             && (suite_match_failure_range(&statement.body).is_some()
                 || sequence_failure_location.is_some_and(|location| {
-                    self.assembler.original_fallthrough_join_location() == Some(location)
+                    self.assembler.original_fallthrough_join_location(None) == Some(location)
                 }))
             && matches!(statement.body.last(), Some(Stmt::Match(matched))
             if matched.cases.iter().all(|case| {
@@ -28833,7 +28833,7 @@ impl<'source> Compiler<'source> {
         let sole_fallthrough_pop_location = (removed_try_pop_block
             && (suite_ends_in_sole_else_fallthrough(&statement.body)
                 || sequence_failure_location.is_some()))
-        .then(|| self.assembler.original_fallthrough_join_location())
+        .then(|| self.assembler.original_fallthrough_join_location(None))
         .flatten();
         // 3.12 keeps every original POP_BLOCK through both small-exit copy
         // passes. A hidden early-copy slot would disappear before the second
@@ -39303,7 +39303,22 @@ impl<'source> Compiler<'source> {
         let sole_else_pop_location = (statement.handlers.is_empty()
             && statement.orelse.is_empty()
             && suite_ends_in_sole_else_fallthrough(&statement.body))
-        .then(|| self.assembler.original_fallthrough_join_location())
+        .then(|| {
+            // Once every earlier arm terminates, the final pass is the sole
+            // predecessor of POP_BLOCK. The latter keeps their shared line.
+            let pass = match statement.body.last() {
+                Some(Stmt::If(branch))
+                    if self.context.python_version >= crate::PythonVersion::Py314 =>
+                {
+                    match branch.elif_else_clauses.last()?.body.as_slice() {
+                        [Stmt::Pass(pass)] => Some(self.source_location(pass.range)),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            self.assembler.original_fallthrough_join_location(pass)
+        })
         .flatten();
         // When all handlers terminate, the normal else exit is the sole donor
         // for the outer POP_BLOCK. Its unowned slot carries the Pass location
