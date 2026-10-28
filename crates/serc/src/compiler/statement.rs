@@ -20431,7 +20431,10 @@ impl<'source> Compiler<'source> {
                                     captured_none_prefix
                                         && self
                                             .copied_finally_starts_local_none_cleanup(context.body),
-                                    suite_has_linear_borrow_fallthrough,
+                                    |body| {
+                                        matches!(body, [Stmt::Pass(_)])
+                                            || suite_has_linear_borrow_fallthrough(body)
+                                    },
                                 ))
                             || (self.unit.flags
                                 & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)

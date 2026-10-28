@@ -8177,6 +8177,28 @@ fn erased_branches_preserve_nested_finalizer_loop_exits() {
 }
 
 #[test]
+fn copied_coroutine_finalizer_continues_after_a_pass_handler() {
+    for body in ["await item.close()", "pass"] {
+        let source = format!(
+            "async def run(items):
+    for item in items:
+        try:
+            continue
+        except LookupError:
+            recover()
+        finally:
+            if item is not None:
+                try:
+                    {body}
+                except ValueError:
+                    pass
+"
+        );
+        assert_matches_cpython(&source, "copied_coroutine_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn copied_finalizer_guard_preserves_each_continue_backedge() {
     for cleanup in ["pass", "release(item)"] {
         let source = format!(
