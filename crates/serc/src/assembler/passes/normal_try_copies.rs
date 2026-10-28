@@ -3031,6 +3031,154 @@ impl OptimizationPipeline {
         }
     }
 
+    /// Keeps the two original unconditional joins of a nested assignment until cleanup copying.
+    fn prepare_nested_named_assignment_joins(&mut self) {
+        use crate::target::opcodes::STORE_FAST;
+        let provenance = &self.exception_owner_provenance;
+        if provenance.original_named_handler_cleanup_joins.is_empty()
+            || provenance.normal_try_exits.is_empty()
+        {
+            return;
+        }
+        let graph = &self.graph;
+        let join_jump = |id: BasicBlockId| {
+            let (last, labels) = graph[id].items().split_last()?;
+            let jump = last.as_instruction()?;
+            (labels.iter().all(|item| matches!(item, Item::Label(_)))
+                && jump.opcode == JUMP_FORWARD
+                && jump.location.line >= 0
+                && jump.jump_policy.defers_redundant_removal()
+                && jump.jump_policy.preserves_nop_after_threading()
+                && jump.jump_policy.allows_threading_target()
+                && !jump.jump_policy.retains_nop_for(jump.operand())
+                && jump.pre_fold_extra_instructions() == 0
+                && jump.local_policy.hidden_exception_owner_slots() == 0)
+                .then_some(*jump)
+        };
+        let mut selections = Vec::new();
+        let mut block_positions = None;
+        let order = graph.order();
+        for (position, &[left, right, join]) in order.array_windows::<3>().enumerate() {
+            let Some(branch) = join_jump(join) else {
+                continue;
+            };
+            let Some(normal) = branch
+                .forward_target()
+                .and_then(|label| graph.label_block(label))
+            else {
+                continue;
+            };
+            let Some(exit) = join_jump(normal) else {
+                continue;
+            };
+            let Some(cleanup) = exit
+                .forward_target()
+                .and_then(|label| graph.label_block(label))
+            else {
+                continue;
+            };
+            let mut left_tail = graph[left]
+                .items()
+                .iter()
+                .rev()
+                .filter_map(Item::as_instruction);
+            let (Some(then_jump), Some(then_store), Some(else_store)) = (
+                left_tail.next(),
+                left_tail.next(),
+                graph[right].last_instruction(),
+            ) else {
+                continue;
+            };
+            if then_jump.opcode != JUMP_FORWARD
+                || then_jump
+                    .forward_target()
+                    .and_then(|label| graph.label_block(label))
+                    != Some(join)
+                || then_store.opcode != STORE_FAST
+                || else_store.opcode != STORE_FAST
+                || then_store.operand() != else_store.operand()
+                || then_jump.location != then_store.location
+                || branch.location != else_store.location
+                || branch.depth_after() != exit.depth_after()
+                || branch.depth_after().is_none()
+                || !provenance.normal_try_exits.iter().any(|(entry, end)| {
+                    graph.label_block(*entry) == Some(normal)
+                        && graph.label_block(*end) == Some(cleanup)
+                })
+            {
+                continue;
+            }
+            // A live outer else can add one more assignment before its normal try exit.
+            let next = &order[position + 3..];
+            if !matches!(next,[first,..] if *first==normal && exit.location==else_store.location)
+                && !matches!(next,[other,second,..] if *second==normal && graph[*other].last_instruction().is_some_and(|store| store.opcode==STORE_FAST && store.operand()==then_store.operand() && store.location==exit.location))
+            {
+                continue;
+            }
+            let Some((_, records)) = provenance
+                .original_named_handler_cleanup_joins
+                .iter()
+                .find(|(entry, _)| graph.label_block(*entry) == Some(cleanup))
+            else {
+                continue;
+            };
+            let Some(returned) = records[4]
+                .forward_target()
+                .and_then(|label| graph.label_block(label))
+            else {
+                continue;
+            };
+            if !graph[cleanup]
+                .items()
+                .iter()
+                .filter_map(Item::as_instruction)
+                .eq(records)
+                || !original_local_return(graph[returned].items())
+                || !graph[returned]
+                    .items()
+                    .iter()
+                    .find_map(Item::as_instruction)
+                    .is_some_and(|load| load.operand() == then_store.operand())
+            {
+                continue;
+            }
+            let positions = block_positions.get_or_insert_with(|| {
+                order
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(i, id)| (id, i))
+                    .collect::<FxHashMap<_, _>>()
+            });
+            if self.exception_regions.iter().any(|region| {
+                let bounds = graph
+                    .label_block(region.start)
+                    .zip(graph.label_block(region.end));
+                bounds.is_none_or(|(start, end)| {
+                    (positions[&start]..positions[&end]).contains(&positions[&cleanup])
+                })
+            }) {
+                continue;
+            }
+            selections.push((join, normal, cleanup));
+        }
+        for (join, normal, cleanup) in selections {
+            // Both jumps originally have no location. CPython visits each copy before
+            // attaching the incoming assignment's position to the surviving records.
+            for block in [join, normal] {
+                let jump = self.graph.instructions_mut(block).next().unwrap();
+                jump.location = SourceLocation::NONE;
+                jump.jump_policy.prevent_threading_target();
+                jump.allow_unconditional_block_inlining();
+            }
+            // The original handler cleanup is outside every enclosing exception range.
+            // Copying it into a protected assignment must keep those four slots unowned.
+            for instruction in self.graph.instructions_mut(cleanup).take(4) {
+                instruction.set_exception_policy(super::super::ExceptionPolicy::EXCLUDE_ALWAYS);
+            }
+        }
+    }
+
     /// Restores original cleanup arrays for a closed ordinary-try/short-return graph.
     ///
     /// These records precede location propagation and NOP compaction in CPython. Keeping
@@ -3042,6 +3190,7 @@ impl OptimizationPipeline {
         if !self.graph.features().has_forward_jump() {
             return;
         }
+        self.prepare_nested_named_assignment_joins();
         self.preserve_nested_recovery_returns();
         if self.exception_owner_provenance.normal_try_exits.is_empty()
             && self
