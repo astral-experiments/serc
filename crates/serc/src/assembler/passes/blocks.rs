@@ -7311,8 +7311,43 @@ impl OptimizationPipeline {
             } else {
                 None
             };
-            let source_location = loop_return_join_location.unwrap_or(source_location);
+            // The predecessor already copied one jump. Copying another jump and a
+            // four-instruction return would exceed the native limit, so the join
+            // survives and its only incoming edge supplies the replaced jump's line.
+            let threaded_return_join_location = if self.python_version
+                >= crate::PythonVersion::Py314
+                && !planned_copy
+                && inline_small_exit
+                && target_position == target_chain_end
+                && target_pre_fusion_size == 4
+                && target_terminal_opcode == Some(RETURN_VALUE)
+                && source_location.line < 0
+                && remaining_predecessors[source.index()] == 1
+                && let Some((Item::Instruction(jump), labels)) = graph[source].items().split_last()
+                && labels.iter().all(|item| matches!(item, Item::Label(_)))
+                && jump.opcode == JUMP_FORWARD
+                && jump.jump_policy.borrow_empty_block()
+                && let [predecessor] = jump_sources[source.index()].as_slice()
+                && !drop_blocks[predecessor.index()]
+                && !inline_copies.contains_key(predecessor)
+                && let Some(edge) = graph[*predecessor].last_instruction()
+                && edge.opcode == JUMP_FORWARD
+                && edge.pre_fold_extra_instructions() == 1
+                && edge.location.line >= 0
+                && edge
+                    .forward_target()
+                    .and_then(|label| graph.label_block(label))
+                    == Some(source)
+            {
+                Some(edge.location)
+            } else {
+                None
+            };
+            let source_location = threaded_return_join_location
+                .or(loop_return_join_location)
+                .unwrap_or(source_location);
             let preserve_inlined_jump_nop = planned_copy
+                || threaded_return_join_location.is_some()
                 || loop_return_join_location.is_some()
                 || deferred_match_donor.is_some()
                 || (inline_small_exit

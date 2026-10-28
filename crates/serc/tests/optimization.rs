@@ -15,6 +15,30 @@ use serc::{
 };
 
 #[test]
+fn surviving_threaded_join_locates_a_four_slot_return() {
+    for returned in ["left", "left, right", "left, right, key"] {
+        let source = format!(
+            "def finish(gate, key, left, right):
+    if gate:
+        try:
+            work()
+        except ValueError as error:
+            pass
+        else:
+            if key:
+                use(left)
+            else:
+                use(right)
+    else:
+        right = left
+    return {returned}
+"
+        );
+        assert_matches_cpython(&source, "threaded_return_join.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
