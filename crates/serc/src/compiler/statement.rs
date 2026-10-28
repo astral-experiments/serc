@@ -32460,6 +32460,23 @@ impl<'source> Compiler<'source> {
                     handler.body.as_slice(),
                     [Stmt::Try(nested)] if is_loop_conversion_try(nested)
                 );
+            // Each short-circuit false edge can leave the handler through the enclosing
+            // loop's backedge. Its cleanup copy inherits that operand's source position.
+            let handler_ends_with_short_circuit_while = self.context.python_version
+                >= crate::PythonVersion::Py314
+                && handler.name.is_some()
+                && matches!(handler.body.last(), Some(Stmt::While(tail))
+                    if tail.orelse.is_empty()
+                        && !suite_contains_loop_break(&tail.body)
+                        && condition_has_only_runtime_tests(&tail.test)
+                        && condition_jump_target_count(&tail.test, false) > 1)
+                && self.assembler.at_original_jump_only_conditional_join();
+            let named_while_at_enclosing_loop_tail = handler_ends_with_short_circuit_while
+                && (loop_tail.is_some()
+                    || self.control.loops.uncopied_loop_tail_statement == Some(statement.range)
+                    || (self.control.in_loop_tail_without_nested_cleanup()
+                        && !self.control.statements.context.has_following
+                        && !self.control.statements.context.inherited_has_following));
             // A trailing conditional joins immediately before the loop backedge. CPython
             // leaves the handler cleanup at that join unlocated, then copies it onto each
             // normal conditional exit together with the backedge.
@@ -32467,11 +32484,12 @@ impl<'source> Compiler<'source> {
                 && (matches!(
                     handler.body.last(),
                     Some(Stmt::If(tail)) if if_has_multiple_normal_exit_targets(tail)
-                ) || (handler.name.is_some()
-                    && matches!(
-                        handler.body.last(),
-                        Some(Stmt::Match(tail)) if match_has_multiple_normal_case_exits(tail)
-                    )));
+                ) || named_while_at_enclosing_loop_tail
+                    || (handler.name.is_some()
+                        && matches!(
+                            handler.body.last(),
+                            Some(Stmt::Match(tail)) if match_has_multiple_normal_case_exits(tail)
+                        )));
             // Generic loop lowering keeps the same original conditional join as
             // the specialized loop-tail path. Its cleanup must remain unlocated
             // until each normal predecessor receives its own copy.
@@ -32705,6 +32723,7 @@ impl<'source> Compiler<'source> {
                 || handler_has_named_while_break_join
                 || handler_has_raising_while_break_cleanup
                 || handler_has_original_conditional_loop_join
+                || named_while_at_enclosing_loop_tail
                 || handler_has_guarded_for_break_join
                 || handler_has_nested_else_loop_cleanup
                 || handler_ends_with_named_conditional_cleanup
@@ -33316,15 +33335,8 @@ impl<'source> Compiler<'source> {
                 // following finally POP_BLOCK the last terminating arm's line.
                 // Each short-circuit false edge reaches the same handler cleanup.
                 // A loop backedge cannot donate the final body's line to that join.
-                let handler_has_shared_while_cleanup = handler.name.is_some()
-                    && handler_cleanup_has_normal_finally_successor
-                    && self.context.python_version >= crate::PythonVersion::Py314
-                    && matches!(handler.body.last(), Some(Stmt::While(tail))
-                        if tail.orelse.is_empty()
-                            && !suite_contains_loop_break(&tail.body)
-                            && condition_has_only_runtime_tests(&tail.test)
-                            && condition_jump_target_count(&tail.test, false) > 1)
-                    && self.assembler.at_original_jump_only_conditional_join();
+                let handler_has_shared_while_cleanup = handler_ends_with_short_circuit_while
+                    && handler_cleanup_has_normal_finally_successor;
                 let handler_has_shared_normal_finally_cleanup = handler.name.is_some()
                     && !terminal
                     && loop_tail.is_none()
@@ -33473,6 +33485,7 @@ impl<'source> Compiler<'source> {
                 if (self.context.python_version <= crate::PythonVersion::Py313
                     && self.assembler.at_jump_target())
                     || handler_cleanup_from_original_join
+                    || named_while_at_enclosing_loop_tail
                     || handler_has_shared_while_cleanup
                     || handler_has_shared_normal_finally_cleanup
                     || handler_ends_with_unlocated_bare_raise_branch_cleanup
@@ -33670,6 +33683,7 @@ impl<'source> Compiler<'source> {
                     && self.context.python_version >= crate::PythonVersion::Py314
                     && (handler_ends_with_loop_tail_join
                         || handler_has_original_conditional_loop_join))
+                    || named_while_at_enclosing_loop_tail
                     || inlineable_bare_handler_if_with_multiline_join
                     || handler_ends_with_nonterminal_with
                     || inlineable_handler_if_with_suspended_join
