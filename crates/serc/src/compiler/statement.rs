@@ -38131,6 +38131,20 @@ impl<'source> Compiler<'source> {
                             && context.finally_end_depth == 0
                             && context.exception_region_depth == 0))
                     && managed_guarded_raise_has_finally_route(statement)));
+        // A completed earlier arm jumps straight to the normal finalizer. An
+        // erased assertion or folded guard can leave an empty array on that route,
+        // where CPython 3.14 stops converting local loads to borrowed loads.
+        let earlier_arm_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && self.unit.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) == 0
+            && !statement.is_star
+            && !statement.handlers.is_empty()
+            && matches!(statement.orelse.last().or_else(|| statement.body.last()),
+                Some(Stmt::If(branch)) if first_arm_has_normal_finally_jump(branch))
+            && (self.suite_has_nonempty_borrow_entry(&statement.finalbody)
+                || matches!(statement.finalbody.first(), Some(Stmt::If(guard))
+                    if condition_has_linear_runtime_leaves(&guard.test)));
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -38138,6 +38152,7 @@ impl<'source> Compiler<'source> {
             || managed_runtime_while_return_reaches_finally
             || runtime_retry_break_reaches_finally
             || conditional_body_reaches_finally
+            || earlier_arm_reaches_finally
             || coroutine_conditional_store_reaches_finally
             || coroutine_await_recovery_reaches_finally
             || coroutine_guarded_nested_cleanup_entry
@@ -44503,6 +44518,41 @@ fn suite_loop_breaks_are_only_in_direct_handlers(body: &[Stmt]) -> bool {
                     && !suite_contains_loop_break(&statement.finalbody)
             }
             _ => !suite_contains_loop_break(std::slice::from_ref(statement)),
+        })
+}
+
+/// Checks for a live first-arm jump over the remaining alternatives into cleanup.
+fn first_arm_has_normal_finally_jump(branch: &ruff_python_ast::StmtIf) -> bool {
+    if branch.elif_else_clauses.is_empty() || !condition_has_linear_runtime_leaves(&branch.test) {
+        return false;
+    }
+    let Some(tail) = branch.body.last() else {
+        return false;
+    };
+    let reaches_jump = match tail {
+        Stmt::If(guard) => {
+            guard.elif_else_clauses.is_empty() && condition_has_linear_runtime_leaves(&guard.test)
+        }
+        Stmt::While(loop_) => {
+            loop_.orelse.is_empty() && condition_has_linear_runtime_leaves(&loop_.test)
+        }
+        _ => suite_has_linear_borrow_fallthrough(std::slice::from_ref(tail)),
+    };
+    reaches_jump
+        && suite_has_fallthrough(&branch.body, false)
+        && !suite_any_statement(&branch.body, |part| match part {
+            Stmt::Assert(_) => true,
+            Stmt::If(guard) => {
+                !condition_has_only_runtime_tests(&guard.test)
+                    || guard.elif_else_clauses.iter().any(|clause| {
+                        clause
+                            .test
+                            .as_ref()
+                            .is_some_and(|test| !condition_has_only_runtime_tests(test))
+                    })
+            }
+            Stmt::While(loop_) => !condition_has_only_runtime_tests(&loop_.test),
+            _ => false,
         })
 }
 

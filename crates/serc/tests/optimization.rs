@@ -1458,6 +1458,40 @@ fn guarded_continue_keeps_the_backedges_before_nested_cleanup() {
 }
 
 #[test]
+fn earlier_conditional_arms_reach_normal_finalizer_local_loads() {
+    let source = r"def guarded(ready, flag, value, other):
+    try:
+        if ready:
+            if other:
+                use(value)
+        elif flag:
+            use(flag)
+    except ValueError:
+        raise
+    finally:
+        value.attr = flag
+
+def folded(ready, flag, value):
+    try:
+        if ready:
+            assert True
+            value.attr = flag
+        elif flag:
+            use(flag)
+    except ValueError as exc:
+        pass
+    finally:
+        value.attr
+";
+    assert_matches_cpython_versions(
+        source,
+        "conditional_finalizer_loads.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn guarded_finally_arms_keep_their_manager_exit_location() {
     for body in ["work(item)", "yield item"] {
         for condition in ["ready", "not ready", "ready is not None"] {
