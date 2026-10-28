@@ -16799,6 +16799,19 @@ impl<'source> Compiler<'source> {
                             self.control.statements.context.has_following || finalizer_exit,
                         )
                         .or_else(|| self.elided_else_exit_location(statement)),
+                        // Several false guard edges reach the same match failure.
+                        Stmt::Match(matched)
+                            if self.context.python_version >= crate::PythonVersion::Py314
+                                && self.assembler.at_original_match_join()
+                                && matched.cases.last().and_then(|case| case.guard.as_deref())
+                                    .is_some_and(|guard| {
+                                        condition_has_only_runtime_tests(guard)
+                                            && !matches!(guard, Expr::Compare(_))
+                                            && condition_jump_target_count(guard, false) > 1
+                                    }) =>
+                        {
+                            Some(NestedIfExitLocation::Unlocated)
+                        }
                         // The loop's else can leave its own shared partial-if join.
                         // Break edges bypass that original join during exit copying.
                         Stmt::For(loop_statement) if !loop_statement.is_async => {
