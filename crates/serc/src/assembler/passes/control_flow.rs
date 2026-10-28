@@ -3118,13 +3118,19 @@ impl OptimizationPipeline {
         // The normal POP_BLOCK/JUMP after a located return can reuse its exact span.
         // A full four-record return is copied here before the earlier branch jumps
         // are threaded. The jump itself contributes no second event for that span.
-        let mut tuple_return_handlers = FxHashMap::default();
+        let mut tuple_return_handlers = std::collections::BTreeMap::new();
         if self.python_version >= crate::PythonVersion::Py314 {
             let instruction_at = |index: usize| {
                 let &(block, offset) = instruction_positions.get(index)?;
                 graph[block].items()[offset].as_instruction()
             };
-            for &entry in &normal_try_exits {
+            let entries = self
+                .exception_owner_provenance
+                .normal_try_exits
+                .iter()
+                .filter_map(|(label, _)| label_offsets.get(*label))
+                .filter(|entry| normal_try_exits.contains(*entry));
+            for &entry in entries {
                 let Some(previous) = entry.checked_sub(1).and_then(instruction_at) else {
                     continue;
                 };
