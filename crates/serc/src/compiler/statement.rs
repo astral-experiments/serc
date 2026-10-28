@@ -45549,7 +45549,17 @@ impl<'source> Compiler<'source> {
                                         manager_fallthrough_removed_by_folding(&handler.body)
                                     })
                                 });
+                            // The handler cleanup acquires its guard location only after
+                            // folding has removed the manager's unlocated POP_BLOCK.
+                            let folded_handler_exit = suite_terminates_before_constant_folding(&statement.body)
+                                && statement.handlers.iter()
+                                    .filter_map(ruff_python_ast::ExceptHandler::as_except_handler)
+                                    .filter_map(|handler| handler.body.last()?.as_if_stmt())
+                                    .filter_map(terminating_if_fallthrough_test)
+                                    .any(|test| condition_jump_target_count(test, false) == 1
+                                        && !original_condition_has_unique_jump_target(test, false));
                             !(shared_assertion_exit
+                                || folded_handler_exit
                                 || manager_fallthrough_removed_by_folding(&statement.body)
                                 || manager_fallthrough_removed_by_folding(&statement.orelse))
                         }
