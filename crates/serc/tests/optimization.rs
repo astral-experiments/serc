@@ -3608,6 +3608,27 @@ fn erased_loop_break_keeps_async_manager_finally_boundary() {
 }
 
 #[test]
+fn copied_membership_keeps_the_return_cleanup_owners() {
+    let source = r#"async def read(flag, item, value):
+    state = "idle"
+    try:
+        if flag:
+            one()
+            two()
+            three()
+            return item
+        return item
+    except KeyError:
+        state = "old"
+    except ValueError:
+        state = "bad"
+    finally:
+        result = value if state in {"old", "bad", "idle"} else None
+"#;
+    assert_matches_cpython(source, "copied_membership_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn consecutive_literal_memberships_preserve_the_following_try_setup_slot() {
     let source = r"def choose(value, enabled):
     if enabled:

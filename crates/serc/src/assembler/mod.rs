@@ -13874,7 +13874,7 @@ impl Assembler {
         if !provenance.source_boundaries.contains(&entry) {
             return;
         }
-        let origin = exception_owners::CopiedReturnMembershipPrefix {
+        let mut origin = exception_owners::CopiedReturnMembershipPrefix {
             entry,
             return_value: *return_value,
             cleanup_labels: labels
@@ -13891,6 +13891,13 @@ impl Assembler {
             condition: *condition,
             marker: *marker,
         };
+        // This copied finalizer has its own source array for the folded set.
+        // Its enclosing return and removed POPs can have different owners.
+        let constant = self.linear_items_mut()[first_pop_item + 3]
+            .as_instruction_mut()
+            .expect("matched membership constant");
+        constant.jump_policy.retire_original_uniform_fold();
+        origin.constant = *constant;
         self.exception_owner_provenance
             .copied_return_membership_prefixes
             .push(origin);
