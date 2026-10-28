@@ -14906,6 +14906,8 @@ impl Assembler {
 
     /// Captures the unchanged first array of an ordinary normal-finally entry.
     pub(crate) fn record_original_normal_finally_array(&mut self, ordinal: usize) {
+        use crate::target::opcodes::{BUILD_MAP, PUSH_NULL};
+
         let items = self.linear_items();
         let Some(index) = self.instruction_item_index(ordinal) else {
             return;
@@ -15143,7 +15145,19 @@ impl Assembler {
                 }
                 return;
             }
-            if instruction.value_argument().is_none() || ends_scope(instruction.opcode) {
+            // The empty positional tuple of a call with unpacked keywords takes
+            // one slot. Its constant-pool index is assigned after this capture.
+            let unpacked_call_args = instruction.opcode == LOAD_CONST
+                && matches!(instruction.operand(), Operand::Deferred(_))
+                && instruction.pre_fold_extra_instructions() == 0
+                && instruction.local_policy.hidden_exception_owner_slots() == 0
+                && end.checked_sub(2).and_then(|before| items.get(before..=end)).is_some_and(|items| {
+                    matches!(items, [Item::Instruction(null), _, Item::Instruction(kwargs)]
+                        if null.opcode == PUSH_NULL && kwargs.opcode == BUILD_MAP && kwargs.value_argument() == Some(0))
+                });
+            if (instruction.value_argument().is_none() && !unpacked_call_args)
+                || ends_scope(instruction.opcode)
+            {
                 return;
             }
             // One authored retained SETUP can introduce range labels without
@@ -18474,11 +18488,21 @@ impl Assembler {
             }
         }
 
-        // A deferred constant in a handler type refers to the same source instruction
-        // as its patch. Preserve that identity only while the entire record matches.
+        // A captured deferred constant refers to the same source instruction as its
+        // patch. Preserve that identity only while the entire record matches.
         if let Some(provenance) = self.exception_owner_provenance.as_mut_if_present() {
-            for origin in &mut provenance.handler_dispatch_arrays {
-                for item in &mut origin.items {
+            for prefix in provenance
+                .handler_dispatch_arrays
+                .iter_mut()
+                .map(|origin| &mut origin.items)
+                .chain(
+                    provenance
+                        .original_normal_finally_arrays
+                        .iter_mut()
+                        .map(|origin| &mut origin.prefix),
+                )
+            {
+                for item in prefix {
                     if let Item::Instruction(instruction) = item
                         && instruction.opcode == LOAD_CONST
                         && let Operand::Deferred(id) = instruction.operand()
