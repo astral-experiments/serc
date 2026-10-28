@@ -743,8 +743,8 @@ impl Compiler<'_> {
         {
             // Numeric negation removes its adjacent, equally owned literal load.
             self.assembler.record_last_uniform_fold_owner_slots(1);
-        } else if matches!(expression, Expr::BinOp(_))
-            && is_literal_binary_tree(expression)
+        } else if matches!(expression, Expr::BinOp(_) | Expr::Tuple(_))
+            && is_literal_arithmetic_tree(expression)
             && self.source_location(expression.range()).line
                 == self.source_location(expression.range()).end_line
         {
@@ -1347,14 +1347,17 @@ impl Compiler<'_> {
     }
 }
 
-/// Returns whether a binary-expression tree has only primitive or small tuple literal leaves.
-fn is_literal_binary_tree(expression: &Expr) -> bool {
+/// Returns whether literal loads, binary operations and small tuple builds form one expression.
+fn is_literal_arithmetic_tree(expression: &Expr) -> bool {
     if crate::stack_growth_required() {
-        return crate::grow_stack(|| is_literal_binary_tree(expression));
+        return crate::grow_stack(|| is_literal_arithmetic_tree(expression));
     }
     match expression {
         Expr::BinOp(binary) => {
-            is_literal_binary_tree(&binary.left) && is_literal_binary_tree(&binary.right)
+            is_literal_arithmetic_tree(&binary.left) && is_literal_arithmetic_tree(&binary.right)
+        }
+        Expr::Tuple(tuple) => {
+            tuple.elts.len() <= 30 && tuple.elts.iter().all(is_literal_arithmetic_tree)
         }
         _ => is_small_literal_tuple_element(expression),
     }
