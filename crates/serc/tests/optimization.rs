@@ -15755,6 +15755,26 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn negated_chained_comparison_shares_the_final_pass_return() {
+    let source = r"
+def falls_through(ready, left, item, right):
+    if ready:
+        emit()
+    elif not left <= item < right:
+        pass
+
+def has_else(ready, left, item, right):
+    if ready:
+        emit()
+    elif not left <= item < right:
+        pass
+    else:
+        clean()
+";
+    assert_matches_cpython(source, "comparison_pass_return.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:

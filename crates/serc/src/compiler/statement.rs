@@ -4708,7 +4708,7 @@ impl<'source> Compiler<'source> {
             return self.emit_deferred_implicit_return();
         }
         // Removed assertions are represented as empty declarations.
-        let empty_comparison_arms: Vec<_> =
+        let mut empty_comparison_arms: Vec<_> =
             std::iter::once((statement.test.as_ref(), statement.body.as_slice()))
                 .chain(statement.elif_else_clauses.iter().filter_map(|clause| {
                     clause
@@ -4732,6 +4732,20 @@ impl<'source> Compiler<'source> {
                     }
                 })
                 .collect();
+        let last_clause = statement.elif_else_clauses.last().map_or(
+            (Some(statement.test.as_ref()), statement.body.as_slice()),
+            |clause| (clause.test.as_ref(), clause.body.as_slice()),
+        );
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && let (Some(Expr::UnaryOp(test)), [Stmt::Pass(_)]) = last_clause
+            && test.op == UnaryOp::Not
+            && let Expr::Compare(comparison) = test.operand.as_ref()
+            && comparison.ops.len() > 1
+        {
+            // The comparison cleanup falls through to the authored pass and its
+            // shared footer. A following else instead supplies a separate exit.
+            empty_comparison_arms.push(comparison.range);
+        }
         let has_empty_comparison_arm = !empty_comparison_arms.is_empty();
         // 3.12 inserts each copied exit after the original shared footer. Eager
         // per-arm returns change that order when a Boolean body is entirely elided.
