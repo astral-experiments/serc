@@ -14394,7 +14394,7 @@ impl Assembler {
             .split_last()
             .expect("at least one cleanup");
         let named_handler_cleanup = if named_handler {
-            if manager_count != 1 || ordinary_try_pops != 1 || retained_outer_handler.is_none() {
+            if manager_count != 1 || ordinary_try_pops != 1 {
                 return;
             }
             let mut prefix = before

@@ -4465,6 +4465,21 @@ fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
 }
 
 #[test]
+fn named_handler_returns_keep_the_manager_discard_on_the_finally_guard() {
+    for kind in ["def", "async def"] {
+        let source = format!(
+            "{kind} run(value, flag):\n    try:\n        with use():\n            try:\n                work()\n            except LookupError as error:\n                if flag:\n                    return value\n    except OSError:\n        pass\n    finally:\n        if flag is not None:\n            finish()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "named_manager_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn handler_and_iterator_returns_reuse_the_final_cleanup_pop() {
     for source in [
         r"async def sample(value, flag):

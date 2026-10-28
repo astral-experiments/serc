@@ -12913,14 +12913,17 @@ impl<'source> Compiler<'source> {
                     } else {
                         None
                     };
-                    // A named handler and one inner manager finish before this copied
-                    // finalizer; the outer managers remain live. Capture their actual
-                    // twelve cleanup records with the two omitted handler POP cells.
-                    let retained_manager_named_return_none_pop = if self.unit.flags
-                        & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
-                        == 0
-                        && preserve_tos
-                        && matches!(statement.value.as_deref(), Some(Expr::Call(_)))
+                    // The named handler and its manager finish before this copied finally.
+                    // Its guard can reuse the discard whether or not an outer manager remains.
+                    let named_handler_manager_return = if preserve_tos
+                        && match (
+                            finally_context.with_depth,
+                            self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
+                        ) {
+                            (0, 0 | CO_COROUTINE) => true,
+                            (1..=2, 0) => matches!(statement.value.as_deref(), Some(Expr::Call(_))),
+                            _ => false,
+                        }
                         && !return_is_overridden
                         && context_index == 0
                         && return_finally_contexts.len() == 1
@@ -12929,7 +12932,6 @@ impl<'source> Compiler<'source> {
                         && finally_context.loop_depth == 0
                         && finally_context.try_body_depth == 0
                         && finally_context.exception_region_depth == 0
-                        && (1..=2).contains(&finally_context.with_depth)
                         && next_with == finally_context.with_depth
                         && self.control.withs.active_with_exits.len() == next_with + 1
                         && next_handler == 0
@@ -12984,7 +12986,9 @@ impl<'source> Compiler<'source> {
                     {
                         Some((
                             self.assembler.item_count(),
-                            self.control.withs.active_with_exits[next_with - 1].handler,
+                            self.control.withs.active_with_exits[..next_with]
+                                .last()
+                                .map(|outer| outer.handler),
                         ))
                     } else {
                         None
@@ -13724,14 +13728,13 @@ impl<'source> Compiler<'source> {
                         }
                     }
                     if result.is_ok()
-                        && let Some((pop_item, outer_handler)) =
-                            retained_manager_named_return_none_pop
+                        && let Some((pop_item, outer_handler)) = named_handler_manager_return
                     {
                         self.assembler.record_copied_manager_return_compaction(
                             pop_item,
                             (false, 1),
                             1,
-                            Some(outer_handler),
+                            outer_handler,
                             true,
                         );
                     }
