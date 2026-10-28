@@ -777,6 +777,20 @@ fn local_fusion_keeps_retained_try_setup_unowned() {
 }
 
 #[test]
+fn a_leading_finally_none_test_keeps_the_async_manager_handler() {
+    let source = r"async def run(manager, item, value):
+    async with manager:
+        try:
+            pass
+        finally:
+            if item.active is not None:
+                consume(value)
+            finish()
+";
+    assert_matches_cpython_versions(source, "case.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
 fn method_call_before_finally_none_test_keeps_the_original_handler() {
     let managed = r"async def finish(manager, service, resource, ready):
     with manager:
