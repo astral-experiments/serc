@@ -147,6 +147,23 @@ def factory(cell):
 }
 
 #[test]
+fn protected_match_conditions_copy_each_short_circuit_exit() {
+    let source = r"async def sample(items, flag):
+    async for value in items:
+        try:
+            match value:
+                case 1:
+                    if flag and ready(value):
+                        await work(value)
+                case 2:
+                    await finish()
+        except RuntimeError as err:
+            pass
+";
+    assert_matches_cpython(source, "protected_loop_case_exits.py", &LEVELS);
+}
+
+#[test]
 fn nested_case_guards_keep_each_loop_exit() {
     for tail in [
         "if first(item) and second(item):\n    return item",
