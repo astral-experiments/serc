@@ -29375,9 +29375,45 @@ impl<'source> Compiler<'source> {
                         && condition_jump_target_count(&branch.test, false) > 1
                         && suite_terminates_before_constant_folding(&branch.body))
                 && self.assembler.at_original_jump_only_conditional_join();
-            let shared_conditional_exit = (guarded_loop_try
-                && shared_guard(&statement.orelse)
-                && self.assembler.at_original_shared_cleanup_join())
+            // A final nested try-else feeds the enclosing try's normal exit.
+            // Its guard and completed body reach the same original while backedge.
+            let nested_while_else_exit = self.context.python_version >= crate::PythonVersion::Py314
+                && self
+                    .control
+                    .loops
+                    .terminal_while_tail_statement
+                    .or(self.control.loops.uncopied_loop_tail_statement)
+                    .is_some_and(|tail| {
+                        tail != statement.range && tail.contains_range(statement.range)
+                    })
+                && self
+                    .control
+                    .loops
+                    .contexts
+                    .last()
+                    .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::None)
+                && self.control.withs.active_with_exits.is_empty()
+                && self.control.finally.is_inactive_for_return_unwind()
+                && !self.control.statements.context.has_following
+                && !self.control.in_exception_handler()
+                && self
+                    .control
+                    .exceptions
+                    .active_exception_region_exclusions
+                    .len()
+                    == 1
+                && self.control.exceptions.direct_try_body_statements.last()
+                    == Some(&statement.range)
+                && try_else_requires_loop_tail_inlining(statement)
+                && matches!(statement.orelse.last(), Some(Stmt::If(branch))
+                    if branch.elif_else_clauses.is_empty()
+                        && condition_has_linear_runtime_leaves(&branch.test)
+                        && !suite_terminates(&branch.body))
+                && self.assembler.at_jump_target();
+            let shared_conditional_exit = nested_while_else_exit
+                || (guarded_loop_try
+                    && shared_guard(&statement.orelse)
+                    && self.assembler.at_original_shared_cleanup_join())
                 || shared_assertion_exit
                 || folded_false_try_exit
                 || terminal_else_orphan_exit
