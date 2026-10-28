@@ -5250,7 +5250,13 @@ impl<'source> Compiler<'source> {
                 }
             }
             if !emitted_fallthrough {
-                if let Some(location) = self.assembler.last_instruction_location() {
+                // The loop's false edge locates the return after constant folding.
+                if self.context.python_version >= crate::PythonVersion::Py314
+                    && matches!(body.last(), Some(Stmt::While(_)))
+                    && let Some(range) = loop_false_fallthrough_range(body)
+                {
+                    self.assembler.set_location(self.source_location(range));
+                } else if let Some(location) = self.assembler.last_instruction_location() {
                     self.assembler.set_location(location);
                 }
                 self.emit_deferred_implicit_return()?;
