@@ -16946,6 +16946,24 @@ fn coroutine_erased_else_preserves_shared_return_locations() {
 }
 
 #[test]
+fn a_folded_guard_in_a_try_arm_keeps_its_threaded_jump_unprotected() {
+    let source = r"def run(choose, ready):
+    try:
+        if choose:
+            work()
+            if __debug__:
+                note()
+        else:
+            wait()
+    finally:
+        finish()
+";
+    for source in [source.to_owned(), source.replace("__debug__", "ready")] {
+        assert_matches_cpython(&source, "folded_try_arm.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertions_inside_terminal_call_suite_preserve_footer() {
     for prefix in [
         "    if a:\n        assert a\n",
