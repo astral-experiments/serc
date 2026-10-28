@@ -492,6 +492,34 @@ fn is_unlocated_value_cleanup_prefix(items: &[Item], python_version: crate::Pyth
     instructions.next().is_none()
 }
 
+/// Recognizes a literal return reached through one or more named handler cleanups.
+fn is_named_cleanup_return<'a>(records: impl Iterator<Item = &'a Instruction>) -> bool {
+    let mut records = records.peekable();
+    let mut saw_handler = false;
+    while records
+        .next_if(|record| record.opcode == POP_EXCEPT)
+        .is_some()
+    {
+        let (Some(clear), Some(store), Some(delete)) =
+            (records.next(), records.next(), records.next())
+        else {
+            return false;
+        };
+        if clear.opcode != LOAD_CONST
+            || store.opcode != STORE_FAST
+            || delete.opcode != DELETE_FAST
+            || store.operand() != delete.operand()
+        {
+            return false;
+        }
+        saw_handler = true;
+    }
+    saw_handler
+        && records
+            .map(|record| record.opcode)
+            .eq([LOAD_CONST, RETURN_VALUE])
+}
+
 // Labels created by later copies have no certificate. Every original alias at an entry must
 // exclude an earlier location donor before the artificial-prefix repair can suppress a seed.
 fn original_entry_has_no_location_donor(items: &[Item], absent: &FxHashSet<Label>) -> bool {
@@ -6368,7 +6396,19 @@ impl OptimizationPipeline {
                         (POP_EXCEPT, Operand::Value(0)),
                         (RETURN_VALUE, Operand::Value(0)),
                     ]);
+            let named_cleanup_return = self.python_version >= crate::PythonVersion::Py314
+                && source_has_fallthrough
+                && target_has_no_location
+                && target_terminal_opcode == Some(RETURN_VALUE)
+                && remaining_predecessors[target.index()] > 1
+                && is_named_cleanup_return(
+                    target_blocks
+                        .iter()
+                        .flat_map(|block| graph[*block].items().iter())
+                        .filter_map(Item::as_instruction),
+                );
             let target_allows_no_location_block_inlining = copy_iterator_return
+                || named_cleanup_return
                 || split_handler_return
                 || graph[target_exit]
                     .last_instruction()
@@ -6410,6 +6450,7 @@ impl OptimizationPipeline {
             }
             if source_has_fallthrough
                 && !copy_shared_match_exit
+                && !named_cleanup_return
                 && !target_has_copied_jump_eval_check
                 && graph[target_exit]
                     .last_instruction()

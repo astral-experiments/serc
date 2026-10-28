@@ -25969,6 +25969,29 @@ fn nested_finalizer_guard_recovers_the_earlier_call_handler() {
 }
 
 #[test]
+fn named_handler_guards_copy_their_cleanup_and_literal_return() {
+    let source = r"def nested(first, second):
+    try:
+        read()
+    except LookupError as outer:
+        try:
+            recover(outer)
+        except ValueError as inner:
+            if first and second:
+                report(inner)
+
+def guarded(flag, value):
+    try:
+        read()
+    except ValueError as error:
+        assert error.args
+        if flag and 0 < value < 10:
+            observe(value)
+";
+    assert_matches_cpython(source, "named_guard_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
     let source = r"def check(manager, value, size):
     with manager, manager, manager, manager, manager, manager:
