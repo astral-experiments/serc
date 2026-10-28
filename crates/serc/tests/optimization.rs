@@ -1254,6 +1254,16 @@ fn async_iterator_exhaustion_keeps_copied_branch_exit() {
 }
 
 #[test]
+fn copied_integer_returns_keep_the_original_try_fallthrough() {
+    for value in [0, 255, 256] {
+        let source = format!(
+            "def run(ready, first, second):\n    try:\n        if ready:\n            first()\n        else:\n            second()\n    except ValueError:\n        pass\n    else:\n        return {value}\n"
+        );
+        assert_matches_cpython(&source, "integer_try_fallthrough.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_try_arms_share_the_normal_exit_before_copying() {
     for exit in [
         "return item",
