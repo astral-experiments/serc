@@ -1,5 +1,47 @@
 # Changelog
 
+## 0.1.9
+
+Released on 2026-10-28.
+
+Serc 0.1.9 expands source-encoding support and improves byte-for-byte
+compatibility with CPython.
+
+### Enhancements
+
+- Compile source files encoded with Big5 or Windows-1252 using
+  CPython-compatible codec aliases and strict decoding behavior
+  (astral-sh/serc#2266; https://github.com/astral-sh/serc/pull/2266)
+
+### Bug fixes
+
+- Produce CPython-compatible bytecode for additional real-world package sources
+  (astral-sh/serc#2266; https://github.com/astral-sh/serc/pull/2266)
+- Preserve CPython-compatible source positions and exception-table coverage when
+  optimization copies, threads, or fuses bytecode (astral-sh/serc#1718;
+  https://github.com/astral-sh/serc/pull/1718)
+- Restore byte-for-byte compatibility with CPython 3.14.5 across the pinned
+  compatibility corpus at all optimization levels (astral-sh/serc#1365;
+  https://github.com/astral-sh/serc/pull/1365)
+- Reject identifiers whose Unicode normalization produces `True`, `False`, or
+  `None`, matching CPython 3.13–3.15 while preserving Python 3.12 behavior
+  (astral-sh/serc#1371; https://github.com/astral-sh/serc/pull/1371)
+- Reject oversized starred assignment targets and named sequence captures with
+  CPython-compatible diagnostics (astral-sh/serc#1370;
+  https://github.com/astral-sh/serc/pull/1370)
+- Match CPython bytecode for sequence patterns that combine captures with
+  trailing wildcards (astral-sh/serc#1372;
+  https://github.com/astral-sh/serc/pull/1372)
+- Parse bare `raise` statements and uses of the `match` soft keyword after
+  semicolons consistently with CPython (astral-sh/serc#2266;
+  https://github.com/astral-sh/serc/pull/2266)
+- Preserve exception-table coverage when `yield from` appears in an
+  exception-handler type expression (astral-sh/serc#1376;
+  https://github.com/astral-sh/serc/pull/1376)
+- Emit CPython-compatible `RESUME` exception depth for explicit `yield`
+  expressions in exception-handler type expressions and `except*` bodies
+  (astral-sh/serc#1375; https://github.com/astral-sh/serc/pull/1375)
+
 ## 0.1.8
 
 Released on 2026-10-20.
