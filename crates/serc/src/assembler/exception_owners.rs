@@ -2648,7 +2648,7 @@ impl ExceptionOwnerProvenance {
         all: &[Item],
     ) -> Option<(Label, &'a [Item], usize)> {
         use crate::target::opcodes::{
-            BUILD_LIST, BUILD_MAP, BUILD_TUPLE, CALL, DICT_UPDATE, LIST_EXTEND, LOAD_ATTR,
+            BUILD_LIST, BUILD_MAP, BUILD_TUPLE, CALL, COPY, DICT_UPDATE, LIST_EXTEND, LOAD_ATTR,
             LOAD_CONST, LOAD_FAST, LOAD_SMALL_INT, STORE_DEREF, STORE_FAST, STORE_NAME, SWAP,
         };
 
@@ -2736,6 +2736,7 @@ impl ExceptionOwnerProvenance {
                         | BUILD_MAP
                         | BUILD_TUPLE
                         | CALL
+                        | COPY
                         | DICT_UPDATE
                         | LIST_EXTEND
                         | LOAD_ATTR
@@ -2880,11 +2881,11 @@ impl ExceptionOwnerProvenance {
     ) -> bool {
         use crate::target::opcodes::{
             BINARY_OP, BUILD_LIST, BUILD_MAP, BUILD_STRING, BUILD_TUPLE, CALL, CALL_INTRINSIC_1,
-            CALL_KW, CONTAINS_OP, DICT_UPDATE, FORMAT_SIMPLE, GET_ITER, IMPORT_FROM, IMPORT_NAME,
-            LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST, LOAD_GLOBAL,
-            LOAD_NAME, LOAD_SMALL_INT, MAKE_FUNCTION, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE,
-            PUSH_NULL, RESUME, SET_FUNCTION_ATTRIBUTE, STORE_ATTR, STORE_DEREF, STORE_FAST,
-            STORE_NAME, TO_BOOL, UNPACK_SEQUENCE, YIELD_VALUE,
+            CALL_KW, CONTAINS_OP, COPY, DICT_UPDATE, FORMAT_SIMPLE, GET_ITER, IMPORT_FROM,
+            IMPORT_NAME, LIST_APPEND, LIST_EXTEND, LOAD_ATTR, LOAD_CONST, LOAD_DEREF, LOAD_FAST,
+            LOAD_GLOBAL, LOAD_NAME, LOAD_SMALL_INT, MAKE_FUNCTION, POP_JUMP_IF_FALSE,
+            POP_JUMP_IF_TRUE, PUSH_NULL, RESUME, SET_FUNCTION_ATTRIBUTE, STORE_ATTR, STORE_DEREF,
+            STORE_FAST, STORE_NAME, TO_BOOL, UNPACK_SEQUENCE, YIELD_VALUE,
         };
         use crate::target::operands::UnaryIntrinsic;
 
@@ -3224,9 +3225,16 @@ impl ExceptionOwnerProvenance {
                 .is_some_and(|next| {
                     matches!(
                         next.opcode,
-                        BUILD_TUPLE | LIST_EXTEND | LOAD_CONST | LOAD_SMALL_INT
+                        BUILD_TUPLE | COPY | LIST_EXTEND | LOAD_CONST | LOAD_SMALL_INT
                     )
                 });
+        // An assignment expression duplicates the restored result, stores one copy,
+        // and tests the other. None of these records can compact or fuse.
+        let assigned_comprehension = comprehension_restore_count > 0
+            && matches!(instructions.get(comprehension_restore_count + 1..),
+                Some([copy, store, truth, _, _]) if copy.opcode == COPY
+                    && copy.value_argument() == Some(1) && matches!(store.opcode, STORE_FAST | STORE_DEREF)
+                    && truth.opcode == TO_BOOL);
         for (index, instruction) in instructions.iter().copied().enumerate() {
             let membership_fold = instruction.opcode == LOAD_CONST
                 && original_folds.contains(&index)
@@ -3512,6 +3520,7 @@ impl ExceptionOwnerProvenance {
                     }
                     expanded_collection = true;
                 }
+                COPY if assigned_comprehension && index == comprehension_restore_count + 1 => {}
                 STORE_FAST => {
                     // Certified comprehension restores are still MAYBE_NULL
                     // pseudo instructions during CP superinstruction insertion.
@@ -3589,6 +3598,7 @@ impl ExceptionOwnerProvenance {
                     }
                     expanded_collection = true;
                 }
+                TO_BOOL if assigned_comprehension => {}
                 TO_BOOL => {
                     // The one conversion is emitted for a nonconstant terminal
                     // condition. Pseudo short-circuit COPY lowering is excluded.

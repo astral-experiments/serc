@@ -25591,6 +25591,21 @@ fn normal_finalizer_call_keeps_its_following_truth_marker() {
 }
 
 #[test]
+fn guards_on_assigned_comprehensions_append_an_unowned_marker() {
+    for capture in ["", "    def read_result(): return found\n"] {
+        let source = format!(
+            "async def collect(values):\n{capture}    try:\n        work()\n    finally:\n        if found := [item for item in values]:\n            use(found)\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "assigned_comprehension.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn normal_finalizer_comprehension_keeps_its_result_guard_owner() {
     let source = r"async def collect(source):
     async with acquire():
