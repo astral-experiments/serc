@@ -15,6 +15,34 @@ use serc::{
 };
 
 #[test]
+fn copied_returns_keep_break_lines_after_try_and_while_else_suites() {
+    let source = r"def choose(first, value):
+    if first:
+        while True:
+            try:
+                inspect(value)
+                break
+            except LookupError:
+                recover(value)
+    else:
+        fallback(value)
+    return value
+
+def retry(first, running, ready, value):
+    if first:
+        while running:
+            if ready:
+                break
+        else:
+            expired(value)
+    else:
+        fallback(value)
+    return value
+";
+    assert_matches_cpython(source, "copied_break_returns.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
