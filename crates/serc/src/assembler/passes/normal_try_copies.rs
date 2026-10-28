@@ -2798,6 +2798,17 @@ impl OptimizationPipeline {
             }
             graph.label_block(jump.forward_target()?)
         };
+        let named_local_returns = self
+            .exception_owner_provenance
+            .original_named_handler_cleanup_joins
+            .iter()
+            .filter_map(|(label, array)| {
+                let returned = graph.label_block(array[4].forward_target()?)?;
+                let cleanup = graph.label_block(*label)?;
+                original_local_return(graph[returned].items()).then_some(cleanup)
+            })
+            .collect::<FxHashSet<_>>();
+        let mut nested_cleanup_bridges = Vec::new();
         let mut local_return_cleanups = FxHashSet::default();
         let mut joins = Vec::new();
         for &(entry_label, join_label) in &self.exception_owner_provenance.normal_try_exits {
@@ -2807,6 +2818,15 @@ impl OptimizationPipeline {
             else {
                 continue;
             };
+            if self.python_version >= crate::PythonVersion::Py314
+                && !named_local_returns.is_empty()
+                && unlocated_jump(entry) == Some(join)
+                && self
+                    .empty_try_cleanup_successor(join)
+                    .is_some_and(|outer| named_local_returns.contains(&outer))
+            {
+                nested_cleanup_bridges.push(entry);
+            }
             let mut cleanup = graph[entry].items().iter().filter_map(Item::as_instruction);
             if original_local_return(graph[join].items())
                 && matches!((cleanup.next(), cleanup.next()), (Some(jump), None)
@@ -2885,6 +2905,18 @@ impl OptimizationPipeline {
                         .defer_removal();
                 }
             }
+        }
+        // The try bridge copies the first cleanup while both it and its outer
+        // successor are still unlocated. Its original predecessors must visit
+        // that bridge before the outer cleanup acquires its local return.
+        for bridge in nested_cleanup_bridges {
+            let jump = self
+                .graph
+                .instructions_mut(bridge)
+                .next()
+                .expect("original try bridge");
+            jump.jump_policy.prevent_threading_target();
+            jump.allow_unconditional_block_inlining();
         }
         for (join, normal_copy) in joins {
             if let Some((normal, tail, _)) = normal_copy {

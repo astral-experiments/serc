@@ -3989,6 +3989,25 @@ fn folded_while_breaks_copy_unnamed_handler_cleanup() {
 }
 
 #[test]
+fn manager_exit_copies_both_named_handler_cleanups_before_a_local_return() {
+    let source = r"def run(manager, value):
+    try:
+        pass
+    except OSError as outer:
+        try:
+            pass
+        except ValueError as middle:
+            try:
+                with manager:
+                    work()
+            except LookupError as inner:
+                pass
+    return value
+";
+    assert_matches_cpython(source, "nested_named_manager_return.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_none_while_break_copies_cleanup() {
     for prefix in ["", "async "] {
         for condition in ["value", "value is None", "value is not None"] {
