@@ -18587,6 +18587,12 @@ async def run(record, select, ready):
 }
 
 #[test]
+fn a_module_keeps_each_terminal_guard_exit_before_erased_assertions() {
+    let source = "if enabled:\n    if ready:\n        work()\n    assert ready\n";
+    assert_matches_cpython(source, "module_guard_footer.py", &LEVELS);
+}
+
+#[test]
 fn a_generator_keeps_each_terminal_guard_exit_before_erased_assertions() {
     let source = r"def visit(enabled, ready, value):
     if enabled:
