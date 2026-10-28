@@ -3213,7 +3213,6 @@ impl ExceptionOwnerProvenance {
             .collect::<FxHashSet<_>>();
         let mut setup_count = 0;
         let mut folded_slots = 0usize;
-        let mut membership_folds = 0;
         let mut null_setup_cells = FxHashSet::default();
         // These entry opcodes extend the original comprehension certificate.
         // Their original array must remain physically continuous through the
@@ -3244,10 +3243,6 @@ impl ExceptionOwnerProvenance {
                 return false;
             }
             if membership_fold {
-                membership_folds += 1;
-                if membership_folds > 1 {
-                    return false;
-                }
                 folded_slots +=
                     usize::from(instruction.local_policy.hidden_exception_owner_slots());
             }

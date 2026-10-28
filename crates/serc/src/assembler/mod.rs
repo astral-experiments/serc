@@ -8203,6 +8203,30 @@ impl Assembler {
         }
     }
 
+    /// Records the exact survivor of a literal set folded for a membership test.
+    pub(crate) fn record_literal_membership_fold(&mut self, count: usize) {
+        if count >= 4 {
+            self.record_last_uniform_fold_owner_slots(count);
+            return;
+        }
+        if self.python_version != crate::PythonVersion::Py314 || count == 0 {
+            return;
+        }
+        let record = self.required_last_instruction_mut("recording a folded membership operand");
+        if record.opcode == LOAD_CONST
+            && matches!(record.operand(), Operand::Deferred(_))
+            && record.exception_policy() == ExceptionPolicy::NoneUnchanged
+            && usize::from(record.pre_fold_extra_instructions()) == count
+            && usize::from(record.local_policy.hidden_exception_owner_slots()) == count
+        {
+            record.jump_policy.mark_original_uniform_fold();
+            let original = *record;
+            self.exception_owner_provenance
+                .original_uniform_folds
+                .push(original);
+        }
+    }
+
     /// Certifies contiguous literal-fold records that share their survivor's owner.
     pub(crate) fn record_last_uniform_fold_owner_slots(&mut self, count: usize) {
         if count >= 4 && count < usize::from(LocalPolicy::MAX_HIDDEN_EXCEPTION_OWNER_SLOTS) {
@@ -13850,7 +13874,7 @@ impl Assembler {
         if !provenance.source_boundaries.contains(&entry) {
             return;
         }
-        let origin = exception_owners::CopiedReturnMembershipPrefix {
+        let mut origin = exception_owners::CopiedReturnMembershipPrefix {
             entry,
             return_value: *return_value,
             cleanup_labels: labels
@@ -13867,6 +13891,13 @@ impl Assembler {
             condition: *condition,
             marker: *marker,
         };
+        // This copied finalizer has its own source array for the folded set.
+        // Its enclosing return and removed POPs can have different owners.
+        let constant = self.linear_items_mut()[first_pop_item + 3]
+            .as_instruction_mut()
+            .expect("matched membership constant");
+        constant.jump_policy.retire_original_uniform_fold();
+        origin.constant = *constant;
         self.exception_owner_provenance
             .copied_return_membership_prefixes
             .push(origin);

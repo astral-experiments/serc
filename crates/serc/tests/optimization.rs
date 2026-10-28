@@ -3608,6 +3608,47 @@ fn erased_loop_break_keeps_async_manager_finally_boundary() {
 }
 
 #[test]
+fn copied_membership_keeps_the_return_cleanup_owners() {
+    let source = r#"async def read(flag, item, value):
+    state = "idle"
+    try:
+        if flag:
+            one()
+            two()
+            three()
+            return item
+        return item
+    except KeyError:
+        state = "old"
+    except ValueError:
+        state = "bad"
+    finally:
+        result = value if state in {"old", "bad", "idle"} else None
+"#;
+    assert_matches_cpython(source, "copied_membership_cleanup.py", &LEVELS);
+}
+
+#[test]
+fn consecutive_literal_memberships_preserve_the_following_try_setup_slot() {
+    let source = r"def choose(value, enabled):
+    if enabled:
+        first = value in {'a', 'b'}
+        second = value in {'b', 'c'}
+        try:
+            result = first if second else False
+        except KeyError:
+            recover()
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "folded_memberships.py",
+        &LEVELS,
+        &VERSIONS.map(|(version, _, _)| version),
+    );
+}
+
+#[test]
 fn stored_finalizer_value_keeps_retained_setup_marker_owner() {
     let params = (0..16)
         .map(|n| format!("p{n}"))
