@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn erased_assertions_keep_the_try_else_guards_backedge_location() {
+    for exit in ["raise ValueError(item)", "return", "break"] {
+        let source = format!(
+            "def scan(items, flag):\n    for item in items:\n        try:\n            value = read(item)\n        except LookupError:\n            recover()\n        else:\n            if flag:\n                {exit}\n            assert value\n"
+        );
+        assert_matches_cpython(&source, "guarded_else_assertion.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
