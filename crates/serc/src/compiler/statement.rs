@@ -32506,7 +32506,6 @@ impl<'source> Compiler<'source> {
                 && !terminal
                 && loop_tail.is_none()
                 && !cleanup_has_small_return_successor
-                && self.control.in_loop()
                 && self.control.withs.active_with_exits.is_empty()
                 && self.control.exceptions.active_exception_handlers.is_empty()
                 && self.control.exceptions.active_exception_group_handlers == 0

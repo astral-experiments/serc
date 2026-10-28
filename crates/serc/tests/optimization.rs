@@ -7764,6 +7764,28 @@ fn raising_finalizer_preserves_handler_return_iterator_owner() {
 }
 
 #[test]
+fn guarded_handler_iterator_break_copies_cleanup_without_an_enclosing_loop() {
+    let source = r"def scan(items, ready):
+    try:
+        start()
+    except ValueError:
+        if ready:
+            for item in items:
+                if skip(item):
+                    continue
+                record(item)
+                break
+    finish()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("                break", "                continue"),
+    ] {
+        assert_matches_cpython(&source, "guarded_handler_iterator.py", &LEVELS);
+    }
+}
+
+#[test]
 fn copied_iterator_break_joins_guarded_handler_exits() {
     let source = r"def nested_cleanup(groups, skip, retry, stop, acquire, transform, close, done):
     for batch in groups:
