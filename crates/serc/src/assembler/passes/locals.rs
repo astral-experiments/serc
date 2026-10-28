@@ -4524,9 +4524,11 @@ impl OptimizationPipeline {
                             .eq([crate::target::opcodes::JUMP_FORWARD]);
                     // A removed normal exit stops fallthrough from the preceding array.
                     // A surviving arm jump can still enter the continuation directly.
-                    // Marked cleanup entries use the original jump checks above.
+                    // A break can thread past an empty loop exit. Use its original
+                    // target checks above, as for marked cleanup entries.
                     let surviving_protected_arm = borrow_unreachable_blocks[target]
                         && last.opcode == JUMP_FORWARD
+                        && !last.fusion_policy.is_authored_break()
                         && target > block + 1
                         && !exception_regions.is_empty()
                         && !jump_entry_blocks.get(target).copied().unwrap_or(false)
