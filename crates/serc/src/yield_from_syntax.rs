@@ -9,6 +9,7 @@ use crate::{grow_stack, stack_growth_required};
 /// Find the diagnostic location when Ruff rejects a tuple as a `yield from` operand.
 pub(crate) fn invalid_tuple_diagnostic(
     parsed: &Parsed<ModModule>,
+    errors: &[ParseError],
 ) -> Option<(&'static str, TextRange)> {
     struct Finder<'a> {
         errors: &'a [ParseError],
@@ -96,7 +97,7 @@ pub(crate) fn invalid_tuple_diagnostic(
     }
 
     if !parsed.unsupported_syntax_errors().is_empty()
-        || !parsed.errors().iter().any(|error| {
+        || !errors.iter().any(|error| {
             matches!(
                 error.error,
                 ParseErrorType::UnparenthesizedTupleExpression
@@ -108,7 +109,7 @@ pub(crate) fn invalid_tuple_diagnostic(
     }
 
     let mut finder = Finder {
-        errors: parsed.errors(),
+        errors,
         tokens: parsed.tokens(),
         found: None,
     };

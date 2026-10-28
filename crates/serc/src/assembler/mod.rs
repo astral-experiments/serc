@@ -1739,14 +1739,14 @@ impl Assembler {
         }
     }
 
-    /// Retains the original final store's location after deferred static reordering.
+    /// Retains the original fallthrough position when lowering reorders a store or elides a discard.
     pub(crate) fn record_original_fallthrough_location(
         &mut self,
         emitted: EmittedInstruction,
         location: SourceLocation,
     ) {
         let instruction = self.emitted_instruction_mut(emitted, "recording original fallthrough");
-        debug_assert_eq!(instruction.opcode, STORE_FAST);
+        debug_assert!(matches!(instruction.opcode, STORE_FAST | POP_TOP));
         self.original_fallthrough_location = Some((emitted, location));
     }
 

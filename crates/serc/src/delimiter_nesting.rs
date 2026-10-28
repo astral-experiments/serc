@@ -355,8 +355,13 @@ fn earlier_indentation_error(
     version: PythonVersion,
 ) -> EarlierIndentation {
     let prefix = &source[..range.start().to_usize()];
-    let parsed = ruff_python_parser::parse_unchecked(prefix, options.clone());
-    let parse_error = parsed.errors().first();
+    let parsed = ruff_python_parser::parse_unchecked(prefix, options.clone())
+        .try_into_module()
+        .expect("module parse");
+    let parsed = crate::ParsedModule::new(parsed);
+    let parsed = parsed.parsed.as_ref().expect("parsed module is present");
+    let (errors, _) = crate::semicolon_syntax::recover(prefix, options, parsed);
+    let parse_error = errors.first();
     if let Some(indent) = indentation::first_excess(parsed.tokens()) {
         return if parse_error.is_none_or(|error| indent.start() <= error.location.start()) {
             EarlierIndentation::Error(
