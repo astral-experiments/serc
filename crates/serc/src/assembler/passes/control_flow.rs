@@ -2562,6 +2562,67 @@ impl OptimizationPipeline {
                 .then_some(source_index)
             })
             .collect::<FxHashSet<_>>();
+        // The jump after a raising else arm carries the raise's line, but the
+        // fallthrough that supplied that line is unreachable. An earlier branch
+        // can retain its own line while threading through this empty join.
+        let retained_forward_jumps = if !SOURCE_GATES || has_retained_forward_nop {
+            forward_jump_positions.as_slice()
+        } else {
+            &[]
+        };
+        let raising_arm_join_targets = retained_forward_jumps
+            .iter()
+            .filter_map(|&(index, (block, offset))| {
+                let jump = graph[block].items()[offset].as_instruction()?;
+                if !jump.jump_policy.always_retains_nop() || jump.location.line < 0 {
+                    return None;
+                }
+                let entry = jump.forward_target()?;
+                let bridge_index = *label_offsets.get(entry)?;
+                let &(raise_block, raise_offset) =
+                    instruction_positions.get(bridge_index.checked_sub(1)?)?;
+                let raise = graph[raise_block].items()[raise_offset].as_instruction()?;
+                let &(bridge_block, bridge_offset) = instruction_positions.get(bridge_index)?;
+                let bridge = graph[bridge_block].items()[bridge_offset].as_instruction()?;
+                let target = bridge.forward_target()?;
+                let target_index = *label_offsets.get(target)?;
+                let mut source_jump = Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(entry),
+                    jump.location,
+                    jump.depth_after(),
+                );
+                source_jump.jump_policy.retain_nop();
+                let mut join_jump = Instruction::new(
+                    JUMP_FORWARD,
+                    Operand::Forward(target),
+                    raise.location,
+                    raise.depth_after(),
+                );
+                join_jump.jump_policy.retain_nop_for_direct_target();
+                join_jump.jump_policy.mark_original_empty_join();
+                (raise.opcode == RAISE_VARARGS
+                    && raise.value_argument() == Some(1)
+                    && raise.location.line >= 0
+                    && jump.location.line != raise.location.line
+                    && jump.depth_after().is_some()
+                    && jump.depth_after() == raise.depth_after()
+                    && *jump == source_jump
+                    && *bridge == join_jump
+                    && graph[bridge_block].last_instruction() == Some(bridge)
+                    && index < bridge_index
+                    && bridge_index < target_index
+                    && !self.original_nop_targets.contains(&entry)
+                    && !self
+                        .exception_owner_provenance
+                        .omitted_nop_counts
+                        .contains_key(&entry)
+                    && region_ranges
+                        .iter()
+                        .all(|range| range.contains(&index) == range.contains(&bridge_index)))
+                .then_some((index, target))
+            })
+            .collect::<FxHashMap<_, _>>();
         // A retained source NOP does not block a located, original loop backedge.
         // Prove the source's authored break slot or conditional false entry, then
         // require a clean single-jump target with the same original exception owner.
@@ -3138,12 +3199,18 @@ impl OptimizationPipeline {
                 }
                 return;
             }
-            if planned_sources.contains(&source_index)
-                || !is_unconditional_jump(instruction.opcode)
-                || (instruction.jump_policy.always_retains_nop()
-                    && !retained_break_backedges.contains(&source_index)
-                    && !retained_located_backedges.contains(&source_index))
+            if planned_sources.contains(&source_index) || !is_unconditional_jump(instruction.opcode)
             {
+                return;
+            }
+            if instruction.jump_policy.always_retains_nop()
+                && !retained_break_backedges.contains(&source_index)
+                && !retained_located_backedges.contains(&source_index)
+            {
+                if let Some(&target) = raising_arm_join_targets.get(&source_index) {
+                    instruction.set_operand(Operand::Forward(target));
+                    changed = true;
+                }
                 return;
             }
             let Operand::Forward(mut target) = instruction.operand() else {
