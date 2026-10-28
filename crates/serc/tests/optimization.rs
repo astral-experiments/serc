@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn a_completed_manager_await_reaches_its_join_after_cold_cleanup() {
+    let source = r"async def process(resource, ready):
+    try:
+        if ready:
+            async with scope():
+                await work()
+        else:
+            await recover()
+    except ValueError as error:
+        try:
+            close()
+        finally:
+            raise error
+    resource.finish()
+";
+    assert_matches_cpython(source, "awaited_cleanup_join.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
