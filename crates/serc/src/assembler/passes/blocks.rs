@@ -8726,8 +8726,22 @@ impl OptimizationPipeline {
             } else {
                 inline_copies.entry(source).or_default().push(copied);
             }
+            // A remaining fallthrough enters the original iterator discard after
+            // the guard gets its own copy. Its line also reaches the split jump.
+            let split_iterator_break = self.python_version == crate::PythonVersion::Py315
+                && source_has_fallthrough
+                && target_has_no_location
+                && target != target_exit
+                && target_terminal_opcode == Some(JUMP_FORWARD)
+                && target_blocks
+                    .iter()
+                    .flat_map(|block| graph[*block].items())
+                    .filter_map(Item::as_instruction)
+                    .map(|instruction| instruction.opcode)
+                    .eq([POP_TOP, POP_TOP, JUMP_FORWARD]);
             if target != target_exit
-                && (split_constant_return
+                && (split_iterator_break
+                    || split_constant_return
                     || (source_has_fallthrough
                         && (target_has_unlocated_jump_eval_check
                             || shared_iterator_return
