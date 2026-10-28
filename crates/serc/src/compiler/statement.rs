@@ -29389,7 +29389,9 @@ impl<'source> Compiler<'source> {
                         || (loop_tail.is_none()
                             // An extracted loop-tail statement is still a source successor.
                             && (borrow_exit_has_source_successor
-                                || self.control.statements.context.inherited_has_following)))
+                                || self.control.statements.context.inherited_has_following
+                                || self.control.statements.context.same_region_continuation
+                                    == Some(statement.range))))
                     && matches!(
                         normal_exit_join_suite.last(),
                         Some(Stmt::If(branch))
