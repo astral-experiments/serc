@@ -38137,7 +38137,11 @@ impl<'source> Compiler<'source> {
             == crate::PythonVersion::Py314
             && matches!(self.unit.scope, Scope::Function { .. })
             && !statement.is_star
-            && !statement.handlers.is_empty()
+            && statement.handlers.iter().any(|handler| {
+                handler
+                    .as_except_handler()
+                    .is_some_and(|handler| !suite_terminates(&handler.body))
+            })
             && statement.orelse.is_empty()
             && statement.body.split_last().is_some_and(|(last, prefix)| {
                 if self.context.is_elided_statement(last)
