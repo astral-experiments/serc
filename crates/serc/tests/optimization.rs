@@ -15755,6 +15755,37 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn conditional_discards_copy_their_protected_value_and_normal_exit() {
+    let source = r"def managed_discard(value, ready):
+    with manager:
+        try:
+            value == 0 if ready else False
+        except ValueError as exc:
+            raise LookupError() from exc
+        finish()
+
+async def iterated_discard(items):
+    items = await fetch(items)
+    for value in items:
+        try:
+            compute(value) if value else 0
+        except ValueError:
+            continue
+        observe(value)
+    finish()
+
+def finalized_discard(item, ready):
+    try:
+        compute() if ready else (None, None)
+    except (OSError, ValueError):
+        pass
+    finally:
+        cleanup(item)
+";
+    assert_matches_cpython(source, "protected_value_discard.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
