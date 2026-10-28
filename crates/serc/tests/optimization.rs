@@ -15755,6 +15755,23 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn folded_assertion_arms_wait_to_copy_the_following_return() {
+    for test in [
+        "value < left if ready else 2",
+        "2 if ready else value < left",
+    ] {
+        let source = format!(
+            "def choose(items, value, left, right, ready):
+    selected = [item for item in items]
+    assert {test}
+    return left, right
+"
+        );
+        assert_matches_cpython(&source, "folded_assertion_arm.py", &LEVELS);
+    }
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
