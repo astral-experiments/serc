@@ -25977,3 +25977,24 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn protected_handlers_copy_a_zero_argument_constructor_raise() {
+    for arguments in ["", "7"] {
+        let source = format!(
+            "def run():
+    try:
+        try:
+            work()
+        except KeyError:
+            pass
+        raise Stop({arguments})
+    except ValueError as error:
+        return None
+    finally:
+        finish()
+"
+        );
+        assert_matches_cpython(&source, "handler_constructor_raise.py", &LEVELS);
+    }
+}
