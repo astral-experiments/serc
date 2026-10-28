@@ -15,6 +15,12 @@ use serc::{
 };
 
 #[test]
+fn protected_for_keeps_the_backedge_after_a_trailing_pass() {
+    let source = "def scan(items, flag):\n    try:\n        for item in items:\n            if flag:\n                use(item)\n            pass\n    except LookupError:\n        recover()\n";
+    assert_matches_cpython(source, "protected_for_pass.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
