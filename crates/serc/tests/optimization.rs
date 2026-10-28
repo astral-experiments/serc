@@ -25977,3 +25977,19 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn iterator_break_uses_the_discarded_finalizer_expressions_position() {
+    let source = r"def scan(items, manager):
+    with manager:
+        for item in items:
+            try:
+                break
+            finally:
+                finish(item)
+        else:
+            raise LookupError
+    after()
+";
+    assert_matches_cpython(source, "iterator_finalizer_exit.py", &LEVELS);
+}
