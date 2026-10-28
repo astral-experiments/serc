@@ -721,6 +721,43 @@ fn is_short_cleanup_return(graph: &BlockGraph, target: Label) -> bool {
             })
 }
 
+/// Checks the original split between a named cleanup and its threaded jump.
+fn is_split_named_cleanup_jump(
+    prefix: &[Item],
+    exit: &[Item],
+    split_labels: &FxHashSet<Label>,
+) -> bool {
+    let Some((Item::Instruction(jump), labels)) = exit.split_last() else {
+        return false;
+    };
+    if jump.opcode != JUMP_FORWARD
+        || jump.location != SourceLocation::NONE
+        || jump.pre_fold_extra_instructions() != 1
+        || !labels.iter().all(|item| matches!(item, Item::Label(_)))
+        || !labels
+            .iter()
+            .any(|item| matches!(item, Item::Label(label) if split_labels.contains(label)))
+    {
+        return false;
+    }
+    let mut instructions = prefix.iter().filter_map(Item::as_instruction);
+    let [Some(pop), Some(load), Some(store), Some(delete), None] =
+        std::array::from_fn(|_| instructions.next())
+    else {
+        return false;
+    };
+    pop.opcode == POP_EXCEPT
+        && load.opcode == LOAD_CONST
+        && store.opcode == STORE_FAST
+        && delete.opcode == DELETE_FAST
+        && store.operand() == delete.operand()
+        && [pop, load, store, delete].iter().all(|instruction| {
+            instruction.location == SourceLocation::NONE
+                && instruction.pre_fold_extra_instructions() == 0
+                && instruction.local_policy.hidden_exception_owner_slots() == 0
+        })
+}
+
 /// Recognizes a named-handler cleanup followed by a short, located value return.
 fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> bool {
     let cleanup = graph[target]
@@ -6501,6 +6538,24 @@ impl OptimizationPipeline {
                         .exception_owner_provenance
                         .original_handler_cleanup_join_exits,
                 );
+            // A split named cleanup can reach another named cleanup through an empty
+            // join. Its unlocated jump has already spent its first copy on that join.
+            let split_named_cleanup = !planned_copy
+                && inline_no_location_block
+                && target_chain_end == target_position
+                && source_position < target_position
+                && source_position.checked_sub(1).is_some_and(|position| {
+                    let previous = order[position];
+                    !drop_blocks[previous.index()]
+                        && !inline_copies.contains_key(&previous)
+                        && !target_copies.contains_key(&previous)
+                        && is_split_named_cleanup_jump(
+                            graph[previous].items(),
+                            graph[source].items(),
+                            &exception_split_labels,
+                        )
+                })
+                && named_cleanup_has_short_return(graph, target);
             if !planned_copy
                 && inline_no_location_block
                 && target_chain_end == target_position
@@ -6508,7 +6563,7 @@ impl OptimizationPipeline {
                     jump.opcode == JUMP_FORWARD
                         // A recorded shared jump waits for its unnamed cleanup's return.
                         // Other unlocated cleanup continuations retain their copy order.
-                        && (jump.location.line >= 0 || shared_unnamed_cleanup_source)
+                        && (jump.location.line >= 0 || shared_unnamed_cleanup_source || split_named_cleanup)
                         // Retained authored line slots keep their original copy order.
                         && !jump.jump_policy.retains_nop_for(jump.operand())
                         && jump.pre_fold_extra_instructions() > 0
