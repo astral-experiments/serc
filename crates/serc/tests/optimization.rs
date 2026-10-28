@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn nested_handlers_share_the_fallthrough_cleanup_position() {
+    let source = r"def recover(value, use_first):
+    try:
+        value = read()
+    except ValueError as error:
+        try:
+            value = retry(value)
+        except LookupError:
+            if use_first:
+                value = first
+            else:
+                value = second
+    return value
+";
+    assert_matches_cpython(source, "recover.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
