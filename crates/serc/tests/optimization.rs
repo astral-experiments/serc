@@ -35,6 +35,16 @@ fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
 }
 
 #[test]
+fn closure_try_else_guards_reuse_the_enclosing_finally_handler() {
+    for condition in ["state", "state.ready", "state.ready()"] {
+        let source = format!(
+            "def bind(state):\n    def run(item):\n        try:\n            item.check()\n        except ValueError:\n            recover()\n        else:\n            if not {condition}:\n                state.finish()\n        finally:\n            state.close()\n    return run\n"
+        );
+        assert_matches_cpython(&source, "closure_try_else.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_finally_guard_inherits_the_preceding_calls_handler() {
     let source = r"def run(group):
     try:
