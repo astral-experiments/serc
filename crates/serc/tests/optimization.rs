@@ -2825,6 +2825,19 @@ fn coroutine_nested_breaks_reach_located_cleanup() {
 }
 
 #[test]
+fn recovery_copies_the_local_assignment_before_a_bare_raise() {
+    for recovery in [
+        "with manager:\n            work()",
+        "try:\n            work()\n        except LookupError as error:\n            record(error)",
+    ] {
+        let source = format!(
+            "def run(manager):\n    try:\n        start()\n    except ValueError:\n        {recovery}\n        failed = True\n        raise\n    finally:\n        finish()\n"
+        );
+        assert_matches_cpython(&source, "store_before_reraise.py", &LEVELS);
+    }
+}
+
+#[test]
 fn async_manager_recovery_copies_the_final_bare_raise() {
     let source = "async def sample(manager):
     try:

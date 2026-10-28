@@ -570,6 +570,12 @@ fn block_is_bare_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) 
         .iter()
         .take_while(|item| matches!(item, Item::Label(_)))
         .count();
+    let operations = &items[prefix_labels..];
+    if let [_, _, raise] = operations
+        && copied_raise_completes_local_store(&operations[..2], std::slice::from_ref(raise), true)
+    {
+        return true;
+    }
     if let [
         Item::Instruction(value),
         Item::Instruction(receiver),
