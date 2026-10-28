@@ -2,11 +2,12 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 
 use super::super::{
-    BorrowFallthrough, COMPARE_OP, CONTAINS_OP, COPY, ExceptionExclusion, ExceptionPolicy, IS_OP,
-    Instruction, Item, JUMP_BACKWARD, JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD,
-    LOAD_COMMON_CONSTANT, Label, NOP, NOT_TAKEN, NormalizedExceptionOwner, Operand,
-    POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST, STORE_FAST_STORE_FAST,
-    SourceLocation, TO_BOOL, UNARY_NOT, UNPACK_SEQUENCE, ends_scope, is_unconditional_jump,
+    BorrowFallthrough, COMPARE_OP, CONTAINS_OP, COPY, ExceptionExclusion, ExceptionPolicy,
+    ExceptionRegion, ExceptionRegionPriority, IS_OP, Instruction, Item, JUMP_BACKWARD,
+    JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LOAD_COMMON_CONSTANT, Label, NOP, NOT_TAKEN,
+    NormalizedExceptionOwner, Operand, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, POP_TOP, STORE_FAST,
+    STORE_FAST_STORE_FAST, SourceLocation, TO_BOOL, UNARY_NOT, UNPACK_SEQUENCE, ends_scope,
+    is_unconditional_jump,
 };
 use crate::assembler::ConstantTable;
 use crate::assembler::OptimizationPipeline;
@@ -66,6 +67,38 @@ impl std::ops::Index<&Label> for ThreadLabelOffsets {
     fn index(&self, label: &Label) -> &Self::Output {
         self.get(*label).expect("no entry found for key")
     }
+}
+
+/// Moving cold blocks can split an enclosing try between a break and its target.
+/// Check that every ending range resumes with its original handler and priority.
+fn break_crosses_resumed_try_regions(
+    regions: &[ExceptionRegion],
+    boundary: Label,
+    depth: Option<u32>,
+) -> bool {
+    let mut ending = regions
+        .iter()
+        .filter(|region| region.end == boundary)
+        .peekable();
+    if ending.peek().is_none() || regions.iter().any(|region| region.target == boundary) {
+        return false;
+    }
+    let mut starting = regions.iter().filter(|region| region.start == boundary);
+    ending.all(|before| {
+        starting.next().is_some_and(|after| {
+            !before.is_scope_fallback
+                && !after.is_scope_fallback
+                && !before.preserve_lasti
+                && !after.preserve_lasti
+                && before.target == after.target
+                && before.depth == after.depth
+                && Some(before.depth) == depth
+                && matches!((before.priority, after.priority), (
+                    ExceptionRegionPriority::Resolved { start: a, end: b },
+                    ExceptionRegionPriority::Resolved { start: c, end: d },
+                ) if a == c && b == d)
+        })
+    }) && starting.next().is_none()
 }
 
 // The original pair is tagged before copying passes; physical copies retire that tag.
@@ -5670,7 +5703,12 @@ impl OptimizationPipeline {
                                             .iter()
                                             .filter(|region| region.end == *label);
                                         let original = ending.next();
-                                        crosses_only_original_cleanup &= *label != target
+                                        let resumed_try = break_crosses_resumed_try_regions(
+                                            &self.exception_regions,
+                                            *label,
+                                            instruction.depth_after(),
+                                        );
+                                        crosses_only_original_cleanup &= resumed_try || (*label != target
                                             && self.exception_owner_provenance.source_boundaries.contains(label)
                                             && self.exception_owner_provenance.block_boundaries.contains(label)
                                             && !self.borrow_block_aliases.contains(label)
@@ -5698,7 +5736,7 @@ impl OptimizationPipeline {
                                                                         _ => false,
                                                                     })))
                                                     })
-                                            });
+                                            }));
                                     }
                                 }
                                 Item::Instruction(removed) => {

@@ -15,6 +15,31 @@ use serc::{
 };
 
 #[test]
+fn copied_finalizer_break_keeps_its_line_inside_an_enclosing_try() {
+    let source = r"def scan(item, flag):
+    try:
+        while True:
+            try:
+                if flag:
+                    work()
+                else:
+                    read()
+                break
+            except ValueError:
+                return
+            finally:
+                if not flag:
+                    cleanup(item)
+            pass
+        pass
+        finish(item)
+    finally:
+        cleanup(item)
+";
+    assert_matches_cpython(source, "split_finalizer_break.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
