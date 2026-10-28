@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn a_same_line_break_keeps_its_event_after_the_loop_backedge() {
+    let source = r"def read(ready, value):
+    while True:
+        if ready: break
+    finish(value)
+";
+    assert_matches_cpython(source, "loop_break.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
