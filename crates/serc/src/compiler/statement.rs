@@ -3883,6 +3883,10 @@ impl<'source> Compiler<'source> {
                 });
         let needs_boundary = legacy
             || terminal_assignment
+            // A conditional operand rejoins before the in-place operation and
+            // store. Even a jumping arm's copied return would include five slots.
+            || matches!(body.last(), Some(Stmt::AugAssign(assignment))
+                if matches!(assignment.value.as_ref(), Expr::If(_)))
             // Erased assertions do not join a call's original block to the return.
             || elided_terminal_call
             // Nonfinal deletion arms have an authored end jump. A one-slot Name
