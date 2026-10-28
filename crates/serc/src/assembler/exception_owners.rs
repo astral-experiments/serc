@@ -10625,7 +10625,9 @@ impl LayoutAssembler {
                                 .and_then(|removed_before| load_index.checked_add(removed_before));
                             if !copied_finally
                                 && removed_pop > 0
-                                && original_pop_slot == Some(instruction_index + 1)
+                                && (original_pop_slot == Some(instruction_index + 1)
+                                    // The preceding ordinary POP in a captured pair has the same NULL owner.
+                                    || (paired && pop_slot_epoch_known && original_pop_slot == Some(instruction_index + 2)))
                             {
                                 pending_normal_none_owner = Some((instruction_index + 1, None));
                                 continue;

@@ -11696,6 +11696,31 @@ impl<'source> Compiler<'source> {
                                 && manager.exception_region_depth == 0
                                 && manager.loop_depth == 0
                                 && manager.normal_finally_depth == 0);
+                    let managed_saved_return = self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && preserve_tos
+                        && finally_context.with_depth == 1
+                        && matches!(finally_context.body.first(), Some(Stmt::If(guard))
+                            if is_specialized_none_condition(&guard.test));
+                    let unwinds_managed_iterator = managed_saved_return
+                        && next_loop == 1
+                        && matches!(self.control.loops.contexts.as_slice(), [iterator]
+                            if iterator.iterator_cleanup == IteratorCleanup::Sync
+                                && iterator.with_depth == 1
+                                && iterator.finally_end_depth == 0
+                                && iterator.exception_region_depth == 2);
+                    // The inner finalizer has already run. The ordinary try between
+                    // the two finalizers still contributes its POP before the outer copy.
+                    let unwinds_managed_finalizer = managed_saved_return
+                        && self.control.exceptions.active_try_marker_slots.len() == 1
+                        && matches!(return_finally_contexts.as_slice(), [_, inner]
+                            if inner.handler_depth == 0 && inner.loop_depth == 0 && inner.with_depth == 1
+                                && inner.try_body_depth == 1 && inner.exception_region_depth == 2
+                                && matches!(inner.body, [Stmt::Expr(expression)]
+                                    if matches!(expression.value.as_ref(), Expr::Call(call)
+                                        if call.arguments.args.is_empty() && call.arguments.keywords.is_empty()
+                                            && matches!(call.func.as_ref(), Expr::Attribute(attribute)
+                                                if matches!(attribute.value.as_ref(), Expr::Name(_))))));
                     // These synchronous managers surround the entire try/finally.
                     // They contribute no unwind cells before the ordinary-try/finally
                     // POP pair, just as a retained outer async manager does.
@@ -11704,21 +11729,22 @@ impl<'source> Compiler<'source> {
                         == 0
                         && ((preserve_tos
                             && matches!(statement.value.as_deref(), Some(Expr::Call(_))))
-                            || constant_return_slots)
+                            || constant_return_slots
+                            || unwinds_managed_finalizer)
                         && !return_is_overridden
                         && context_index == 0
-                        && return_finally_contexts.len() == 1
+                        && (return_finally_contexts.len() == 1 || unwinds_managed_finalizer)
                         && handler_count == 0
                         && finally_context.handler_depth == 0
                         && finally_context.loop_depth == 0
                         && finally_context.exception_region_depth == 0
                         && finally_context.try_body_depth == 0
-                        && next_loop == 0
+                        && (next_loop == 0 || unwinds_managed_iterator)
                         && (1..=2).contains(&finally_context.with_depth)
                         && next_with == finally_context.with_depth
                         && next_with == self.control.withs.active_with_exits.len()
                         && with_unwind_starts.is_empty()
-                        && self.control.loops.contexts.is_empty()
+                        && (self.control.loops.contexts.is_empty() || unwinds_managed_iterator)
                         && self.control.finally.active_copied_finally_bodies == 0
                         && self
                             .control
@@ -11740,7 +11766,7 @@ impl<'source> Compiler<'source> {
                                             if matches!(attribute.value.as_ref(), Expr::Name(_)))))
                                     && matches!(comparison.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
                                     && matches!(comparison.comparators(), [Expr::NoneLiteral(_)]),
-                                Expr::BoolOp(boolean) => (boolean.op == BoolOp::Or || constant_return_slots)
+                                Expr::BoolOp(boolean) => (boolean.op == BoolOp::Or || constant_return_slots || unwinds_managed_finalizer)
                                     && matches!(boolean.values.first(), Some(Expr::Compare(comparison))
                                         if matches!(comparison.first_operand(), Expr::Name(_))
                                             && matches!(comparison.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
@@ -12063,7 +12089,13 @@ impl<'source> Compiler<'source> {
                             self.assembler.mark_last_as_converted_pop_block();
                         }
                     }
-                    if (return_finally_contexts.len() == 1 || copied_return_keeps_nested_iterator)
+                    let retained_manager_finalizer =
+                        copied_return_keeps_outer_sync_managers && unwinds_managed_finalizer;
+                    let retained_manager_iterator =
+                        copied_return_keeps_outer_sync_managers && unwinds_managed_iterator;
+                    if (return_finally_contexts.len() == 1
+                        || copied_return_keeps_nested_iterator
+                        || retained_manager_finalizer)
                         && handler_count == 0
                         && let Some(ordinary_try_count) = self
                             .control
@@ -12078,7 +12110,9 @@ impl<'source> Compiler<'source> {
                             .active_exception_region_exclusions
                             .len()
                             .checked_sub(finally_context.exception_region_depth)
-                            == Some(ordinary_try_count + 1)
+                            == Some(
+                                ordinary_try_count + 1 + usize::from(retained_manager_finalizer),
+                            )
                         && (self.control.withs.active_with_exits.is_empty()
                             || (unwinds_inner_managers && ordinary_try_count >= 2)
                             || (copied_return_keeps_outer_async_manager && ordinary_try_count == 1)
@@ -12097,6 +12131,7 @@ impl<'source> Compiler<'source> {
                                         && statement.value.is_none())))
                             || (copied_return_unwinds_value_while_tries
                                 && (1..=2).contains(&ordinary_try_count))
+                            || retained_manager_iterator
                             || (copied_return_unwinds_inner_iterator && ordinary_try_count == 1)
                             || (self.unit.flags & CO_ASYNC_GENERATOR != 0
                                 && !preserve_tos
@@ -12147,6 +12182,7 @@ impl<'source> Compiler<'source> {
                             && (self.control.loops.contexts.is_empty()
                                 || copied_return_keeps_outer_loop
                                 || copied_return_unwinds_while_only
+                                || retained_manager_iterator
                                 || (copied_return_unwinds_inner_iterator
                                     && (preserve_tos || statement.value.is_none())))
                         {

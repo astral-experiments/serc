@@ -4369,6 +4369,44 @@ fn retained_manager_returns_unwind_tries_before_attribute_none_guards() {
 }
 
 #[test]
+fn saved_returns_unwind_the_ordinary_try_inside_a_retained_manager() {
+    let iterator = r"def collect(items, item, value, ready):
+    with manager():
+        try:
+            for item in items:
+                return build(item)
+        except KeyError:
+            retry()
+        finally:
+            if value is not None:
+                clean()
+";
+    let nested = r"def collect(items, item, value, ready):
+    with manager():
+        try:
+            try:
+                if ready:
+                    return item
+                return item
+            finally:
+                value.close()
+        except KeyError:
+            retry()
+        finally:
+            if value is not None:
+                clean()
+";
+    for source in [iterator, nested] {
+        assert_matches_cpython_versions(
+            source,
+            "manager_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn continue_from_nested_handlers_keeps_the_finalizer_setup_unowned() {
     for (binding, action) in [
         ("", "continue"),
