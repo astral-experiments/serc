@@ -188,9 +188,9 @@ fn original_local_subscript_return(items: &[Item]) -> Option<OriginalTail> {
     .then_some(OriginalTail::ComputedReturn { width: 4 })
 }
 
-/// Recognizes an intact, single-line global attribute or zero-argument call return.
+/// Recognizes an intact, single-line attribute access or zero-argument global call return.
 fn original_computed_return(items: &[Item]) -> Option<OriginalTail> {
-    use crate::target::opcodes::{CALL, LOAD_ATTR, LOAD_GLOBAL, RETURN_VALUE};
+    use crate::target::opcodes::{CALL, LOAD_ATTR, LOAD_FAST, LOAD_GLOBAL, RETURN_VALUE};
 
     let head_len = items
         .iter()
@@ -205,8 +205,7 @@ fn original_computed_return(items: &[Item]) -> Option<OriginalTail> {
         return None;
     };
     let argument = load.value_argument()?;
-    if load.opcode != LOAD_GLOBAL
-        || ret.opcode != RETURN_VALUE
+    if ret.opcode != RETURN_VALUE
         || ret.value_argument() != Some(0)
         || value.depth_after() != Some(1)
         || ret.depth_after() != Some(0)
@@ -222,13 +221,14 @@ fn original_computed_return(items: &[Item]) -> Option<OriginalTail> {
     {
         return None;
     }
-    let width = if argument & 1 == 0
+    let width = if (load.opcode == LOAD_FAST || (load.opcode == LOAD_GLOBAL && argument & 1 == 0))
         && load.depth_after() == Some(1)
         && value.opcode == LOAD_ATTR
         && matches!(value.operand(), Operand::Value(attribute) if attribute & 1 == 0)
     {
         3
-    } else if argument & 1 != 0
+    } else if load.opcode == LOAD_GLOBAL
+        && argument & 1 != 0
         && load.depth_after() == Some(2)
         && value.opcode == CALL
         && value.value_argument() == Some(0)
@@ -4064,7 +4064,14 @@ impl OptimizationPipeline {
                     .contains(&label)
                 || (!exits.contains_key(&target)
                     && !guarded_handler_joins.contains_key(&target)
-                    && !matches!(returns.get(&target), Some(OriginalTail::LocalTupleReturn { .. } | OriginalTail::ConstantReturn { .. })))
+                    && !matches!(
+                        returns.get(&target),
+                        Some(
+                            OriginalTail::LocalTupleReturn { .. }
+                                | OriginalTail::ConstantReturn { .. }
+                                | OriginalTail::ComputedReturn { width: 3 }
+                        )
+                    ))
                 || positions[&block] >= positions[&target]
                 || !items[..head_len].iter().any(|item| {
                     matches!(item, Item::Label(label)
