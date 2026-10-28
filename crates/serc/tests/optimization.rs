@@ -15,6 +15,17 @@ use serc::{
 };
 
 #[test]
+fn a_comprehension_attribute_store_donates_its_branch_return() {
+    let source = r"def collect(obj, items, ready):
+    if ready:
+        if obj.values is None:
+            obj.values = [item for item in items]
+        assert obj.values
+";
+    assert_matches_cpython(source, "comprehension_attribute_return.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
