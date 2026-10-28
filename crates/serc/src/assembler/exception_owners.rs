@@ -14940,7 +14940,7 @@ impl LayoutAssembler {
         positions: &OwnerLabelPositions,
     ) -> Option<usize> {
         use crate::target::opcodes::{
-            POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_EXC_INFO, WITH_EXCEPT_START,
+            COPY, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_EXC_INFO, TO_BOOL, WITH_EXCEPT_START,
         };
 
         let [pop, operands @ .., condition] = instructions.get(array.clone())? else {
@@ -14954,6 +14954,13 @@ impl LayoutAssembler {
             || !matches!(condition.opcode, POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE)
             || condition.forward_target().is_none()
             || condition.location != instructions[array.end].location
+        {
+            return None;
+        }
+        // A value-preserving jump expands into COPY, TO_BOOL, and the conditional.
+        // Those insertions consume the slot freed by an earlier fusion.
+        if matches!(operands, [.., copy, truth] if copy.opcode == COPY
+            && copy.value_argument() == Some(1) && truth.opcode == TO_BOOL)
         {
             return None;
         }

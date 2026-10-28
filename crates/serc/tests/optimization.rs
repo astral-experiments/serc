@@ -4492,6 +4492,29 @@ fn managed_finally_guards_reuse_the_condition_after_one_fusion() {
 }
 
 #[test]
+fn managed_finally_boolean_arguments_consume_the_freed_condition_slot() {
+    for operator in ["and", "or"] {
+        let source = format!(
+            "def run(value):
+    with acquire():
+        try:
+            if value:
+                raise LookupError
+        finally:
+            if not check(value {operator} {{}}):
+                raise ValueError
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_finally_boolean_argument.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn handler_and_iterator_returns_reuse_the_final_cleanup_pop() {
     for source in [
         r"async def sample(value, flag):
