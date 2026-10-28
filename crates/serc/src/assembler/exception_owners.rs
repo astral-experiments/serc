@@ -1704,6 +1704,29 @@ struct ExceptionOwnerTail {
     post_compaction_fusions: usize,
 }
 
+/// Checks the unchanged POP, name read and truth test after a value Boolean.
+fn is_unchanged_value_boolean_test(records: &[&Instruction]) -> bool {
+    use crate::target::opcodes::{
+        LOAD_ATTR, LOAD_DEREF, LOAD_FAST, LOAD_FAST_BORROW, LOAD_FAST_CHECK, LOAD_NAME,
+        POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, TO_BOOL,
+    };
+    let [discard, value, attributes @ .., truth, guard] = records else {
+        return false;
+    };
+    discard.opcode == POP_TOP
+        && (matches!(
+            value.opcode,
+            LOAD_DEREF | LOAD_FAST | LOAD_FAST_BORROW | LOAD_FAST_CHECK | LOAD_NAME
+        ) || (value.opcode == LOAD_GLOBAL
+            && value.value_argument().is_some_and(|arg| arg & 1 == 0)))
+        && attributes.iter().all(|attr| {
+            attr.opcode == LOAD_ATTR && attr.value_argument().is_some_and(|arg| arg & 1 == 0)
+        })
+        && truth.opcode == TO_BOOL
+        && matches!(guard.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+        && guard.forward_target().is_some()
+}
+
 fn is_local_fusion(instruction: &Instruction) -> bool {
     matches!(
         instruction.opcode,
@@ -11158,6 +11181,34 @@ impl LayoutAssembler {
                         owners.insert(
                             instruction_index,
                             ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
+                    // A value-preserving Boolean starts its fallthrough array with POP_TOP.
+                    // Loading the next name, optionally reading attributes, and testing it
+                    // leave every original cell occupied when NOT_TAKEN is appended.
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::NonePresent
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.early_removals == 0
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && is_unchanged_value_boolean_test(
+                            &indexed_instructions[original_array_start..instruction_index],
+                        )
+                        && original_array_start.checked_sub(1).is_some_and(|previous| {
+                            original_value_jump_positions
+                                .values()
+                                .any(|&i| i == previous)
+                        })
+                        && owners
+                            .get(instruction_index)
+                            .is_none_or(|owner| !owner.is_definitive())
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
                     if threaded_null_append == Some(instruction_index) {

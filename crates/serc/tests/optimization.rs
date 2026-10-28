@@ -9672,6 +9672,33 @@ fn saved_handler_value_keeps_owner_across_enclosing_try() {
 }
 
 #[test]
+fn a_guard_after_a_value_boolean_appends_an_unowned_marker() {
+    let source = r"def outer(value):
+    def choose(first):
+        try:
+            work()
+        finally:
+            try:
+                picked = first or (value.item if value else None)
+                consume(picked)
+            except (ValueError, TypeError):
+                fail()
+    return choose
+";
+    for source in [
+        source.to_owned(),
+        source.replace("if value else", "if value.ready else"),
+    ] {
+        assert_matches_cpython_versions(
+            &source,
+            "boolean_fallthrough.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn threaded_handler_booleans_append_an_unowned_marker() {
     let source = r"def choose(first, second, other):
     try:
