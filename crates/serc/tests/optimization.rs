@@ -15,6 +15,29 @@ use serc::{
 };
 
 #[test]
+fn short_circuit_loop_exits_inherit_each_condition_edge() {
+    let source = r"def guarded(items, left, middle, right):
+    for item in items:
+        try:
+            if not ((left(item) and middle(item)) or right(item)):
+                work(item)
+        except ValueError:
+            raise
+
+def nested(items, a, b, c, d):
+    for item in items:
+        if enabled():
+            while (a(item) and b(item)) or (c(item) and d(item)):
+                if ready(item):
+                    break
+                work(item)
+        else:
+            finish(item)
+";
+    assert_matches_cpython(source, "compound_loop_guard.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
