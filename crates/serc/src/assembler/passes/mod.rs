@@ -317,7 +317,8 @@ impl Assembler {
                 continue;
             }
             // A folded successful arm can thread through an original unlocated
-            // branch exit. The remaining runtime test then owns that exit's line.
+            // branch exit. With a live fallthrough predecessor the shared exit stays
+            // unlocated. After a raise the remaining runtime test supplies its line.
             // A folded success jump in a protected assertion also loses its owner.
             let folded_join = (|| {
                 use crate::target::opcodes::{
@@ -356,11 +357,12 @@ impl Assembler {
                 let source_position = order.iter().position(|block| *block == source)?;
                 let target_position = order.iter().position(|block| *block == target)?;
                 let end_position = order.iter().position(|block| *block == end)?;
+                let previous = &graph[*order.get(target_position.checked_sub(1)?)?];
+                let predecessor = previous.last_instruction()?;
+                let live_fallthrough =
+                    !protected && previous.successors().0 && predecessor.location.line >= 0;
                 if !(source_position < target_position && target_position < end_position)
-                    || graph[*order.get(target_position.checked_sub(1)?)?]
-                        .last_instruction()?
-                        .opcode
-                        != RAISE_VARARGS
+                    || (!live_fallthrough && predecessor.opcode != RAISE_VARARGS)
                 {
                     return None;
                 }
@@ -418,7 +420,7 @@ impl Assembler {
                 } else {
                     return None;
                 };
-                let is_condition = if protected {
+                let is_condition = if protected || live_fallthrough {
                     matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
                 } else {
                     matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
@@ -440,9 +442,9 @@ impl Assembler {
                 {
                     return None;
                 }
-                Some((bridge.operand(), protected))
+                Some((bridge.operand(), protected, live_fallthrough))
             })();
-            if let Some((destination, protected)) = folded_join {
+            if let Some((destination, protected, live_fallthrough)) = folded_join {
                 let folded = graph
                     .instructions_mut(source)
                     .next()
@@ -451,12 +453,14 @@ impl Assembler {
                 if protected {
                     folded.set_exception_policy(super::ExceptionPolicy::EXCLUDE_ALWAYS);
                 }
-                graph
-                    .instructions_mut(target)
-                    .next()
-                    .expect("exact original join")
-                    .no_location_policy
-                    .clear_preserved_location();
+                if !live_fallthrough {
+                    graph
+                        .instructions_mut(target)
+                        .next()
+                        .expect("exact original join")
+                        .no_location_policy
+                        .clear_preserved_location();
+                }
                 continue;
             }
             let mut instructions = graph[target]
