@@ -6449,11 +6449,11 @@ impl OptimizationPipeline {
                             || (!membership.contains(&source_position)
                                 && !membership.contains(&target_position))
                     });
-            // RAISE_VARARGS stays under its original handlers until it executes.
-            // Revisit the copied block when source and target share those handlers
-            // and no exception boundary splits the target's original array.
-            let inline_raise = inline_small_exit
-                && target_terminal_opcode == Some(RAISE_VARARGS)
+            // A raise stays under its original handlers until it executes. An explicit
+            // raise can be copied again. Either kind can fuse with the preceding load
+            // when the copy preserves its handlers and crosses no exception boundary.
+            let inline_raise_with_same_handlers = inline_small_exit
+                && matches!(target_terminal_opcode, Some(RAISE_VARARGS | RERAISE))
                 && region_memberships
                     .iter()
                     .enumerate()
@@ -6467,6 +6467,8 @@ impl OptimizationPipeline {
                                 && membership.contains(&source_position)
                                 && membership.contains(&target_position))
                     });
+            let inline_raise =
+                inline_raise_with_same_handlers && target_terminal_opcode == Some(RAISE_VARARGS);
             let inline_no_location_block =
                 !source_has_fallthrough && target_is_no_location_no_fallthrough;
             let shared_unnamed_cleanup_source = !planned_copy
@@ -8345,18 +8347,16 @@ impl OptimizationPipeline {
                             || (!membership.contains(&positions[source.index()])
                                 && !membership.contains(&positions[target.index()]))
                     });
-            // A newly copied, unprotected straight-line exit has no native block boundary at
-            // this seam. Admit its local pair through the same predicate used by the fuser;
-            // the following operation does not determine whether CPython combines the loads.
-            // Keep all existing copying paths unchanged, and decline protected participating
-            // blocks or copies with an interior label or branch that could observe the entry offset.
-            let inline_unprotected_local_pair = inline_small_exit
+            // Copying a straight-line exit joins its first load to the source's final
+            // load before fusion. A protected raise can do the same when both blocks
+            // belong to the same handlers and the copy introduces no exception range.
+            let inline_copied_local_pair = inline_small_exit
                 && !exception_boundary_blocks[source.index()]
                 && !exception_boundary_blocks[target.index()]
-                && region_memberships.iter().all(|membership| {
+                && (inline_raise_with_same_handlers || region_memberships.iter().all(|membership| {
                     !membership.contains(&positions[source.index()])
                         && !membership.contains(&positions[target.index()])
-                })
+                }))
                 && copied_exception_regions.is_empty()
                 && copied_region_exclusions.iter().all(Vec::is_empty)
                 && self.borrow_finally_jump_sources.is_empty()
@@ -8565,9 +8565,7 @@ impl OptimizationPipeline {
                 // the original owner. Retain those labels just like original region ends.
                 exception_boundary_blocks[source.index()] = true;
             }
-            if inline_borrowed_tuple_exit
-                || inline_unprotected_local_pair
-                || inline_keyword_return_pair
+            if inline_borrowed_tuple_exit || inline_copied_local_pair || inline_keyword_return_pair
             {
                 let first_instruction = copied
                     .iter()
