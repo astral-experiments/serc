@@ -16266,18 +16266,23 @@ impl Assembler {
         else {
             return;
         };
-        let records = items[store_item..]
+        let mut instructions = items[store_item..]
             .iter()
             .enumerate()
             .filter_map(|(offset, item)| match item {
                 Item::Instruction(instruction) => Some((offset, *instruction)),
                 Item::Label(_) => None,
             })
-            .take(5)
-            .collect::<Vec<_>>();
+            .peekable();
+        let mut records = instructions.by_ref().take(2).collect::<Vec<_>>();
+        while let Some(attribute) = instructions.next_if(|(_, record)| record.opcode == LOAD_ATTR) {
+            records.push(attribute);
+        }
+        records.extend(instructions.take(3));
         let [
             (_, store),
             (_, load),
+            attributes @ ..,
             (_, truth),
             (_, condition),
             (last, marker),
@@ -16302,9 +16307,18 @@ impl Assembler {
             || [condition, marker]
                 .iter()
                 .any(|record| record.depth_after() != Some(depth))
-            || [load, truth, condition]
+            || [truth, condition]
                 .iter()
                 .any(|record| record.location != marker.location)
+            || attributes
+                .last()
+                .map_or(load.location, |(_, attribute)| attribute.location)
+                != marker.location
+            || attributes.iter().any(|(_, attribute)| {
+                attribute.value_argument().is_none_or(|arg| arg & 1 != 0)
+                    || attribute.depth_after() != load.depth_after()
+                    || attribute.exception_policy() != ExceptionPolicy::NoneUnchanged
+            })
             || [store, load, truth, condition]
                 .iter()
                 .any(|record| record.exception_policy() != ExceptionPolicy::NoneUnchanged)

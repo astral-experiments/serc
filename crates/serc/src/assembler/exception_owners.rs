@@ -13251,7 +13251,10 @@ impl LayoutAssembler {
             let Some((item_start, start)) = unique.get(origin.entry) else {
                 continue;
             };
-            let marker = start + 4;
+            let Some((_, prefix)) = origin.items.split_last() else {
+                continue;
+            };
+            let marker = start + prefix.iter().filter_map(Item::as_instruction).count();
             let within = |label: &Label| {
                 positions
                     .get(label)
@@ -13369,9 +13372,8 @@ impl LayoutAssembler {
             {
                 continue;
             }
-            // Original cells are STORE, SETUP(NULL), LOAD, TO_BOOL, condition.
-            // The SETUP prevents early STORE/LOAD fusion. Its late removal leaves
-            // the old condition cell at index four for the appended NOT_TAKEN.
+            // SETUP prevents early STORE/LOAD fusion. Removing it shifts the test
+            // and its attribute loads left, leaving the condition cell for NOT_TAKEN.
             owners.insert(
                 marker,
                 ExceptionOwnerDecision::override_with_region(Some(region)),
