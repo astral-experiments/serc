@@ -1999,6 +1999,7 @@ impl OptimizationPipeline {
         graph: &crate::assembler::block_graph::BlockGraph,
         original_block_boundaries: &FxHashSet<Label>,
         nonempty_targets: &FxHashSet<Label>,
+        compound_exits: &[(Label, Label)],
     ) -> FxHashMap<Label, Label> {
         let mut links = FxHashMap::default();
         let mut pending = Vec::new();
@@ -2023,8 +2024,14 @@ impl OptimizationPipeline {
                         && instruction.jump_policy.allows_threading_target()
                         && instruction.jump_policy.allows_borrow_threading_target()
                         && !instruction.jump_policy.always_retains_nop()
-                        && !instruction.jump_policy.borrow_empty_block()
                         && let Some(target) = instruction.forward_target()
+                        // A compound try's normal jump can forward an original break
+                        // before its own empty block is removed.
+                        && (!instruction.jump_policy.borrow_empty_block()
+                            || (instruction.location == crate::assembler::SourceLocation::NONE
+                                && compound_exits.iter().any(|(entry, exit)| {
+                                    *exit == target && pending.contains(entry)
+                                })))
                     {
                         for label in &pending {
                             links.insert(*label, target);
@@ -2090,6 +2097,7 @@ impl OptimizationPipeline {
             graph,
             original_block_boundaries,
             &nonempty_targets,
+            &[],
         );
         let mut has_prefix = false;
         for position in graph.item_positions() {
@@ -2404,6 +2412,7 @@ impl OptimizationPipeline {
         graph: &crate::assembler::block_graph::BlockGraph,
         original_boundaries: &FxHashSet<Label>,
         origins: &mut AuthoredFinallyBreakOrigins,
+        compound_exits: &[(Label, Label)],
     ) -> AuthoredFinallyBreakEntries {
         let origins = std::mem::take(origins);
         let verified = Self::verified_threaded_borrow_positions(graph, &origins.snapshots);
@@ -2436,6 +2445,9 @@ impl OptimizationPipeline {
                             AuthoredFinallyBreakEntry {
                                 original_source,
                                 target,
+                                compound_exit: compound_exits
+                                    .iter()
+                                    .any(|(_, exit)| *exit == target),
                             },
                         );
                     }
@@ -3578,9 +3590,21 @@ impl OptimizationPipeline {
                     entry.map_or((None, vec![label]), |(call, aliases)| (Some(call), aliases));
                 for alias in aliases {
                     // An independent unreachable marker keeps its own barrier even when
-                    // it shares this original physical block with normal cleanup.
+                    // it shares this original physical block with normal cleanup. A
+                    // recorded compound try exit, however, targets the cleanup itself.
+                    let compound_break_target = call.is_some()
+                        && !self
+                            .borrow_authored_finally_break_origins
+                            .snapshots
+                            .is_empty()
+                        && self
+                            .exception_owner_provenance
+                            .compound_try_owner_exits
+                            .iter()
+                            .any(|(_, exit)| *exit == alias);
                     if self.borrow_unreachable_blocks.contains(&alias)
                         && !self.borrow_finally_entries.contains_key(&alias)
+                        && !compound_break_target
                     {
                         continue;
                     }
@@ -3616,6 +3640,7 @@ impl OptimizationPipeline {
                     &self.graph,
                     &self.exception_owner_provenance.block_boundaries,
                     &nonempty,
+                    &self.exception_owner_provenance.compound_try_owner_exits,
                 );
         }
         origins
@@ -4284,9 +4309,9 @@ impl OptimizationPipeline {
                         && last.no_location_policy.borrow_fallthrough()
                             == BorrowFallthrough::Reachable
                         && !last.jump_policy.borrow_empty_block()
-                        && (jump_entry_blocks.get(target).copied().unwrap_or(false)
+                        && (((jump_entry_blocks.get(target).copied().unwrap_or(false)
                             || explicit_break_entry)
-                        && (!pre_copy_jump_entries.is_empty()
+                            && !pre_copy_jump_entries.is_empty())
                             || (last.fusion_policy.is_authored_break()
                                 && !authored_finally_break_entries.is_empty()))
                         && surviving_instruction_offsets
@@ -4362,7 +4387,7 @@ impl OptimizationPipeline {
                                             _ => None,
                                         }
                                     }) == Some(entry.original_source)
-                                    && jump_entry_blocks.get(target).copied().unwrap_or(false)
+                                    && (jump_entry_blocks.get(target).copied().unwrap_or(false) || entry.compound_exit)
                                     && borrow_finally_entries
                                         .get(&label)
                                         .copied()
@@ -7234,6 +7259,7 @@ mod tests {
                 &pipeline.graph,
                 &pipeline.exception_owner_provenance.block_boundaries,
                 &mut pipeline.borrow_authored_finally_break_origins,
+                &[],
             );
             assert_eq!(entries[&Label::from_u32(1)].target, Label::from_u32(3));
             let mut items = pipeline.graph.into_items();
@@ -7333,6 +7359,7 @@ mod tests {
                 &pipeline.graph,
                 &pipeline.exception_owner_provenance.block_boundaries,
                 &mut pipeline.borrow_authored_finally_break_origins,
+                &[],
             );
             assert_eq!(entries.contains_key(&Label::from_u32(1)), reachable);
             assert!(
@@ -7401,6 +7428,7 @@ mod tests {
                 &pipeline.graph,
                 &pipeline.exception_owner_provenance.block_boundaries,
                 &mut pipeline.borrow_authored_finally_break_origins,
+                &[],
             );
             if new_original_boundary {
                 assert!(entries.is_empty());
@@ -7448,6 +7476,7 @@ mod tests {
                         &pipeline.graph,
                         &pipeline.exception_owner_provenance.block_boundaries,
                         &mut pipeline.borrow_authored_finally_break_origins,
+                        &[],
                     );
                 assert!(entries.is_empty());
                 assert!(
@@ -7486,6 +7515,7 @@ mod tests {
                 &pipeline.graph,
                 &pipeline.exception_owner_provenance.block_boundaries,
                 &mut pipeline.borrow_authored_finally_break_origins,
+                &[],
             );
             assert!(entries.is_empty());
         }
@@ -7503,6 +7533,7 @@ mod tests {
                     &pipeline.graph,
                     &pipeline.exception_owner_provenance.block_boundaries,
                     &mut pipeline.borrow_authored_finally_break_origins,
+                    &[],
                 );
             assert!(entries.contains_key(&Label::from_u32(1)));
             let mut items = pipeline.graph.into_items();
