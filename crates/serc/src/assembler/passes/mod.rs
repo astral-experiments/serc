@@ -30,13 +30,11 @@ fn folded_condition_return(
     graph: &BlockGraph,
     source: BasicBlockId,
     target: BasicBlockId,
+    regions: &[super::ir::ExceptionRegion],
 ) -> Option<(usize, [Instruction; 2])> {
-    use crate::target::opcodes::{LOAD_CONST, RETURN_VALUE};
+    use crate::target::opcodes::{LOAD_COMMON_CONSTANT, LOAD_CONST, RAISE_VARARGS, RETURN_VALUE};
 
     let position = graph.order().iter().position(|block| *block == target)?;
-    let [.., body, body_exit] = &graph.order()[..position] else {
-        return None;
-    };
     let return_pair = |block: BasicBlockId| {
         let [Item::Label(_), load, ret] = graph[block].items() else {
             return None;
@@ -44,13 +42,7 @@ fn folded_condition_return(
         Some([*load.as_instruction()?, *ret.as_instruction()?])
     };
     let [load, ret] = return_pair(target)?;
-    let [body_load, body_ret] = return_pair(*body_exit)?;
-    let donor = graph[*body].last_instruction()?.location;
-    // The falling body has already received its own copy. An authored return or
-    // raise terminates its block and has no such fallthrough predecessor.
-    if !graph[*body].successors().0
-        || donor.line < 0
-        || load != Instruction::new(LOAD_CONST, load.operand(), SourceLocation::NONE, Some(1))
+    if load != Instruction::new(LOAD_CONST, load.operand(), SourceLocation::NONE, Some(1))
         || ret
             != Instruction::new(
                 RETURN_VALUE,
@@ -58,13 +50,55 @@ fn folded_condition_return(
                 SourceLocation::NONE,
                 Some(0),
             )
-        || body_load.opcode != LOAD_CONST
-        || body_load.operand() != load.operand()
-        || body_ret.opcode != RETURN_VALUE
-        || body_load.location != donor
-        || body_ret.location != donor
     {
         return None;
+    }
+    let falling_return = regions.is_empty()
+        && graph.order()[..position]
+            .last_chunk()
+            .is_some_and(|[body, body_exit]| {
+                let (Some([body_load, body_ret]), Some(last)) =
+                    (return_pair(*body_exit), graph[*body].last_instruction())
+                else {
+                    return false;
+                };
+                // The falling body has already received its own return copy.
+                graph[*body].successors().0
+                    && last.location.line >= 0
+                    && body_load.opcode == LOAD_CONST
+                    && body_load.operand() == load.operand()
+                    && body_ret.opcode == RETURN_VALUE
+                    && body_load.location == last.location
+                    && body_ret.location == last.location
+            });
+    if !falling_return {
+        let start = graph.order().iter().position(|id| *id == source)?;
+        let failure = graph.order().get(start + 1..position)?;
+        let first = *failure.first()?;
+        let last = graph[*failure.last()?].last_instruction()?;
+        let mut entry = graph[first].items().iter().filter_map(Item::as_instruction);
+        let error = entry.next()?;
+        if error.opcode != LOAD_COMMON_CONSTANT
+            || error.value_argument()
+                != Some(crate::target::operands::CommonConstant::ASSERTIONERROR.argument())
+            || last.opcode != RAISE_VARARGS
+            || last.value_argument() != Some(1)
+            || error.pre_fusion_width() + entry.map(Instruction::pre_fusion_width).sum::<usize>()
+                <= 4
+        {
+            return None;
+        }
+        // A large assertion failure stays between the folded edge and the shared return.
+        // Ignore unrelated protection, such as an earlier comprehension's cleanup.
+        let label_position = |label| {
+            let block = graph.label_block(label)?;
+            graph.order().iter().position(|id| *id == block)
+        };
+        for region in regions {
+            if label_position(region.start)? <= position && label_position(region.end)? > start {
+                return None;
+            }
+        }
     }
     // Both original conditionals jump to the unlocated return. The literal
     // takes its copy before the other conditional in CPython's insertion order.
@@ -511,8 +545,8 @@ impl Assembler {
                     .clear_preserved_location();
                 continue;
             }
-            if self.exception_regions.is_empty()
-                && let Some((position, mut exit)) = folded_condition_return(&graph, source, target)
+            if let Some((position, mut exit)) =
+                folded_condition_return(&graph, source, target, &self.exception_regions)
             {
                 let label = Label::from_u32(self.next_label);
                 self.next_label += 1;
