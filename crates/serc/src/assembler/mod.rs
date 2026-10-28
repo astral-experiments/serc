@@ -14683,10 +14683,22 @@ impl Assembler {
         pop_item: usize,
         unnamed_handler: bool,
         retained_inner_try: bool,
+        coroutine: bool,
     ) {
         use crate::target::opcodes::CALL;
 
         let items = self.linear_items();
+        let discarded_await = coroutine
+            && items[..return_item]
+                .iter()
+                .rev()
+                .filter_map(Item::as_instruction)
+                .map(|record| record.opcode)
+                .take(2)
+                .eq([POP_TOP, crate::target::opcodes::END_SEND]);
+        if coroutine && !retained_inner_try && !discarded_await {
+            return;
+        }
         let Some(before) = items.get(return_item..pop_item) else {
             return;
         };
@@ -14778,11 +14790,10 @@ impl Assembler {
             [pop, load, to_bool, condition, marker] if to_bool.opcode == TO_BOOL => {
                 (pop, load, Some(to_bool), condition, marker)
             }
-            // The unnamed-handler and retained inner-try cleanup can precede a local
-            // None comparison. Its three fused condition records are modeled by replay;
-            // only the separately captured adjacent inner POP proves its own epoch.
+            // A local None comparison fuses three condition records. The captured
+            // handler, inner POP, or discarded await fixes the start of its cleanup.
             [pop, load, condition, marker, ..]
-                if (unnamed_handler || retained_inner_try)
+                if (unnamed_handler || retained_inner_try || discarded_await)
                     && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE) =>
             {
                 (pop, load, None, condition, marker)

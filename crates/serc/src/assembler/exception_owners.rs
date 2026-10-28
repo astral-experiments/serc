@@ -9530,8 +9530,8 @@ impl LayoutAssembler {
                         {
                             owners.insert(instruction_index, decision);
                         }
-                        // This exact adjacent authored-NOP/inner-try-POP pair certifies the
-                        // retained NULL cell independently of the generic POP epoch.
+                        // The retained return NOP fixes the POP's position after a
+                        // discarded await or when it absorbs an adjacent inner-try POP.
                         if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
                             && owner_history_exact
                             && tail.insertions == 0
@@ -14527,7 +14527,7 @@ impl LayoutAssembler {
         instructions: &[&Instruction],
         positions: &OwnerLabelPositions,
         jump_targets: &FxHashSet<Label>,
-        retained_inner_try_only: bool,
+        require_retained_prefix: bool,
     ) -> Option<ExceptionOwnerDecision> {
         use crate::target::opcodes::LOAD_FAST_BORROW;
 
@@ -14538,11 +14538,15 @@ impl LayoutAssembler {
             .copied_manager_return_compactions
             .iter()
             .filter(|origin| {
-                !retained_inner_try_only
+                !require_retained_prefix
                     || origin
                         .constant_return_prefix
                         .as_ref()
-                        .is_some_and(|prefix| prefix.retained_inner_try_pop.is_some())
+                         .is_some_and(|prefix| prefix.retained_inner_try_pop.is_some()
+                            || (prefix.retained_authored && origin.ordinary_try_pops == 1
+                                && matches!(instructions.get(array_start..array_start + 3), Some([end, discard, authored])
+                                    if end.opcode == crate::target::opcodes::END_SEND && discard.opcode == POP_TOP
+                                    && **authored == prefix.authored_nop)))
             })
             .filter_map(|origin| {
                 let load_index = marker.checked_sub(2 + usize::from(origin.to_bool.is_some()))?;

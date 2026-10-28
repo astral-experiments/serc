@@ -13337,6 +13337,35 @@ fn python312_async_iteration_preserves_repeated_conditional_return() {
 }
 
 #[test]
+fn discarded_await_preserves_the_manager_return_pop_before_a_none_guard() {
+    let source = r"async def run(task, manager, flag):
+    try:
+        with manager:
+            if flag:
+                await task()
+                return
+    except ValueError:
+        pass
+    finally:
+        if flag is not None:
+            finish()
+
+async def inner_try(manager, flag):
+    try:
+        with manager:
+            try:
+                if flag:
+                    return
+            except ValueError:
+                pass
+    finally:
+        if flag is not None:
+            finish()
+";
+    assert_matches_cpython_versions(source, "await_manager.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
 fn synchronous_iterator_return_keeps_enclosing_try_pop_before_finally() {
     let source = r"async def drain(stream, state):
     try:

@@ -12346,7 +12346,7 @@ impl<'source> Compiler<'source> {
                     // A bare return through a sync manager can leave an ordinary try
                     // between the manager and finally. Capture the exact cleanup before
                     // its primitive test, including an optional unnamed-handler unwind.
-                    let copied_try_manager_pop = (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                    let copied_try_manager_pop = (matches!(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR), 0 | CO_COROUTINE)
                         && !preserve_tos
                         && !return_is_overridden
                         && context_index == 0
@@ -13664,6 +13664,7 @@ impl<'source> Compiler<'source> {
                             pop_item,
                             unnamed_handler,
                             retained_inner_try,
+                            self.unit.flags & CO_COROUTINE != 0,
                         );
                     }
                     if result.is_ok()
