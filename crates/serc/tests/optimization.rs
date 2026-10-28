@@ -25996,3 +25996,16 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn nested_loop_guard_keeps_the_boolean_discard_unlocated() {
+    let source = r"def scan(values, enabled, alternate):
+    for item in values:
+        if enabled:
+            if not ready(item) or alternate:
+                item and accept(item)
+        else:
+            item and reject(item)
+";
+    assert_matches_cpython(source, "nested_loop_value_discard.py", &LEVELS);
+}
