@@ -23729,6 +23729,7 @@ impl<'source> Compiler<'source> {
                         .is_none()
                     && !self.control.finally.copy_return_finally_condition_exit
                     && !self.control.finally.copies_terminating_finally_returns;
+                let mut shared_while_exit = false;
                 let copied_erased_branch_exit = self.context.python_version
                     >= crate::PythonVersion::Py314
                     && branch_index + 1 < branch_count
@@ -23920,11 +23921,17 @@ impl<'source> Compiler<'source> {
                     && early_condition_truthiness(&statement.test).is_none()
                     && suite_contains_loop_break(&statement.body)
                 {
-                    // The normal exit falls through from the while condition. Breaks are
-                    // threaded independently, so the body backedge cannot supply this range.
-                    self.assembler.set_location(
-                        self.source_location(condition_fallthrough_range(&statement.test)),
-                    );
+                    // A shared exhaustion edge gets one copy per short-circuit predecessor.
+                    // Breaks are threaded separately from the condition's normal exit.
+                    shared_while_exit = self.context.python_version >= crate::PythonVersion::Py314
+                        && !non_final_branch
+                        && condition_has_only_runtime_tests(&statement.test)
+                        && condition_jump_target_count(&statement.test, false) > 1;
+                    self.assembler.set_location(if shared_while_exit {
+                        SourceLocation::NONE
+                    } else {
+                        self.source_location(condition_fallthrough_range(&statement.test))
+                    });
                 } else if self.context.python_version >= crate::PythonVersion::Py314
                     && branch_index == 0
                     && has_else
@@ -23980,7 +23987,7 @@ impl<'source> Compiler<'source> {
                         .set_location(self.source_location(statement.range()));
                 }
                 let backedge = self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
-                if shared_match_failure || copied_erased_branch_exit {
+                if shared_match_failure || copied_erased_branch_exit || shared_while_exit {
                     // Native copies the common backedge into this arm's forward exit:
                     // [unlocated NOP, unlocated JUMP]. Preserve that original array so
                     // each incoming condition edge supplies its own backedge location.
@@ -24055,9 +24062,18 @@ impl<'source> Compiler<'source> {
                     || (self.context.python_version >= crate::PythonVersion::Py314
                         && independent_original_fallthrough))
                 && condition_jump_target_count(fallthrough_test, false) > 1
-                && let Expr::BoolOp(boolean) = fallthrough_test
             {
-                Some(boolean)
+                match fallthrough_test {
+                    Expr::BoolOp(boolean) => Some((boolean, false)),
+                    Expr::UnaryOp(unary)
+                        if self.context.python_version >= crate::PythonVersion::Py314
+                            && unary.op == UnaryOp::Not
+                            && let Expr::BoolOp(boolean) = unary.operand.as_ref() =>
+                    {
+                        Some((boolean, true))
+                    }
+                    _ => None,
+                }
             } else {
                 None
             };
@@ -24065,11 +24081,11 @@ impl<'source> Compiler<'source> {
             // surviving original must also inherit its remaining predecessor's location.
             let fallthrough_location = copied_protected_fallthrough.map_or_else(
                 || self.source_location(condition_fallthrough_range(fallthrough_test)),
-                |boolean| {
+                |(boolean, jump_on)| {
                     boolean
                         .values
                         .last()
-                        .and_then(|last| unique_condition_jump_target(last, false))
+                        .and_then(|last| unique_condition_jump_target(last, jump_on))
                         .map_or(SourceLocation::NONE, |last| {
                             self.source_location(last.range())
                         })
