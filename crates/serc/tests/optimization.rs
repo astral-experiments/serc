@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn an_iterator_break_keeps_the_conditional_arm_owner_before_an_attribute_return() {
+    for guard in ["", "    assert store.value is not None\n"] {
+        let source = format!(
+            "def choose(store, items, key):\n    if store.ready:\n        try:\n            if key is not None:\n                for item in items:\n                    if item:\n                        break\n            else:\n                store.value = key\n        except ValueError:\n            pass\n{guard}    return defaults.value\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "conditional_iterator_return.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

@@ -11927,6 +11927,30 @@ impl Assembler {
             .prevent_threading_target();
     }
 
+    /// Records the excluded break jumps that reach the end of this iterator arm.
+    pub(crate) fn record_conditional_iterator_breaks(
+        &mut self,
+        arm_start: usize,
+        exclusions: &[(Label, Label)],
+    ) {
+        let Some([.., Item::Label(loop_end)]) = self.linear_items().get(arm_start..) else {
+            return;
+        };
+        let loop_end = *loop_end;
+        for &(start, end) in exclusions {
+            if self.linear_items()[arm_start..].windows(3).any(|items| {
+                matches!(items,
+                [Item::Label(a), Item::Instruction(jump), Item::Label(b)]
+                if *a == start && *b == end && jump.fusion_policy.is_authored_break()
+                    && jump.forward_target() == Some(loop_end))
+            }) {
+                self.exception_owner_provenance
+                    .conditional_iterator_breaks
+                    .push((start, end));
+            }
+        }
+    }
+
     /// Keeps an original cleanup from certifying a borrowed-load route through its jump.
     /// Physical jump threading still transfers the break's owner and interrupt check.
     pub(crate) fn prevent_borrow_jump_threading_target(&mut self, emitted: EmittedJump) {

@@ -18542,6 +18542,21 @@ impl<'source> Compiler<'source> {
         } else {
             prefix_end
         };
+        let iterator_arm = (self.context.python_version == crate::PythonVersion::Py314
+            && !std::ptr::eq(body, fallthrough_body)
+            && statement
+                .elif_else_clauses
+                .last()
+                .is_some_and(|clause| clause.test.is_none())
+            && matches!(body.last(), Some(Stmt::For(iterator)) if !iterator.is_async)
+            && self.control.exceptions.active_exception_handlers.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && !self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .is_empty())
+        .then(|| self.assembler.item_count());
         // Conditional tails reach the same manager exit; erased assertions add no array.
         let manager_tail = self
             .control
@@ -18602,6 +18617,16 @@ impl<'source> Compiler<'source> {
                 )
             },
         );
+        if let Some(arm_start) = iterator_arm
+            && let Some(exclusions) = self
+                .control
+                .exceptions
+                .active_exception_region_exclusions
+                .last()
+        {
+            self.assembler
+                .record_conditional_iterator_breaks(arm_start, exclusions);
+        }
         if let Some(previous) = manager_tail {
             self.control
                 .withs
