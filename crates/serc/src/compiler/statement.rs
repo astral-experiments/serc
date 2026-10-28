@@ -33863,6 +33863,18 @@ impl<'source> Compiler<'source> {
                         end,
                         exception_policy,
                     )?;
+                    // A final authored Pass gives the cleanup a located NOP in
+                    // CPython's original array, so incoming jumps cannot copy it.
+                    if self.context.python_version == crate::PythonVersion::Py314
+                        && handler.name.is_none()
+                        && !matches!(handler.body.last(), Some(Stmt::Pass(_)))
+                    {
+                        self.assembler.record_unnamed_handler_borrow_exit(
+                            body_end,
+                            next_handler,
+                            handler_exit,
+                        );
+                    }
                     if let Some(start) = ordinary_exit_start {
                         // The nested exit drops ordinary try owners, but a manager entered
                         // inside those tries remains active across the handler continuation.

@@ -56,13 +56,16 @@ fn copyable_comprehension_reraise(items: &[Item], original: &[Instruction]) -> b
 }
 
 /// A small local return can be copied into the warm try exit before dead handlers empty.
-fn copyable_local_return<'a>(mut ops: impl Iterator<Item = &'a Instruction>) -> bool {
+fn copyable_local_return<'a>(
+    mut ops: impl Iterator<Item = &'a Instruction>,
+    prefix_slots: usize,
+) -> bool {
     use crate::target::opcodes::{LOAD_FAST, RETURN_VALUE};
 
     let Some(load) = ops.next().filter(|op| op.opcode == LOAD_FAST) else {
         return false;
     };
-    let mut slots = 1 + usize::from(load.pre_fold_extra_instructions());
+    let mut slots = prefix_slots + 1 + usize::from(load.pre_fold_extra_instructions());
     for op in ops {
         slots += 1 + usize::from(op.pre_fold_extra_instructions());
         if slots > 4 {
@@ -471,6 +474,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) borrow_normal_try_exits: Vec<(Label, Instruction)>,
     pub(super) initial_borrow_normal_try_exits: Vec<NormalTryBorrowExit>,
     pub(super) cold_handler_borrow_jumps: Vec<(Label, Label)>,
+    pub(super) unnamed_handler_borrow_exits: Vec<(Label, Label, Label)>,
     // The following cold blocks locate emptied originals through relocation.
     pub(super) copied_borrow_exit_anchors: Vec<Label>,
     pub(super) retired_normal_try_exits: Vec<RetiredNormalTryExit>,
@@ -587,6 +591,50 @@ impl ExceptionOwnerProvenance {
             && self.ordinary_try_setups.get(setup) == Some(target)
     }
 
+    /// Checks whether an erased finally and its local return fit in one copied exit.
+    fn erased_finally_copies_local_return(
+        graph: &super::block_graph::BlockGraph,
+        entry: BasicBlockId,
+    ) -> bool {
+        use crate::target::opcodes::{JUMP_FORWARD, PUSH_EXC_INFO, RERAISE};
+        let Some((Item::Instruction(jump), labels)) = graph[entry].items().split_last() else {
+            return false;
+        };
+        // The unlocated POP_BLOCK and JUMP occupy two original instruction slots.
+        if jump.opcode != JUMP_FORWARD
+            || jump.location.line >= 0
+            || jump.pre_fold_extra_instructions() != 1
+            || !labels.iter().all(|item| matches!(item, Item::Label(_)))
+        {
+            return false;
+        }
+        let Some(target) = jump
+            .forward_target()
+            .and_then(|label| graph.label_block(label))
+        else {
+            return false;
+        };
+        let Some(pair) = graph.order().windows(2).find(|pair| pair[0] == entry) else {
+            return false;
+        };
+        let mut handler = graph[pair[1]]
+            .items()
+            .iter()
+            .filter_map(Item::as_instruction);
+        handler.next().is_some_and(|op| op.opcode == PUSH_EXC_INFO)
+            && handler
+                .next()
+                .is_some_and(|op| op.opcode == RERAISE && op.value_argument() == Some(0))
+            && handler.next().is_none()
+            && copyable_local_return(
+                graph[target]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction),
+                2,
+            )
+    }
+
     /// Finds original exits copied into all their unconditional predecessors.
     fn bind_copied_borrow_exits(
         &mut self,
@@ -599,7 +647,7 @@ impl ExceptionOwnerProvenance {
             NormalTry(Label),
             Comprehension(&'a [Instruction]),
             HandlerJump(Label),
-            NamedHandler(Label),
+            HandlerCleanup(Label),
         }
         let mut entries = self
             .borrow_normal_try_exits
@@ -624,7 +672,9 @@ impl ExceptionOwnerProvenance {
             }
         }
         let mut named_exit_splits = FxHashMap::default();
-        if !self.named_handler_cleanup_targets.is_empty() {
+        if !self.named_handler_cleanup_targets.is_empty()
+            || !self.unnamed_handler_borrow_exits.is_empty()
+        {
             let order = graph.order();
             let normal_targets: FxHashSet<_> = self
                 .borrow_normal_try_exits
@@ -641,10 +691,35 @@ impl ExceptionOwnerProvenance {
                             .iter()
                             .flat_map(|block| graph[*block].items())
                             .filter_map(Item::as_instruction),
+                        0,
                     )
                 })
                 .map(|(_, block)| *block)
                 .collect();
+            for &(entry, target, following) in &self.unnamed_handler_borrow_exits {
+                let Some(block) = graph.label_block(entry) else {
+                    continue;
+                };
+                let mut ops = graph[block].items().iter().filter_map(Item::as_instruction);
+                if graph.label_block(target).is_some_and(|block| {
+                    copied_returns.contains(&block)
+                        || Self::erased_finally_copies_local_return(graph, block)
+                }) {
+                    continue;
+                }
+                if ops
+                    .next()
+                    .is_some_and(|op| op.opcode == crate::target::opcodes::POP_EXCEPT)
+                    && ops.next().is_some_and(|op| {
+                        op.opcode == JUMP_FORWARD && op.forward_target() == Some(target)
+                    })
+                    && ops.next().is_none()
+                {
+                    entries
+                        .entry(block)
+                        .or_insert((Exit::HandlerCleanup(following), true));
+                }
+            }
             for (position, pair) in order.windows(2).enumerate() {
                 let [normal, exceptional] = *pair else {
                     unreachable!()
@@ -680,7 +755,7 @@ impl ExceptionOwnerProvenance {
                 if is_named_handler_exit(records.clone(), graph[exceptional].items()) {
                     entries
                         .entry(normal)
-                        .or_insert((Exit::NamedHandler(target), true));
+                        .or_insert((Exit::HandlerCleanup(target), true));
                 // A range endpoint can split the final jump from its name clear.
                 // Reject that seam below if any branch or exception can enter it.
                 } else if let Some(&prefix) =
@@ -697,7 +772,7 @@ impl ExceptionOwnerProvenance {
                 {
                     entries
                         .entry(prefix)
-                        .or_insert((Exit::NamedHandler(target), true));
+                        .or_insert((Exit::HandlerCleanup(target), true));
                     named_exit_splits.insert(normal, prefix);
                 }
             }
@@ -717,6 +792,7 @@ impl ExceptionOwnerProvenance {
             return;
         }
         if !self.cold_handler_borrow_jumps.is_empty()
+            || !self.unnamed_handler_borrow_exits.is_empty()
             || !self.named_handler_cleanup_targets.is_empty()
         {
             for region in regions {
@@ -725,7 +801,7 @@ impl ExceptionOwnerProvenance {
                 };
                 if matches!(
                     entries.get(&block),
-                    Some((Exit::HandlerJump(_) | Exit::NamedHandler(_), _))
+                    Some((Exit::HandlerJump(_) | Exit::HandlerCleanup(_), _))
                 ) {
                     entries.remove(&block);
                 }
@@ -812,7 +888,7 @@ impl ExceptionOwnerProvenance {
                     }
                     handler(&cleanup_handlers)
                 }
-                Exit::NamedHandler(target) => {
+                Exit::HandlerCleanup(target) => {
                     if !super::ends_scope(previous.opcode)
                         && !super::is_unconditional_jump(previous.opcode)
                     {
