@@ -15,6 +15,18 @@ use serc::{
 };
 
 #[test]
+fn folded_while_uses_its_false_edge_for_the_implicit_return() {
+    let source = r"def drain(reader):
+    if True:
+        while not reader.done:
+            yield reader.next()
+    else:
+        yield None
+";
+    assert_matches_cpython(source, "folded_while_return.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
