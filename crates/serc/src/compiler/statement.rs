@@ -139,6 +139,7 @@ impl LoopBreakPolicy {
 struct ExceptionHandlerContext {
     name: Option<NameId>,
     first: bool,
+    terminal: bool,
     loop_depth: usize,
     try_body_depth: usize,
     with_depth: usize,
@@ -6795,6 +6796,29 @@ impl<'source> Compiler<'source> {
                         .set_location(self.source_location(last.range()));
                 }
                 self.emit(POP_TOP, 0, -1)?;
+                if self.context.python_version >= crate::PythonVersion::Py314
+                    && !self.control.statements.context.has_following
+                    && self
+                        .control
+                        .exceptions
+                        .active_exception_handlers
+                        .last()
+                        .is_some_and(|handler| {
+                            handler.terminal
+                                || !self
+                                    .control
+                                    .finally
+                                    .active_return_finally_contexts
+                                    .is_empty()
+                        })
+                    && matches!(expression.value.as_ref(), Expr::If(conditional) if early_condition_truthiness(&conditional.test).is_none())
+                {
+                    // The value arms end before the shared discard and handler cleanup.
+                    // Each private copy takes its own value's source position.
+                    self.assembler.preserve_last_no_location();
+                    self.assembler
+                        .make_last_no_location_copy_inherit_shared_predecessor();
+                }
                 // Allow copied conditional discards to inherit their branch's location.
                 // A folded true branch retains its separate unlocated join.
                 if preserve_no_location
@@ -32288,6 +32312,7 @@ impl<'source> Compiler<'source> {
                 let context = ExceptionHandlerContext {
                     name: handler_name,
                     first: handler_index == 0,
+                    terminal,
                     loop_depth: self.control.loops.contexts.len(),
                     try_body_depth: self.control.exceptions.active_try_marker_slots.len(),
                     with_depth: self.control.withs.active_with_exits.len(),
