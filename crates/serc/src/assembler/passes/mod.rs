@@ -2,7 +2,7 @@
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use super::block_graph::BlockGraph;
+use super::block_graph::{BasicBlockId, BlockGraph};
 use super::exception_owners::OwnerLabelPositions;
 use super::fusion_owner_slots::FusionOwnerCertificates;
 use super::layout::{backward_argument, label_position};
@@ -24,6 +24,58 @@ mod locals;
 mod normal_try_copies;
 mod normal_try_copy_plan;
 mod swaps;
+
+/// Finds the private return that CPython gives a conditional edge before folding its test.
+fn folded_condition_return(
+    graph: &BlockGraph,
+    source: BasicBlockId,
+    target: BasicBlockId,
+) -> Option<(usize, [Instruction; 2])> {
+    use crate::target::opcodes::{LOAD_CONST, RETURN_VALUE};
+
+    let position = graph.order().iter().position(|block| *block == target)?;
+    let [.., body, body_exit] = &graph.order()[..position] else {
+        return None;
+    };
+    let return_pair = |block: BasicBlockId| {
+        let [Item::Label(_), load, ret] = graph[block].items() else {
+            return None;
+        };
+        Some([*load.as_instruction()?, *ret.as_instruction()?])
+    };
+    let [load, ret] = return_pair(target)?;
+    let [body_load, body_ret] = return_pair(*body_exit)?;
+    let donor = graph[*body].last_instruction()?.location;
+    // The falling body has already received its own copy. An authored return or
+    // raise terminates its block and has no such fallthrough predecessor.
+    if !graph[*body].successors().0
+        || donor.line < 0
+        || load != Instruction::new(LOAD_CONST, load.operand(), SourceLocation::NONE, Some(1))
+        || ret
+            != Instruction::new(
+                RETURN_VALUE,
+                Operand::Value(0),
+                SourceLocation::NONE,
+                Some(0),
+            )
+        || body_load.opcode != LOAD_CONST
+        || body_load.operand() != load.operand()
+        || body_ret.opcode != RETURN_VALUE
+        || body_load.location != donor
+        || body_ret.location != donor
+    {
+        return None;
+    }
+    // Both original conditionals jump to the unlocated return. The literal
+    // takes its copy before the other conditional in CPython's insertion order.
+    let mut incoming = graph.iter().filter_map(|(id, block)| {
+        let edge = block.last_instruction()?;
+        (id != source && graph.label_block(edge.jump_target()?) == Some(target)).then_some(edge)
+    });
+    let other = incoming.next()?;
+    (crate::target::is_conditional_jump(other.opcode) && incoming.next().is_none())
+        .then_some((position, [load, ret]))
+}
 
 #[cfg(any(test, debug_assertions))]
 fn validate_structure(
@@ -457,6 +509,33 @@ impl Assembler {
                     .expect("exact original join")
                     .no_location_policy
                     .clear_preserved_location();
+                continue;
+            }
+            if self.exception_regions.is_empty()
+                && let Some((position, mut exit)) = folded_condition_return(&graph, source, target)
+            {
+                let label = Label::from_u32(self.next_label);
+                self.next_label += 1;
+                for instruction in &mut exit {
+                    instruction.location = original.location;
+                }
+                graph.insert_block(
+                    position,
+                    vec![
+                        Item::Label(label),
+                        Item::Instruction(exit[0]),
+                        Item::Instruction(exit[1]),
+                    ],
+                );
+                if let Some(reachable) = &mut initial_reachable {
+                    reachable.push(reachable[source.index()]);
+                }
+                let jump = graph
+                    .instructions_mut(source)
+                    .next()
+                    .expect("exact folded arm");
+                jump.retarget(Operand::Forward(label));
+                jump.jump_policy.prevent_small_exit_inlining();
                 continue;
             }
             let mut instructions = graph[target]
