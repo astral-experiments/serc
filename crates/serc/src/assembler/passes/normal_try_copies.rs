@@ -2742,7 +2742,12 @@ impl OptimizationPipeline {
         if graph.order().windows(2).any(|pair| {
             (pair[1] == cleanup || pair[1] == join)
                 && super::super::block_has_fallthrough(graph[pair[0]].items())
-        }) || !self
+        }) {
+            return None;
+        }
+        // A surviving handler arm can enter the original name cleanup directly.
+        // Its jump copies that cleanup before the shared join acquires the tuple.
+        if !self
             .exception_owner_provenance
             .normal_try_exits
             .iter()
@@ -2750,6 +2755,11 @@ impl OptimizationPipeline {
                 graph.label_block(entry) == Some(recovered)
                     && graph.label_block(end) == Some(cleanup)
             })
+            && !self
+                .exception_owner_provenance
+                .original_named_handler_cleanup_joins
+                .iter()
+                .any(|(entry, _)| graph.label_block(*entry) == Some(cleanup))
         {
             return None;
         }

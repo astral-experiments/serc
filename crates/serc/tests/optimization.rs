@@ -1959,6 +1959,24 @@ fn compound_handler_loop_exits_keep_separate_cleanup_copies() {
 }
 
 #[test]
+fn guarded_named_handler_reaches_the_shared_tuple_return() {
+    let source = "def resolve(left, right, read, keep):
+    if read:
+        try:
+            left = read(right)
+        except ValueError as error:
+            if keep:
+                pass
+            else:
+                raise error
+    else:
+        left = 1
+    return left, right
+";
+    assert_matches_cpython(source, "guarded_recovery_tuple.py", &LEVELS);
+}
+
+#[test]
 fn nested_recovery_reaches_a_separate_tuple_return() {
     let source = "def sample(flag, left, right):
     if flag:
