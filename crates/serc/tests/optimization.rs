@@ -25936,6 +25936,30 @@ fn specialized_comparison_keeps_its_try_else_guard_handler() {
 }
 
 #[test]
+fn terminal_guard_edges_locate_returns_after_elided_assertions() {
+    let source = r#"def shared(first, second, a, b, c):
+    if first:
+        work()
+    elif second:
+        if a and b and c:
+            return
+        assert valid()
+    else:
+        assert valid()
+
+async def unique(ready, value):
+    result = await start()
+    if ready:
+        saved = result()
+        if not value:
+            assert saved()
+            return
+        assert saved()
+"#;
+    assert_matches_cpython(source, "elided_guard_returns.py", &LEVELS);
+}
+
+#[test]
 fn erased_assertions_keep_the_finally_call_argument_guard_protected() {
     let source = r"def check(manager, handle, data, ok):
     with manager:
