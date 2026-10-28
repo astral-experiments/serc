@@ -3881,6 +3881,29 @@ impl<'source> Compiler<'source> {
                         if matches!(expression.value.as_ref(), Expr::Call(_))
                             && !expression_suspends_current_scope(&expression.value))
                 });
+        // Fast and fallback generator calls rejoin before a single discard or
+        // name store. A nested arm or protected exit can add its own jump or cleanup.
+        let result = match body.last() {
+            Some(Stmt::Expr(expression)) => Some(expression.value.as_ref()),
+            Some(Stmt::Assign(assignment))
+                if has_later_arm && matches!(assignment.targets.as_slice(), [Expr::Name(_)]) =>
+            {
+                Some(assignment.value.as_ref())
+            }
+            _ => None,
+        };
+        let generator_call = !legacy
+            && !self.control.statements.terminal_if_branch_has_forward_exit
+            && self.control.exceptions.active_try_marker_slots.is_empty()
+            && self.control.withs.active_with_exits.is_empty()
+            && self.control.finally.is_inactive_for_return_unwind()
+            && matches!(result, Some(Expr::Call(call))
+                if optimized_generator_callable_for_target(call, self.context.python_version).is_some());
+        if generator_call && has_later_arm {
+            // The discard or store's exit jump is replaced when it receives the return.
+            self.assembler.add_last_original_block_slots(1);
+            return;
+        }
         let needs_boundary = legacy
             || terminal_assignment
             // Erased assertions do not join a call's original block to the return.
@@ -3896,7 +3919,11 @@ impl<'source> Compiler<'source> {
             // a branch, so an incoming jump cannot copy an assignment, deletion, or call
             // with the footer.
             let implicit_return = self.assembler.label();
-            if legacy {
+            if generator_call {
+                self.assembler.preserve_last_no_location();
+                self.assembler.set_location(SourceLocation::NONE);
+            }
+            if legacy || generator_call {
                 self.assembler.preserve_block_boundary(implicit_return);
             }
             self.assembler.mark(implicit_return);

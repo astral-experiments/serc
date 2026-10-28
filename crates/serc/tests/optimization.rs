@@ -15755,6 +15755,29 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn optimized_generator_results_retain_their_arm_exit() {
+    let source = r"def falling(active, items):
+    if active:
+        finish()
+    else:
+        all(f(x) for x in items for _ in extras)
+
+def jumping(active, items):
+    if active:
+        tuple(f(x) for x in items)
+    else:
+        return finish()
+
+def stored(active, items):
+    if active:
+        saved = list(read(item) for item in items)
+    else:
+        raise ValueError()
+";
+    assert_matches_cpython(source, "generator_result_exits.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:

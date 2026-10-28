@@ -18981,6 +18981,7 @@ impl Assembler {
             return;
         }
 
+        let items = self.linear_items();
         let mut label_positions = FxHashMap::default();
         for (index, item) in items.iter().enumerate() {
             if let Item::Label(label) = item {
@@ -19019,12 +19020,12 @@ impl Assembler {
             else {
                 continue;
             };
-            // The original POP_TOP block ends at the next jump target. Its
-            // fallthrough successor cannot participate in small-exit copying.
+            // The discard ends at the next original block. A distributed
+            // return can retain that boundary without an incoming jump.
             let crosses_target = |start: usize, end: usize| {
                 items[start + 1..end]
                     .iter()
-                    .any(|item| matches!(item, Item::Label(label) if jump_targets.contains(label)))
+                    .any(|item| matches!(item, Item::Label(label) if jump_targets.contains(label) || self.preserved_block_boundaries.contains(label)))
             };
             if crosses_target(pop_position, return_load.0) {
                 continue;
@@ -19064,6 +19065,7 @@ impl Assembler {
                 replacements.push((index, return_load, return_value));
             }
         }
+        let items = self.linear_items_mut();
         let mut copied_positions = Vec::with_capacity(replacements.len() * 2);
         for (index, (load_position, return_load), (value_position, return_value)) in replacements {
             items[index] = Item::Instruction(return_load);
