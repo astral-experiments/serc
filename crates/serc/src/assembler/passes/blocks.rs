@@ -7838,15 +7838,26 @@ impl OptimizationPipeline {
                     })
                     .collect::<FxHashMap<_, _>>()
             };
+            // The removed POP_BLOCK divides an unlocated handler exit in two.
+            // Copy both records before the remaining guard supplies their line.
+            let split_handler_jump = inline_no_location_block
+                && target_has_no_location
+                && target != target_exit
+                && target_terminal_opcode == Some(JUMP_FORWARD)
+                && target_blocks
+                    .iter()
+                    .flat_map(|block| graph[*block].items())
+                    .filter_map(Item::as_instruction)
+                    .map(|record| record.opcode)
+                    .eq([POP_EXCEPT, JUMP_FORWARD]);
             let copied_inline_entry_labels = copied_labels
                 .iter()
                 .filter_map(|(original, copied)| {
-                    // An unlocated cleanup and its backedge are one native array.
-                    // A copied exception split still inherits the line when another
-                    // edge enters the copy before its predecessor has a location.
+                    // An unlocated cleanup and its jump are one native array.
+                    // Carry its interior split even if the predecessor is located later.
                     (copied_exit_or_eval_entry_labels.contains(original)
                         || (inline_no_location_block
-                            && target_has_unlocated_jump_eval_check
+                            && (target_has_unlocated_jump_eval_check || split_handler_jump)
                             && exception_split_labels.contains(original)))
                     .then_some(*copied)
                 })
@@ -8249,6 +8260,7 @@ impl OptimizationPipeline {
                 if target_terminal_opcode
                     .is_some_and(|opcode| ends_scope(opcode) || opcode == JUMP_BACKWARD)
                     || target_has_artificial_eval_break
+                    || split_handler_jump
                 {
                     copied_exit_or_eval_entry_labels.insert(copied_label);
                     // A later copy of this array must also cross copied interior

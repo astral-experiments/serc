@@ -15,6 +15,31 @@ use serc::{
 };
 
 #[test]
+fn a_guard_locates_the_jump_after_inlined_handler_pops() {
+    let source = r"def attempt(enabled, retry, value):
+    if enabled:
+        try:
+            read()
+        except ValueError:
+            try:
+                read()
+            except ValueError:
+                try:
+                    read()
+                except ValueError:
+                    try:
+                        read()
+                    except:
+                        if enabled:
+                            pass
+                        elif retry:
+                            pass
+    return value
+";
+    assert_matches_cpython(source, "nested_handler_exit_jump.py", &LEVELS);
+}
+
+#[test]
 fn a_copied_exception_cleanup_keeps_its_backedge_line() {
     let source = r"def scan(items, ready, active):
     for item in items:
