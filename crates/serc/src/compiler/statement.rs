@@ -23842,6 +23842,24 @@ impl<'source> Compiler<'source> {
                         .set_location(self.source_location(statement.range));
                 } else if self.context.python_version >= crate::PythonVersion::Py314
                     && test.is_none()
+                    && try_body_normal_exit
+                    && !non_final_branch
+                    && elided_else
+                    && self.control.exceptions.normal_try_loop_tail_owner
+                        == Some((
+                            restart,
+                            self.control
+                                .exceptions
+                                .active_exception_region_exclusions
+                                .len(),
+                        ))
+                    && let Some(donor) = self.assembler.try_exit_condition_donor()
+                {
+                    // The earlier arms already end in copied backedges. Only the
+                    // last condition enters this empty false arm of the protected loop.
+                    self.assembler.set_location(donor);
+                } else if self.context.python_version >= crate::PythonVersion::Py314
+                    && test.is_none()
                     && ((non_final_branch && !try_body_normal_exit)
                         || (try_body_normal_exit
                             && !non_final_branch
