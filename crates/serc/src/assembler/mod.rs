@@ -1969,10 +1969,10 @@ impl Assembler {
             })
     }
 
-    /// Checks the live call suffix of the current original source array.
-    pub(crate) fn current_original_block_ends_with_discarded_call(&self) -> bool {
+    /// Checks whether the current original array discards the result of this opcode.
+    pub(crate) fn current_original_block_ends_with_discarded(&self, opcode: Opcode) -> bool {
         let mut items = self.linear_items().iter().rev();
-        for expected in [POP_TOP, crate::target::opcodes::CALL] {
+        for expected in [POP_TOP, opcode] {
             loop {
                 match items.next() {
                     Some(Item::Label(label))
@@ -14683,22 +14683,11 @@ impl Assembler {
         pop_item: usize,
         unnamed_handler: bool,
         retained_inner_try: bool,
-        coroutine: bool,
+        discarded_await: bool,
     ) {
         use crate::target::opcodes::CALL;
 
         let items = self.linear_items();
-        let discarded_await = coroutine
-            && items[..return_item]
-                .iter()
-                .rev()
-                .filter_map(Item::as_instruction)
-                .map(|record| record.opcode)
-                .take(2)
-                .eq([POP_TOP, crate::target::opcodes::END_SEND]);
-        if coroutine && !retained_inner_try && !discarded_await {
-            return;
-        }
         let Some(before) = items.get(return_item..pop_item) else {
             return;
         };

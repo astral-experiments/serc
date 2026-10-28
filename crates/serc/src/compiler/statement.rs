@@ -8383,6 +8383,15 @@ impl<'source> Compiler<'source> {
                                         if matches!(test.first_operand(), Expr::Name(_))
                                             && matches!(test.ops.as_ref(), [CmpOp::Is | CmpOp::IsNot])
                                             && matches!(test.comparators(), [Expr::NoneLiteral(_)]))));
+                let discarded_await = self.context.python_version == crate::PythonVersion::Py314
+                    && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        == CO_COROUTINE
+                    && !preserve_tos
+                    && self.control.withs.active_with_exits.len() == 1
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.assembler.current_original_block_ends_with_discarded(
+                        crate::target::opcodes::END_SEND,
+                    );
                 let copied_handler_return_item = self.assembler.item_count();
                 if !preserve_tos {
                     let range = statement
@@ -12346,7 +12355,7 @@ impl<'source> Compiler<'source> {
                     // A bare return through a sync manager can leave an ordinary try
                     // between the manager and finally. Capture the exact cleanup before
                     // its primitive test, including an optional unnamed-handler unwind.
-                    let copied_try_manager_pop = (matches!(self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR), 0 | CO_COROUTINE)
+                    let copied_try_manager_pop = ((self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0 || discarded_await)
                         && !preserve_tos
                         && !return_is_overridden
                         && context_index == 0
@@ -13664,7 +13673,7 @@ impl<'source> Compiler<'source> {
                             pop_item,
                             unnamed_handler,
                             retained_inner_try,
-                            self.unit.flags & CO_COROUTINE != 0,
+                            discarded_await,
                         );
                     }
                     if result.is_ok()
@@ -16931,7 +16940,7 @@ impl<'source> Compiler<'source> {
                             if matches!(expression.value.as_ref(), Expr::Call(_)))
                         && self
                             .assembler
-                            .current_original_block_ends_with_discarded_call();
+                            .current_original_block_ends_with_discarded(CALL);
                     let discarded_if_exit = matches!(body.last(), Some(Stmt::Expr(expression))
                         if matches!(expression.value.as_ref(), Expr::If(conditional)
                             if early_condition_truthiness(&conditional.test).is_none()))
@@ -30116,7 +30125,7 @@ impl<'source> Compiler<'source> {
                         && ((self.suite_has_nonempty_borrow_entry(&statement.finalbody)
                             && self
                                 .assembler
-                                .current_original_block_ends_with_discarded_call())
+                                .current_original_block_ends_with_discarded(CALL))
                             || stored_call_finally_source)));
             let retained_finally_normal_source = !statement.is_star
                 && !statement.finalbody.is_empty()
