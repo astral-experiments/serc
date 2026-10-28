@@ -6385,7 +6385,18 @@ impl OptimizationPipeline {
                         (POP_EXCEPT, Operand::Value(0)),
                         (RETURN_VALUE, Operand::Value(0)),
                     ]);
+            // A region boundary may split a wholly artificial named-handler cleanup
+            // from its literal return. It is still one original scope-exit block.
+            let split_named_handler_return = matches!(target_blocks, [cleanup, returned]
+                if self.python_version >= crate::PythonVersion::Py314
+                    && target_has_no_location
+                    && graph[*cleanup].items().iter().find_map(Item::as_instruction)
+                        .is_some_and(|instruction| instruction.opcode == POP_EXCEPT)
+                    && is_unlocated_value_cleanup_prefix(graph[*cleanup].items(), self.python_version)
+                    && graph[*returned].items().iter().filter_map(Item::as_instruction)
+                        .map(|instruction| instruction.opcode).eq([LOAD_CONST, RETURN_VALUE]));
             let target_allows_no_location_block_inlining = copy_iterator_return
+                || split_named_handler_return
                 || split_handler_return
                 || graph[target_exit]
                     .last_instruction()

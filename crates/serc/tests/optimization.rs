@@ -3989,6 +3989,29 @@ fn folded_while_breaks_copy_unnamed_handler_cleanup() {
 }
 
 #[test]
+fn literal_return_copies_the_split_named_handler_cleanup() {
+    let source = r"def acquire(accept):
+    try:
+        try:
+            start()
+        except Busy as busy:
+            if accept(busy):
+                try:
+                    retry()
+                except Empty as empty:
+                    return False
+                finally:
+                    try:
+                        state = release()
+                    except Closed:
+                        pass
+    except Aborted:
+        pass
+";
+    assert_matches_cpython(source, "split_named_cleanup_return.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_none_while_break_copies_cleanup() {
     for prefix in ["", "async "] {
         for condition in ["value", "value is None", "value is not None"] {
