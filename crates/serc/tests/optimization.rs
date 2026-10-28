@@ -4895,6 +4895,27 @@ fn erased_loop_before_managed_dispatch_keeps_empty_exit() {
 }
 
 #[test]
+fn protected_while_break_keeps_the_enclosing_cleanup_unlocated() {
+    let body = r"        try:
+            while True:
+                if active:
+                    break
+                step()
+        except ValueError:
+            raise";
+    let managed = format!(
+        "        with manager:\n    {}",
+        body.replace('\n', "\n    ")
+    );
+    for nested in [body, &managed] {
+        let source = format!(
+            "def sample(active, manager):\n    try:\n{nested}\n    finally:\n        release()\n"
+        );
+        assert_matches_cpython(&source, "nested_loop_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn folded_manager_loop_preserves_shared_cleanup_locations() {
     for (outer, cleanup) in [
         (
