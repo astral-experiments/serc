@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn bare_raise_copies_the_local_attribute_store_after_recovery() {
+    let source = r"def handle(obj):
+    try:
+        run()
+    except ValueError as err:
+        try:
+            run()
+        except KeyError:
+            pass
+        obj.saved = err
+        raise
+    finally:
+        release()
+";
+    assert_matches_cpython(source, "store_before_reraise.py", &LEVELS);
+}
+
+#[test]
 fn nested_handler_jumps_stop_at_a_shared_raise() {
     let source = r"def handle(outer):
     try:

@@ -577,10 +577,10 @@ fn block_is_bare_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) 
         Item::Instruction(raise),
     ] = &items[prefix_labels..]
     {
-        // A literal attribute store followed by a bare raise still has exactly four
+        // A literal or local attribute store followed by a bare raise has four
         // original slots. The raise uses the active handler instead of copying finally
         // cleanup, so an enclosing try's return-copy barrier does not apply.
-        return value.opcode == LOAD_CONST
+        return matches!(value.opcode, LOAD_CONST | LOAD_FAST | LOAD_DEREF)
             && matches!(receiver.opcode, LOAD_FAST | LOAD_DEREF)
             && store.opcode == STORE_ATTR
             && raise.opcode == RAISE_VARARGS
