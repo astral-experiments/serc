@@ -25842,7 +25842,13 @@ impl<'source> Compiler<'source> {
             }
             let loop_tail_boolean = self.prepare_loop_tail_boolean_discard(&statement.body);
             let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, start)?;
-            if unlocated_original_backedge {
+            if self.context.python_version >= crate::PythonVersion::Py314
+                && matches!(statement.body.last(), Some(Stmt::Pass(_)))
+            {
+                // The pass still heads the backedge block when branches are threaded.
+                // Its location survives even when suite emission has omitted the NOP.
+                self.assembler.prevent_jump_threading_target(backedge);
+            } else if unlocated_original_backedge {
                 self.assembler
                     .prepare_no_location_block_for_inlining(backedge);
             }
