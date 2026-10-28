@@ -15,6 +15,32 @@ use serc::{
 };
 
 #[test]
+fn implicit_return_after_a_comprehension_keeps_the_result_store_position() {
+    let source = r"
+def folded(values):
+    if True:
+        result = [item for item in values]
+    assert result
+
+def shared(values, left, right):
+    if left:
+        pass
+    else:
+        if right:
+            pass
+        else:
+            result = {item for item in values}
+        assert result
+";
+    assert_matches_cpython_versions(
+        source,
+        "comprehension_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

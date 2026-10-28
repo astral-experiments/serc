@@ -823,7 +823,8 @@ impl OptimizationPipeline {
                     // store with a comprehension restore. Retain that original origin.
                     for position in &positions[last + 1..] {
                         let Some(next) = graph.instruction_mut(*position) else {
-                            break;
+                            // Labels inside a swap partition have no independent predecessor.
+                            continue;
                         };
                         if next.location.line >= 0 || next.no_location_policy.preserves_location() {
                             break;

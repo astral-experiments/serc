@@ -18389,7 +18389,14 @@ impl<'source> Compiler<'source> {
             }
         }
 
-        if self.control.in_loop()
+        let fallthrough_body = statement
+            .elif_else_clauses
+            .last()
+            .map_or(statement.body.as_slice(), |clause| clause.body.as_slice());
+        if self
+            .terminal_comprehension_assignment(fallthrough_body)
+            .is_some()
+            || self.control.in_loop()
             || self
                 .control
                 .exceptions
@@ -18399,8 +18406,8 @@ impl<'source> Compiler<'source> {
                     handler.name.is_none() && handler.trailing_statement == Some(statement.range)
                 })
         {
-            // A final comprehension can fall through to an unlocated loop exit or
-            // handler cleanup. Preserve its store donor before static SWAP reordering.
+            // A final comprehension can fall through to a return, a loop exit, or
+            // handler cleanup. Preserve its result store before static SWAP reordering.
             self.assembler.record_comprehension_assignment_exit(end);
         }
         self.assembler.record_exception_owner_block_boundary(end);

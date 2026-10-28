@@ -2091,17 +2091,19 @@ fn comprehension_assignment_exit_location(
         .iter()
         .take_while(|item| matches!(item, Item::Label(_)))
         .count();
-    let jump = match &target[entry_len..] {
-        [Item::Instruction(jump)] if entry_len == 1 => jump,
-        [Item::Instruction(pop), Item::Instruction(jump)]
-            if pop.opcode == POP_EXCEPT && pop.location.line < 0 =>
-        {
-            jump
-        }
-        _ => return None,
+    let unlocated_jump = |jump: &Instruction| {
+        matches!(jump.opcode, JUMP_FORWARD | JUMP_BACKWARD) && jump.location.line < 0
     };
-    if !matches!(jump.opcode, JUMP_FORWARD | JUMP_BACKWARD) || jump.location.line >= 0 {
-        return None;
+    match &target[entry_len..] {
+        [Item::Instruction(jump)] if entry_len == 1 && unlocated_jump(jump) => {}
+        [Item::Instruction(pop), Item::Instruction(jump)]
+            if pop.opcode == POP_EXCEPT && pop.location.line < 0 && unlocated_jump(jump) => {}
+        [Item::Instruction(load), Item::Instruction(ret)]
+            if matches!(load.opcode, LOAD_CONST | LOAD_COMMON_CONSTANT)
+                && ret.opcode == RETURN_VALUE
+                && load.location == SourceLocation::NONE
+                && ret.location == SourceLocation::NONE => {}
+        _ => return None,
     }
     let (entries, instructions) = target[..entry_len].iter().find_map(|item| match item {
         Item::Label(exit) => origins.get(exit),
