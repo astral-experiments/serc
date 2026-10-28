@@ -6054,6 +6054,24 @@ impl<'source> Compiler<'source> {
             // before CPython removes the NOP and joins these blocks.
             return self.compile_suite_inner(body, false);
         }
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && !self.control.statements.terminal_if_branch_has_forward_exit
+            && matches!(body.last(), Some(Stmt::Expr(expression))
+                if matches!(expression.value.as_ref(), Expr::If(value)
+                    if early_condition_truthiness(&value.test).is_none()))
+        {
+            // Both value arms enter a shared POP_TOP, then fall through to the
+            // enclosing if's return block. Neither arm can copy that footer.
+            self.compile_suite_inner(body, false)?;
+            self.assembler.preserve_last_no_location();
+            let footer = self.assembler.label();
+            self.assembler.preserve_block_boundary(footer);
+            self.assembler.mark(footer);
+            self.assembler.set_location(SourceLocation::NONE);
+            self.emit_deferred_implicit_return()?;
+            self.control.statements.emitted_fallthrough_return = true;
+            return Ok(());
+        }
         let has_siblings = has_siblings || self.control.statements.terminal_if_branch_has_siblings;
         // A conditional name assignment in the last arm falls through its STORE
         // to the implicit return. Earlier tested arms have a jump over a sibling

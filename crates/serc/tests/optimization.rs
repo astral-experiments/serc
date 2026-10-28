@@ -15755,6 +15755,24 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn falling_if_arm_keeps_its_value_discard_separate_from_the_return() {
+    let source = r"def falling(active, ready):
+    if active:
+        read() if ready else None
+
+def jumping(active, ready):
+    if active:
+        read() if ready else None
+    else:
+        finish()
+
+def direct(ready):
+    read() if ready else None
+";
+    assert_matches_cpython(source, "falling_conditional_discard.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
