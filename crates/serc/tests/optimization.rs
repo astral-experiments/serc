@@ -6749,6 +6749,34 @@ fn terminal_returning_alternative_keeps_guarded_cleanup_entry() {
 }
 
 #[test]
+fn a_surviving_normal_jump_keeps_the_enclosing_exception_handler() {
+    let source = r"def run(value):
+    try:
+        work()
+    except KeyError as error:
+        try:
+            assert value
+        except ValueError:
+            pass
+        value += 1
+
+    try:
+        try:
+            assert value
+        except ValueError:
+            pass
+    finally:
+        finish(value)
+";
+    assert_matches_cpython_versions(
+        source,
+        "empty_nested_try_jump.py",
+        &[OptimizationLevel::One, OptimizationLevel::Two],
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn finalizer_loop_empty_try_keeps_exception_owner() {
     for manager in ["", "with acquire():", "with acquire(), acquire():"] {
         for prefix in ["def", "async def"] {
