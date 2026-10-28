@@ -21304,6 +21304,25 @@ fn folded_protected_branch_before_elided_assertion_keeps_exit_location() {
 }
 
 #[test]
+fn a_folded_try_else_marker_keeps_the_replacement_jumps_owner() {
+    let source = r"def run(ready):
+    try:
+        try:
+            work()
+        except LookupError:
+            recover()
+        else:
+            if __debug__:
+                observe()
+    finally:
+        finish()
+";
+    for source in [source.to_owned(), source.replace("__debug__", "ready")] {
+        assert_matches_cpython(&source, "folded_try_else_marker.py", &LEVELS);
+    }
+}
+
+#[test]
 fn folded_try_pass_after_branch_keeps_existing_exception_owner() {
     const TRACE: &str = r"
 import dis, marshal, sys, types
