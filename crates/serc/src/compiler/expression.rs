@@ -1580,7 +1580,18 @@ impl Compiler<'_> {
                 // instruction separately from the wildcard pattern's line event.
                 self.assembler
                     .set_location(self.source_location(pass.range));
-                self.emit(NOP, 0, 0)?;
+                if self.context.python_version >= PythonVersion::Py314
+                    && case.guard.is_none()
+                    && self.control.ends_synchronous_with_body(statement.range)
+                    && statement.cases[..matched_cases]
+                        .iter()
+                        .all(|case| suite_terminates(&case.body))
+                {
+                    // Only the wildcard reaches the manager's normal POP_BLOCK.
+                    self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
+                } else {
+                    self.emit(NOP, 0, 0)?;
+                }
             }
             if terminal && !suite_terminates(&case.body) && !emitted_fallthrough {
                 self.set_branch_end_location(&case.body, body_start);

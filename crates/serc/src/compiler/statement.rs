@@ -870,6 +870,13 @@ impl ControlFlowState<'_> {
             .is_some_and(|context| !context.is_async)
     }
 
+    /// True when this statement exits the innermost synchronous manager by fallthrough.
+    pub(super) fn ends_synchronous_with_body(&self, range: TextRange) -> bool {
+        self.withs.active_with_exits.last().is_some_and(|manager| {
+            !manager.is_async && manager.terminal_statement_range == Some(range)
+        })
+    }
+
     pub(super) fn current_synchronous_with_body_start_item(&self) -> Option<usize> {
         self.withs
             .active_with_exits

@@ -14737,6 +14737,25 @@ fn annotated_comprehension_preserves_implicit_return_location() {
 }
 
 #[test]
+fn a_wildcard_pass_locates_the_manager_pop_block() {
+    let source = r"def parse(value, flag, manager):
+    with manager:
+        match value:
+            case [1 | 2, item] if flag:
+                return item
+            case _:
+                pass
+    finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "wildcard_manager_pass.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn erased_match_default_keeps_manager_exit_outside_exception_regions() {
     let source = "def f(manager, other, value):\n    with manager:\n        match value:\n            case 1:\n                return first()\n            case 2:\n                return second()\n            case _:\n                assert False\n";
     for (case, source) in [
