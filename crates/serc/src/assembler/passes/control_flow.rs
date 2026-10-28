@@ -6970,7 +6970,7 @@ impl OptimizationPipeline {
                             .contains(&instruction.location)))
                 && (!instruction.jump_policy.preserves_explicit_nop()
                     // Keep empty SETUPs through reachability, then compact their NOP
-                    // once the threaded exit carries the same source location.
+                    // once the threaded exit or copied handler pop carries its source location.
                     || (self.python_version >= crate::PythonVersion::Py314
                         && setup_nop
                         && instruction.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
@@ -6983,7 +6983,7 @@ impl OptimizationPipeline {
                         && next.is_some_and(|next| {
                             next.location == instruction.location
                                 && (is_unconditional_jump(next.opcode)
-                                    || next.opcode == RERAISE)
+                                    || matches!(next.opcode, RERAISE | POP_EXCEPT))
                         }))
                     || (original_manager_pops.contains(&position)
                         && (instruction.location.line < 0
