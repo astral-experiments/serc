@@ -49631,6 +49631,19 @@ fn suite_contains_terminal_nested_try(
                     && suite_has_linear_borrow_fallthrough(&recovery.finalbody)
                     && suite_contains_terminal_nested_try(&recovery.body, version, true))
         }
+        // A successful try-else break leaves the following normal-exit jump in
+        // its own unreachable block. Cold ordering retains that empty block.
+        Stmt::While(loop_) => {
+            through_cleanup
+                && condition_has_only_runtime_tests(&loop_.test)
+                && !expression_contains_inline_branch(&loop_.test)
+                && loop_.body.iter().any(|part| {
+                    matches!(part, Stmt::Try(recovery)
+                if !recovery.is_star && !recovery.handlers.is_empty()
+                    && recovery.finalbody.is_empty() && !suite_terminates(&recovery.body)
+                    && matches!(recovery.orelse.as_slice(), [Stmt::Break(_)]))
+                })
+        }
         Stmt::With(manager) => {
             through_cleanup
                 && !manager.is_async

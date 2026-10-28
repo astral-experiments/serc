@@ -26004,3 +26004,24 @@ fn while_else_breaks_copy_the_enclosing_handler_exit() {
         );
     }
 }
+
+#[test]
+fn a_try_else_break_stops_borrowing_after_the_enclosing_handler() {
+    let source = r"def process(ready, value):
+    try:
+        begin()
+    except LookupError:
+        while ready:
+            try:
+                work()
+            except ValueError:
+                recover()
+            else:
+                break
+            advance()
+        else:
+            finish()
+    use(value)
+";
+    assert_matches_cpython(source, "handler_borrow.py", &LEVELS);
+}
