@@ -646,11 +646,11 @@ fn copied_raise_completes_local_store(
         })
 }
 
-/// Certifies a local raise without copied return/finally unwind records.
+/// Certifies a short explicit raise without copied return or finally unwind records.
 ///
-/// A local or constant cause adds one load before the raise. One converted `POP_BLOCK`
-/// may precede either form. Authored or folded NOPs do not prove its size.
-fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) -> bool {
+/// A local raise, with or without a local or constant cause, can follow one converted
+/// `POP_BLOCK`. A global exception constructor uses all four slots by itself.
+fn block_is_short_explicit_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>) -> bool {
     if !original_nop_targets.is_empty()
         && items
             .iter()
@@ -662,7 +662,8 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
     let Some(mut first) = instructions.next() else {
         return false;
     };
-    if first.opcode == NOP {
+    let has_pop = first.opcode == NOP;
+    if has_pop {
         if first.value_argument() != Some(0)
             || first.location != SourceLocation::NONE
             || !first.fusion_policy.is_converted_pop_block()
@@ -681,6 +682,27 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
         instruction.pre_fold_extra_instructions() == 0
             && instruction.local_policy.hidden_exception_owner_slots() == 0
     };
+    // A global zero-argument constructor occupies LOAD_GLOBAL, PUSH_NULL, CALL,
+    // and RAISE_VARARGS before fusion. A preceding POP_BLOCK would exceed four.
+    if !has_pop
+        && first.opcode == LOAD_GLOBAL
+        && first.value_argument().is_some_and(|arg| arg & 1 != 0)
+        && visible(first)
+    {
+        let (Some(call), Some(raise), None) = (
+            instructions.next(),
+            instructions.next(),
+            instructions.next(),
+        ) else {
+            return false;
+        };
+        return call.opcode == CALL
+            && call.value_argument() == Some(0)
+            && visible(call)
+            && raise.opcode == RAISE_VARARGS
+            && raise.value_argument() == Some(1)
+            && visible(raise);
+    }
     if first.opcode != LOAD_FAST || !visible(first) {
         return false;
     }
@@ -1191,7 +1213,7 @@ fn source_may_copy_exit(
     if !source_falls
         && target_last.opcode == RAISE_VARARGS
         && (block_is_bare_raise(graph[target].items(), original_nop_targets)
-            || block_is_local_raise(graph[target].items(), original_nop_targets))
+            || block_is_short_explicit_raise(graph[target].items(), original_nop_targets))
     {
         return true;
     }
@@ -1273,7 +1295,7 @@ fn source_may_copy_exit_original(
     let small_exit_source = !source_has_fallthrough
         && ((target_last.opcode == RAISE_VARARGS
             && (block_is_bare_raise(graph[target].items(), original_nop_targets)
-                || block_is_local_raise(graph[target].items(), original_nop_targets)))
+                || block_is_short_explicit_raise(graph[target].items(), original_nop_targets)))
             || graph[source]
                 .last_instruction()
                 .is_some_and(|instruction| instruction.jump_policy.inline_small_exit()));
@@ -1465,7 +1487,7 @@ fn exit_block_analysis(
                     && target_chain_end == target_position
                     && target_last.opcode == RAISE_VARARGS
                     && (block_is_bare_raise(graph[target].items(), original_nop_targets)
-                        || block_is_local_raise(graph[target].items(), original_nop_targets)),
+                        || block_is_short_explicit_raise(graph[target].items(), original_nop_targets)),
                 copy_conditional_split_return: target_is_small_exit
                     && predecessors[target.index()] > 1
                     && !exception_handler_blocks[target.index()],
@@ -6302,7 +6324,10 @@ impl OptimizationPipeline {
             let source_allows_small_exit_inlining = (target_chain_end == target_position
                 && target_terminal_opcode == Some(RAISE_VARARGS)
                 && (block_is_bare_raise(graph[target].items(), &self.original_nop_targets)
-                    || block_is_local_raise(graph[target].items(), &self.original_nop_targets)))
+                    || block_is_short_explicit_raise(
+                        graph[target].items(),
+                        &self.original_nop_targets,
+                    )))
                 || graph[source]
                     .last_instruction()
                     .is_some_and(|instruction| instruction.jump_policy.inline_small_exit());
