@@ -2339,6 +2339,18 @@ fn named_handler_cleanup_exit_location(
         .count();
     let target_body = &target[target_entry_len..];
     let supported_exit = match target_body {
+        [
+            Item::Instruction(none),
+            Item::Instruction(ret),
+            trailing @ ..,
+        ] if none.opcode == LOAD_CONST && ret.opcode == RETURN_VALUE => {
+            none.operand() == load.operand()
+                && trailing.iter().all(|item| matches!(item, Item::Label(_)))
+                && [none, ret].iter().all(|instruction| {
+                    instruction.location.line < 0
+                        && !instruction.no_location_policy.preserves_location()
+                })
+        }
         [Item::Instruction(jump)] => {
             is_unconditional_jump(jump.opcode)
                 && jump.location.line < 0
