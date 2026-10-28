@@ -25977,3 +25977,39 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn a_copied_handler_backedge_unwinds_one_handler_at_each_pop() {
+    for guard in [
+        "left",
+        "left and right",
+        "left or right",
+        "left and right and other",
+    ] {
+        let source = format!(
+            r"def process(items, left, right, other):
+    try:
+        for item in items:
+            try:
+                work()
+            except LookupError:
+                try:
+                    recover()
+                except OSError:
+                    try:
+                        if {guard}:
+                            break
+                    except ValueError:
+                        pass
+    except ArithmeticError:
+        fallback()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "handler.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
