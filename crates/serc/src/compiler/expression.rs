@@ -1199,6 +1199,7 @@ impl Compiler<'_> {
                                 self.assembler.at_original_unconditional_join()
                                     || self.assembler.original_return_guard_has_false_donor(
                                         self.source_location(test.range()),
+                                        0,
                                     )
                             });
                         if let Some(test) = final_condition_join {

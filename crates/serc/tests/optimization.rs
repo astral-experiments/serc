@@ -15,6 +15,20 @@ use serc::{
 };
 
 #[test]
+fn a_same_line_loop_return_keeps_its_guards_false_edge() {
+    let source = r"def scan(items, wanted):
+    for item in items:
+        try:
+            if wanted in item: return
+        except ValueError:
+            pass
+        if item:
+            consume(item)
+";
+    assert_matches_cpython(source, "same_line_loop_return.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

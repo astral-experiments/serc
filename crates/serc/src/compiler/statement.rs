@@ -29546,12 +29546,12 @@ impl<'source> Compiler<'source> {
                         chained_comparison_cleanup: false,
                     })
                 });
-            let retained_return_guard_exit = self.context.python_version
-                >= crate::PythonVersion::Py314
-                && !statement.is_star
-                && statement.orelse.is_empty()
-                && statement.finalbody.is_empty()
-                && matches!(statement.body.last(), Some(Stmt::If(branch))
+            let retained_return_guard_exit =
+                self.context.python_version >= crate::PythonVersion::Py314
+                    && !statement.is_star
+                    && statement.orelse.is_empty()
+                    && statement.finalbody.is_empty()
+                    && matches!(statement.body.last(), Some(Stmt::If(branch))
                     if branch.elif_else_clauses.is_empty()
                         && condition_has_only_runtime_tests(&branch.test)
                         && original_condition_has_unique_jump_target(&branch.test, false)
@@ -29561,11 +29561,20 @@ impl<'source> Compiler<'source> {
                                     && !expression_suspends_current_scope(value)
                             }))
                         && !suite_contains_yield_with_headers(&branch.body, true, true))
-                && direct_exit_location.is_some_and(|location| {
-                    self.assembler.original_return_guard_has_false_donor(
-                        self.source_location(location.test.range()),
-                    )
-                });
+                    && direct_exit_location.is_some_and(|location| {
+                        let iterator_slots =
+                            if self.control.loops.contexts.last().is_some_and(|loop_| {
+                                loop_.iterator_cleanup == IteratorCleanup::Sync
+                            }) {
+                                self.iterator_slots().cast_unsigned()
+                            } else {
+                                0
+                            };
+                        self.assembler.original_return_guard_has_false_donor(
+                            self.source_location(location.test.range()),
+                            iterator_slots,
+                        )
+                    });
             // A final runtime comparison assertion has one original success array
             // after its failure RAISE. The try's POP_BLOCK precedes the else suite;
             // this array contains only the existing unlocated normal-exit jump.
