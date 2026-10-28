@@ -30787,6 +30787,9 @@ impl<'source> Compiler<'source> {
                         !suite_contains_loop(&handler.body)
                             && handler.body.last().is_some_and(|last| {
                                 !suite_contains_nested_handler_cold_join(std::slice::from_ref(last))
+                                    // A conditional value ends in its own join before the store.
+                                    && !matches!(last, Stmt::Assign(store)
+                                        if expression_contains_inline_branch(&store.value))
                             })
                     })
                 });
