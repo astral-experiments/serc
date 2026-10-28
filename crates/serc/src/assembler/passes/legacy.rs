@@ -13,9 +13,9 @@ use crate::target::opcodes::{
     CALL, CALL_FUNCTION_EX, CALL_INTRINSIC_1, CLEANUP_THROW, COMPARE_OP, CONTAINS_OP, COPY,
     COPY_FREE_VARS, END_ASYNC_FOR, END_SEND, GET_ANEXT, IS_OP, JUMP_BACKWARD,
     JUMP_BACKWARD_NO_INTERRUPT, JUMP_FORWARD, LOAD_CLOSURE, LOAD_CONST, LOAD_FAST,
-    LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_TOP, PUSH_NULL, RERAISE, RESUME,
-    RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_ATTR, STORE_DEREF, STORE_FAST,
-    STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, STORE_NAME, STORE_SLICE,
+    LOAD_FAST_LOAD_FAST, LOAD_GLOBAL, MAKE_CELL, NOP, POP_EXCEPT, POP_TOP, PUSH_NULL, RERAISE,
+    RESUME, RETURN_CONST, RETURN_GENERATOR, RETURN_VALUE, SEND, STORE_ATTR, STORE_DEREF,
+    STORE_FAST, STORE_FAST_LOAD_FAST, STORE_FAST_STORE_FAST, STORE_GLOBAL, STORE_NAME, STORE_SLICE,
     STORE_SUBSCR, TO_BOOL, UNARY_NOT, YIELD_VALUE,
 };
 use crate::target::operands::ResumeLocation;
@@ -2404,7 +2404,16 @@ impl OptimizationPipeline {
                 }
             }
         }
+        let shared_cleanup_blocks = if self.python_version == PythonVersion::Py313 {
+            self.folded_original_predecessor_targets
+                .iter()
+                .filter_map(|label| self.graph.label_block(*label))
+                .collect::<FxHashSet<_>>()
+        } else {
+            FxHashSet::default()
+        };
         for (index, block) in order.iter().copied().enumerate() {
+            let shared_cleanup = shared_cleanup_blocks.contains(&block);
             let mut location = SourceLocation::NONE;
             let mut follows_generator_prefix = false;
             for instruction in self.graph.instructions_mut(block) {
@@ -2417,7 +2426,11 @@ impl OptimizationPipeline {
                     // Native propagation ignores modern preservation flags except
                     // certified shared POP_BLOCKs and later prefix insertion.
                     if !inserted_generator_pop
-                        && !legacy_shared_entry_keeps_no_location(self.python_version, instruction)
+                        && !legacy_shared_entry_keeps_no_location(
+                            self.python_version,
+                            instruction,
+                            shared_cleanup,
+                        )
                     {
                         instruction.location = location;
                     }
@@ -2451,7 +2464,7 @@ impl OptimizationPipeline {
                 if predecessors.get(&successor) == Some(&1)
                     && let Some(first) = self.graph.instructions_mut(successor).next()
                     && first.location.line < 0
-                    && !legacy_shared_entry_keeps_no_location(self.python_version, first)
+                    && !legacy_shared_entry_keeps_no_location(self.python_version, first, shared_cleanup_blocks.contains(&successor))
                     // A cold bridge beyond an erased loop test has no located
                     // predecessor in its original layout.
                     && !(self.python_version == PythonVersion::Py313
@@ -2474,10 +2487,12 @@ impl OptimizationPipeline {
 fn legacy_shared_entry_keeps_no_location(
     version: PythonVersion,
     instruction: &Instruction,
+    shared_cleanup: bool,
 ) -> bool {
     version == PythonVersion::Py313
         && instruction.no_location_policy.preserves_location()
         && (instruction.opcode == LOAD_CONST
+            || (instruction.opcode == POP_EXCEPT && shared_cleanup)
             || (instruction.opcode == NOP && instruction.fusion_policy.is_converted_pop_block()))
 }
 

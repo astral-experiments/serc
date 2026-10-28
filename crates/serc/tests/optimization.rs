@@ -16933,6 +16933,18 @@ fn coroutine_erased_else_preserves_shared_return_locations() {
 }
 
 #[test]
+fn a_folded_handler_guard_keeps_its_cleanup_join_unlocated() {
+    let source = "def run(value):\n    try:\n        work()\n    except LookupError:\n        if __debug__:\n            recover(value)\n    finish()\n";
+    assert_matches_cpython(source, "folded_handler_guard.py", &LEVELS);
+    assert_matches_cpython_versions(
+        &source.replace("recover(value)", "assert value"),
+        "erased_handler_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py313],
+    );
+}
+
+#[test]
 fn a_format_prefix_keeps_the_folded_guard_at_its_original_join() {
     for action in ["check(value)", "return value"] {
         let source = format!(

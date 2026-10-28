@@ -1926,6 +1926,20 @@ impl<'source> Compiler<'source> {
             }
     }
 
+    /// Whether a folded false guard still had two paths into the next block before optimization.
+    fn folded_guard_has_fallthrough(&self, guard: &ruff_python_ast::StmtIf) -> bool {
+        guard.elif_else_clauses.is_empty()
+            && self
+                .context
+                .fold_constant(&guard.test)
+                .is_some_and(|constant| !constant.is_truthy())
+            && !suite_terminates(&guard.body)
+            && guard
+                .body
+                .iter()
+                .any(|part| !self.context.is_elided_statement(part))
+    }
+
     fn supports_protected_terminal_if(&self) -> bool {
         self.context.python_version >= crate::PythonVersion::Py313
             && matches!(self.unit.scope, Scope::Function { .. })
@@ -3450,11 +3464,8 @@ impl<'source> Compiler<'source> {
                             if binary.op == ruff_python_ast::Operator::Mod
                                 && matches!(binary.left.as_ref(), Expr::StringLiteral(_)))
                         && matches!(previous_statement, Some(Stmt::If(guard))
-                            if guard.elif_else_clauses.is_empty()
-                                && self.context.fold_constant(&guard.test).is_some_and(|c| !c.is_truthy())
-                                && !suite_terminates(&guard.body)
-                                && guard.body.iter().any(|part| !self.context.is_elided_statement(part))))
-                        .then(|| value.range())
+                            if self.folded_guard_has_fallthrough(guard)))
+                    .then(|| value.range())
                 });
                 let preceded_by_terminating_if = matches!(
                     previous_statement,
@@ -33190,19 +33201,24 @@ impl<'source> Compiler<'source> {
                     && matches!(handler.body.last(), Some(Stmt::If(tail))
                         if handler_cleanup_has_runtime_else_join(tail)));
 
-            let handler_ends_with_preserved_unlocated_cleanup = matches!(
-                handler.body.last(),
-                Some(Stmt::If(tail))
-                    if handler.name.is_none()
-                        && handler.body.len() > 1
-                        && !self.control.withs.active_with_exits.is_empty()
-                        && tail.elif_else_clauses.is_empty()
-                        && matches!(
-                            tail.body.as_slice(),
-                            [Stmt::Expr(expression)]
-                                if matches!(expression.value.as_ref(), Expr::Call(_))
-                        )
-            );
+            let folded_handler_join = self.context.python_version >= crate::PythonVersion::Py313
+                && handler.name.is_none()
+                && matches!(handler.body.last(), Some(Stmt::If(guard))
+                    if self.folded_guard_has_fallthrough(guard));
+            let handler_ends_with_preserved_unlocated_cleanup = folded_handler_join
+                || matches!(
+                    handler.body.last(),
+                    Some(Stmt::If(tail))
+                        if handler.name.is_none()
+                            && handler.body.len() > 1
+                            && !self.control.withs.active_with_exits.is_empty()
+                            && tail.elif_else_clauses.is_empty()
+                            && matches!(
+                                tail.body.as_slice(),
+                                [Stmt::Expr(expression)]
+                                    if matches!(expression.value.as_ref(), Expr::Call(_))
+                            )
+                );
             let handler_ends_with_unlocated_bare_raise_branch_cleanup = handler.name.is_none()
                 && handler.body.len() > 1
                 && matches!(
@@ -33276,6 +33292,10 @@ impl<'source> Compiler<'source> {
                     .unwrap_or(SourceLocation::NONE)
             });
             self.assembler.mark(body_end);
+            if folded_handler_join && self.context.python_version == crate::PythonVersion::Py313 {
+                // Its original body and false edge both enter the cleanup when 3.13 assigns lines.
+                self.assembler.record_folded_condition_predecessor(body_end);
+            }
             if handler.name.is_some() {
                 self.assembler
                     .record_named_handler_cleanup_target(name_cleanup);
@@ -33681,6 +33701,9 @@ impl<'source> Compiler<'source> {
                     // jump, it can put a following name return over the four-slot limit.
                     self.emit_with_exception_policy(NOP, 0, 0, ExceptionPolicy::EXCLUDE_ALWAYS)?;
                     self.assembler.mark_last_as_converted_pop_block();
+                    if folded_handler_join {
+                        self.assembler.preserve_last_no_location();
+                    }
                 }
                 self.emit(POP_EXCEPT, 0, -1)?;
                 let materialized_cleanup_slots = usize::from(legacy_handler_pop);
