@@ -2147,6 +2147,18 @@ impl Assembler {
         let (before, entry_depth) = if matches!(last.opcode, STORE_FAST | STORE_DEREF) {
             (prefix, 1)
         } else if self.python_version >= crate::PythonVersion::Py314
+            && last.opcode == crate::target::opcodes::STORE_ATTR
+            && let Some((Item::Instruction(receiver), before)) = prefix.split_last()
+            && receiver.opcode == LOAD_FAST
+            && receiver.value_argument().is_some()
+            && receiver.location.line >= 0
+            && *receiver
+                == Instruction::new(LOAD_FAST, receiver.operand(), receiver.location, Some(2))
+        {
+            // On entry only the selected value is on the stack. The receiver load and
+            // store consume it before the original constant condition is folded away.
+            (before, 1)
+        } else if self.python_version >= crate::PythonVersion::Py314
             && last.opcode == POP_TOP
             && last.value_argument() == Some(0)
             && let Some((Item::Instruction(call), before)) = prefix.split_last()

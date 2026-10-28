@@ -25936,6 +25936,21 @@ fn specialized_comparison_keeps_its_try_else_guard_handler() {
 }
 
 #[test]
+fn attribute_store_join_precedes_a_folded_terminal_guard() {
+    let source = r"def run(obj, value):
+    obj.result = compute() if value is sentinel else value
+    if __debug__:
+        observe()
+";
+    for source in [
+        source.to_owned(),
+        source.replace(" if value is sentinel else value", ""),
+    ] {
+        assert_matches_cpython(&source, "folded_attribute_guard.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertions_keep_the_finally_call_argument_guard_protected() {
     let source = r"def check(manager, handle, data, ok):
     with manager:
