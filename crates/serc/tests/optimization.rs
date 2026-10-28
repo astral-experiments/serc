@@ -15755,6 +15755,33 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn nested_finalizer_store_exits_respect_guard_reachability() {
+    let source = r"async def finish(state):
+    def closing():
+        return closed
+    try:
+        try:
+            work()
+        finally:
+            if state and state.ready:
+                value = None
+    finally:
+        closed = True
+
+def unreachable_store():
+    try:
+        try:
+            work()
+        finally:
+            if False:
+                value = None
+    finally:
+        closed = True
+";
+    assert_matches_cpython(source, "nested_finalizer_store.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
