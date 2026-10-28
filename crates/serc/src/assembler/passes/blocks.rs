@@ -6975,19 +6975,27 @@ impl OptimizationPipeline {
                 // turns it backward. The original synthetic cleanup edge remains no-interrupt.
                 instruction.opcode = JUMP_BACKWARD;
             }
-            // A short keyword-call raise is also a scope exit in CPython's
-            // original array. Keep the same empty-join provenance and location
-            // guards as returns, including an optional final keyword value load.
-            let inline_unprotected_keyword_raise = inline_small_exit
+            // A global exception or short keyword call fits the original exit-copy
+            // budget. Preserve the same empty-join location as a short return.
+            let inline_unprotected_raise = inline_small_exit
                 && target_chain_end == target_position
-                && matches!(target_pre_fusion_size, 3 | 4)
+                && target_terminal_opcode == Some(RAISE_VARARGS)
                 && {
                     let mut opcodes = graph[target].items().iter().filter_map(|item| {
                         item.as_instruction().map(|instruction| instruction.opcode)
                     });
-                    (target_pre_fusion_size == 3
-                        || matches!(opcodes.next(), Some(LOAD_FAST | LOAD_DEREF | LOAD_CONST)))
-                        && opcodes.eq([LOAD_CONST, CALL_KW, RAISE_VARARGS])
+                    match target_pre_fusion_size {
+                        2 => opcodes.eq([LOAD_GLOBAL, RAISE_VARARGS]),
+                        3 | 4 => {
+                            (target_pre_fusion_size == 3
+                                || matches!(
+                                    opcodes.next(),
+                                    Some(LOAD_FAST | LOAD_DEREF | LOAD_CONST)
+                                ))
+                                && opcodes.eq([LOAD_CONST, CALL_KW, RAISE_VARARGS])
+                        }
+                        _ => false,
+                    }
                 }
                 && graph[target]
                     .last_instruction()
@@ -7045,7 +7053,7 @@ impl OptimizationPipeline {
             // Exception bookkeeping can split a block without creating an original
             // CFG boundary, so only retain markers on recorded original blocks.
             let preserve_unlocated_join_nop = (((inline_unprotected_return
-                || inline_unprotected_keyword_raise
+                || inline_unprotected_raise
                 || inline_keyword_reraise)
                 && target_chain_end == target_position)
                 || inline_protected_keyword_return)
@@ -7096,7 +7104,7 @@ impl OptimizationPipeline {
             // direct-edge line policy is cleared. Current block width alone cannot
             // prove this: earlier folding may have removed original instructions.
             let preserve_threaded_join_nop = (inline_unprotected_return
-                || inline_unprotected_keyword_raise)
+                || inline_unprotected_raise)
                 && target_chain_end == target_position
                 && source_location.line >= 0
                 && graph[source].items().iter().any(|item| {
