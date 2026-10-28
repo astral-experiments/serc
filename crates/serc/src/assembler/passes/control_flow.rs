@@ -4631,8 +4631,9 @@ impl OptimizationPipeline {
                     return None;
                 }
                 // A falling-through case body and its failed conditions reach the
-                // same original case-success jump. A small local return is copied
-                // onto the enclosing branch exit before conditional threading.
+                // same original case-success jump. The enclosing branch copies a
+                // local return before conditional threading. An ordinary try's
+                // normal exit can also copy the following constant return here.
                 if previous_falls_through
                     && jump.opcode == JUMP_FORWARD
                     && jump.location == SourceLocation::NONE
@@ -4645,8 +4646,14 @@ impl OptimizationPipeline {
                     && self.graph[block].items().iter().filter_map(Item::as_instruction).count() == 1
                     && self.graph[target].items().iter().filter_map(Item::as_instruction).count() == 1
                     && first.opcode == JUMP_FORWARD
-                    && let Some(ret) = first.forward_target().and_then(|label| self.graph.label_block(label))
-                    && super::normal_try_copies::original_local_return(self.graph[ret].items())
+                    && let Some(return_label) = first.forward_target()
+                    && let Some(ret) = self.graph.label_block(return_label)
+                    && (super::normal_try_copies::original_local_return(self.graph[ret].items())
+                        || (self.python_version >= crate::PythonVersion::Py314
+                            && is_original_constant_return(&self.graph, return_label)
+                            && self.exception_owner_provenance.normal_try_exits.iter().any(|&(entry, exit)| {
+                                exit == return_label && self.graph.label_block(entry) == Some(target)
+                            })))
                 {
                     return None;
                 }
