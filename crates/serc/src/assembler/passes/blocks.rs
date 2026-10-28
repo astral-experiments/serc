@@ -795,18 +795,18 @@ fn is_shared_threaded_handler_jump(
 }
 
 /// Recognizes a recorded unnamed cleanup whose original `POP_BLOCK` survives in its width.
-fn unnamed_cleanup_has_short_return(
+pub(super) fn recorded_unnamed_cleanup_target(
     graph: &BlockGraph,
     target: BasicBlockId,
     recorded_exits: &FxHashSet<Label>,
-) -> bool {
+) -> Option<Label> {
     let items = graph[target].items();
     let entry_len = items
         .iter()
         .take_while(|item| matches!(item, Item::Label(_)))
         .count();
     let [Item::Instruction(pop), Item::Instruction(jump)] = &items[entry_len..] else {
-        return false;
+        return None;
     };
     if pop.opcode != POP_EXCEPT
         || pop.pre_fold_extra_instructions() != 1
@@ -817,14 +817,21 @@ fn unnamed_cleanup_has_short_return(
                 || instruction.local_policy.hidden_exception_owner_slots() != 0
         })
     {
-        return false;
+        return None;
     }
-    let Some(label) = jump.forward_target() else {
+    let label = jump.forward_target()?;
+    recorded_exits.contains(&label).then_some(label)
+}
+
+/// Checks whether the preserved handler cleanup jumps directly to a small return.
+fn unnamed_cleanup_has_short_return(
+    graph: &BlockGraph,
+    target: BasicBlockId,
+    recorded_exits: &FxHashSet<Label>,
+) -> bool {
+    let Some(label) = recorded_unnamed_cleanup_target(graph, target, recorded_exits) else {
         return false;
     };
-    if !recorded_exits.contains(&label) {
-        return false;
-    }
     let Some(successor) = graph.label_block(label) else {
         return false;
     };

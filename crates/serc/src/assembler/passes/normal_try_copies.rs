@@ -2798,6 +2798,10 @@ impl OptimizationPipeline {
             }
             graph.label_block(jump.forward_target()?)
         };
+        let recorded_exits = &self
+            .exception_owner_provenance
+            .original_handler_cleanup_join_exits;
+        let mut copyable_cleanup_bridges = FxHashSet::default();
         let mut local_return_cleanups = FxHashSet::default();
         let mut joins = Vec::new();
         for &(entry_label, join_label) in &self.exception_owner_provenance.normal_try_exits {
@@ -2807,6 +2811,23 @@ impl OptimizationPipeline {
             else {
                 continue;
             };
+            if self.python_version >= crate::PythonVersion::Py314
+                && unlocated_jump(entry) == Some(join)
+                && graph[entry]
+                    .items()
+                    .iter()
+                    .take_while(|item| matches!(item, Item::Label(_)))
+                    .any(
+                        |item| matches!(item, Item::Label(label) if recorded_exits.contains(label)),
+                    )
+                && let Some(outer) =
+                    super::blocks::recorded_unnamed_cleanup_target(graph, join, recorded_exits)
+                        .and_then(|target| graph.label_block(target))
+                && unlocated_jump(outer)
+                    .is_some_and(|returned| original_local_return(graph[returned].items()))
+            {
+                copyable_cleanup_bridges.insert(outer);
+            }
             let mut cleanup = graph[entry].items().iter().filter_map(Item::as_instruction);
             if original_local_return(graph[join].items())
                 && matches!((cleanup.next(), cleanup.next()), (Some(jump), None)
@@ -2820,6 +2841,31 @@ impl OptimizationPipeline {
             let Some(tail) = unlocated_jump(join) else {
                 continue;
             };
+            // The normal edge copies this bridge while the handler still points at
+            // its unlocated jump. Threading directly to the return makes the
+            // handler's cleanup too large for its own predecessors to copy.
+            if self.python_version >= crate::PythonVersion::Py314
+                && self
+                    .exception_owner_provenance
+                    .original_handler_cleanup_join_exits
+                    .contains(&join_label)
+                && original_local_return(graph[tail].items())
+            {
+                let has_protected_body = self.exception_regions.iter().any(|region| {
+                    !region.is_scope_fallback
+                        && !region.preserve_lasti
+                        && graph.label_block(region.end) == Some(entry)
+                        && graph.label_block(region.start).is_some_and(|start| {
+                            start != entry
+                                && graph[start]
+                                    .items()
+                                    .iter()
+                                    .any(|item| item.as_instruction().is_some())
+                        })
+                });
+                joins.push((join, None, has_protected_body));
+                continue;
+            }
             let instructions = graph[tail].items().iter().filter_map(Item::as_instruction);
             if graph[tail]
                 .last_instruction()
@@ -2837,7 +2883,7 @@ impl OptimizationPipeline {
             if unlocated_jump(entry) != Some(join) {
                 if let Some(donor) = self.nested_recovery_tuple_donor(entry, join, tail) {
                     let tail_label = graph[tail].first_label().expect("original return target");
-                    joins.push((join, Some((entry, tail_label, donor))));
+                    joins.push((join, Some((entry, tail_label, donor)), false));
                 }
                 continue;
             }
@@ -2857,7 +2903,7 @@ impl OptimizationPipeline {
                     })
                 });
             if incoming.nth(1).is_some() {
-                joins.push((join, None));
+                joins.push((join, None, false));
             }
         }
         // The original POP_BLOCK, skip jump and two-slot local return fit in one
@@ -2886,7 +2932,7 @@ impl OptimizationPipeline {
                 }
             }
         }
-        for (join, normal_copy) in joins {
+        for (join, normal_copy, has_protected_body) in joins {
             if let Some((normal, tail, _)) = normal_copy {
                 // The normal try exit copies the original, one-slot bridge first.
                 self.graph
@@ -2901,6 +2947,12 @@ impl OptimizationPipeline {
                 .next_back()
                 .expect("singleton try join");
             jump.jump_policy.prevent_threading_target();
+            // The inner normal try and its handler share one unlocated cleanup.
+            // They copy the outer bridge before it acquires the local return.
+            if has_protected_body && copyable_cleanup_bridges.contains(&join) {
+                jump.allow_unconditional_block_inlining();
+            }
+
             if let Some((_, _, donor)) = normal_copy {
                 // The recovery reaches the bridge after it copies the tuple return.
                 // Its old jump remains as the fifth slot, with the recovery's line.
