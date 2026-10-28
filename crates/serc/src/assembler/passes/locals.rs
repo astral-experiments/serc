@@ -4113,6 +4113,35 @@ impl OptimizationPipeline {
                     {
                         pending.push((finally_block, true));
                     }
+                    // Awaiting a manager's exit ends in a populated END_SEND/POP_TOP
+                    // array. Its jump skips the emptied ordinary try exit. An adjacent
+                    // label for the outer finalizer still denotes the same instruction.
+                    let completed_await = python_version == crate::PythonVersion::Py314
+                        && last.opcode == crate::target::opcodes::JUMP_FORWARD
+                        && last.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Barrier
+                        && target > block + 1
+                        && last.location.line >= 0
+                        && items[blocks[block].clone()]
+                            .iter()
+                            .filter_map(Item::as_instruction)
+                            .map(|op| (op.opcode, op.location))
+                            .eq([
+                                (END_SEND, last.location),
+                                (POP_TOP, last.location),
+                                (last.opcode, last.location),
+                            ]);
+                    if completed_await
+                        && target + 1 < blocks.len()
+                        && !borrow_unreachable_blocks[target]
+                        && borrow_unreachable_blocks[target + 1]
+                        && jump_entry_blocks[target + 1]
+                        && items[blocks[target].clone()]
+                            .iter()
+                            .all(|item| matches!(item, Item::Label(_)))
+                    {
+                        pending.push((target + 1, true));
+                    }
                     let for_cleanup_entry = for_iter_enters_original_cleanup(
                         last,
                         label,
@@ -4397,7 +4426,8 @@ impl OptimizationPipeline {
                             });
                     pending.push((
                         target,
-                        for_cleanup_entry
+                        completed_await
+                            || for_cleanup_entry
                             || conditional_entry
                             || shared_break
                             || independent_loop_entry
