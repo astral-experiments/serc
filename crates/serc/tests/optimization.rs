@@ -15755,6 +15755,33 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn managed_finalizers_copy_saved_and_constant_iterator_returns() {
+    let source = r"def find(items, manager, value):
+    try:
+        for item in items:
+            try:
+                return value
+            finally:
+                with manager:
+                    record(item)
+    except ValueError:
+        pass
+
+def visit(groups, manager):
+    for group in groups:
+        for item in group:
+            try:
+                work(item)
+            except ValueError as error:
+                return
+            finally:
+                with manager:
+                    record(item)
+";
+    assert_matches_cpython(source, "managed_iterator_returns.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:

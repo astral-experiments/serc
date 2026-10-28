@@ -14839,10 +14839,25 @@ impl<'source> Compiler<'source> {
                         && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [context]
                             if context.loop_depth == loops.len()
                                 && matches!(context.body.last(), Some(Stmt::If(branch)) if branch.elif_else_clauses.is_empty()));
+                    // Both normal completion and suppression of a copied manager
+                    // enter the same unlocated iterator-disposal array.
+                    let managed_iterator_return = self.context.python_version
+                        == crate::PythonVersion::Py315
+                        && !loops.is_empty()
+                        && loops
+                            .iter()
+                            .all(|context| context.iterator_cleanup == IteratorCleanup::Sync)
+                        && self.control.withs.active_with_exits.is_empty()
+                        && matches!(self.control.finally.active_return_finally_contexts.as_slice(), [context]
+                            if context.loop_depth == loops.len()
+                                && matches!(context.body.last(), Some(Stmt::With(manager))
+                                    if !manager.is_async && manager.items.len() == 1
+                                        && !suite_contains_abrupt_control_flow(&manager.body)));
                     // Pass finalizers use the same established no-location route.
                     if unwinds_return_finally
                         && (conditional_handler_cleanup
                             || iterator_return
+                            || managed_iterator_return
                             || self
                                 .control
                                 .finally
