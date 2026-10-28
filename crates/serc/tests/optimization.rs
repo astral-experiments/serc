@@ -25977,3 +25977,30 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn iterator_exhaustion_locates_the_normal_manager_exit() {
+    let source = r"def choose(manager, first, second, items):
+    with manager:
+        if first:
+            return 1
+        elif second:
+            return 2
+        else:
+            for item in items:
+                consume(item)
+
+async def read(groups):
+    for group in groups:
+        with manager():
+            async for item in await group.items():
+                consume(item)
+            assert ready
+";
+    assert_matches_cpython_versions(
+        source,
+        "manager_iterator_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}

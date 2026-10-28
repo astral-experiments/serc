@@ -3194,8 +3194,8 @@ impl<'source> Compiler<'source> {
                                     == context.exception_region_depth
                         });
                 // Erased assertions still leave the manager's original POP_BLOCK
-                // after END_ASYNC_FOR. An outer async manager does not change
-                // the innermost synchronous manager's original exit.
+                // after END_ASYNC_FOR. A surrounding synchronous loop leaves
+                // the manager's original exit intact when it encloses the manager.
                 let protected_async_for_elided_assert_suffix = (self.context.python_version
                     == crate::PythonVersion::Py314
                     || (self.context.python_version == crate::PythonVersion::Py315
@@ -3204,7 +3204,12 @@ impl<'source> Compiler<'source> {
                     && matches!(statement, Stmt::For(statement) if statement.is_async)
                     && matches!(self.unit.scope, Scope::Function { .. })
                     && self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
-                    && self.control.loops.contexts.is_empty()
+                    && self
+                        .control
+                        .loops
+                        .contexts
+                        .iter()
+                        .all(|outer| outer.iterator_cleanup == IteratorCleanup::Sync)
                     && !self.control.in_exception_handler()
                     && self.control.finally.is_inactive_for_return_unwind()
                     && self
@@ -3214,6 +3219,7 @@ impl<'source> Compiler<'source> {
                         .last()
                         .is_some_and(|context| {
                             !context.is_async
+                                && context.loop_depth == self.control.loops.contexts.len()
                                 && context.exception_region_depth
                                     == self
                                         .control
@@ -44903,6 +44909,18 @@ fn with_body_has_folded_while_predecessor(body: &[Stmt]) -> bool {
         || (infinite_loop(&otherwise.body) && suite_has_linear_borrow_fallthrough(&statement.body))
 }
 
+/// Returns the iterator span when exhaustion is the sole normal exit from this arm.
+fn manager_iterator_exhaustion(
+    version: crate::PythonVersion,
+    iterator: &ruff_python_ast::StmtFor,
+) -> Option<TextRange> {
+    (version >= crate::PythonVersion::Py314
+        && !iterator.is_async
+        && iterator.orelse.is_empty()
+        && !suite_contains_loop_break(&iterator.body))
+    .then(|| iterator.iter.range())
+}
+
 // A complete conditional with one terminal arm leaves the other arm as the sole
 // predecessor of the synchronous manager's unlocated POP_BLOCK.
 fn with_body_conditional_exit_location(
@@ -45058,15 +45076,8 @@ fn with_body_conditional_exit_location(
             // locates this arm's jump and the manager's original normal POP_BLOCK.
             unique_condition_jump_target(&assertion.test, true).map(Ranged::range)
         }
-        Stmt::For(iterator)
-            if compiler.context.python_version >= crate::PythonVersion::Py314
-                && !iterator.is_async
-                && iterator.orelse.is_empty()
-                && !suite_contains_loop_break(&iterator.body) =>
-        {
-            // Exhaustion is the sole normal edge from this arm. Its iterator span
-            // reaches the manager's original POP_BLOCK through the arm's jump.
-            Some(iterator.iter.range())
+        Stmt::For(iterator) => {
+            manager_iterator_exhaustion(compiler.context.python_version, iterator)
         }
         Stmt::With(manager)
             if manager.items.len() == 1
@@ -45181,6 +45192,9 @@ fn with_chained_manager_exit_location(
             continue;
         }
         let range = match arm.last()? {
+            Stmt::For(iterator) => {
+                manager_iterator_exhaustion(compiler.context.python_version, iterator)?
+            }
             Stmt::With(manager)
                 if manager.items.len() == 1
                     && matches!(manager.body.last(), Some(Stmt::Return(_) | Stmt::Raise(_))) =>
