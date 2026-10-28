@@ -3178,10 +3178,14 @@ impl OptimizationPipeline {
         use crate::target::opcodes::POP_TOP;
 
         let recorded = &self.exception_owner_provenance.normal_try_exits;
-        if self.python_version < crate::PythonVersion::Py314 || recorded.is_empty() {
+        let compound = &self.exception_owner_provenance.compound_try_owner_exits;
+        if self.python_version < crate::PythonVersion::Py314
+            || (recorded.is_empty() && compound.is_empty())
+        {
             return;
         }
         let mut candidates = Vec::new();
+        let mut incoming = FxHashMap::<Label, (Option<u32>, bool)>::default();
         for pair in self.graph.order().windows(2) {
             let (
                 [Item::Label(join), Item::Instruction(pop)],
@@ -3190,7 +3194,7 @@ impl OptimizationPipeline {
             else {
                 continue;
             };
-            let Some(target) = jump.forward_target() else {
+            let (Some(target), Some(depth)) = (jump.forward_target(), pop.depth_after()) else {
                 continue;
             };
             // Borrow analysis can turn this fallthrough into a barrier. It still
@@ -3199,7 +3203,7 @@ impl OptimizationPipeline {
                 JUMP_FORWARD,
                 Operand::Forward(target),
                 SourceLocation::NONE,
-                Some(0),
+                Some(depth),
             );
             if jump.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier {
                 expected
@@ -3208,8 +3212,8 @@ impl OptimizationPipeline {
             }
             if *jump == expected
                 && *pop
-                    == Instruction::new(POP_TOP, Operand::Value(0), SourceLocation::NONE, Some(0))
-                && recorded.contains(&(*end, target))
+                    == Instruction::new(POP_TOP, Operand::Value(0), SourceLocation::NONE, Some(depth))
+                && (recorded.contains(&(*end, target)) || compound.contains(&(*end, target)))
                 && self.preserved_block_boundaries.contains(join)
                 && self
                     .exception_owner_provenance
@@ -3228,12 +3232,14 @@ impl OptimizationPipeline {
                     .contains(end)
                 && self.exception_regions.iter().any(|region| {
                     region.end == *end
-                        && region.depth == 0
+                        && region.depth == depth
                         && !region.preserve_lasti
                         && !region.is_scope_fallback
                 })
             {
                 candidates.push((*join, *end, pair[1]));
+                incoming.insert(*join, (Some(depth + 1), false));
+                incoming.insert(*end, (None, false));
             }
         }
         if candidates.is_empty() {
@@ -3241,17 +3247,19 @@ impl OptimizationPipeline {
         }
         // A value arm may jump to the discard. No control-flow edge may enter
         // between it and the ordinary try exit, which is only a range boundary.
-        let mut incoming = FxHashMap::<Label, bool>::default();
         for instruction in self.graph.iter_items().filter_map(Item::as_instruction) {
-            if let Operand::Forward(target) | Operand::Backward(target) = instruction.operand() {
-                *incoming.entry(target).or_default() |= instruction.opcode == JUMP_FORWARD
-                    && instruction.depth_after() == Some(1)
-                    && instruction.pre_fold_extra_instructions() == 0;
+            if let Operand::Forward(target) | Operand::Backward(target) = instruction.operand()
+                && let Some((depth, seen)) = incoming.get_mut(&target)
+            {
+                *seen |= depth.is_none()
+                    || (instruction.opcode == JUMP_FORWARD
+                        && instruction.depth_after() == *depth
+                        && instruction.pre_fold_extra_instructions() == 0);
             }
         }
         let mut starts = FxHashMap::default();
         for (join, end, exit) in candidates {
-            if incoming.get(&join) != Some(&true) || incoming.contains_key(&end) {
+            if !incoming[&join].1 || incoming[&end].1 {
                 continue;
             }
             self.graph
