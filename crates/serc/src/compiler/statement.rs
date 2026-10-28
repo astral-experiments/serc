@@ -26682,7 +26682,14 @@ impl<'source> Compiler<'source> {
                 .generators
                 .pre_suspension_coroutine_boolean_assertion
                 .is_none()
-            && !matches!(statement.test.as_ref(), Expr::If(_))
+            // A folded arm reaches its source successor through a conditional
+            // edge during early copying. An implicit return is still unlocated
+            // and can be copied onto both arms later.
+            && !matches!(statement.test.as_ref(), Expr::If(conditional)
+                if !self.control.statements.context.has_following
+                    || self.source_location(statement.range).line != self.source_location(conditional.range).line
+                    || [conditional.body.as_ref(), conditional.orelse.as_ref()]
+                        .into_iter().all(|arm| early_condition_truthiness(arm) != Some(true)))
             && retained_chained_comparison_exit.is_none()
         {
             let base_depth = self.control.stack.depth;
