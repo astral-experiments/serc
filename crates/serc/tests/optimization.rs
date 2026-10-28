@@ -21304,6 +21304,21 @@ fn folded_protected_branch_before_elided_assertion_keeps_exit_location() {
 }
 
 #[test]
+fn terminal_try_pass_locates_the_copied_implicit_return() {
+    for predecessor in ["value", "if True:\n            del value"] {
+        let source = format!(
+            "def run(value):\n    try:\n        {predecessor}\n        pass\n    except ValueError:\n        return value\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "terminal_try_pass.py",
+            &LEVELS,
+            &[PythonVersion::Py314, PythonVersion::Py315],
+        );
+    }
+}
+
+#[test]
 fn folded_try_pass_after_branch_keeps_existing_exception_owner() {
     const TRACE: &str = r"
 import dis, marshal, sys, types

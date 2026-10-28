@@ -29035,10 +29035,30 @@ impl<'source> Compiler<'source> {
             self.assembler
                 .limit_break_nop_to_direct_target(self.source_location(tail.range));
         }
+        // The copied implicit return takes the location of the authored pass
+        // removed at the try exit, including when the exit has multiple labels.
+        let trailing_pass_location = match statement.body.last() {
+            Some(Stmt::Pass(pass))
+                if terminal
+                    && self.context.python_version >= crate::PythonVersion::Py314
+                    && !statement.is_star
+                    && statement.orelse.is_empty() =>
+            {
+                let location = self.source_location(pass.range);
+                (self
+                    .assembler
+                    .has_single_omitted_fallthrough_nop_before_label(try_end, location)
+                    || self
+                        .assembler
+                        .has_single_omitted_nop_before_label(try_end, location))
+                .then_some(location)
+            }
+            _ => None,
+        };
         let normal_exit_ends_in_nop = self.assembler.last_instruction_is_nop();
         if direct_continue {
         } else if terminal {
-            if let Some(location) = orelse_noop_location {
+            if let Some(location) = orelse_noop_location.or(trailing_pass_location) {
                 self.assembler.set_location(location);
             } else if matches!(statement.body.last(), Some(Stmt::Try(_))) {
                 self.assembler.set_location(SourceLocation::NONE);
