@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn returning_calls_copy_short_finalizers_with_their_exception_ranges() {
+    for cleanup in ["del value", "pass", "del value, flag"] {
+        let source = format!(
+            "def choose(value, flag):\n    try:\n        return build(value if flag else None)\n    finally:\n        {cleanup}\n"
+        );
+        assert_matches_cpython(&source, "returning_call_finalizer.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

@@ -1018,8 +1018,8 @@ fn represented_setup_nops(
         )
 }
 
-/// Finds the region end already represented by a returned local's `POP_BLOCK`.
-fn local_return_finally_pop(
+/// Finds the region end already represented by a returning value's `POP_BLOCK`.
+fn value_return_finally_pop(
     graph: &BlockGraph,
     blocks: &[BasicBlockId],
     regions: &[ExceptionRegion],
@@ -1033,7 +1033,7 @@ fn local_return_finally_pop(
     let [
         cleanup_labels @ ..,
         Item::Instruction(pop),
-        Item::Instruction(delete),
+        Item::Instruction(finalizer),
         Item::Instruction(ret),
     ] = graph[*cleanup].items()
     else {
@@ -1043,13 +1043,14 @@ fn local_return_finally_pop(
         .iter()
         .chain(cleanup_labels)
         .all(|item| matches!(item, Item::Label(_)))
-        || value.opcode != LOAD_FAST
+        || !matches!(value.opcode, LOAD_FAST | CALL)
         || value.depth_after() != Some(1)
         || pop.opcode != NOP
         || !pop.fusion_policy.is_converted_pop_block()
         || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
         || pop.location.line < 0
-        || delete.opcode != DELETE_FAST
+        || !(finalizer.opcode == DELETE_FAST
+            || (value.opcode == CALL && finalizer.opcode == NOP && finalizer.location.line >= 0))
         || ret.opcode != RETURN_VALUE
     {
         return None;
@@ -1419,7 +1420,7 @@ fn exit_block_analysis(
                 && (target_chain_end == target_position
                     || matches!(target_last.opcode, RAISE_VARARGS | RETURN_VALUE))
             {
-                let represented_pop = local_return_finally_pop(graph, target_blocks, exception_regions);
+                let represented_pop = value_return_finally_pop(graph, target_blocks, exception_regions);
                 let represented_setups = represented_setup_nops(graph, target_blocks, provenance);
                 let mut at_target_entry = true;
                 target_blocks
@@ -6234,7 +6235,7 @@ impl OptimizationPipeline {
                 continue;
             }
             let represented_pop =
-                local_return_finally_pop(graph, target_blocks, &self.exception_regions);
+                value_return_finally_pop(graph, target_blocks, &self.exception_regions);
             let represented_setups =
                 represented_setup_nops(graph, target_blocks, &self.exception_owner_provenance);
             let mut at_target_entry = true;
