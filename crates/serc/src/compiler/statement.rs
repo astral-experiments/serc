@@ -23751,17 +23751,19 @@ impl<'source> Compiler<'source> {
                         condition_has_only_runtime_tests(test)
                             && condition_has_linear_runtime_leaves(test)
                             && !expression_suspends_current_scope(test)
-                            && condition_jump_target_count(test, true) > 1
                     })
                     && condition_has_only_runtime_tests(&statement.test)
                     && condition_has_linear_runtime_leaves(&statement.test)
                     && !expression_suspends_current_scope(&statement.test)
                     // Sibling arms cannot enter this condition's empty true target.
                     // Their live work does not populate its shared backedge array.
-                    && !body.is_empty()
-                    && body
-                        .iter()
-                        .all(|statement| self.context.is_elided_statement(statement))
+                    && body.last().is_some_and(|part| self.context.is_elided_statement(part))
+                    && ((test.is_some_and(|test| condition_jump_target_count(test, true) > 1)
+                        && body.iter().all(|part| self.context.is_elided_statement(part)))
+                        // A terminating guard can leave several forward edges at the same
+                        // empty exit when its following assertions emit no instructions.
+                        || (!self.assembler.emitted_region_has_final_fallthrough(arm_start)
+                            && self.has_original_unlocated_loop_tail_join()))
                     && statement.elif_else_clauses.iter().all(|clause| {
                         clause.test.as_ref().is_none_or(|test| {
                             condition_has_only_runtime_tests(test)

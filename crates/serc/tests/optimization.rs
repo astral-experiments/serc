@@ -15,6 +15,38 @@ use serc::{
 };
 
 #[test]
+fn preceding_branch_keeps_the_final_continue_guards_backedges_separate() {
+    let source = r"def update(items, early, left, right):
+    for item in items:
+        if ready(item):
+            if early:
+                if done(item):
+                    continue
+            elif left and right:
+                continue
+            assert item
+        else:
+            record(item)
+";
+    assert_matches_cpython(source, "shared_elif_before_erased_assertion.py", &LEVELS);
+}
+
+#[test]
+fn erased_assertions_leave_a_continue_guards_false_backedges_separate() {
+    let source = r"def update(items, first, second):
+    for item in items:
+        if ready(item):
+            if first and second:
+                record(item)
+                continue
+            assert item
+        elif pending(item):
+            finish(item)
+";
+    assert_matches_cpython(source, "guard_before_erased_assertion.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
