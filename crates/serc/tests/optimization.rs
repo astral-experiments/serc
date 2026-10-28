@@ -1458,6 +1458,33 @@ fn guarded_continue_keeps_the_backedges_before_nested_cleanup() {
 }
 
 #[test]
+fn guarded_finalizer_leaves_a_protected_marker_before_manager_exit() {
+    let source = r"def load(manager, ready):
+    try:
+        with manager:
+            try:
+                if ready:
+                    try:
+                        pass
+                    except LookupError:
+                        recover()
+                    finally:
+                        close()
+            except ValueError:
+                pass
+    except OSError:
+        pass
+    return False
+";
+    assert_matches_cpython_versions(
+        source,
+        "guarded_manager_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn guarded_finally_arms_keep_their_manager_exit_location() {
     for body in ["work(item)", "yield item"] {
         for condition in ["ready", "not ready", "ready is not None"] {

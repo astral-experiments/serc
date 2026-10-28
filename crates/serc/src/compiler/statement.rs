@@ -29245,28 +29245,33 @@ impl<'source> Compiler<'source> {
                                 self.source_location(TextRange::new(first.start(), last.end())),
                             )
                 });
+            // The finalizer jumps directly to manager cleanup. The guard's false
+            // edge can still reach the protected try-exit marker on its own.
+            let managed_exit = self.context.python_version >= crate::PythonVersion::Py314
+                && !self.control.withs.active_with_exits.is_empty();
             let guarded_finally_exit_location = if !statement.is_star
                 && statement.orelse.is_empty()
                 && statement.finalbody.is_empty()
-                && self.control.statements.context.has_following
-                && self.control.loops.contexts.is_empty()
-                && self.control.withs.active_with_exits.is_empty()
-                && self.control.exceptions.active_exception_handlers.is_empty()
-                && self
-                    .control
-                    .exceptions
-                    .active_exception_region_exclusions
-                    .is_empty()
-                && self.control.finally.active_finally_try_bodies == 0
-                && self.control.finally.active_normal_finally_bodies == 0
-                && self.control.finally.active_copied_finally_bodies == 0
+                && (managed_exit
+                    || (self.control.statements.context.has_following
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.exceptions.active_exception_handlers.is_empty()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && self.control.finally.active_finally_try_bodies == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0))
                 && let Some(Stmt::If(branch)) = statement.body.last()
                 && branch.elif_else_clauses.is_empty()
                 && condition_has_only_runtime_tests(&branch.test)
                 && original_condition_has_unique_jump_target(&branch.test, false)
                 && let Some(Stmt::Try(cleanup)) = branch.body.last()
                 && !cleanup.is_star
-                && cleanup.handlers.is_empty()
+                && (managed_exit || cleanup.handlers.is_empty())
                 && cleanup.orelse.is_empty()
                 && !cleanup.finalbody.is_empty()
                 && !suite_terminates(&cleanup.body)
