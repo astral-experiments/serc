@@ -10394,16 +10394,19 @@ impl<'source> Compiler<'source> {
                             self.assembler.mark_last_as_converted_pop_block();
                         }
                         if preserve_tos {
-                            // SWAP precedes POP_BLOCK. A lone unnamed handler's body
-                            // covers it even when an outer try surrounds the handler.
+                            // The current unnamed handler's body covers its SWAP unless a
+                            // younger region intervenes. The inner POP_EXCEPT can already
+                            // have opened a range through a resumed handler's SWAP.
+                            let covered_by_previous_pop = protected_outer_pop_except_start
+                                .is_some_and(|(target, _)| target == handler_index);
                             let cleanup_start = (name.is_some()
-                                || handler_count > 1
-                                || self
-                                    .control
-                                    .exceptions
-                                    .active_exception_region_exclusions
-                                    .len()
-                                    > region_depth + 1)
+                                || !covered_by_previous_pop
+                                    && self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                                        > region_depth + 1)
                                 .then(|| {
                                     let start = self.assembler.label();
                                     self.assembler.mark(start);

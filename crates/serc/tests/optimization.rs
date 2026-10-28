@@ -9796,6 +9796,23 @@ fn unnamed_handler_return_preserves_the_copied_finalizer_guard() {
 }
 
 #[test]
+fn resumed_handler_return_preserves_a_copied_finalizer_guard() {
+    let source = r"async def recover(value):
+    try:
+        read()
+    except ValueError:
+        try:
+            retry()
+        except LookupError:
+            return value
+    finally:
+        if value is not None:
+            pass
+";
+    assert_matches_cpython(source, "resumed_handler_finalizer_guard.py", &LEVELS);
+}
+
+#[test]
 fn nested_handler_value_returns_protect_the_resumed_handler_swap() {
     let source = r"def read(key):
     try:
