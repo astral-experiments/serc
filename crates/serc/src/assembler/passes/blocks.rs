@@ -6093,6 +6093,12 @@ impl OptimizationPipeline {
                 )
             })
             .collect::<Vec<_>>();
+        let branch_donors = self
+            .exception_owner_provenance
+            .normal_try_copy_branch_locations
+            .iter()
+            .filter_map(|(label, &location)| Some((graph.label_block(*label)?, location)))
+            .collect::<Vec<_>>();
         let mut original_join_marker_donors = Vec::new();
         let mut planned_cursor = 0;
         let mut source_cursor = 0;
@@ -8933,6 +8939,18 @@ impl OptimizationPipeline {
             }
         }
         self.exception_regions.extend(copied_exception_regions);
+
+        // A surviving copied jump follows the original discard in the same native
+        // block. Synthetic copy-entry labels must not sever that location donor.
+        for (block, location) in branch_donors {
+            if let Some(jump) = graph.instructions_mut(block).next_back()
+                && jump.opcode == JUMP_FORWARD
+                && jump.location == SourceLocation::NONE
+            {
+                jump.location = location;
+                jump.no_location_policy.clear_preserved_location();
+            }
+        }
 
         let copied_pop_block_heads = order
             .iter()

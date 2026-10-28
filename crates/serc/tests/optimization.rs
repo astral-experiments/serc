@@ -15755,6 +15755,33 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn nested_branch_joins_copy_the_original_normal_try_arrays() {
+    let source = r"def choose(a, b, c, d, selected):
+    if a:
+        if b:
+            if c:
+                if d:
+                    try:
+                        if selected:
+                            use()
+                        else:
+                            other()
+                    except ValueError:
+                        pass
+                else:
+                    pass
+            else:
+                pass
+        else:
+            pass
+    else:
+        pass
+    return True
+";
+    assert_matches_cpython(source, "nested_branch_joins.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:

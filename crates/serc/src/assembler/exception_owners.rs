@@ -426,6 +426,8 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_try_jump_owners: FxHashMap<(Label, Label), Vec<super::ExceptionRegion>>,
     pub(super) normal_try_copy_blocks: FxHashSet<Label>,
     pub(super) normal_try_copy_steps: Vec<(Label, Label, usize)>,
+    // Located branch predecessors of deeply nested normal cleanup copies.
+    pub(super) normal_try_copy_branch_locations: FxHashMap<Label, SourceLocation>,
     // Captured source/continuation labels whose instructions were erased by reachability pruning.
     pub(super) retired_normal_try_copy_labels: FxHashSet<Label>,
     // Candidate original fallthrough stores; only a successful static swap certifies them.
