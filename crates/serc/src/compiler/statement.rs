@@ -12568,8 +12568,12 @@ impl<'source> Compiler<'source> {
                                 && outer_sync_managers == self.control.withs.active_with_exits.len()
                                 && self.control.loops.contexts.is_empty()
                                 && return_finally_contexts.len() == 1
-                                && self.control.exceptions.active_try_marker_slots.is_empty()
-                                && self.control.withs.active_with_exits.iter().all(|manager| manager.exception_region_depth == 1)))
+                                // An ordinary try enclosing every manager contributes a
+                                // single POP after the outermost manager cleanup.
+                                && self.control.exceptions.active_try_marker_slots.len() <= 1
+                                && self.control.withs.active_with_exits.iter().all(|manager| {
+                                    manager.exception_region_depth == 1 + self.control.exceptions.active_try_marker_slots.len()
+                                })))
                         && next_with == 0
                         && with_unwind_starts
                             .iter()

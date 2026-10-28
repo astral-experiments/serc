@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn nested_manager_returns_count_an_ordinary_try_before_the_finalizer_guard() {
+    for managers in ["first", "first, second", "first, second, third"] {
+        let source = format!(
+            "def run(value):\n    try:\n        with {managers}:\n            if value:\n                prepare()\n            return value\n    except ValueError:\n        recover()\n    finally:\n        if value is None:\n            finish()\n"
+        );
+        assert_matches_cpython(&source, "nested_manager_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
