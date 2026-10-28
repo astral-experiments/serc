@@ -10229,11 +10229,10 @@ impl<'source> Compiler<'source> {
                         if exception_unwind_start.is_none() {
                             with_unwind_before_exception_start = with_unwind_starts.len();
                         }
-                        // A constant return from an ordinary try inside a handler's
-                        // iterator discards that iterator before clearing the handler name.
+                        // A return from an ordinary try inside a handler's iterator
+                        // discards the iterator before clearing the handler name.
                         // Keep that exact prefix separate from the direct-handler captures.
-                        let copied_inner_iterator_handler = !preserve_tos
-                            && !return_is_overridden
+                        let copied_inner_iterator_handler = !return_is_overridden
                             && handler_count == 1
                             && handler_index == 0
                             && name.is_some()
@@ -10273,6 +10272,11 @@ impl<'source> Compiler<'source> {
                                     && iterator.with_depth == 0
                                     && iterator.finally_end_depth == 0
                                     && iterator.exception_region_depth == 2);
+                        let iterator_return_start = if preserve_tos {
+                            self.assembler.item_count()
+                        } else {
+                            copied_handler_return_item
+                        };
                         self.emit_return_loop_iterator_cleanup(
                             loop_depth,
                             next_loop,
@@ -10723,7 +10727,7 @@ impl<'source> Compiler<'source> {
                                     self.assembler.record_copied_iterator_handler_cleanup(
                                         start,
                                         end,
-                                        copied_handler_return_item,
+                                        iterator_return_start,
                                     );
                                 }
                                 let handler_before_finally_iterator = next_finally == 1
