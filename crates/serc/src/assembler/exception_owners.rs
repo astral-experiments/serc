@@ -1353,12 +1353,20 @@ pub(super) struct ConstantManagerReturnPrefix {
     pub(super) missing_null_pops: usize,
 }
 
+/// The saved-value manager cleanups before a copied finally guard.
+#[derive(Debug)]
+pub(super) struct ReturnGuardManagers {
+    pub(super) records: Vec<Instruction>,
+    pub(super) following_pops: usize,
+    pub(super) named_handler: bool,
+}
+
 /// The final POP of a handler or iterator return and the copied finally's first test.
 #[derive(Debug)]
 pub(super) struct CopiedReturnGuard {
     pub(super) cleanup: Instruction,
-    /// The captured exit call immediately before a saved return’s manager discard.
-    pub(super) manager_call: Option<Instruction>,
+    /// The outer exit's seven instructions and the ordinary-try POPs that follow.
+    pub(super) manager_cleanup: Option<ReturnGuardManagers>,
     pub(super) operands: Vec<Instruction>,
     pub(super) condition: Instruction,
     pub(super) marker: Instruction,
@@ -14925,6 +14933,8 @@ impl LayoutAssembler {
         positions: &OwnerLabelPositions,
         targets: &FxHashSet<Label>,
     ) -> Option<ExceptionOwnerDecision> {
+        use crate::target::opcodes::{DELETE_FAST, POP_EXCEPT, STORE_FAST, SWAP};
+
         let condition = marker.checked_sub(1)?;
         let mut origins = self
             .exception_owner_provenance
@@ -14983,24 +14993,65 @@ impl LayoutAssembler {
         let pop_slot = load
             .checked_add(tail.early_removals.checked_sub(suffix.early_removals)?)?
             .checked_add(origin.omitted_pops)?;
-        if pop_slot == marker {
+        let Some(managers) = origin.manager_cleanup.as_ref() else {
+            return (pop_slot == marker)
+                .then(|| ExceptionOwnerDecision::override_with_region(None));
+        };
+        // Every original manager POP precedes its seven cleanup instructions.
+        // Check that the complete captured stack is still in this array before
+        // projecting a chained comparison through its earlier manager/handler POPs.
+        let stacked = managers.records.len() > 7;
+        if !stacked && pop_slot == marker {
             return Some(ExceptionOwnerDecision::override_with_region(None));
         }
-        // A saved return's manager POP comes before CALL and POP_TOP. A marker
-        // one or two cells before the final POP instead inherits their handler.
-        let call = previous.checked_sub(1)?;
-        if call < array
-            || !(1..=2).contains(&pop_slot.checked_sub(marker)?)
-            || *instructions[call] != origin.manager_call?
+        let width = if stacked { managers.records.len() } else { 2 };
+        let start = load.checked_sub(width)?;
+        if start < array
+            || !instructions[start..load]
+                .iter()
+                .zip(&managers.records[managers.records.len() - width..])
+                .all(|(live, original)| **live == *original)
             || targets
                 .iter()
                 .chain(&self.exception_owner_provenance.source_boundaries)
                 .chain(&self.exception_owner_provenance.block_boundaries)
-                .any(|label| positions.get(label) == Some(&previous))
+                .any(|label| {
+                    positions
+                        .get(label)
+                        .is_some_and(|&pos| start < pos && pos <= previous)
+                })
         {
             return None;
         }
-        let region = self.uniform_exception_owner(call, load, positions)?;
+        if managers.named_handler {
+            let cleanup = instructions[array..start].windows(5).filter(|records| {
+                let [swap, pop, none, store, delete] = *records else {
+                    return false;
+                };
+                swap.opcode == SWAP
+                    && swap.value_argument() == Some(2)
+                    && pop.opcode == POP_EXCEPT
+                    && none.opcode == LOAD_CONST
+                    && store.opcode == STORE_FAST
+                    && delete.opcode == DELETE_FAST
+                    && store.operand() == delete.operand()
+                    && records
+                        .iter()
+                        .all(|record| record.location == swap.location)
+            });
+            if cleanup.count() != 1 {
+                return None;
+            }
+        }
+        let distance = pop_slot.checked_sub(marker)?;
+        if distance <= managers.following_pops {
+            return Some(ExceptionOwnerDecision::override_with_region(None));
+        }
+        let width = if stacked { 7 } else { 2 };
+        if distance - managers.following_pops > width {
+            return None;
+        }
+        let region = self.uniform_exception_owner(load - width, load, positions)?;
         (!self.exception_regions[region].preserve_lasti
             && !self.exception_regions[region].is_scope_fallback)
             .then(|| ExceptionOwnerDecision::override_with_region(Some(region)))

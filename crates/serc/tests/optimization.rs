@@ -975,6 +975,19 @@ fn conditional_return_counts_both_try_pops_before_the_finalizer_guard() {
 }
 
 #[test]
+fn manager_returns_restore_the_outer_exit_on_an_attribute_comparison() {
+    for managers in [
+        "first, second",
+        "first, second, third, fourth, fifth, sixth",
+    ] {
+        let source = format!(
+            "def run(flag, state):\n    try:\n        with {managers}:\n            try:\n                perform()\n            except LookupError as error:\n                if flag:\n                    prepare()\n                result = next_value()\n                return result\n            finally:\n                note(flag)\n    except RuntimeError:\n        repair()\n    finally:\n        if state != Status.ACTIVE:\n            finish()\n"
+        );
+        assert_matches_cpython(&source, "manager_comparison_guard.py", &LEVELS);
+    }
+}
+
+#[test]
 fn manager_return_keeps_the_exit_handler_on_a_comparison_guard() {
     let source = r"def scan(manager, value):
     try:

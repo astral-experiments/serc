@@ -12530,6 +12530,24 @@ impl<'source> Compiler<'source> {
                         self.assembler
                             .record_nested_finally_manager_return(unwind.start, try_pops);
                     }
+                    // Every manager unwinds before this finalizer. Each manager has
+                    // one original POP and clearing an inner named handler has two.
+                    let manager_compare_pop = (self.context.python_version == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                        && preserve_tos && !return_is_overridden && context_index == 0
+                        && outer_sync_managers >= 2 && outer_sync_managers == self.control.withs.active_with_exits.len()
+                        && finally_context.with_depth == 0 && finally_context.exception_region_depth == 0
+                        && self.control.loops.contexts.is_empty() && next_with == 0
+                        && self.control.exceptions.active_try_marker_slots.len() <= 1
+                        && self.control.withs.active_with_exits.iter().all(|manager| manager.exception_region_depth == 1 + self.control.exceptions.active_try_marker_slots.len())
+                        && return_finally_contexts.iter().skip(1).all(|inner| inner.with_depth == outer_sync_managers)
+                        && (handler_count == 0 || matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler] if handler_count == 1 && handler.name.is_some() && handler.with_depth == outer_sync_managers))
+                        && self.control.exceptions.active_exception_region_exclusions.len() == self.control.exceptions.active_try_marker_slots.len() + return_finally_contexts.len() + handler_count
+                        && with_unwind_starts.iter().map(|unwind| unwind.index).eq((0..outer_sync_managers).rev())
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0)
+                        .then(|| (self.assembler.item_count(), self.control.exceptions.active_try_marker_slots.len(), 2 * handler_count));
                     let copied_manager_return_pop = (matches!(
                             self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR),
                             0 | CO_COROUTINE
@@ -13685,6 +13703,16 @@ impl<'source> Compiler<'source> {
                     {
                         self.assembler.record_copied_manager_return_compaction(
                             pop_item, try_pops, managers, None, false,
+                        );
+                    }
+                    if result.is_ok()
+                        && let Some((pop, ordinary, handler_pops)) = manager_compare_pop
+                    {
+                        self.assembler.record_manager_comparison_guard(
+                            pop,
+                            outer_sync_managers,
+                            ordinary,
+                            handler_pops,
                         );
                     }
                     if result.is_ok()
