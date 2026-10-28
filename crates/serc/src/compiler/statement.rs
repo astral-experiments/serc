@@ -10447,8 +10447,12 @@ impl<'source> Compiler<'source> {
                                         && inner.finally_end_depth
                                             == handlers[handler_index].finally_end_depth
                                 });
+                            // The inner POP_EXCEPT may already have opened this same range
+                            // through the outer SWAP.
+                            let covered_by_previous_pop = protected_outer_pop_except_start
+                                .is_some_and(|(target, _)| target == handler_index);
                             let common_cleanup_start = (name.is_some()
-                                || resumed_handler
+                                || (resumed_handler && !covered_by_previous_pop)
                                 || ((handler_count == 1
                                     || unwinds_plain_nested_handlers
                                     || (unwinds_named_outer_unnamed_handlers
