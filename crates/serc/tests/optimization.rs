@@ -13961,6 +13961,24 @@ fn collections_before_a_protected_condition_preserve_the_marker_slot() {
 }
 
 #[test]
+fn attribute_tests_at_named_handler_entry_keep_the_cleanup() {
+    let source = r"def check(item, active, skip):
+    try:
+        if skip:
+            pass
+        elif active:
+            try:
+                work()
+            except ValueError as error:
+                if item.state.ready:
+                    visit(error)
+    except KeyError:
+        pass
+";
+    assert_matches_cpython_versions(source, "case.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
 fn local_truth_test_after_handler_starts_with_an_unowned_marker() {
     let source = r"def read(rows, flag):
     with resource() as reader:
