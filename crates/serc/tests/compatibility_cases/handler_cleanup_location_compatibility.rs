@@ -139,3 +139,30 @@ def finalizer_barrier(manager, value):
 ";
     common::assert_matches_cpython_marshal(source, "handler_store_source_barriers.py");
 }
+
+#[test]
+fn copied_finalizer_preserves_the_shared_handler_cleanup_position() {
+    let source = r"def process(active, stop):
+    try:
+        while active:
+            try:
+                pass
+            except Failure as failure:
+                if recover(failure):
+                    try:
+                        pass
+                    except RetryError as retry:
+                        return
+                    finally:
+                        try:
+                            result = release()
+                        except ReleaseError:
+                            pass
+    except Cancelled:
+        pass
+    finally:
+        if stop:
+            pass
+";
+    common::assert_matches_cpython_pop_except_positions(source, "copied_handler_cleanup.py");
+}
