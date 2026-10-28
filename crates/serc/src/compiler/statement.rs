@@ -16794,6 +16794,21 @@ impl<'source> Compiler<'source> {
                         {
                             Some(NestedIfExitLocation::Located(&guard.test))
                         }
+                        // The false edge of the guard in the loop else and the inner
+                        // iterator's exhaustion reach the same empty branch exit.
+                        Stmt::If(nested) if self.context.python_version >= crate::PythonVersion::Py314
+                            && let Some(last) = nested.elif_else_clauses.last()
+                            && last.test.is_none()
+                            && let Some(Stmt::For(outer)) = last.body.last()
+                            && !outer.is_async
+                            && let Some(Stmt::If(guard)) = outer.orelse.last()
+                            && guard.elif_else_clauses.is_empty()
+                            && condition_has_only_runtime_tests(&guard.test)
+                            && matches!(guard.body.last(), Some(Stmt::For(inner))
+                                if !inner.is_async && inner.orelse.is_empty()) =>
+                        {
+                            Some(NestedIfExitLocation::Unlocated)
+                        }
                         Stmt::If(statement) => nested_if_exit_location(
                             statement,
                             self.control.statements.context.has_following || finalizer_exit,
@@ -25737,6 +25752,9 @@ impl<'source> Compiler<'source> {
             IteratorCleanup::Sync,
             self.loop_break_policy(statement.range),
         );
+        let same_region_continuation = self.context.python_version >= crate::PythonVersion::Py314
+            && self.control.statements.context.same_region_continuation == Some(statement.range);
+        context.break_target_keeps_exception_owner |= same_region_continuation;
         // A split loop-tail condition or a following match sibling keeps this
         // exact iterator's break inside the enclosing ordinary try body.
         if (self.control.loops.split_loop_tail_prefix_end == Some(statement.range)
@@ -25890,7 +25908,17 @@ impl<'source> Compiler<'source> {
             self.symbols.initialized_locals.remove(name);
         }
         let orelse_start = self.assembler.instruction_count();
-        self.compile_suite(&statement.orelse)?;
+        if same_region_continuation && let Some(tail) = statement.orelse.last() {
+            // The loop has already discarded its iterator. Its else suite reaches
+            // the same enclosing exception region as the loop's continuation.
+            self.with_control_override(
+                |control| &mut control.statements.context.same_region_continuation,
+                Some(tail.range()),
+                |compiler| compiler.compile_suite(&statement.orelse),
+            )?;
+        } else {
+            self.compile_suite(&statement.orelse)?;
+        }
         if self.assembler.instruction_count() == orelse_start
             && let [Stmt::Pass(statement)] = statement.orelse.as_slice()
             && self

@@ -25977,3 +25977,27 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn guarded_iterator_exhaustion_keeps_the_outer_branch_and_try() {
+    let source = r"def scan(items, enabled, ready, retry, manager):
+    with manager:
+        try:
+            if enabled:
+                if ready:
+                    use()
+                else:
+                    for first in items:
+                        pass
+                    else:
+                        if retry:
+                            for second in items:
+                                break
+            else:
+                skip()
+            finish()
+        except ValueError:
+            recover()
+";
+    assert_matches_cpython(source, "guarded_iterator_exhaustion.py", &LEVELS);
+}
