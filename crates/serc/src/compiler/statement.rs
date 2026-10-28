@@ -8101,14 +8101,27 @@ impl<'source> Compiler<'source> {
                 let sync_continue_test = if let [finally] =
                     self.control.finally.active_loop_finally_contexts.as_slice()
                     && let [Stmt::If(tail)] = finally.body
-                    && context.iterator_cleanup == IteratorCleanup::Sync
+                    && match self.control.exceptions.active_exception_handlers.as_slice() {
+                        [] => context.iterator_cleanup == IteratorCleanup::Sync,
+                        // A directly unwound handler leaves the ordinary enclosing try
+                        // active across the copied finalizer, just as in the iterator case.
+                        [handler] => {
+                            context.iterator_cleanup == IteratorCleanup::None
+                                && handler.name.is_none()
+                                && handler.loop_depth == finally.loop_depth
+                                && handler.with_depth == finally.with_depth
+                                && handler.finally_end_depth == context.finally_end_depth
+                                && handler.exception_region_depth
+                                    == finally.exception_region_depth + 1
+                        }
+                        _ => false,
+                    }
                     && finally.loop_depth == self.control.loops.contexts.len()
                     && finally.with_depth == context.with_depth
                     && context.exception_region_depth.checked_add(1)
                         == Some(finally.exception_region_depth)
                     && finally.try_body_depth
                         == self.control.exceptions.active_try_marker_slots.len()
-                    && self.control.exceptions.active_exception_handlers.is_empty()
                     && self.control.withs.active_with_exits.len() == context.with_depth
                     && self.control.finally.active_finally_end_blocks == context.finally_end_depth
                     && tail.elif_else_clauses.is_empty()
@@ -8133,6 +8146,13 @@ impl<'source> Compiler<'source> {
                                 finally_unwind_start,
                             )
                         });
+                if copies_finally_continue_exit
+                    && sync_continue_test.is_some()
+                    && !self.control.exceptions.active_exception_handlers.is_empty()
+                {
+                    self.assembler
+                        .record_copied_handler_continue_marker(finally_unwind_start);
+                }
                 if !copies_finally_continue_exit
                     && !legacy_pending_finally_try
                     && self

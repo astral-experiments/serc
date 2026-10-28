@@ -25977,3 +25977,22 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn unwound_handler_continue_copies_each_finalizer_guard_edge() {
+    let source = r"def scan(flag):
+    while True:
+        try:
+            try:
+                work()
+                return True
+            except Retry:
+                continue
+            finally:
+                if flag is not None:
+                    close()
+        except Error:
+            return False
+";
+    assert_matches_cpython(source, "handler_continue_guard.py", &LEVELS);
+}

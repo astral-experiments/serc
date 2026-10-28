@@ -11871,6 +11871,45 @@ impl Assembler {
         true
     }
 
+    /// Restores the original `POP_BLOCK` slot in a directly continued handler's local None guard.
+    pub(crate) fn record_copied_handler_continue_marker(&mut self, start: usize) {
+        let (head, body) = self.linear_items_mut().split_at_mut(start);
+        let mut prior = head.iter().rev().filter_map(Item::as_instruction);
+        let [Some(authored), Some(discard), Some(dispatch)] = std::array::from_fn(|_| prior.next())
+        else {
+            return;
+        };
+        if authored.opcode != NOP
+            || authored.fusion_policy.is_converted_pop_block()
+            || discard.opcode != POP_TOP
+            || dispatch.opcode != NOT_TAKEN
+            || discard.location != dispatch.location
+        {
+            return;
+        }
+        let mut copy = body.iter_mut().filter_map(Item::as_instruction_mut);
+        let [Some(pop_except), Some(load), Some(guard), Some(marker)] =
+            std::array::from_fn(|_| copy.next())
+        else {
+            return;
+        };
+        if pop_except.opcode == POP_EXCEPT
+            && load.opcode == LOAD_FAST
+            && matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            && guard.local_policy.hidden_exception_owner_slots() == 3
+            && marker.opcode == NOT_TAKEN
+            && marker.location == guard.location
+            && [authored, discard, pop_except, load, guard, marker]
+                .iter()
+                .all(|i| i.pre_fold_extra_instructions() == 0)
+        {
+            // The original handler starts [POP_TOP, continue NOP, handler POP_BLOCK,
+            // POP_EXCEPT, finalizer POP_BLOCK]. Four instructions survive through the
+            // specialized guard, so NOT_TAKEN reuses the unowned finalizer POP_BLOCK.
+            marker.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
+        }
+    }
+
     fn copied_finally_continue_head_label(
         &mut self,
         emitted: EmittedJump,
