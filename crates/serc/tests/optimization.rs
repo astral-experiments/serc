@@ -13872,6 +13872,44 @@ fn finalizer_none_marker_keeps_the_protected_result_after_local_fusion() {
 }
 
 #[test]
+fn coroutine_finalizer_tests_reuse_the_try_exit_or_its_protected_prefix() {
+    let saved = r"async def collect(active, flag, items):
+    try:
+        for left, right in items:
+            pass
+    except ValueError:
+        pass
+    else:
+        return finish(value=flag, result=result(data=make(value=None)))
+    finally:
+        if active:
+            touch()
+";
+    let nested = r"async def collect(value, active):
+    global count
+    try:
+        try:
+            try:
+                check()
+            except ValueError:
+                return build(key=value)
+        finally:
+            count += 1
+    finally:
+        if active:
+            complete()
+";
+    for source in [saved, nested] {
+        assert_matches_cpython_versions(
+            source,
+            "coroutine_finalizer_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn finalizer_truth_test_can_reuse_one_removed_pop_block() {
     for calls in 3..=5 {
         let prefix = "        step()\n".repeat(calls);

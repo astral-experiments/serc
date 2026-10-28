@@ -1695,7 +1695,7 @@ pub(super) struct RetainedSetupValueArray {
 }
 
 /// The unused instruction-array suffix across CPython's three relevant assembler stages.
-#[derive(Clone, Copy, Debug, Default)]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct ExceptionOwnerTail {
     early_removals: usize,
     insertions: usize,
@@ -6322,7 +6322,7 @@ impl LayoutAssembler {
         ))
     }
 
-    /// Resolves a truth marker that reuses an unchanged cleanup-condition record.
+    /// Resolves a truth marker when the original cleanup array identifies its owner.
     fn original_cleanup_truth_owner(
         &self,
         condition_index: usize,
@@ -6331,7 +6331,7 @@ impl LayoutAssembler {
         instructions: &[&Instruction],
         positions: &OwnerLabelPositions,
         jump_targets: &FxHashSet<Label>,
-    ) -> Option<usize> {
+    ) -> Option<ExceptionOwnerDecision> {
         use crate::target::opcodes::{
             LOAD_DEREF, LOAD_FAST, LOAD_FAST_BORROW, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE,
             PUSH_EXC_INFO, TO_BOOL,
@@ -6379,6 +6379,39 @@ impl LayoutAssembler {
         {
             return None;
         }
+        // The local truth test has three live records. A fourth removal places
+        // its marker on the unowned POP. Each further removal moves the marker
+        // one record into the preceding protected return or finalizer body.
+        if tail.late_removals == 0
+            && load.local_policy.hidden_exception_owner_slots() == 1
+            && let Some(width) = tail.early_removals.checked_sub(4)
+            && let Some(donor) = start
+                .checked_sub(width.max(1))
+                .filter(|donor| *donor >= array)
+            && instructions[donor..start].iter().all(|record| {
+                let mut changes = ExceptionOwnerTail::default();
+                changes.instruction(record, None);
+                record.opcode != NOP
+                    && record.exception_policy() == super::ExceptionPolicy::NoneUnchanged
+                    && record.pre_fold_extra_instructions() == 0
+                    && changes == ExceptionOwnerTail::default()
+            })
+            && let Some(owner) = self.uniform_exception_owner(donor, start, positions)
+            && let region = self.exception_regions[owner]
+            && !region.is_scope_fallback
+            && !region.preserve_lasti
+            && positions.get(&region.end) == Some(&start)
+            && provenance
+                .removed_pop_block_boundaries
+                .contains(&region.end)
+            && let Some(fallback) =
+                self.uniform_exception_owner(start, condition_index + 1, positions)
+            && self.exception_regions[fallback].is_scope_fallback
+        {
+            return Some(ExceptionOwnerDecision::override_with_region(
+                (width > 0).then_some(owner),
+            ));
+        }
         let normal = tail.late_removals == 0
             && (1..=3).contains(&tail.early_removals)
             && provenance
@@ -6423,7 +6456,8 @@ impl LayoutAssembler {
             return None;
         }
         let region = self.uniform_exception_owner(start, condition_index + 1, positions)?;
-        (!self.exception_regions[region].is_scope_fallback).then_some(region)
+        (!self.exception_regions[region].is_scope_fallback)
+            .then(|| ExceptionOwnerDecision::override_with_region(Some(region)))
     }
 
     /// Recovers an owned handler cell across its fully captured finalizer SETUP.
@@ -10326,7 +10360,7 @@ impl LayoutAssembler {
                         && instruction_index >= 2
                         && (instruction_index - 2..=instruction_index)
                             .all(|index| !owners.contains_key(index))
-                        && let Some(region) = self.original_cleanup_truth_owner(
+                        && let Some(decision) = self.original_cleanup_truth_owner(
                             instruction_index,
                             original_array_start,
                             tail,
@@ -10335,7 +10369,8 @@ impl LayoutAssembler {
                             &jump_targets,
                         )
                     {
-                        pending_normal_none_owner = Some((instruction_index + 1, Some(region)));
+                        pending_normal_none_owner =
+                            Some((instruction_index + 1, decision.source_region()));
                     }
 
                     // Value returns have no authored return NOP. Both adjacent POPs can
