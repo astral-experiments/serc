@@ -701,6 +701,56 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
         && instructions.next().is_none()
 }
 
+/// A direct handler visits an unlocated jump before its four-instruction return is copied.
+fn handler_reaches_short_return_bridge(
+    graph: &BlockGraph,
+    source: BasicBlockId,
+    target: BasicBlockId,
+) -> bool {
+    if !graph[source]
+        .items()
+        .iter()
+        .filter_map(Item::as_instruction)
+        .map(|i| i.opcode)
+        .eq([POP_EXCEPT, JUMP_FORWARD])
+    {
+        return false;
+    }
+    let mut bridge = graph[target]
+        .items()
+        .iter()
+        .filter_map(Item::as_instruction);
+    let (Some(jump), None) = (bridge.next(), bridge.next()) else {
+        return false;
+    };
+    if jump.opcode != JUMP_FORWARD
+        || jump.location != SourceLocation::NONE
+        || jump.pre_fusion_width() != 1
+    {
+        return false;
+    }
+    let Some(successor) = jump
+        .forward_target()
+        .and_then(|label| graph.label_block(label))
+    else {
+        return false;
+    };
+    let mut returned = graph[successor]
+        .items()
+        .iter()
+        .filter_map(Item::as_instruction);
+    let [Some(first), Some(second), Some(third), Some(last)] =
+        std::array::from_fn(|_| returned.next())
+    else {
+        return false;
+    };
+    returned.next().is_none()
+        && last.opcode == RETURN_VALUE
+        && [first, second, third, last]
+            .iter()
+            .all(|i| i.pre_fusion_width() == 1 && i.location.line >= 0)
+}
+
 /// Recognizes a named-handler cleanup followed by a short, located value return.
 fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> bool {
     let cleanup = graph[target]
@@ -2126,6 +2176,7 @@ pub(in crate::assembler) struct ThreadedNormalTryJoins {
     entries: FxHashMap<Label, (Vec<Item>, Vec<Item>)>,
     recoveries: FxHashMap<Label, NamedRecoveryCopy>,
     located_joins: FxHashMap<Label, (Label, Vec<Item>, Instruction)>,
+    handler_return_bridges: FxHashMap<Label, Label>,
 }
 
 struct NamedRecoveryCopy {
@@ -2139,6 +2190,25 @@ struct NamedRecoveryCopy {
 }
 
 impl ThreadedNormalTryJoins {
+    /// Checks that the original bridge still leads directly to the same short return.
+    fn matches_handler_return_bridge(
+        &self,
+        graph: &BlockGraph,
+        source: BasicBlockId,
+        target_label: Label,
+        target: BasicBlockId,
+    ) -> bool {
+        self.handler_return_bridges
+            .get(&target_label)
+            .is_some_and(|&exit| {
+                graph[target]
+                    .last_instruction()
+                    .and_then(Instruction::forward_target)
+                    == Some(exit)
+                    && handler_reaches_short_return_bridge(graph, source, target)
+            })
+    }
+
     /// Accepts only the captured source after one threading step and its unchanged target.
     fn matches(&self, graph: &BlockGraph, entry: Label, source: &[Item], target: &[Item]) -> bool {
         self.entries
@@ -4572,8 +4642,30 @@ impl OptimizationPipeline {
         }
     }
 
+    /// Records the handler's direct jump through an unlocated block before jump threading.
+    pub(in crate::assembler) fn original_handler_return_bridges(&self) -> FxHashMap<Label, Label> {
+        if self.exception_regions.is_empty() {
+            return FxHashMap::default();
+        }
+        let graph = &self.graph;
+        graph
+            .iter()
+            .filter_map(|(source, block)| {
+                let label = block.last_instruction()?.forward_target()?;
+                let target = graph.label_block(label)?;
+                if !handler_reaches_short_return_bridge(graph, source, target) {
+                    return None;
+                }
+                Some((label, graph[target].last_instruction()?.forward_target()?))
+            })
+            .collect()
+    }
+
     /// Captures normal exits that bypass a separate branch join before named cleanup copying.
-    pub(in crate::assembler) fn capture_threaded_normal_try_joins(&self) -> ThreadedNormalTryJoins {
+    pub(in crate::assembler) fn capture_threaded_normal_try_joins(
+        &self,
+        handler_return_bridges: FxHashMap<Label, Label>,
+    ) -> ThreadedNormalTryJoins {
         let mut entries = FxHashMap::default();
         let mut recoveries = FxHashMap::default();
         let mut located_joins = FxHashMap::default();
@@ -4582,6 +4674,7 @@ impl OptimizationPipeline {
                 entries,
                 recoveries,
                 located_joins,
+                handler_return_bridges,
             };
         }
         let graph = &self.graph;
@@ -4954,6 +5047,7 @@ impl OptimizationPipeline {
             entries,
             recoveries,
             located_joins,
+            handler_return_bridges,
         }
     }
 
@@ -5136,7 +5230,8 @@ impl OptimizationPipeline {
         owner_retargets: &mut Vec<(Instruction, Instruction)>,
     ) -> Vec<Label> {
         let origins = self.capture_reversed_store_exits();
-        let threaded_normal_try_joins = self.capture_threaded_normal_try_joins();
+        let threaded_normal_try_joins =
+            self.capture_threaded_normal_try_joins(self.original_handler_return_bridges());
         self.duplicate_exit_blocks_with_store_origins(
             original_location_absence,
             (owner_retargets, &mut Vec::new()),
@@ -6374,7 +6469,16 @@ impl OptimizationPipeline {
                     .last_instruction()
                     .is_some_and(|instruction| {
                         instruction.no_location_policy.allows_block_inlining()
-                    });
+                    })
+                || (target_has_no_location
+                    && !source_has_fallthrough
+                    && target_blocks.len() == 1
+                    && threaded_normal_try_joins.matches_handler_return_bridge(
+                        graph,
+                        source,
+                        target_label,
+                        target,
+                    ));
             let target_has_unlocated_jump_eval_check = target_has_no_location
                 && graph[target_exit]
                     .last_instruction()
@@ -11296,9 +11400,59 @@ mod located_normal_try_join_tests {
     }
 
     #[test]
+    fn handler_return_bridge_must_be_direct_and_unlocated_before_threading() {
+        let label = Label::from_u32;
+        let located = SourceLocation::new(5, 5, 4, 18);
+        let op = |opcode, operand, location| {
+            Item::Instruction(Instruction::new(opcode, operand, location, None))
+        };
+        for (bridge_location, destination) in [
+            (SourceLocation::NONE, 3),
+            (located, 3),
+            (SourceLocation::NONE, 2),
+        ] {
+            let mut assembler = Assembler::from_linear_items(vec![
+                Item::Label(label(0)),
+                op(POP_EXCEPT, Operand::Value(0), located),
+                op(JUMP_FORWARD, Operand::Forward(label(1)), located),
+                Item::Label(label(1)),
+                op(
+                    JUMP_FORWARD,
+                    Operand::Forward(label(destination)),
+                    bridge_location,
+                ),
+                Item::Label(label(2)),
+                op(
+                    JUMP_FORWARD,
+                    Operand::Forward(label(3)),
+                    SourceLocation::NONE,
+                ),
+                Item::Label(label(3)),
+                op(LOAD_FAST, Operand::Value(0), located),
+                op(LOAD_ATTR, Operand::Value(0), located),
+                op(CALL, Operand::Value(0), located),
+                op(RETURN_VALUE, Operand::Value(0), located),
+            ]);
+            assembler.add_exception_region(label(0), label(1), label(2), 0, false);
+            let mut pipeline = assembler.into_optimization_pipeline();
+            let joins = pipeline
+                .capture_threaded_normal_try_joins(pipeline.original_handler_return_bridges());
+            let source = pipeline.graph.label_block(label(0)).unwrap();
+            let bridge = pipeline.graph.label_block(label(1)).unwrap();
+            let jump = pipeline.graph.instructions_mut(bridge).next().unwrap();
+            jump.location = SourceLocation::NONE;
+            jump.retarget(Operand::Forward(label(3)));
+            assert_eq!(
+                joins.matches_handler_return_bridge(&pipeline.graph, source, label(1), bridge),
+                bridge_location == SourceLocation::NONE && destination == 3
+            );
+        }
+    }
+
+    #[test]
     fn located_join_requires_unique_source_condition_provenance() {
         for count in 0..=2 {
-            let captured = fixture(count).capture_threaded_normal_try_joins();
+            let captured = fixture(count).capture_threaded_normal_try_joins(FxHashMap::default());
             assert_eq!(captured.entries.len(), usize::from(count == 1));
             assert_eq!(captured.located_joins.len(), usize::from(count == 1));
         }
@@ -11308,7 +11462,7 @@ mod located_normal_try_join_tests {
     fn located_join_replays_exact_source_target_join_and_condition() {
         for changed_label in [None, Some(0), Some(1), Some(2), Some(3)] {
             let mut pipeline = fixture(1);
-            let captured = pipeline.capture_threaded_normal_try_joins();
+            let captured = pipeline.capture_threaded_normal_try_joins(FxHashMap::default());
             let entry = Label::from_u32(1);
             let source = pipeline.graph.label_block(entry).unwrap();
             let target = pipeline.graph.label_block(Label::from_u32(3)).unwrap();

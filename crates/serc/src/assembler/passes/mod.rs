@@ -717,6 +717,7 @@ impl OptimizationPipeline {
             }
             original_owners.retain_pipeline(&self);
         }
+        let handler_return_bridges = self.original_handler_return_bridges();
         self.record_original_jump_heads();
         self.capture_normal_try_break_pop_owners();
         original_owners.retain_pipeline(&self);
@@ -754,7 +755,8 @@ impl OptimizationPipeline {
         original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeBooleanConversions)?;
-        let threaded_normal_try_joins = self.capture_threaded_normal_try_joins();
+        let threaded_normal_try_joins =
+            self.capture_threaded_normal_try_joins(handler_return_bridges);
         let threaded_jumps = !assertion_side_exits && self.thread_forward_jumps();
         self.borrow_threaded_jump_targets.clear();
         original_owners.retain_pipeline(&self);
