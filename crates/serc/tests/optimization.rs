@@ -15,6 +15,23 @@ use serc::{
 };
 
 #[test]
+fn short_circuit_handler_discards_copy_their_return_cleanup() {
+    let source = r"def recover(enabled, item):
+    try:
+        fetch(item)
+    except LookupError as error:
+        enabled and report(error)
+
+async def retry(enabled, item):
+    try:
+        await fetch(item)
+    except LookupError:
+        enabled or report(item)
+";
+    assert_matches_cpython(source, "short_handler_discard.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
