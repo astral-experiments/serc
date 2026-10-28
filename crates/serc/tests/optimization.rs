@@ -25936,6 +25936,28 @@ fn specialized_comparison_keeps_its_try_else_guard_handler() {
 }
 
 #[test]
+fn elided_assertions_preserve_handler_arm_cleanup_locations() {
+    let source = r"def run(ready):
+    try:
+        assert valid()
+    except AssertionError:
+        if ready:
+            first()
+            assert valid()
+        else:
+            second()
+            assert valid()
+    finish()
+";
+    for source in [
+        source.to_owned(),
+        source.replace("            assert valid()\n", ""),
+    ] {
+        assert_matches_cpython(&source, "elided_handler_arm.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertions_keep_the_finally_call_argument_guard_protected() {
     let source = r"def check(manager, handle, data, ok):
     with manager:
