@@ -4409,7 +4409,13 @@ impl OptimizationPipeline {
                         && items[blocks[target - 1].clone()]
                             .iter()
                             .rev()
-                            .find_map(Item::as_instruction)
+                            .filter_map(Item::as_instruction)
+                            .find(|record| {
+                                // A synthetic empty array has no native instruction.
+                                !(record.opcode == NOP
+                                    && record.location.line < 0
+                                    && record.jump_policy.borrow_empty_block())
+                            })
                             .is_none_or(|record| {
                                 record.opcode == NOP
                                     && record.jump_policy.always_retains_nop()
