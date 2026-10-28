@@ -25977,3 +25977,22 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn guarded_nested_try_reaches_the_outer_finalizer() {
+    let source = r"def close(ready, resource):
+    try:
+        if ready:
+            try:
+                work()
+            finally:
+                if ready:
+                    finish()
+    except OSError:
+        pass
+    finally:
+        resource.close()
+    return 0
+";
+    assert_matches_cpython(source, "guarded_nested_finalizer.py", &LEVELS);
+}
