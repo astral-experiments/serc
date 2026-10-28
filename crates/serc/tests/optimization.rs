@@ -15755,6 +15755,32 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn match_case_copies_each_short_circuit_condition_exit() {
+    let source = r"
+def copied(outer, inner, marker, item):
+    match outer:
+        case 'selected':
+            match inner:
+                case _ if ready(item):
+                    if marker is not None and check(
+                        item
+                    ):
+                        emit(item)
+    finish(item)
+
+def single(outer, inner, marker, item):
+    match outer:
+        case 'selected':
+            match inner:
+                case _ if ready(item):
+                    if marker is not None:
+                        emit(item)
+    finish(item)
+";
+    assert_matches_cpython(source, "match_condition_exits.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:

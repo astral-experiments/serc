@@ -1742,7 +1742,13 @@ impl Compiler<'_> {
                     .active_exception_region_exclusions
                     .is_empty()
                 && original_unlocated_head;
-            let location = protected_case_exit
+            // The case-success jump is an unlocated block shared by each failing
+            // operand. Its private copies inherit the specific operand's span.
+            let copied_case_exit = protected_case_exit
+                || (self.context.python_version >= PythonVersion::Py314
+                    && original_unlocated_head
+                    && condition_jump_target_count(&statement.test, false) > 1);
+            let location = copied_case_exit
                 .then(|| {
                     self.assembler
                         .last_condition_location_to(false_exit, condition_start)
@@ -1754,7 +1760,7 @@ impl Compiler<'_> {
             self.assembler
                 .mark_conditional_threading_target(false_exit, location);
             let success_exit = self.emit_jump_forward_instruction(JUMP_FORWARD, match_end)?;
-            if protected_case_exit {
+            if copied_case_exit {
                 self.assembler
                     .prepare_no_location_block_for_inlining(success_exit);
                 self.assembler.mark_as_artificial_eval_break(success_exit);
