@@ -3852,6 +3852,14 @@ impl<'source> Compiler<'source> {
                                     || self.control.statements.terminal_if_branch_has_forward_exit))
                             && !expression_suspends_current_scope(&assignment.value))
                         || body.last().map(Ranged::range) == Some(assignment.range))
+                    // A local attribute annotation emits no extra work. The receiver,
+                    // store and arm jump still make the copied return five original slots.
+                    || (has_later_arm
+                        && matches!(self.unit.scope, Scope::Function { .. })
+                        && matches!(statement, Stmt::AnnAssign(assignment)
+                            if matches!(assignment.target.as_ref(), Expr::Attribute(attribute)
+                                if matches!(attribute.value.as_ref(), Expr::Name(_)))
+                                && matches!(assignment.value.as_deref(), Some(Expr::If(_)))))
             });
         let elided_terminal_call = self.context.python_version >= crate::PythonVersion::Py314
             && matches!(self.unit.scope, Scope::Function { .. })
