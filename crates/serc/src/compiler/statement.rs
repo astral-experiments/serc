@@ -23769,6 +23769,30 @@ impl<'source> Compiler<'source> {
                                 && !expression_suspends_current_scope(test)
                         })
                     });
+                let loop_else = match body.last() {
+                    Some(Stmt::For(inner)) if !inner.is_async => inner.orelse.as_slice(),
+                    Some(Stmt::While(inner)) => inner.orelse.as_slice(),
+                    _ => &[],
+                };
+                // Both the guard and its completed body reach the inner loop's exit.
+                // This arm jumps forward from there to the enclosing loop's backedge.
+                let copied_loop_else = self.context.python_version >= crate::PythonVersion::Py314
+                    && branch_index + 1 < branch_count
+                    && !try_body_normal_exit
+                    && self.control.in_loop_tail_without_nested_cleanup()
+                    && self
+                        .control
+                        .loops
+                        .contexts
+                        .last()
+                        .is_some_and(|context| context.continue_label == restart)
+                    && matches!(loop_else.last(), Some(Stmt::If(guard))
+                        if guard.elif_else_clauses.is_empty()
+                            && condition_has_linear_runtime_leaves(&guard.test)
+                            && !expression_suspends_current_scope(&guard.test)
+                            && suite_has_nonsuspending_linear_fallthrough(&guard.body));
+                let copied_exit =
+                    shared_match_failure || copied_erased_branch_exit || copied_loop_else;
                 let linear_exit_body = |body: &[Stmt]| {
                     if erased_nested_coroutine_donor
                         && iterator_inside_finally
@@ -23833,7 +23857,7 @@ impl<'source> Compiler<'source> {
                     && self.control.finally.active_copied_finally_bodies == 0
                     && self.control.finally.active_finally_end_blocks == 0
                     && self.control.finally.active_overriding_finally_returns == 0;
-                if shared_match_failure || copied_erased_branch_exit {
+                if copied_exit {
                     self.assembler.set_location(SourceLocation::NONE);
                 } else if let Some(range) = suite_match_failure_range(body) {
                     self.assembler.set_location(self.source_location(range));
@@ -23980,7 +24004,7 @@ impl<'source> Compiler<'source> {
                         .set_location(self.source_location(statement.range()));
                 }
                 let backedge = self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
-                if shared_match_failure || copied_erased_branch_exit {
+                if copied_exit {
                     // Native copies the common backedge into this arm's forward exit:
                     // [unlocated NOP, unlocated JUMP]. Preserve that original array so
                     // each incoming condition edge supplies its own backedge location.

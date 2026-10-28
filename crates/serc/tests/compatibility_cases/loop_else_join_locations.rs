@@ -1,6 +1,16 @@
 use crate::common;
 
 #[test]
+fn guarded_inner_loop_else_copies_the_enclosing_backedge() {
+    for header in ["for value in group:", "while ready():"] {
+        let source = format!(
+            "def scan(items, group, visible):\n    for item in items:\n        if enabled(item):\n            {header}\n                if stop():\n                    break\n            else:\n                if visible:\n                    record(item)\n        elif pending(item):\n            finish(item)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "guarded_inner_loop_else.py");
+    }
+}
+
+#[test]
 fn terminal_else_does_not_locate_original_normal_try_exit() {
     for condition in ["flag", "flag and matched"] {
         for action in ["break", "continue", "return result", "raise Error()"] {
