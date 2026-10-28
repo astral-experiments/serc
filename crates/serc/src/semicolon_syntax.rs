@@ -13,15 +13,16 @@ pub(crate) fn recover<'a>(
     options: &ParseOptions,
     parsed: &'a Parsed<ModModule>,
 ) -> (Cow<'a, [ParseError]>, BareRaises) {
+    // A packaged dependency resolves to the registry release. The Git backport
+    // already handles both constructs, including its own malformed-input diagnostics.
+    static NEEDS_RECOVERY: OnceLock<bool> = OnceLock::new();
+
     let mut raises = BareRaises::default();
     let candidates = parsed.errors().iter().any(|error| match error.error {
         ParseErrorType::ExpectedExpression => &source[error.location] == ";",
         ParseErrorType::SimpleAndCompoundStatementOnSameLine => &source[error.location] == "match",
         _ => false,
     });
-    // A packaged dependency resolves to the registry release. The Git backport
-    // already handles both constructs, including its own malformed-input diagnostics.
-    static NEEDS_RECOVERY: OnceLock<bool> = OnceLock::new();
     if !candidates
         || !NEEDS_RECOVERY
             .get_or_init(|| ruff_python_parser::parse_module("raise; match = value\n").is_err())
