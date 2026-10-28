@@ -8564,6 +8564,18 @@ fn a_finalizer_guard_keeps_the_following_local_load_owned() {
 }
 
 #[test]
+fn erased_short_circuit_condition_keeps_the_shared_loop_backedge() {
+    let source = r"
+def process(items, left, right):
+    for item in items:
+        if left or right:
+            assert item
+        assert left
+";
+    assert_matches_cpython(source, "shared_short_circuit_backedge.py", &LEVELS);
+}
+
+#[test]
 fn erased_assertion_after_nested_condition_preserves_the_loop_backedge() {
     let source = r"def validate(rows, enabled, check):
     for row in rows:

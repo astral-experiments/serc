@@ -19305,6 +19305,19 @@ impl<'source> Compiler<'source> {
                         && !clause.body.is_empty()
                         && clause.body.iter().all(|part| self.context.is_elided_statement(part)))
         };
+        // When both arms vanish, short-circuit operands can share the original
+        // backedge. Threading the first operand to the loop header too early
+        // loses the forward target used when it is inverted.
+        let shared_erased_condition_exit = |tail: &ruff_python_ast::StmtIf| {
+            self.unit.flags & (CO_COROUTINE | CO_ASYNC_GENERATOR | CO_GENERATOR) == 0
+                && matches!(tail.test.as_ref(), Expr::BoolOp(_))
+                && tail.elif_else_clauses.is_empty()
+                && !original_condition_has_unique_jump_target(&tail.test, true)
+                && tail
+                    .body
+                    .iter()
+                    .all(|part| self.context.is_elided_statement(part))
+        };
         let erased_elif_else = |tail: &ruff_python_ast::StmtIf| {
             !mode.non_final_branch
                 && self.control.in_loop_tail_without_nested_cleanup()
@@ -19333,7 +19346,7 @@ impl<'source> Compiler<'source> {
                 .iter()
                 .any(|statement| self.context.is_elided_statement(statement))
             && ((mode == LoopTailMode::default()
-                && matches!(&body[end], Stmt::If(_))
+                && matches!(&body[end], Stmt::If(tail) if !shared_erased_condition_exit(tail))
                 && self.control.reaches_loop_header(restart))
                 || matches!(&body[end], Stmt::While(statement)
                 if statement.orelse.is_empty()
