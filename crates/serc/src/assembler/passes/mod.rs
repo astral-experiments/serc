@@ -325,11 +325,6 @@ impl Assembler {
                     POP_JUMP_IF_TRUE, RAISE_VARARGS,
                 };
 
-                if kind == super::ir::FoldedGuardExit::BooleanOperand {
-                    // A Boolean operand can target a located return, but it does
-                    // not carry the conditional-expression proof for a shared join.
-                    return None;
-                }
                 let protected = !self.exception_regions.is_empty();
                 let (Item::Instruction(bridge), labels) = graph[target].items().split_last()?
                 else {
@@ -368,6 +363,51 @@ impl Assembler {
                         != RAISE_VARARGS
                 {
                     return None;
+                }
+                if kind == super::ir::FoldedGuardExit::BooleanOperand {
+                    let [.., Item::Instruction(error), Item::Instruction(raise)] =
+                        graph[order[target_position - 1]].items()
+                    else {
+                        return None;
+                    };
+                    if protected
+                        || error.opcode != crate::target::opcodes::LOAD_COMMON_CONSTANT
+                        || error.value_argument()
+                            != Some(
+                                crate::target::operands::CommonConstant::ASSERTIONERROR.argument(),
+                            )
+                        || raise.value_argument() != Some(1)
+                        || graph[end]
+                            .items()
+                            .iter()
+                            .filter_map(Item::as_instruction)
+                            .map(Instruction::pre_fusion_width)
+                            .sum::<usize>()
+                            <= 4
+                    {
+                        return None;
+                    }
+                    let reachable = graph.reachable_blocks(&self.exception_regions);
+                    if !reachable[source.index()]
+                        || order[source_position + 1..target_position]
+                            .iter()
+                            .any(|block| reachable[block.index()])
+                        || graph.iter().any(|(id, block)| {
+                            id != source
+                                && reachable[id.index()]
+                                && block
+                                    .successors()
+                                    .1
+                                    .and_then(|label| graph.label_block(label))
+                                    == Some(target)
+                        })
+                    {
+                        return None;
+                    }
+                    // Only this folded success edge still reaches the assertion exit. Its
+                    // larger continuation could not have been copied onto the bridge.
+                    initial_reachable = None;
+                    return Some((bridge.operand(), false));
                 }
                 if protected {
                     let position = |label| {
