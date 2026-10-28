@@ -18701,6 +18701,17 @@ impl<'source> Compiler<'source> {
             return None;
         }
         let (final_clause, earlier) = statement.elif_else_clauses.split_last()?;
+        // Successful arms jump past the erased else. Its remaining conditional
+        // predecessor also donates the outer jump's line across nested else suites.
+        if final_clause.test.is_none()
+            && let Some(Stmt::If(nested)) = final_clause.body.last()
+            && let Some(location @ NestedIfExitLocation::Located(test)) =
+                self.elided_else_exit_location(nested)
+            && self.assembler.try_exit_condition_donor()
+                == Some(self.source_location(condition_fallthrough_range(test)))
+        {
+            return Some(location);
+        }
         // Erasing the suffix can expose a partial if whose true and false edges
         // share the outer jump. Neither supplies a unique source position.
         if final_clause.test.is_none()
