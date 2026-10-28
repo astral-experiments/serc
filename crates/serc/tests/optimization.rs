@@ -25623,6 +25623,20 @@ fn arithmetic_store_in_copied_finally_owns_outer_none_guard() {
 }
 
 #[test]
+fn literal_arithmetic_tuples_preserve_the_following_guard_owner() {
+    let source = r"bounds = {'range': (0, 4 - 3)}
+try:
+    if active:
+        pass
+except ValueError:
+    pass
+def finish() -> Result:
+    pass
+";
+    assert_matches_cpython_versions(source, "case.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
 fn folded_signed_tuple_preserves_finally_guard_owner() {
     for number in ["-1", "+2"] {
         let source = format!(
