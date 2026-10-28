@@ -6322,6 +6322,84 @@ impl LayoutAssembler {
         ))
     }
 
+    /// Checks whether an else guard reuses the POP of a try entered during handler-return cleanup.
+    fn handler_return_reuses_try_else_pop(
+        &self,
+        array: usize,
+        marker: usize,
+        instructions: &[&Instruction],
+        positions: &OwnerLabelPositions,
+        jump_targets: &FxHashSet<Label>,
+    ) -> bool {
+        use crate::target::opcodes::{
+            LOAD_DEREF, LOAD_FAST, LOAD_FAST_BORROW, POP_EXCEPT, POP_JUMP_IF_FALSE,
+            POP_JUMP_IF_TRUE, POP_TOP, TO_BOOL,
+        };
+        let [discard, restore, setup, body @ .., load, truth, condition] =
+            &instructions[array..marker]
+        else {
+            return false;
+        };
+        let provenance = &self.exception_owner_provenance;
+        let pop = marker - 3;
+        if discard.opcode != POP_TOP
+            || discard.local_policy.hidden_exception_owner_slots() != 0
+            || restore.opcode != POP_EXCEPT
+            || restore.local_policy.hidden_exception_owner_slots() != 2
+            || setup.opcode != NOP
+            || setup.local_policy.hidden_exception_owner_slots() != 1
+            || setup.exception_policy() != super::ExceptionPolicy::AlwaysUnchanged
+            || !matches!(load.opcode, LOAD_FAST | LOAD_FAST_BORROW | LOAD_DEREF)
+            || load.local_policy.hidden_exception_owner_slots() != 1
+            || truth.opcode != TO_BOOL
+            || truth.location != condition.location
+            || load.location != truth.location
+            || !matches!(condition.opcode, POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE)
+            || !provenance
+                .original_primitive_condition_boundaries
+                .contains(condition)
+            || !provenance.source_boundaries.iter().any(|label| {
+                provenance.block_boundaries.contains(label) && positions.get(label) == Some(&array)
+            })
+            || jump_targets
+                .iter()
+                .chain(&provenance.source_boundaries)
+                .chain(&provenance.block_boundaries)
+                .any(|label| {
+                    positions
+                        .get(label)
+                        .is_some_and(|&index| array < index && index <= marker)
+                })
+            || body.is_empty()
+            || body.iter().any(|record| {
+                record.local_policy.hidden_exception_owner_slots() != 0
+                    || record.pre_fold_extra_instructions() != 0
+                    || record.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+            })
+        {
+            return false;
+        }
+        let Some(region) = self.uniform_exception_owner(array + 3, pop, positions) else {
+            return false;
+        };
+        let region = self.exception_regions[region];
+        // Two erased records before POP_EXCEPT and one before SETUP move the
+        // original try-body POP three slots past the live guard load.
+        !region.is_scope_fallback
+            && !region.preserve_lasti
+            && positions.get(&region.start) == Some(&(array + 3))
+            && positions.get(&region.end) == Some(&pop)
+            && provenance
+                .removed_pop_block_boundaries
+                .contains(&region.end)
+            && provenance
+                .ordinary_try_setups
+                .iter()
+                .any(|(setup, target)| {
+                    *target == region.target && positions.get(setup) == Some(&(array + 3))
+                })
+    }
+
     /// Resolves a truth marker that reuses an unchanged cleanup-condition record.
     fn original_cleanup_truth_owner(
         &self,
@@ -11158,6 +11236,27 @@ impl LayoutAssembler {
                         owners.insert(
                             instruction_index,
                             ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
+                    if instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy().owner()
+                            == NormalizedExceptionOwner::DynamicCondition
+                        && owner_history_exact
+                        && tail.early_removals == 4
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && self.handler_return_reuses_try_else_pop(
+                            original_array_start,
+                            instruction_index,
+                            &indexed_instructions,
+                            &label_positions,
+                            &jump_targets,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(None),
                         );
                     }
                     if threaded_null_append == Some(instruction_index) {

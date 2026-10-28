@@ -4369,6 +4369,34 @@ fn retained_manager_returns_unwind_tries_before_attribute_none_guards() {
 }
 
 #[test]
+fn a_handler_return_leaves_the_copied_try_else_pop_unowned() {
+    let source = r"def collect(flag, manager, ready):
+    with manager:
+        try:
+            try:
+                pass
+            except ValueError:
+                return None
+            if flag:
+                pass
+        finally:
+            try:
+                flag.write(limit=limit)
+            except TimeoutError:
+                pass
+            else:
+                if not ready:
+                    pass
+";
+    assert_matches_cpython_versions(
+        source,
+        "handler_else_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn continue_from_nested_handlers_keeps_the_finalizer_setup_unowned() {
     for (binding, action) in [
         ("", "continue"),
