@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.8"
 resolution-markers = [
     "python_full_version >= '3.12'",
@@ -646,13 +646,16 @@ wheels = [
 
 [[package]]
 name = "serc"
-version = "0.1.8"
+version = "0.1.9"
 source = { editable = "." }
 
 [package.dev-dependencies]
 release = [
     { name = "rooster", marker = "python_full_version >= '3.12'" },
 ]
+
+[package.group-requires-python]
+release = ">=3.12"
 
 [package.metadata]
 
