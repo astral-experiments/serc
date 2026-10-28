@@ -1399,7 +1399,7 @@ impl OptimizationPipeline {
             &self.exception_owner_provenance,
             &self.preserved_block_boundaries,
         );
-        Ok(LayoutAssembler {
+        let mut layout = LayoutAssembler {
             python_version: self.python_version,
             legacy_uniform_jump_seed: self.legacy_uniform_jump_seed,
             items,
@@ -1409,7 +1409,9 @@ impl OptimizationPipeline {
             removed_max_depth,
             next_label: self.next_label,
             has_next_location: self.has_next_location,
-        })
+        };
+        layout.restore_surviving_normal_try_jump_owners();
+        Ok(layout)
     }
 }
 

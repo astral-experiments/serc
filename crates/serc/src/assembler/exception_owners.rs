@@ -3797,6 +3797,51 @@ impl ExceptionOwnerProvenance {
 }
 
 impl LayoutAssembler {
+    /// Restores the enclosing exception region if an empty try's original jump survives.
+    /// A jump converted to a NOP can instead represent the unprotected `POP_BLOCK`.
+    pub(super) fn restore_surviving_normal_try_jump_owners(&mut self) {
+        let provenance = &self.exception_owner_provenance;
+        if !provenance
+            .normal_try_jump_owners
+            .values()
+            .any(|owners| !owners.is_empty())
+        {
+            return;
+        }
+        let labels = UniqueLabelPositions::new(&self.items);
+        let edges = provenance
+            .normal_try_exits
+            .iter()
+            .filter_map(|&(entry, exit)| Some((labels.get(entry)?.1, labels.get(exit)?.1)))
+            .collect::<FxHashSet<_>>();
+        let mut recorded = provenance.normal_try_jump_owners.iter().collect::<Vec<_>>();
+        recorded.sort_unstable_by_key(|&(&(start, end), _)| (start.as_u32(), end.as_u32()));
+        for (&(start, end), owners) in recorded {
+            let Some((index, source)) = labels.get(start) else {
+                continue;
+            };
+            if owners.is_empty() || labels.get(end).is_none_or(|(_, end)| end != source + 1) {
+                continue;
+            }
+            let Some(jump) = self.items[index + 1..]
+                .iter_mut()
+                .find_map(Item::as_instruction_mut)
+            else {
+                continue;
+            };
+            if jump.opcode == crate::target::opcodes::JUMP_FORWARD
+                && jump.exception_policy() == super::ExceptionPolicy::EXCLUDE_ALWAYS
+                && jump.jump_policy.retained_nop() == super::ir::RetainedJumpNop::DirectTarget
+                && jump.pre_fold_extra_instructions() == 0
+                && let Some((_, target)) = jump.forward_target().and_then(|label| labels.get(label))
+                && edges.contains(&(source, target))
+            {
+                jump.set_exception_policy(super::ExceptionPolicy::default());
+                self.exception_regions.extend(owners.iter().copied());
+            }
+        }
+    }
+
     /// Keeps only the unchanged `SEND` entry immediately before its authored async setup.
     fn original_async_with_setups<const INDEX_ORIGINS: bool>(
         &self,
