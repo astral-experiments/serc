@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn a_folded_import_branch_starts_a_fresh_borrow_block() {
+    for tail in ["", "    return value\n"] {
+        let source = format!(
+            "def process(owner, value, ready):\n    if ready:\n        def inner():\n            return (value, owner)\n        if True:\n            from helpers import entry\n{tail}"
+        );
+        assert_matches_cpython(&source, "folded_import.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

@@ -5218,6 +5218,11 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .record_exception_owner_block_boundary(selected);
                 self.assembler.mark(selected);
+            } else if self.context.python_version == crate::PythonVersion::Py314 {
+                let selected = self.assembler.label();
+                self.assembler
+                    .record_borrow_analysis_block_boundary(selected);
+                self.assembler.mark(selected);
             }
             let body = if truthiness {
                 &statement.body
@@ -15305,16 +15310,17 @@ impl<'source> Compiler<'source> {
                 .record_exception_owner_block_boundary(selected);
             self.assembler.mark(selected);
             if truthiness
-                && self
-                    .control
-                    .withs
-                    .active_with_exits
-                    .iter()
-                    .any(|context| !context.is_async)
+                && (self.context.python_version == crate::PythonVersion::Py314
+                    || self
+                        .control
+                        .withs
+                        .active_with_exits
+                        .iter()
+                        .any(|context| !context.is_async))
             {
-                // A manager's saved exit receiver crosses the original conditional
-                // block even after the jump is folded away. Its reference must be
-                // consumed within that block to qualify as borrowed.
+                // The selected suite starts a new instruction array even when its test
+                // folds away. Borrow analysis indexes temporary references by their
+                // instruction position within that original array.
                 self.assembler
                     .record_borrow_analysis_block_boundary(selected);
             }
