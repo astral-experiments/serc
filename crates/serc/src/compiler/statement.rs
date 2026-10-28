@@ -3882,6 +3882,9 @@ impl<'source> Compiler<'source> {
                             && !expression_suspends_current_scope(&expression.value))
                 });
         let needs_boundary = legacy
+            // A final else falls through its authored Pass into a separate enclosing
+            // return block. A jump from the preceding if can reach only the Pass.
+            || (!has_later_arm && matches!(body, [.., Stmt::If(_), Stmt::Pass(_)]))
             || terminal_assignment
             // Erased assertions do not join a call's original block to the return.
             || elided_terminal_call

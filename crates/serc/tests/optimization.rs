@@ -15755,6 +15755,33 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn trailing_pass_separates_a_nested_branch_from_the_implicit_return() {
+    let source = r"
+def choose(ready, selected, manager):
+    if ready:
+        pass
+    else:
+        with manager:
+            value = 1
+        if selected:
+            observe()
+        else:
+            consume(value)
+        pass
+
+def choose_without_pass(ready, selected):
+    if ready:
+        pass
+    else:
+        if selected:
+            observe()
+        else:
+            consume()
+";
+    assert_matches_cpython(source, "nested_branch_pass.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
