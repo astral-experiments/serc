@@ -3888,10 +3888,10 @@ impl OptimizationPipeline {
         // so each branch sees the target width from its own visit.
         let mut nested_normals = FxHashSet::default();
         let mut nested_prefixes = FxHashMap::default();
-        for (&normal, &(_, first, pass)) in &exits {
-            if pass.is_some() {
+        for &normal in order {
+            let Some(&(_, first, None)) = exits.get(&normal) else {
                 continue;
-            }
+            };
             if !graph[first].last_instruction().is_some_and(|op| {
                 op.location == SourceLocation::NONE && op.jump_policy.borrow_empty_block()
             }) {
@@ -3899,11 +3899,7 @@ impl OptimizationPipeline {
             }
             let mut path = Vec::new();
             let mut block = first;
-            loop {
-                let Some((Item::Instruction(jump), head)) = graph[block].items().split_last()
-                else {
-                    break;
-                };
+            while let Some((Item::Instruction(jump), head)) = graph[block].items().split_last() {
                 let Some(label) = jump.forward_target() else {
                     break;
                 };
