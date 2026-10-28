@@ -15,6 +15,12 @@ use serc::{
 };
 
 #[test]
+fn protected_while_guard_reaches_the_trailing_pass_backedge() {
+    let source = "def scan(flag):\n    while flag:\n        try:\n            item = read()\n            if ready(item):\n                flag = item\n                pass\n        except LookupError:\n            break\n        pass\n    return flag\n";
+    assert_matches_cpython(source, "guarded_while_pass.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
