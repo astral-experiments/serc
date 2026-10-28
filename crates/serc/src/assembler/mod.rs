@@ -2242,6 +2242,12 @@ impl Assembler {
     /// Range and fusion labels do not establish a CPython instruction-array boundary.
     /// Hidden authored NOPs and handler entries also prevent treating the join as unlocated.
     pub(crate) fn at_original_unconditional_join(&self) -> bool {
+        self.original_join_has_unconditional_edge(false)
+    }
+
+    /// Checks for an original unconditional jump into an unlocated join.
+    /// The last physical arm of a conditional handler can fall through to that same label.
+    pub(crate) fn original_join_has_unconditional_edge(&self, allow_fallthrough: bool) -> bool {
         let items = self.linear_items();
         let labels = trailing_labels(items).collect::<Vec<_>>();
         let Some(Item::Instruction(previous)) =
@@ -2252,7 +2258,8 @@ impl Assembler {
         let match_join = self
             .original_match_join
             .filter(|label| labels.contains(label));
-        if !(ends_scope(previous.opcode)
+        if !(allow_fallthrough
+            || ends_scope(previous.opcode)
             || is_unconditional_jump(previous.opcode)
             || match_join.is_some())
             || self.join_labels_have_authored_location(&labels)

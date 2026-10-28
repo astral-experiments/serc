@@ -15,6 +15,35 @@ use serc::{
 };
 
 #[test]
+fn named_handler_branches_copy_cleanup_at_their_original_join() {
+    let source = r"def recover(flag, ready, value):
+    try:
+        work()
+    except LookupError as error:
+        if flag is not None:
+            if ready:
+                report(error)
+            else:
+                value = fallback()
+    return value
+
+def single_arm(flag, ready, value):
+    try:
+        work()
+    except LookupError as error:
+        if flag:
+            return value
+        else:
+            if ready:
+                raise ValueError
+            else:
+                report(error)
+    return value
+";
+    assert_matches_cpython(source, "named_branch_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
