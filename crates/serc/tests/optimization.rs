@@ -15773,6 +15773,19 @@ def raises(ready, item):
 }
 
 #[test]
+fn folded_assertion_arm_skips_a_large_message_before_its_return() {
+    let source = r"
+def with_message(ready, item, values):
+    saved = [value for value in values]
+    assert item if ready else 0.5, f'bad {saved} at {item if ready else 0}'
+
+def without_message(ready, item):
+    assert item if ready else 0.5
+";
+    assert_matches_cpython(source, "assertion_message_return.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
