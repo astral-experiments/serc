@@ -17628,6 +17628,16 @@ fn manager_setups_preserve_repeated_legacy_empty_branch_locations() {
 }
 
 #[test]
+fn guarded_finally_keeps_async_iterator_exhaustion_before_erased_assertions() {
+    for body in ["yield item", "consume(item)"] {
+        let source = format!(
+            "async def stream(source, enabled):\n    try:\n        async for item in source:\n            {body}\n        assert item\n    finally:\n        if enabled:\n            finish()\n"
+        );
+        assert_matches_cpython(&source, "guarded_iterator_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn direct_finally_async_for_keeps_exit_before_erased_assertions() {
     for (index, source) in [
         "async def f(items, obj):\n    try:\n        async for item in items:\n            pass\n        assert items\n    finally:\n        obj.finish()\n",
