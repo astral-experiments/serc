@@ -27325,6 +27325,20 @@ impl<'source> Compiler<'source> {
         } else {
             normal_exit_suite
         };
+        let erased_loop_else_guard = (self.context.python_version >= crate::PythonVersion::Py314
+            && self.control.loops.uncopied_loop_tail_statement == Some(statement.range)
+            && self.control.in_loop_tail_without_nested_cleanup()
+            && statement
+                .orelse
+                .last()
+                .is_some_and(|tail| self.context.is_elided_statement(tail)))
+        .then(|| {
+            statement
+                .orelse
+                .iter()
+                .rfind(|part| !self.context.is_elided_statement(part))
+        })
+        .flatten();
         let guarded_raise_finally_test = (!statement.is_star
             && statement.finalbody.is_empty()
             && matches!(self.unit.scope, Scope::Function { .. })
@@ -29701,10 +29715,13 @@ impl<'source> Compiler<'source> {
             } else if !statement.is_star
                 && statement.finalbody.is_empty()
                 && !self.control.loops.contexts.is_empty()
-                && let Some(Stmt::If(nested)) = statement.orelse.last()
+                && let Some(Stmt::If(nested)) =
+                    erased_loop_else_guard.or_else(|| statement.orelse.last())
                 && nested.elif_else_clauses.is_empty()
                 && nested.body.split_last().is_some_and(|(tail, leading)| {
-                    matches!(tail, Stmt::Break(_))
+                    (matches!(tail, Stmt::Break(_))
+                        || (erased_loop_else_guard.is_some()
+                            && matches!(tail, Stmt::Return(_) | Stmt::Raise(_))))
                         && (leading.is_empty() || suite_has_linear_borrow_fallthrough(leading))
                 })
                 && let Some(test) = terminating_if_fallthrough_test(nested)
@@ -29713,7 +29730,7 @@ impl<'source> Compiler<'source> {
                 && let Some(donor) = unique_condition_jump_target(test, false)
             {
                 // Only the false condition reaches the normal try-else exit;
-                // the break exits the loop and cannot donate its location.
+                // the terminating arm cannot donate its location.
                 self.assembler
                     .set_location(self.source_location(donor.range()));
             } else if self.context.python_version >= crate::PythonVersion::Py314
