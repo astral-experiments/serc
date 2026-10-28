@@ -18383,6 +18383,48 @@ fn nested_branch_returns_survive_removed_inner_assertions() {
 }
 
 #[test]
+fn copied_normal_try_exits_keep_their_trailing_pass() {
+    let source = r"def finalized(value):
+    try:
+        value = receive()
+    finally:
+        close()
+        pass
+    return value
+
+
+def selected(value):
+    try:
+        check(value)
+    except LookupError:
+        return value
+    else:
+        pass
+    return value
+
+
+def recovered(value):
+    try:
+        value = receive()
+    finally:
+        try:
+            pass
+        except LookupError:
+            recover()
+    return value
+
+
+def same_line(value):
+    try:
+        check(value)
+    finally:
+        close(); pass
+    return value
+";
+    assert_matches_cpython(source, "copied_pass_return.py", &LEVELS);
+}
+
+#[test]
 fn nested_authored_pass_preserves_returns_before_removed_assertions() {
     for (index, source) in [
         "def f(a, b, c):\n    if a:\n        if b:\n            if c:\n                pass\n        assert a\n",
