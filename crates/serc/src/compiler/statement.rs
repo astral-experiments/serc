@@ -32630,8 +32630,11 @@ impl<'source> Compiler<'source> {
             let handler_has_original_terminal_false_join = handler.name.is_some()
                 && terminal
                 && self.assembler.at_original_jump_only_conditional_join();
-            let handler_has_named_while_break_join = handler.name.is_some()
-                // Removed assertions leave the loop's original cleanup predecessors intact.
+            // A break and exhaustion can enter the same unlocated handler cleanup.
+            // From 3.14, this also applies to an unnamed handler returning to an outer loop.
+            let handler_has_while_break_join = (handler.name.is_some()
+                || (self.context.python_version >= crate::PythonVersion::Py314
+                    && self.control.in_loop()))
                 && matches!(handler.body.iter().rev().find(|part| {
                     !self.context.is_elided_statement(part)
                 }), Some(Stmt::While(tail)) if tail.orelse.is_empty())
@@ -32702,7 +32705,7 @@ impl<'source> Compiler<'source> {
                 || handler_has_finalizer_false_join
                 || handler_has_guarded_finally_cleanup
                 || coroutine_guarded_finally_cleanup
-                || handler_has_named_while_break_join
+                || handler_has_while_break_join
                 || handler_has_raising_while_break_cleanup
                 || handler_has_original_conditional_loop_join
                 || handler_has_guarded_for_break_join

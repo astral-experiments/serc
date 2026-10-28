@@ -25977,3 +25977,18 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn inner_while_exit_copies_the_handler_cleanup_before_the_outer_backedge() {
+    let source = r"def run(items, ready, stop):
+    while items:
+        try:
+            work()
+        except KeyError:
+            while ready:
+                if stop:
+                    break
+                update()
+";
+    assert_matches_cpython(source, "nested_loop_handler.py", &LEVELS);
+}
