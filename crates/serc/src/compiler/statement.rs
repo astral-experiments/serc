@@ -16231,7 +16231,13 @@ impl<'source> Compiler<'source> {
                 let retained_chained_comparison_exit =
                     (matches!(body, [Stmt::Return(_) | Stmt::Raise(_)])
                         || terminal_break_return
-                        || literal_store)
+                        || literal_store
+                        // Copying the return into a pass-only arm can leave four
+                        // slots, so the final comparison can receive that copy too.
+                        || (self.context.python_version >= crate::PythonVersion::Py314
+                            && self.control.statements.context.has_following
+                            && branch_index < statement.elif_else_clauses.len()
+                            && matches!(body, [Stmt::Pass(_)])))
                         .then(|| {
                             final_chained_comparison_target(test, self.context.python_version >= crate::PythonVersion::Py314
                                 && matches!(body, [Stmt::Return(ret)] if ret.value.as_deref().is_none_or(|value| {

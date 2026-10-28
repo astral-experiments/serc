@@ -15755,6 +15755,32 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn chained_comparison_success_copies_a_pass_arm_and_return() {
+    let source = r"def both_chains(left, mid, right, low, center, high):
+    if left <= mid <= right and low <= center <= high:
+        pass
+    else:
+        mid = None
+    return mid
+
+def single_chain(left, mid, right):
+    if left <= mid <= right:
+        pass
+    else:
+        mid = None
+    return mid
+
+def live_arm(left, mid, right, low, center, high):
+    if left <= mid <= right and low <= center <= high:
+        keep()
+    else:
+        mid = None
+    return mid
+";
+    assert_matches_cpython(source, "chained_comparison_pass_exit.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
