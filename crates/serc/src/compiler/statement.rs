@@ -2917,6 +2917,13 @@ impl<'source> Compiler<'source> {
                 // At a true suite end, normal cleanup can still absorb the omitted marker.
                 && (self.control.exceptions.active_exception_region_exclusions.is_empty()
                     || self.control.finally.active_finally_end_blocks > 0
+                    // Both paths through the conditional reach the authored Pass
+                    // before the manager runs its normal exit.
+                    || (self.context.python_version >= crate::PythonVersion::Py314
+                        && protected_direct_sync_manager_body
+                        && is_final
+                        && matches!(body.get(index.wrapping_sub(1)), Some(Stmt::If(branch))
+                            if branch.elif_else_clauses.is_empty() && !suite_terminates(&branch.body)))
                     || protected_async_with_pass
                     || protected_sync_with_join_pass
                     || optimized_sync_with_pass_tail

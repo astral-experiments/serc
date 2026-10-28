@@ -15,6 +15,22 @@ use serc::{
 };
 
 #[test]
+fn protected_manager_keeps_pass_after_a_conditional() {
+    let source = r"def sample(flag, manager):
+    try:
+        with manager as resource:
+            start(resource)
+            if flag:
+                use(resource)
+            pass
+    except Error:
+        report()
+    finish()
+";
+    assert_matches_cpython(source, "manager_pass.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
