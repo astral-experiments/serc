@@ -4465,6 +4465,34 @@ fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
 }
 
 #[test]
+fn multiline_string_additions_keep_their_owner_before_a_try_guard() {
+    let source = r#"def render(value):
+    with acquire():
+        if value:
+            text = (
+                "a"
+                + "b"
+                + "c"
+                + "d"
+                + "e"
+                + "f"
+                + f"{value}"
+            )
+            try:
+                if not check(value):
+                    emit(text)
+            except ValueError:
+                recover()
+"#;
+    assert_matches_cpython_versions(
+        source,
+        "string_addition_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn handler_and_iterator_returns_reuse_the_final_cleanup_pop() {
     for source in [
         r"async def sample(value, flag):

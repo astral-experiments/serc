@@ -744,12 +744,13 @@ impl Compiler<'_> {
             // Numeric negation removes its adjacent, equally owned literal load.
             self.assembler.record_last_uniform_fold_owner_slots(1);
         } else if matches!(expression, Expr::BinOp(_))
-            && is_literal_binary_tree(expression)
-            && self.source_location(expression.range()).line
+            && ((self.source_location(expression.range()).line
                 == self.source_location(expression.range()).end_line
+                && is_literal_binary_tree(expression))
+                || is_string_addition_chain(expression))
         {
-            // The literal loads, small tuple builds and binary operations share one
-            // owner on a single source line, with no intervening line NOPs.
+            // Single-line literal operations have no intervening line NOPs. A chain
+            // of string additions also retains one owner across its source lines.
             self.assembler
                 .record_last_uniform_fold_owner_slots(hidden_owner_slots);
         }
@@ -1345,6 +1346,17 @@ impl Compiler<'_> {
             .push((instruction, name.to_string()));
         Ok(())
     }
+}
+
+/// Recognizes a left-associated addition of string literals.
+fn is_string_addition_chain(mut expression: &Expr) -> bool {
+    while let Expr::BinOp(binary) = expression {
+        if binary.op != Operator::Add || !matches!(binary.right.as_ref(), Expr::StringLiteral(_)) {
+            return false;
+        }
+        expression = &binary.left;
+    }
+    matches!(expression, Expr::StringLiteral(_))
 }
 
 /// Returns whether a binary-expression tree has only primitive or small tuple literal leaves.
