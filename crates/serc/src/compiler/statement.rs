@@ -38131,6 +38131,25 @@ impl<'source> Compiler<'source> {
                             && context.finally_end_depth == 0
                             && context.exception_region_depth == 0))
                     && managed_guarded_raise_has_finally_route(statement)));
+        // A populated normal try exit reaches the following finalizer directly. A
+        // guarded reraise in a typed handler retains its own jump to that finalizer.
+        let guarded_reraise_reaches_finally = self.context.python_version == crate::PythonVersion::Py314
+            && !statement.is_star
+            && statement.orelse.is_empty()
+            && (matches!(statement.body.as_slice(), [Stmt::Pass(_)])
+                || statement.body.last().is_some_and(|last| {
+                    suite_has_linear_borrow_fallthrough(std::slice::from_ref(last))
+                }))
+            && statement.handlers.iter().any(|handler| {
+                handler.as_except_handler().is_some_and(|handler| {
+                    handler.type_.is_some() && suite_has_normal_fallthrough(&handler.body) && suite_any_statement(&handler.body, |part| {
+                        matches!(part, Stmt::If(guard)
+                            if guard.elif_else_clauses.is_empty()
+                                && condition_has_only_runtime_tests(&guard.test)
+                                && matches!(guard.body.as_slice(), [Stmt::Raise(raised)] if raised.exc.is_none()))
+                    })
+                })
+            });
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
@@ -38153,6 +38172,7 @@ impl<'source> Compiler<'source> {
             || dispatcher_break_reaches_finally
             || inner_try_break_loop_range.is_some()
             || conditional_handler_reaches_finally
+            || guarded_reraise_reaches_finally
             || nested_fallthrough_handler_reaches_finally
             || managed_recovery_reaches_finally
             || managed_coroutine_recovery_reaches_finally

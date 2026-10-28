@@ -15,6 +15,36 @@ use serc::{
 };
 
 #[test]
+fn guarded_reraises_preserve_the_normal_finalizer_borrow_entry() {
+    let source = r"def read(flag, value):
+    try:
+        yield value
+    except ValueError as exc:
+        if flag:
+            raise
+        finish()
+    finally:
+        choice = flag or value.ready
+        value.close()
+    return value
+
+def finish_value(flag, guard, value):
+    try:
+        if guard:
+            pass
+        pass
+    except ValueError as exc:
+        if flag:
+            raise
+        return value
+    finally:
+        value.close()
+    return value
+";
+    assert_matches_cpython(source, "guarded_reraise_finally.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
