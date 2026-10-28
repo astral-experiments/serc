@@ -23638,6 +23638,26 @@ fn loop_breaks_preserve_shared_try_exit_positions() {
 }
 
 #[test]
+fn a_nested_elided_else_leaves_its_condition_on_the_outer_jump() {
+    let source = r"def select(enabled, ready, first, value):
+    if enabled:
+        if ready:
+            pass
+        else:
+            if first:
+                pass
+            elif value is None or value == first:
+                pass
+            else:
+                assert False
+    else:
+        fallback()
+    finish()
+";
+    assert_matches_cpython(source, "nested_elided_else_jump.py", &LEVELS);
+}
+
+#[test]
 fn erased_assertion_exposes_shared_else_exit() {
     let source = "def run(left, right, outer, value):\n    if outer:\n        if left:\n            pass\n        else:\n            if right:\n                value = left\n            assert left\n    else:\n        pass\n    observe(value)\n";
     assert_matches_cpython_versions(
