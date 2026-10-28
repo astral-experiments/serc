@@ -6299,10 +6299,39 @@ impl OptimizationPipeline {
                         && (target_chain_end == target_position
                             || matches!(opcode, RAISE_VARARGS | RETURN_VALUE))
                 });
-            let source_allows_small_exit_inlining = (target_chain_end == target_position
-                && target_terminal_opcode == Some(RAISE_VARARGS)
-                && (block_is_bare_raise(graph[target].items(), &self.original_nop_targets)
-                    || block_is_local_raise(graph[target].items(), &self.original_nop_targets)))
+            // The comparison's failure POP belongs to its own original block.
+            // The separate iterator return is small enough to copy before folding.
+            let comparison_iterator_return = self.python_version == crate::PythonVersion::Py314
+                && target_is_small_exit
+                && target_chain_end == target_position
+                && matches!(graph[target].items(), [labels @ ..,
+                    Item::Instruction(marker), Item::Instruction(pop),
+                    Item::Instruction(value), Item::Instruction(ret)]
+                    if labels.iter().all(|item| matches!(item, Item::Label(_)))
+                        && marker.opcode == NOP && pop.opcode == POP_TOP
+                        && value.opcode == LOAD_CONST && ret.opcode == RETURN_VALUE
+                        && marker.location.line >= 0 && marker.location == pop.location
+                        && pop.depth_after() == Some(0) && value.depth_after() == Some(1))
+                && self
+                    .exception_owner_provenance
+                    .original_comparison_fallthroughs
+                    .iter()
+                    .any(|(cleanup, _, [_, _, _, _, pop, jump])| {
+                        graph.label_block(*cleanup) == Some(source)
+                            && graph[source]
+                                .items()
+                                .iter()
+                                .filter_map(Item::as_instruction)
+                                .eq([pop, jump])
+                    });
+            let source_allows_small_exit_inlining = comparison_iterator_return
+                || (target_chain_end == target_position
+                    && target_terminal_opcode == Some(RAISE_VARARGS)
+                    && (block_is_bare_raise(graph[target].items(), &self.original_nop_targets)
+                        || block_is_local_raise(
+                            graph[target].items(),
+                            &self.original_nop_targets,
+                        )))
                 || graph[source]
                     .last_instruction()
                     .is_some_and(|instruction| instruction.jump_policy.inline_small_exit());

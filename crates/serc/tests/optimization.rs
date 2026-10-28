@@ -15755,6 +15755,24 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn comparison_cleanup_copies_a_small_iterator_return() {
+    for result in ["'missing'", "(low, high)"] {
+        let source = format!(
+            "def select(items, ready, low, mid, high):
+    if ready:
+        pass
+    else:
+        for item in items:
+            if low == mid == high:
+                return item
+            return {result}
+"
+        );
+        assert_matches_cpython(&source, "iterator_comparison_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
