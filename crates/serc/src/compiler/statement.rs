@@ -33770,6 +33770,14 @@ impl<'source> Compiler<'source> {
                         || handler_ends_with_nonterminal_with
                         || handler_cleanup_from_original_join)
                         && (handler.name.is_some()
+                            // The raising arm has no normal successor. The other arm jumps
+                            // to the unlocated cleanup before cold exception blocks move.
+                            || (handler_cleanup_from_original_join
+                                && !self.control.exceptions.active_exception_region_exclusions.is_empty()
+                                && matches!(handler.body.last(), Some(Stmt::If(tail))
+                                    if if_normal_exit_count(tail) == 1
+                                        && tail.elif_else_clauses.last().is_some_and(|clause|
+                                            clause.test.is_none() && matches!(clause.body.last(), Some(Stmt::Raise(_))))))
                             || (handler_cleanup_from_original_join
                                 && matches!(handler.body.as_slice(), [Stmt::With(manager)]
                                     if !manager.is_async && suite_terminates(&manager.body)))
