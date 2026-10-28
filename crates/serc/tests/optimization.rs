@@ -25992,3 +25992,21 @@ fn nested_handler_guards_copy_the_shared_return() {
 ";
     assert_matches_cpython(source, "shared_handler_return.py", &LEVELS);
 }
+
+#[test]
+fn handler_guards_copy_the_return_past_an_outer_try() {
+    let source = r"def run(first, left, right):
+    try:
+        if first:
+            begin()
+        else:
+            try:
+                load()
+            except KeyError:
+                if left and right:
+                    work()
+    except OSError as error:
+        recover(error)
+";
+    assert_matches_cpython(source, "guarded_outer_try.py", &LEVELS);
+}

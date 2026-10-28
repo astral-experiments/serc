@@ -6352,8 +6352,8 @@ impl OptimizationPipeline {
                 };
             let copy_iterator_return = copied_iterators >= 2
                 || (copied_iterators == 1 && self.python_version == crate::PythonVersion::Py314);
-            // A handler's POP_BLOCK can split a saved return value or separate two
-            // handler pops. Each guard entering the unlocated exit supplies a copy.
+            // POP_BLOCK can separate a handler pop from the saved value, the outer
+            // handler pop, or the return. Each guard entering this exit supplies a copy.
             let split_handler_return = self.python_version == crate::PythonVersion::Py314
                 && target_chain_end > target_position
                 && target_has_no_location
@@ -6374,7 +6374,6 @@ impl OptimizationPipeline {
                     let mut opcodes = operations.map(|record| record.opcode);
                     saved_value
                         || (source_has_fallthrough
-                            && opcodes.next() == Some(POP_EXCEPT)
                             && opcodes.next() == Some(POP_EXCEPT)
                             && opcodes
                                 .skip_while(|&opcode| opcode == POP_EXCEPT)
