@@ -25977,3 +25977,22 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn nested_finalizer_reaches_the_enclosing_branch_exit() {
+    let source = r"def scan(items, enabled, ready):
+    for item in items:
+        try:
+            if enabled:
+                try:
+                    read(item)
+                finally:
+                    if ready:
+                        record(item)
+            else:
+                skip(item)
+        finally:
+            release(item)
+";
+    assert_matches_cpython(source, "nested_finalizer_branch.py", &LEVELS);
+}

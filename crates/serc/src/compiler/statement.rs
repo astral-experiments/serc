@@ -18472,6 +18472,9 @@ impl<'source> Compiler<'source> {
         let same_region_continuation = if self.control.statements.context.same_region_continuation
             == Some(statement.range)
             || self.control.loops.split_loop_tail_prefix_end == Some(statement.range)
+            || matches!(branch_tail, Some(Stmt::Try(tail))
+                if !tail.finalbody.is_empty()
+                    && fallthrough_body.last().map(Ranged::range) != Some(tail.range))
         {
             branch_tail.map(Ranged::range)
         } else {
@@ -26956,10 +26959,11 @@ impl<'source> Compiler<'source> {
     }
 
     fn compile_try(&mut self, statement: &ruff_python_ast::StmtTry) -> Result<(), CompileError> {
-        // Only ordinary statement lowering supplies authored following-statement flags.
-        // Specialized terminal and loop-tail dispatch must not seed this continuation.
+        // A following statement or an enclosing branch exit can supply the
+        // continuation for an otherwise terminal finalizer.
         let continuation_depths = if self.control.statements.context.has_following
             || self.control.statements.context.inherited_has_following
+            || self.control.statements.context.same_region_continuation == Some(statement.range)
         {
             Some((
                 self.control.loops.contexts.len(),
