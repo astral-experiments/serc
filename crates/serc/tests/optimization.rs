@@ -23507,6 +23507,24 @@ fn protected_tuple_returns_copy_onto_conditional_call_arms() {
 }
 
 #[test]
+fn guarded_case_shares_the_constant_return_after_a_try() {
+    let source = r"def run(value, flag):
+    try:
+        match value:
+            case 'first':
+                prepare()
+                if flag:
+                    call()
+            case 'last':
+                finish()
+    except ValueError:
+        return 1
+    return 0
+";
+    assert_matches_cpython(source, "guarded_case_return.py", &LEVELS);
+}
+
+#[test]
 fn nested_match_arms_preserve_tuple_return_copy_budget() {
     for otherwise in ["assert False", "pass", "result = [7]; tag = 'seven'"] {
         for returned in ["result, tag", "result", "result, tag, kind"] {
