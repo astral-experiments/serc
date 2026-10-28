@@ -22886,6 +22886,8 @@ impl<'source> Compiler<'source> {
                 )?;
                 if nested_tail == LoopBackedge::Required && !suite_terminates(body) {
                     self.set_branch_end_location(body, body_start);
+                    // The value joins before this arm reaches the outer guard's exit.
+                    self.prepare_copied_loop_discard(body);
                     self.emit_loop_tail_backedge(restart, protected_try_normal_exit)?;
                 }
 
