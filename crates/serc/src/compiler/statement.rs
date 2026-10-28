@@ -40782,9 +40782,13 @@ impl<'source> Compiler<'source> {
                             && manager.terminal_statement_range == Some(statement.range)
                     })
                 && matches!(statement.finalbody.last(), Some(Stmt::If(guard))
-                    if condition_has_only_runtime_tests(&guard.test) && !suite_terminates(&guard.body)
-                        && matches!(guard.elif_else_clauses.as_slice(), [otherwise]
-                            if otherwise.test.is_none() && suite_has_linear_borrow_fallthrough(&otherwise.body)))
+                if condition_has_only_runtime_tests(&guard.test) && !suite_terminates(&guard.body)
+                    && guard.elif_else_clauses.split_last().is_some_and(|(otherwise, earlier)| {
+                        otherwise.test.is_none()
+                            && earlier.iter().all(|clause| clause.test.as_ref().is_some_and(condition_has_only_runtime_tests))
+                            && (suite_has_linear_borrow_fallthrough(&otherwise.body)
+                                || matches!(otherwise.body.as_slice(), [Stmt::Import(_) | Stmt::ImportFrom(_)]))
+                    }))
             {
                 // The earlier arm jumps past the finalizer's normal exit, leaving the else
                 // suite to locate its jump before the manager cleanup.
