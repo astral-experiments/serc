@@ -4465,6 +4465,35 @@ fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
 }
 
 #[test]
+fn consecutive_try_else_guards_reuse_the_last_protected_store() {
+    for guard in ["flag", "not flag or reject(second)"] {
+        let source = format!(
+            "def scan(values, flag):
+    for item in values:
+        try:
+            first = lookup(1, item)
+        except ValueError:
+            pass
+        else:
+            try:
+                second = lookup(2, first)
+            except TypeError:
+                pass
+            else:
+                if {guard}:
+                    break
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "try_else_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn handler_and_iterator_returns_reuse_the_final_cleanup_pop() {
     for source in [
         r"async def sample(value, flag):
