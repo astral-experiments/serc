@@ -52441,7 +52441,7 @@ fn handler_cleanup_has_stable_fallthrough_location(statement: &ruff_python_ast::
     if clause.test.is_some() || !suite_has_normal_fallthrough(&clause.body) {
         return true;
     }
-    match clause.body.last() {
+    match handler_cleanup_runtime_tail(&clause.body) {
         Some(Stmt::If(tail)) => handler_cleanup_has_stable_fallthrough_location(tail),
         Some(Stmt::Assign(assignment)) => match assignment.value.as_ref() {
             Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_) => false,
@@ -52469,14 +52469,21 @@ fn handler_cleanup_has_nested_branch_exit(statement: &ruff_python_ast::StmtIf) -
     })
 }
 
+// An elided assertion leaves an empty synthetic declaration in its arm.
+// The last live statement supplies the location of the actual fallthrough.
+fn handler_cleanup_runtime_tail(body: &[Stmt]) -> Option<&Stmt> {
+    body.iter()
+        .rfind(|part| !matches!(part, Stmt::Global(global) if global.names.is_empty()))
+}
+
 // Declarations emit no instruction and cannot donate the location of a copied exit.
 // Leave their cleanup on the existing path until its synthetic branch location is resolved.
 fn handler_cleanup_has_runtime_exit_location(body: &[Stmt]) -> bool {
     if !suite_has_normal_fallthrough(body) {
         return true;
     }
-    match body.last() {
-        Some(Stmt::Global(_) | Stmt::Nonlocal(_)) => false,
+    match handler_cleanup_runtime_tail(body) {
+        None | Some(Stmt::Global(_) | Stmt::Nonlocal(_)) => false,
         Some(Stmt::AnnAssign(assignment))
             if assignment.value.is_none()
                 && matches!(assignment.target.as_ref(), Expr::Name(_)) =>
