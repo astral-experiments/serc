@@ -4608,6 +4608,18 @@ impl Assembler {
             > 1
     }
 
+    /// Records the original conditional edge before a Boolean operand short-circuits.
+    pub(crate) fn record_folded_short_circuit_exit(&mut self, target: Label) {
+        if self.python_version >= crate::PythonVersion::Py314
+            && let [.., Item::Label(entry), Item::Instruction(jump)] = self.linear_items()
+        {
+            // The remaining operands become unreachable only after the original
+            // conditional has missed the early small-exit copy pass.
+            self.prevent_folded_arm_exit_inlining(*entry, target, jump.location);
+        }
+        self.record_folded_condition_borrow_entry(target);
+    }
+
     /// Records an empty folded-condition entry without confusing pending label aliases.
     pub(crate) fn record_folded_condition_borrow_entry(&mut self, target: Label) {
         let labels = self

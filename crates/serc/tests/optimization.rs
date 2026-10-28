@@ -15755,6 +15755,27 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn short_circuited_operand_jumps_to_its_shared_literal_return() {
+    let source = r"
+def folded(ready, active):
+    if ready or (active and not (
+        False
+        and check()
+    )) or other():
+        return False
+    emit()
+    return True
+
+def runtime(ready, active, flag):
+    if ready or (active and not (flag and check())) or other():
+        return False
+    emit()
+    return True
+";
+    assert_matches_cpython(source, "short_circuit_return.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
