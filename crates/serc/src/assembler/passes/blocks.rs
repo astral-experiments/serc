@@ -9,6 +9,7 @@ use super::super::{
 };
 use crate::assembler::block_graph::{BasicBlockId, BlockGraph, ItemPosition};
 use crate::assembler::exception_owners::ExceptionOwnerProvenance;
+use crate::assembler::ir::BorrowFallthrough;
 use crate::target::opcodes::{
     BUILD_LIST, BUILD_MAP, BUILD_SET, BUILD_TUPLE, CALL, CALL_INTRINSIC_1, CALL_KW, DELETE_ATTR,
     DELETE_FAST, DICT_UPDATE, END_ASYNC_FOR, END_FOR, END_SEND, FOR_ITER, LIST_EXTEND, LOAD_ATTR,
@@ -2094,6 +2095,8 @@ fn comprehension_assignment_exit_location(
 
 /// Original normal-try exits threaded through one authenticated shared branch join.
 pub(in crate::assembler) struct ThreadedNormalTryJoins {
+    first_new_label: u32,
+    jump_only: FxHashMap<Label, (Vec<Item>, Vec<Item>)>,
     entries: FxHashMap<Label, (Vec<Item>, Vec<Item>)>,
     recoveries: FxHashMap<Label, NamedRecoveryCopy>,
     located_joins: FxHashMap<Label, (Label, Vec<Item>, Instruction)>,
@@ -2112,6 +2115,21 @@ struct NamedRecoveryCopy {
 impl ThreadedNormalTryJoins {
     /// Accepts only the captured source after one threading step and its unchanged target.
     fn matches(&self, graph: &BlockGraph, entry: Label, source: &[Item], target: &[Item]) -> bool {
+        // Exception splitting may insert labels around the original jump. It cannot
+        // change any of the original records or the cleanup they identified.
+        if self
+            .jump_only
+            .get(&entry)
+            .is_some_and(|(expected, cleanup)| {
+                let original_source = source.iter().filter(|item| match item {
+                    Item::Label(label) => label.as_u32() < self.first_new_label,
+                    Item::Instruction(_) => true,
+                });
+                target == cleanup.as_slice() && original_source.eq(expected)
+            })
+        {
+            return true;
+        }
         self.entries
             .get(&entry)
             .is_some_and(|(expected_source, expected_target)| {
@@ -4545,11 +4563,14 @@ impl OptimizationPipeline {
 
     /// Captures normal exits that bypass a separate branch join before named cleanup copying.
     pub(in crate::assembler) fn capture_threaded_normal_try_joins(&self) -> ThreadedNormalTryJoins {
+        let mut jump_only = FxHashMap::default();
         let mut entries = FxHashMap::default();
         let mut recoveries = FxHashMap::default();
         let mut located_joins = FxHashMap::default();
         if self.exception_owner_provenance.normal_try_exits.is_empty() {
             return ThreadedNormalTryJoins {
+                first_new_label: self.next_label,
+                jump_only,
                 entries,
                 recoveries,
                 located_joins,
@@ -4577,6 +4598,44 @@ impl OptimizationPipeline {
             let Some(target_block) = graph.label_block(target) else {
                 continue;
             };
+            if source == join_block
+                || target_block == source
+                || target_block == join_block
+                || jump.opcode != JUMP_FORWARD
+                || jump.forward_target() != Some(join)
+                || jump.location.line < 0
+                || jump.pre_fold_extra_instructions() != 0
+                || jump.local_policy.hidden_exception_owner_slots() != 0
+                || head.is_empty()
+                || head.iter().any(|item| !matches!(item, Item::Label(_)))
+                || join_jump.opcode != JUMP_FORWARD
+                || join_jump.pre_fold_extra_instructions() != 0
+                || join_jump.local_policy.hidden_exception_owner_slots() != 0
+                || join_jump.depth_after() != jump.depth_after()
+                || !join_jump.jump_policy.allows_threading_target()
+                || join_jump.jump_policy.is_interruptible()
+                || join_head.is_empty()
+                || join_head.iter().any(|item| !matches!(item, Item::Label(_)))
+                || !named_cleanup_has_short_return(graph, target_block)
+            {
+                continue;
+            }
+            // CPython first copies the jump-only array into this normal try exit.
+            // Before the next visit, the named cleanup absorbs the return and no longer fits.
+            let mut threaded = *jump;
+            threaded.retarget(Operand::Forward(target));
+            threaded.add_pre_fold_extra_instructions(1);
+            if join_jump.jump_policy.borrow_empty_block()
+                || join_jump.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier
+                || !join_jump.jump_policy.allows_borrow_threading_target()
+            {
+                threaded
+                    .no_location_policy
+                    .set_borrow_fallthrough(BorrowFallthrough::Barrier);
+            }
+            let mut expected = head.to_vec();
+            expected.push(Item::Instruction(threaded));
+            jump_only.insert(entry, (expected, graph[target_block].items().to_vec()));
             let located_join_condition = (join_jump.location.line >= 0)
                 .then(|| {
                     graph.iter_items().find_map(|item| {
@@ -4602,28 +4661,11 @@ impl OptimizationPipeline {
                     })
                 })
                 .flatten();
-            if source == join_block
-                || target_block == source
-                || target_block == join_block
-                || jump.opcode != JUMP_FORWARD
-                || jump.operand() != Operand::Forward(join)
-                || jump.location.line < 0
-                || jump.pre_fold_extra_instructions() != 0
-                || jump.local_policy.hidden_exception_owner_slots() != 0
-                || head.is_empty()
-                || head.iter().any(|item| !matches!(item, Item::Label(_)))
-                || join_jump.opcode != JUMP_FORWARD
-                || (join_jump.location != SourceLocation::NONE && located_join_condition.is_none())
-                || join_jump.pre_fold_extra_instructions() != 0
-                || join_jump.local_policy.hidden_exception_owner_slots() != 0
-                || join_jump.depth_after() != jump.depth_after()
-                || !join_jump.jump_policy.allows_threading_target()
+            if (join_jump.location != SourceLocation::NONE && located_join_condition.is_none())
                 || (join_jump.jump_policy.retains_nop_for(join_jump.operand())
                     && (join_jump.location == SourceLocation::NONE
                         || join_jump.jump_policy.retained_nop()
                             != super::super::ir::RetainedJumpNop::DirectTarget))
-                || join_jump.jump_policy.is_interruptible()
-                || join_head.is_empty()
                 || join_head.iter().any(|item| match item {
                     Item::Instruction(_) => true,
                     Item::Label(label) => {
@@ -4648,7 +4690,6 @@ impl OptimizationPipeline {
                                 .any(|(setup, _)| setup == label)
                     }
                 })
-                || !named_cleanup_has_short_return(graph, target_block)
             {
                 continue;
             }
@@ -4922,6 +4963,8 @@ impl OptimizationPipeline {
             }
         }
         ThreadedNormalTryJoins {
+            first_new_label: self.next_label,
+            jump_only,
             entries,
             recoveries,
             located_joins,
