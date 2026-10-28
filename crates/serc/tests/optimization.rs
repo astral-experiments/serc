@@ -15,6 +15,27 @@ use serc::{
 };
 
 #[test]
+fn nested_handler_jumps_stop_at_a_shared_raise() {
+    let source = r"def handle(outer):
+    try:
+        record()
+    except OSError:
+        if outer:
+            if True:
+                try:
+                    work()
+                except ValueError:
+                    pass
+            else:
+                work()
+        else:
+            record()
+        raise Trouble()
+";
+    assert_matches_cpython(source, "nested_handler_raise.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

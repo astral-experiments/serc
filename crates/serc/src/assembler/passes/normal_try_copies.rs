@@ -2820,6 +2820,24 @@ impl OptimizationPipeline {
             let Some(tail) = unlocated_jump(join) else {
                 continue;
             };
+            if let Some(exit) = unlocated_jump(tail)
+                && graph[entry].last_instruction().is_some_and(|jump| {
+                    jump.opcode == JUMP_FORWARD && jump.forward_target() == Some(join_label)
+                })
+                && graph[exit]
+                    .last_instruction()
+                    .is_some_and(|op| op.opcode == crate::target::opcodes::RAISE_VARARGS)
+            {
+                let operations = graph[exit].items().iter().filter_map(Item::as_instruction);
+                if operations.clone().all(|op| {
+                    op.location.line >= 0 && op.local_policy.hidden_exception_owner_slots() == 0
+                }) && operations.map(Instruction::pre_fusion_width).sum::<usize>() == 4
+                {
+                    // The normal and recovered paths copy the first bridge's jump. The
+                    // second bridge then copies the raise, retaining its jump as a fifth slot.
+                    joins.push((tail, None));
+                }
+            }
             let instructions = graph[tail].items().iter().filter_map(Item::as_instruction);
             if graph[tail]
                 .last_instruction()
