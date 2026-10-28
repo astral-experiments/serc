@@ -4758,6 +4758,12 @@ fn finalizer_copies_named_handler_cleanup_onto_elif_exits() {
 }
 
 #[test]
+fn folded_return_guard_keeps_the_original_finalizer_predecessor() {
+    let source = "def work(state, skip, value):\n    try:\n        if not skip:\n            if 1:\n                return value\n    finally:\n        state.count -= 1\n";
+    assert_matches_cpython(source, "folded_guard_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn nested_handler_raise_keeps_empty_outer_exit() {
     for scope in ["def", "async def"] {
         for binding in ["", " as parse_error"] {
