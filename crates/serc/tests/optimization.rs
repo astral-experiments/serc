@@ -15,6 +15,27 @@ use serc::{
 };
 
 #[test]
+fn nested_assignments_copy_an_unprotected_named_cleanup_in_order() {
+    let source = r"def choose(value, first, second):
+    try:
+        work()
+    except ValueError as error:
+        try:
+            if first:
+                if second:
+                    value = 1
+                else:
+                    value = 2
+            else:
+                value = error.detail
+        except LookupError:
+            value = 3
+    return value
+";
+    assert_matches_cpython(source, "nested_assignment_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
