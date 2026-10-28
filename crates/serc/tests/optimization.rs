@@ -15,6 +15,27 @@ use serc::{
 };
 
 #[test]
+fn copied_nested_try_exits_keep_the_outer_handler() {
+    let source = r"def recover(key, fallback):
+    try:
+        value = read(key)
+    except LookupError:
+        try:
+            if key:
+                value = key
+            else:
+                value = fallback
+        except ValueError:
+            if fallback:
+                value = fallback
+            else:
+                raise
+    return value
+";
+    assert_matches_cpython(source, "nested_recovery_jump.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
