@@ -29038,7 +29038,26 @@ impl<'source> Compiler<'source> {
         let normal_exit_ends_in_nop = self.assembler.last_instruction_is_nop();
         if direct_continue {
         } else if terminal {
-            if let Some(location) = orelse_noop_location {
+            let conditional_pass = match statement.body.as_slice() {
+                [.., Stmt::If(branch), Stmt::Pass(pass)]
+                    if self.context.python_version >= crate::PythonVersion::Py314
+                        && statement.orelse.is_empty()
+                        && branch
+                            .elif_else_clauses
+                            .last()
+                            .is_some_and(|clause| clause.test.is_some())
+                        && self.assembler.has_single_omitted_nop_before_label(
+                            try_end,
+                            self.source_location(pass.range),
+                        ) =>
+                {
+                    Some(self.source_location(pass.range))
+                }
+                _ => None,
+            };
+            if let Some(location) = conditional_pass {
+                self.assembler.set_location(location);
+            } else if let Some(location) = orelse_noop_location {
                 self.assembler.set_location(location);
             } else if matches!(statement.body.last(), Some(Stmt::Try(_))) {
                 self.assembler.set_location(SourceLocation::NONE);
@@ -29160,6 +29179,10 @@ impl<'source> Compiler<'source> {
                 // This eagerly copies the function footer into the normal try exit. CPython
                 // retains the replaced JUMP as a NOP until after small-exit inlining.
                 self.assembler.add_last_inlined_jump_slot();
+                if conditional_pass.is_some() {
+                    // The authored Pass and POP_BLOCK precede the replaced return jump.
+                    self.assembler.add_last_original_block_slots(2);
+                }
             }
         } else {
             // A direct loop-tail try has no following statement in this iteration, even

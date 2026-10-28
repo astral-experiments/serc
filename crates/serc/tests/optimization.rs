@@ -15755,6 +15755,34 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn terminal_try_pass_counts_toward_the_shared_return_size() {
+    let source = r"def update(first, second, box):
+    try:
+        if first:
+            box.value = 1
+        elif second:
+            pass
+        elif box.ready and box.active:
+            work()
+        pass
+    except:
+        pass
+
+def without_pass(first, second, box):
+    try:
+        if first:
+            box.value = 1
+        elif second:
+            pass
+        elif box.ready and box.active:
+            work()
+    except:
+        pass
+";
+    assert_matches_cpython(source, "shared_try_return.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
