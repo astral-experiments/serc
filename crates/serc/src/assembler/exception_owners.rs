@@ -13446,8 +13446,8 @@ impl LayoutAssembler {
             if location.is_some() || at < array || at > marker {
                 continue;
             }
-            if !provenance.synchronous_with_setups.contains(label)
-                && !(at == setup + 1 && provenance.ordinary_try_setups.contains_key(label))
+            if !(provenance.synchronous_with_setups.contains(label)
+                || at == setup + 1 && provenance.ordinary_try_setups.contains_key(label))
             {
                 return None;
             }
