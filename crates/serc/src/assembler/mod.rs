@@ -15942,7 +15942,9 @@ impl Assembler {
                 return None;
             }
         }
-        ((donor.opcode == STORE_FAST || (!has_iterator && donor.opcode == POP_TOP))
+        // The store or discarded expression ends the copied finalizer. Iterator
+        // cleanup only pops the stack entries checked above and has no position.
+        (matches!(donor.opcode, STORE_FAST | POP_TOP)
             && donor.value_argument().is_some()
             && donor.location.line >= 0
             && jump.opcode == JUMP_FORWARD
