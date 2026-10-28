@@ -446,6 +446,8 @@ pub(super) struct ExceptionState {
     pub(super) active_try_body_tail: Option<TextRange>,
     active_try_marker_slots: Vec<Option<TryMarkerSlotContext>>,
     active_exception_handlers: Vec<ExceptionHandlerContext>,
+    // A terminal named handler can emit its own cleanup without pushing a handler context.
+    in_terminal_named_handler: bool,
     // Exception-group handlers retain their body marker owner after coroutine suspension.
     pub(super) active_exception_group_handlers: usize,
     // Existing runtime loop-tail splits also exclude their fresh condition and backedge
@@ -34518,7 +34520,11 @@ impl<'source> Compiler<'source> {
                 self.source_location(body[0].range())
             } else {
                 let instruction_count = self.assembler.instruction_count();
-                self.compile_suite(body)?;
+                self.with_control_override(
+                    |control| &mut control.exceptions.in_terminal_named_handler,
+                    true,
+                    |compiler| compiler.compile_suite(body),
+                )?;
                 if let Some(range) = suite_unary_not_fallthrough_range(body) {
                     self.source_location(range)
                 } else if self.assembler.instruction_count() > instruction_count {
@@ -43532,6 +43538,7 @@ impl<'source> Compiler<'source> {
                     .active_exception_region_exclusions
                     .is_empty()
                 || !self.control.exceptions.active_exception_handlers.is_empty()
+                || self.control.exceptions.in_terminal_named_handler
                 || self.control.exceptions.active_exception_group_handlers > 0
                 || self.control.finally.active_finally_try_bodies > 0
                 || self.control.finally.active_finally_end_blocks > 0
