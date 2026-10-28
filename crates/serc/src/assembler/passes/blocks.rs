@@ -7795,6 +7795,23 @@ impl OptimizationPipeline {
                 // their own predecessor, as CPython resolves each copied exit separately.
                 instruction.no_location_policy.clear_preserved_location();
             }
+            if self.python_version >= crate::PythonVersion::Py314
+                && inline_no_location_block
+                && predecessors[source.index()] > 1
+                && graph[source].last_instruction().is_some_and(|jump| {
+                    jump.opcode == JUMP_FORWARD
+                        && jump.location.line < 0
+                        && jump.no_location_policy.preserves_location()
+                })
+                && let Some(jump) = copied.iter_mut().find_map(Item::as_instruction_mut)
+                && jump.opcode == JUMP_FORWARD
+                && jump.only_allows_unconditional_inlining()
+                && jump.location.line < 0
+            {
+                // A copied jump replaces the original shared jump. Both incoming paths
+                // still reach it, so the physical fallthrough cannot donate its line.
+                jump.no_location_policy.preserve_location();
+            }
             let inherit_copied_locations = copied
                 .iter()
                 .find_map(Item::as_instruction)

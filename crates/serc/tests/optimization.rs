@@ -15,6 +15,38 @@ use serc::{
 };
 
 #[test]
+fn copied_try_exits_keep_their_predecessors_positions() {
+    let source = r"def choose(items, update, stop, value):
+    for item in items:
+        try:
+            if item > 0:
+                if update:
+                    value = read(item)
+            elif item < 0:
+                if stop:
+                    break
+            else:
+                continue
+        except LookupError:
+            raise
+        observe(value)
+    return value
+";
+    assert_matches_cpython_versions(
+        source,
+        "copied_try_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
+fn protected_while_copies_its_backedge_before_a_final_else_break() {
+    let source = "def scan(flag):\n    while True:\n        try:\n            first = read()\n            if flag:\n                second = read()\n                if first == second:\n                    break\n            else:\n                break\n        except LookupError:\n            return None\n    return first\n";
+    assert_matches_cpython(source, "protected_while_break.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

@@ -29632,6 +29632,16 @@ impl<'source> Compiler<'source> {
                             if terminating_if_fallthrough_test(branch).is_some()
                                 && condition_jump_target_count(&branch.test, false) > 1
                     );
+            let copied_try_loop_join = self.context.python_version >= crate::PythonVersion::Py314
+                && self.control.in_loop()
+                && handlers_terminate
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && matches!(statement.body.last(), Some(Stmt::If(branch))
+                    if branch.elif_else_clauses.last().is_some_and(|arm| arm.test.is_none()
+                        && suite_terminates_before_constant_folding(&arm.body)))
+                && self.assembler.at_original_unconditional_join();
             let omitted_fallthrough_pass_exit = statement.orelse.is_empty()
                 && !suite_terminates(&statement.body)
                 && matches!(normal_exit_suite.last(), Some(Stmt::Pass(pass))
@@ -30496,6 +30506,13 @@ impl<'source> Compiler<'source> {
                     .last_mut()
                     .expect("trailing handler try exit requires an outer handler")
                     .push((start, exclusion_end));
+            }
+            if copied_try_loop_join {
+                // The final else leaves the loop. Copy the unlocated try exit onto
+                // the earlier unconditional edges before their guards supply a line.
+                self.assembler
+                    .prepare_no_location_block_for_inlining(normal_exit);
+                self.assembler.allow_last_unconditional_block_inlining();
             }
             if copy_break_only_loop_exit {
                 // Copy the following try exit directly onto the only reachable loop break.
