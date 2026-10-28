@@ -25937,7 +25937,7 @@ fn specialized_comparison_keeps_its_try_else_guard_handler() {
 
 #[test]
 fn terminal_guard_edges_locate_returns_after_elided_assertions() {
-    let source = r#"def shared(first, second, a, b, c):
+    let source = r"def shared(first, second, a, b, c):
     if first:
         work()
     elif second:
@@ -25955,7 +25955,7 @@ async def unique(ready, value):
             assert saved()
             return
         assert saved()
-"#;
+";
     assert_matches_cpython(source, "elided_guard_returns.py", &LEVELS);
 }
 
