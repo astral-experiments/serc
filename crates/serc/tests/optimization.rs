@@ -4398,6 +4398,32 @@ fn continue_from_nested_handlers_keeps_the_finalizer_setup_unowned() {
 }
 
 #[test]
+fn continuing_through_finalizer_work_leaves_the_next_setup_unowned() {
+    let source = r"def run(items, flag):
+    for item in items:
+        try:
+            if check():
+                continue
+            handle()
+        except ValueError:
+            pass
+        finally:
+            value = get()
+            try:
+                if flag is not None:
+                    sink()
+            finally:
+                close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "continue_setup.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn straight_line_finalizer_work_keeps_the_following_setup_outside_its_own_handler() {
     let source = r"def close(items, value):
     try:

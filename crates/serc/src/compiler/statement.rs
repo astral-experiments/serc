@@ -7511,6 +7511,29 @@ impl<'source> Compiler<'source> {
                 let context = self.control.loops.contexts.last().copied().ok_or_else(|| {
                     CompileError::invalid_syntax("'continue' not properly in loop", statement.range)
                 })?;
+                // The continue unwinds one ordinary try and its finally before the
+                // assignment. Both omitted POPs precede the nested try's SETUP.
+                let continued_assignment_setup = (self.context.python_version == crate::PythonVersion::Py314
+                    && context.iterator_cleanup == IteratorCleanup::Sync
+                    && self.control.withs.active_with_exits.is_empty()
+                    && self.control.exceptions.active_exception_handlers.is_empty()
+                    && self.control.exceptions.active_exception_group_handlers == 0
+                    && self.control.finally.active_finally_end_blocks == 0
+                    && self.control.finally.active_normal_finally_bodies == 0
+                    && self.control.finally.active_copied_finally_bodies == 0
+                    && self.control.exceptions.active_exception_region_exclusions.len() == context.exception_region_depth + 2
+                    && self.control.finally.active_loop_finally_contexts.last().is_some_and(|finally|
+                        finally.loop_depth == self.control.loops.contexts.len()
+                        && finally.handler_depth == 0 && finally.with_depth == 0
+                        && self.control.exceptions.active_try_marker_slots.len() == finally.try_body_depth + 1
+                        && finally.exception_region_depth == context.exception_region_depth
+                        && matches!(finally.body,[Stmt::Assign(assign),Stmt::Try(inner),..]
+                            if matches!(assign.targets.as_slice(),[Expr::Name(_)])
+                                && !expression_contains_inline_branch(&assign.value)
+                                && !expression_suspends_current_scope(&assign.value)
+                                && !inner.is_star && inner.handlers.is_empty() && !inner.finalbody.is_empty()
+                                && matches!(inner.body.first(),Some(Stmt::If(_))))))
+                    .then(|| self.assembler.item_count());
                 let nested_handler_setup = match (
                     self.control.exceptions.active_exception_handlers.as_slice(),
                     self.control.finally.active_loop_finally_contexts.as_slice(),
@@ -8038,6 +8061,9 @@ impl<'source> Compiler<'source> {
                     self.control.withs.active_with_exits.len(),
                     false,
                 );
+                if let Some(item) = continued_assignment_setup {
+                    self.assembler.record_assignment_continue_setup(item);
+                }
                 if let Some((item, names)) = nested_handler_setup {
                     self.assembler.record_copied_continue_setup(item, names);
                 }

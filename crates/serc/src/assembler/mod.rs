@@ -13099,28 +13099,52 @@ impl Assembler {
         {
             let start = pop + index + 1;
             if let Some(entry) = work_entry {
-                // Intervening work separates the original SETUP from the unwind
-                // POPs. Only the SETUP itself can be certified as unowned here.
-                let mut cursor = start;
-                let mut has_work = false;
-                while let Some(item) = items.get(cursor) {
-                    if let Item::Instruction(record) = item {
-                        if record.opcode == NOP {
-                            break;
-                        }
-                        if record.jump_target().is_some() || ends_scope(record.opcode) {
-                            return;
-                        }
-                        has_work = true;
-                    }
-                    cursor += 1;
-                }
-                if has_work && items[start..cursor].contains(&Item::Label(entry)) {
-                    self.record_copied_setup_guard(cursor, missing_pops, 0, false, Some(entry));
-                }
+                self.record_finalizer_setup_after_work(start, entry, missing_pops);
             } else {
                 self.record_copied_setup_guard(start, missing_pops, ordinary + 1, true, None);
             }
+        }
+    }
+
+    /// Records the two POPs before a continue enters its finalizer assignment.
+    pub(crate) fn record_assignment_continue_setup(&mut self, start: usize) {
+        let [Item::Instruction(authored), Item::Label(work), ..] = &self.linear_items()[start..]
+        else {
+            return;
+        };
+        if authored.opcode == NOP
+            && !authored.fusion_policy.is_converted_pop_block()
+            && authored.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+        {
+            self.record_finalizer_setup_after_work(start + 1, *work, 2);
+        }
+    }
+
+    fn record_finalizer_setup_after_work(
+        &mut self,
+        start: usize,
+        entry: Label,
+        missing_pops: usize,
+    ) {
+        let items = self.linear_items();
+        // Intervening work separates the original SETUP from the unwind
+        // POPs. Only the SETUP itself can be certified as unowned here.
+        let mut cursor = start;
+        let mut has_work = false;
+        while let Some(item) = items.get(cursor) {
+            if let Item::Instruction(record) = item {
+                if record.opcode == NOP {
+                    break;
+                }
+                if record.jump_target().is_some() || ends_scope(record.opcode) {
+                    return;
+                }
+                has_work = true;
+            }
+            cursor += 1;
+        }
+        if has_work && items[start..cursor].contains(&Item::Label(entry)) {
+            self.record_copied_setup_guard(cursor, missing_pops, 0, false, Some(entry));
         }
     }
 
