@@ -33787,7 +33787,24 @@ impl<'source> Compiler<'source> {
                         }
                     }
                 } else if handler_ends_with_loop_tail_join && let Some((restart, _)) = loop_tail {
-                    let backedge = self.emit_jump_backward_instruction(JUMP_BACKWARD, restart)?;
+                    // The copied POP_EXCEPT remains protected, but the backedge following
+                    // it reaches the loop after leaving the surrounding ordinary try.
+                    let leaves_try = self.context.python_version >= crate::PythonVersion::Py314
+                        && self.control.loops.contexts.last().is_some_and(|context| {
+                            context.continue_label == restart
+                                && context.exception_region_depth
+                                    < self
+                                        .control
+                                        .exceptions
+                                        .active_exception_region_exclusions
+                                        .len()
+                                && context.with_depth == self.control.withs.active_with_exits.len()
+                        });
+                    let backedge = if leaves_try {
+                        self.emit_loop_tail_backedge(restart, true)?
+                    } else {
+                        self.emit_jump_backward_instruction(JUMP_BACKWARD, restart)?
+                    };
                     self.assembler
                         .prepare_no_location_block_for_inlining(backedge);
                 } else {
