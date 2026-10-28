@@ -15,6 +15,28 @@ use serc::{
 };
 
 #[test]
+fn a_threaded_pass_join_keeps_its_line_before_a_named_raise() {
+    for exit in ["raise Failure", "return left"] {
+        let source = format!(
+            "def finish(ready, flag, left):
+    if ready:
+        if flag:
+            if left:
+                pass
+            else:
+                pass
+        else:
+            pass
+    else:
+        work()
+    {exit}
+"
+        );
+        assert_matches_cpython(&source, "threaded_named_raise.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
