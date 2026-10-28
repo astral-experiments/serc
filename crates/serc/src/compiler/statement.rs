@@ -16798,7 +16798,7 @@ impl<'source> Compiler<'source> {
                             statement,
                             self.control.statements.context.has_following || finalizer_exit,
                         )
-                        .or_else(|| self.elided_else_exit_location(statement)),
+                        .or_else(|| self.nested_else_exit_location(statement)),
                         // The loop's else can leave its own shared partial-if join.
                         // Break edges bypass that original join during exit copying.
                         Stmt::For(loop_statement) if !loop_statement.is_async => {
@@ -18687,13 +18687,10 @@ impl<'source> Compiler<'source> {
         .then_some(tail.test.as_ref())
     }
 
-    fn elided_else_exit_location<'a>(
+    fn nested_else_exit_location<'a>(
         &self,
         statement: &'a ruff_python_ast::StmtIf,
     ) -> Option<NestedIfExitLocation<'a>> {
-        // An optimizer-elided else still owns the original false-edge
-        // join. Declarations also emit no instructions, so they do not
-        // add a fallthrough donor alongside an elided statement.
         if self.context.python_version < crate::PythonVersion::Py314
             || !condition_has_only_runtime_tests(&statement.test)
             || expression_suspends_current_scope(&statement.test)
@@ -18701,12 +18698,13 @@ impl<'source> Compiler<'source> {
             return None;
         }
         let (final_clause, earlier) = statement.elif_else_clauses.split_last()?;
-        // Successful arms jump past the erased else. Its remaining conditional
-        // predecessor also donates the outer jump's line across nested else suites.
+        // Successful arms can jump past a nested guard's exit. If its false
+        // edge is the sole remaining predecessor, it also locates the outer jump.
         if final_clause.test.is_none()
             && let Some(Stmt::If(nested)) = final_clause.body.last()
             && let Some(location @ NestedIfExitLocation::Located(test)) =
-                self.elided_else_exit_location(nested)
+                nested_if_exit_location(nested, false)
+                    .or_else(|| self.nested_else_exit_location(nested))
             && self.assembler.try_exit_condition_donor()
                 == Some(self.source_location(condition_fallthrough_range(test)))
         {
@@ -18733,6 +18731,7 @@ impl<'source> Compiler<'source> {
         {
             return Some(NestedIfExitLocation::Unlocated);
         }
+        // Declarations emit no instructions alongside an optimizer-elided else.
         if final_clause.test.is_some()
             || final_clause.body.is_empty()
             || !final_clause
@@ -40001,7 +40000,7 @@ impl<'source> Compiler<'source> {
                     .last()
                     .and_then(|statement| match statement {
                         Stmt::If(statement) => nested_if_exit_location(statement, true)
-                            .or_else(|| self.elided_else_exit_location(statement)),
+                            .or_else(|| self.nested_else_exit_location(statement)),
                         _ => None,
                     });
             // An awaited guard can be the sole donor after nested cleanup jumps
