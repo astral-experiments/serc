@@ -4404,6 +4404,14 @@ impl OptimizationPipeline {
                             == crate::assembler::ir::RetainedJumpNop::DirectTarget
                         && target > block + 1
                         && borrow_unreachable_blocks[target]
+                        && {
+                            let mut target_ops = items[blocks[target].clone()]
+                                .iter()
+                                .filter_map(Item::as_instruction);
+                            matches!((target_ops.next(), target_ops.next()), (Some(receiver),Some(attr))
+                                if receiver.opcode == LOAD_FAST && attr.opcode == LOAD_ATTR
+                                    && receiver.location.line == attr.location.line)
+                        }
                         && !last.jump_policy.borrow_empty_block()
                         && block.checked_sub(1).is_some_and(|preceding| {
                             items[blocks[preceding].clone()]
