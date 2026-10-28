@@ -245,3 +245,43 @@ fn constant_loop_bridges_preserve_small_return_line_events() {
         }
     }
 }
+
+#[test]
+fn copies_a_protected_local_return_before_removing_a_while_break() {
+    let source = r"def consume(items, active):
+    try:
+        value = active
+        while active:
+            items = [item for item in items]
+            break
+        return value
+    except OSError:
+        pass
+";
+    common::assert_matches_cpython_marshal(source, "protected_while_return.py");
+}
+
+#[test]
+fn borrows_the_copied_return_at_a_constant_loop_break() {
+    for (outer, protected) in [
+        ("", true),
+        ("    yield flag\n", true),
+        ("    for item in values:\n", false),
+    ] {
+        for returned in ["value.name", "value.name.other", "(value, flag)"] {
+            let body = format!(
+                "while True:\n    if flag:\n        work()\n    elif value:\n        break\nreturn {returned}\n",
+            );
+            let body = if protected {
+                format!(
+                    "    try:\n{}    except Error:\n        raise\n",
+                    common::indent(&common::indent(&body))
+                )
+            } else {
+                common::indent(&common::indent(&body))
+            };
+            let source = format!("def choose(value, flag, values):\n{outer}{body}");
+            common::assert_matches_cpython_marshal(&source, "copied_loop_return.py");
+        }
+    }
+}

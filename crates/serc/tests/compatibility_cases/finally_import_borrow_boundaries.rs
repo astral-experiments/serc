@@ -29,3 +29,13 @@ fn matches_cpython_terminal_finally_while_exit_locations() {
         common::assert_matches_cpython_marshal(&source, &filename);
     }
 }
+
+#[test]
+fn terminating_if_arms_preserve_the_else_borrow_boundary_before_import() {
+    for exit in ["return", "raise Error()"] {
+        let source = format!(
+            "def choose(flag, table, key):\n    if flag:\n        {exit}\n    else:\n        key = table[normalize(key)]\n    from other import result\n    return result\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "sole_else_import.py");
+    }
+}

@@ -1,6 +1,14 @@
 use crate::common;
 
 #[test]
+fn matches_copied_break_after_guarded_await_recovery() {
+    common::assert_matches_cpython_marshal(
+        "async def events(ready):\n    try:\n        while ready():\n            try:\n                yield await read()\n            except End:\n                break\n            finally:\n                if ready():\n                    try:\n                        await finish()\n                    except Cancelled:\n                        pass\n    finally:\n        await close()\n",
+        "copied_break_after_await.py",
+    );
+}
+
+#[test]
 fn matches_cpython_single_finally_pop_before_copied_break_condition() {
     for (definition, prefix, loop_header, tail) in [
         ("async def", "", "while flag", ""),
@@ -25,4 +33,22 @@ fn matches_cpython_single_finally_pop_before_copied_break_condition() {
             }
         }
     }
+}
+
+#[test]
+fn matches_handler_unwind_slots_after_a_generator_yields() {
+    for value in ["emit(item)", "emit(emit(item))", "emit(emit(emit(item)))"] {
+        let source = format!(
+            "def entries(rows, ready):\n    for item in rows:\n        try:\n            use(item)\n        except Error:\n            yield {value}\n            break\n        finally:\n            if ready:\n                yield item\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "resumed_handler_break.py");
+    }
+}
+
+#[test]
+fn matches_named_generator_handler_break_and_continue_slots() {
+    common::assert_matches_cpython_marshal(
+        "def entries(rows, manager, ready, done):\n    for item in rows:\n        with manager:\n            try:\n                use(item)\n            except Error as error:\n                yield item\n                if ready:\n                    continue\n                break\n            finally:\n                if done:\n                    use(item)\n",
+        "named_generator_loop_exits.py",
+    );
 }

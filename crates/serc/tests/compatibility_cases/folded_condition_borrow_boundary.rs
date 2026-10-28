@@ -1,6 +1,35 @@
 use crate::common;
 
 #[test]
+fn matches_cpython_loads_after_a_discarded_if_suite() {
+    for condition in ["not __debug__", "not True", "__debug__", "check()"] {
+        let source = format!(
+            r"def run(value, flag):
+    if flag:
+        if {condition}:
+            other = 1
+            consume(other)
+        else:
+            value.method()
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "discarded_if_suite.py");
+    }
+    common::assert_matches_cpython_marshal(
+        r"def run(func, flag):
+    if func is None:
+        return default()
+    if not __debug__ and not flag:
+        return func
+    if ready(func):
+        consume(func)
+    return func
+",
+        "discarded_short_circuit_suite.py",
+    );
+}
+
+#[test]
 fn matches_cpython_short_circuit_constant_borrow_entries() {
     for (filename, condition) in [
         ("false_and_dead_operand.py", "0 and check(x)"),
@@ -54,5 +83,15 @@ fn matches_cpython_folded_elif_with_pending_chain_join() {
 "
         );
         common::assert_matches_cpython_marshal(&source, filename);
+    }
+}
+
+#[test]
+fn folded_value_prefix_keeps_its_empty_block_before_a_line_nop() {
+    for prefix in ["None\n        or", "True\n        and"] {
+        let source = format!(
+            "def f(value, flag):\n    return (\n        first(value)\n        if flag\n        else {prefix} value.open()\n    )\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "folded_value_borrow.py");
     }
 }

@@ -1,6 +1,33 @@
 use crate::common;
 
 #[test]
+fn copied_finalizer_preserves_the_shared_handler_cleanup_position() {
+    let source = r"def process(active, stop):
+    try:
+        while active:
+            try:
+                pass
+            except Failure as failure:
+                if recover(failure):
+                    try:
+                        pass
+                    except RetryError as retry:
+                        return
+                    finally:
+                        try:
+                            result = release()
+                        except ReleaseError:
+                            pass
+    except Cancelled:
+        pass
+    finally:
+        if stop:
+            pass
+";
+    common::assert_matches_cpython_pop_except_positions(source, "copied_handler_cleanup.py");
+}
+
+#[test]
 fn matches_cpython_cleanup_positions_for_folded_and_handlers() {
     let source = r"def true_and_value_control(value):
     try:
@@ -138,4 +165,25 @@ def finalizer_barrier(manager, value):
     consume(result)
 ";
     common::assert_matches_cpython_marshal(source, "handler_store_source_barriers.py");
+}
+
+#[test]
+fn copied_nested_unwinds_keep_the_assignment_location() {
+    use std::fmt::Write as _;
+
+    for depth in [6, 7] {
+        let mut source = String::from("def rewrite(value, flag, chosen):\n    if chosen:\n");
+        let mut indent = "        ".to_owned();
+        for _ in 1..depth {
+            writeln!(
+                source,
+                "{indent}try:\n{indent}    pass\n{indent}except Failure:"
+            )
+            .unwrap();
+            indent.push_str("    ");
+        }
+        writeln!(source, "{indent}try:\n{indent}    if flag:\n{indent}        pass\n{indent}    else:\n{indent}        value = convert(value)\n{indent}except Failure:\n{indent}    pass").unwrap();
+        source.push_str("    if value and chosen:\n        finish(value)\n");
+        common::assert_matches_cpython_pop_except_positions(&source, "nested_unwind.py");
+    }
 }

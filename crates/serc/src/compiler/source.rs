@@ -221,6 +221,7 @@ pub(super) struct CompilationContext<'source> {
     constant_origins: Option<RefCell<ConstantOrigins>>,
     // Discarded code can intern an equal literal tuple without interning standalone literals.
     interned_metadata_tuples: Option<RefCell<Vec<Vec<String>>>>,
+    annotation_local_tails: RefCell<FxHashSet<Vec<crate::code_object::MetadataName>>>,
     static_attribute_names: FxHashSet<String>,
     active_class_static_attributes: RefCell<Vec<BTreeSet<String>>>,
     cached_static_attribute_tuples: RefCell<FxHashSet<Vec<String>>>,
@@ -229,6 +230,7 @@ pub(super) struct CompilationContext<'source> {
     // Restricted generic-class identifiers also require real child lowering for key origins.
     pub(super) requires_interning_trace: bool,
     pub(super) requires_empty_bytes_cache_trace: bool,
+    pub(super) has_percent_format_expression: bool,
     empty_bytes_origin: Cell<EmptyBytesOrigin>,
     interning_events: RefCell<Vec<CompilationInterningEvent>>,
 }
@@ -436,6 +438,7 @@ impl<'source> CompilationContext<'source> {
             .collect::<Vec<_>>();
         dotted_import_names.sort_unstable();
         dotted_import_names.dedup();
+        let has_percent_format_expression = source_analysis.has_percent_format_expression;
         let (constant_string_origins, requires_empty_bytes_cache_trace) = source_analysis.finish(
             &mut generated_mangled_strings,
             &mut requires_interning_trace,
@@ -477,12 +480,14 @@ impl<'source> CompilationContext<'source> {
             dotted_constant_origins: RefCell::default(),
             constant_origins,
             interned_metadata_tuples,
+            annotation_local_tails: RefCell::default(),
             static_attribute_names,
             active_class_static_attributes: RefCell::default(),
             cached_static_attribute_tuples: RefCell::new(FxHashSet::default()),
             generated_mangled_strings,
             requires_interning_trace,
             requires_empty_bytes_cache_trace,
+            has_percent_format_expression,
             empty_bytes_origin: Cell::default(),
             interning_events: RefCell::new(Vec::new()),
         };
@@ -763,6 +768,20 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn record_code_assembly(&self, code: &CodeObject) -> Option<usize> {
+        if code.marshal_provenance.locals_identity == crate::code_object::LocalsIdentity::Fresh
+            || code
+                .locals
+                .first()
+                .is_some_and(|name| name.as_str() == ".format")
+        {
+            // CPython interns annotation locals before replacing the parameter's
+            // public spelling. Type-alias scopes retain the original name.
+            let tail = &code.locals[1..];
+            let mut tails = self.annotation_local_tails.borrow_mut();
+            if !tails.contains(tail) {
+                tails.insert(tail.to_vec());
+            }
+        }
         if let Some(tuples) = &self.interned_metadata_tuples {
             let mut tuples = tuples.borrow_mut();
             if code.names.iter().any(|name| !name.is_ascii()) {
@@ -817,9 +836,16 @@ impl<'source> CompilationContext<'source> {
     }
 
     pub(super) fn take_interned_metadata_tuples(&self) -> Vec<Vec<String>> {
-        self.interned_metadata_tuples
+        let mut tuples = self
+            .interned_metadata_tuples
             .as_ref()
-            .map_or_else(Vec::new, RefCell::take)
+            .map_or_else(Vec::new, RefCell::take);
+        tuples.extend(self.annotation_local_tails.take().into_iter().map(|tail| {
+            std::iter::once(".format".to_string())
+                .chain(tail.iter().map(ToString::to_string))
+                .collect()
+        }));
+        tuples
     }
 
     pub(super) fn has_tracked_string_origins(&self) -> bool {
@@ -985,6 +1011,7 @@ pub(super) struct SourceAnalysis<'ast> {
     restricted_private_identifier: bool,
     static_attribute_names: FxHashSet<String>,
     has_percent_replacement: bool,
+    has_percent_format_expression: bool,
     requires_empty_bytes_cache_trace: bool,
 }
 
@@ -1215,6 +1242,8 @@ impl<'ast> SourceAnalysis<'ast> {
             }
             Expr::BinOp(binary) if binary.op == Operator::Mod => {
                 if let Expr::StringLiteral(format) = binary.left.as_ref() {
+                    self.has_percent_format_expression |=
+                        matches!(binary.right.as_ref(), Expr::Tuple(_));
                     self.has_percent_replacement |= format.value.to_str().contains("%%");
                 }
             }
@@ -1944,45 +1973,54 @@ impl Compiler<'_> {
         &self,
         attribute: &ruff_python_ast::ExprAttribute,
     ) -> SourceLocation {
-        let location = self.source_location(attribute.range);
+        self.location_with_attribute_start(self.source_location(attribute.range), attribute)
+    }
+
+    /// CPython moves the start of a multiline attribute operation to the method name.
+    /// A parenthesized call can start before a callee that fits on a single line.
+    fn location_with_attribute_start(
+        &self,
+        location: SourceLocation,
+        attribute: &ruff_python_ast::ExprAttribute,
+    ) -> SourceLocation {
         if location.line == location.end_line {
-            location
+            return location;
+        }
+        let name = self.source_location(attribute.attr.range());
+        if location.line == name.end_line {
+            return location;
+        }
+        // CPython subtracts the normalized identifier's character count from a byte column.
+        let length = i32::try_from(attribute.attr.as_str().chars().count()).unwrap_or(i32::MAX);
+        let (column, end_column) = if length <= name.end_column {
+            (name.end_column - length, location.end_column)
         } else {
-            self.source_location(attribute.attr.range())
+            (-1, -1)
+        };
+        SourceLocation {
+            line: name.end_line,
+            column,
+            end_column,
+            ..location
         }
     }
 
     pub(super) fn call_opcode_location(&self, call: &ruff_python_ast::ExprCall) -> SourceLocation {
-        let Expr::Attribute(attribute) = call.func.as_ref() else {
-            return self.source_location(call.range());
-        };
-        let attribute_location = self.source_location(attribute.range);
-        if attribute_location.line == attribute_location.end_line {
-            return self.source_location(call.range());
+        let location = self.source_location(call.range());
+        if location.line == location.end_line || !call.func.is_attribute_expr() {
+            return location;
         }
-        self.call_opcode_location_with_method(
-            call,
-            self.call_shape(call).direct_method,
-            self.source_location(call.range()),
-        )
+        self.call_opcode_location_with_method(self.call_shape(call).direct_method, location)
     }
 
     pub(super) fn call_opcode_location_with_method(
         &self,
-        call: &ruff_python_ast::ExprCall,
         direct_method: Option<&ruff_python_ast::ExprAttribute>,
         fallback: SourceLocation,
     ) -> SourceLocation {
-        if let Some(attribute) = direct_method {
-            let attribute_location = self.source_location(attribute.range);
-            if attribute_location.line != attribute_location.end_line {
-                return self.source_location(ruff_text_size::TextRange::new(
-                    attribute.attr.range().start(),
-                    call.range().end(),
-                ));
-            }
-        }
-        fallback
+        direct_method.map_or(fallback, |attribute| {
+            self.location_with_attribute_start(fallback, attribute)
+        })
     }
 
     pub(super) fn call_shape<'a>(&self, call: &'a ruff_python_ast::ExprCall) -> CallShape<'a> {

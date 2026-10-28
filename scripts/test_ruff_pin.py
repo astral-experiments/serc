@@ -65,6 +65,58 @@ class RuffPinTests(unittest.TestCase):
     def test_coherent_inputs(self):
         self.check()
 
+    def test_pinned_parser_backport(self):
+        source = self.ruff / "crates/ruff_python_parser"
+        source.mkdir(parents=True)
+        manifest = source / "Cargo.toml"
+        manifest.write_text('name = "ruff_python_parser"\n')
+        self.git(self.ruff, "add", ".")
+        self.git(self.ruff, "commit", "--quiet", "-m", "parser backport")
+        backport = self.git(self.ruff, "rev-parse", "HEAD")
+        self.git(
+            self.root, "update-index", "--cacheinfo", f"160000,{backport},vendor/ruff"
+        )
+        checkout = self.root / "cargo-checkout"
+        self.git(self.root, "clone", "--quiet", str(self.ruff), str(checkout))
+        parser = self.packages[1]
+        parser["manifest_path"] = str(checkout / manifest.relative_to(self.ruff))
+        pin = f"git+https://github.com/astral-sh/ruff?rev={backport}#{backport}"
+        with patch.dict(
+            CHECK["check_dependencies"].__globals__,
+            PARSER_BACKPORT=backport,
+            PARSER_RELEASE=self.revision,
+        ):
+            for wrong_source in (
+                CHECK["CRATES_IO"],
+                pin.replace("astral-sh", "other"),
+                pin.replace(f"rev={backport}", "branch=main"),
+            ):
+                parser["source"] = wrong_source
+                with (
+                    self.subTest(source=wrong_source),
+                    self.assertRaisesRegex(ValueError, "pinned Ruff Git revision"),
+                ):
+                    self.check()
+            parser["source"] = pin
+            self.check()
+            published = Path(self.packages[0]["manifest_path"]).with_name(
+                ".cargo_vcs_info.json"
+            )
+            released = published.read_text()
+            published.write_text(json.dumps({"git": {"sha1": backport}}))
+            with self.assertRaisesRegex(ValueError, "published source revision"):
+                self.check()
+            published.write_text(released)
+            self.git(checkout, "checkout", "--quiet", "--detach", self.revision)
+            with self.assertRaisesRegex(ValueError, "checkout does not match"):
+                # Keep the manifest path present in the release checkout.
+                Path(parser["manifest_path"]).parent.mkdir(parents=True, exist_ok=True)
+                self.check()
+            self.git(checkout, "checkout", "--quiet", "--detach", backport)
+            Path(parser["manifest_path"]).write_text("changed\n")
+            with self.assertRaisesRegex(ValueError, "checkout does not match"):
+                self.check()
+
     def test_stale_version(self):
         self.packages[0]["version"] = "0.0.14"
         with self.assertRaisesRegex(ValueError, "must resolve to one release"):

@@ -2084,12 +2084,12 @@ impl Compiler<'_> {
             freevars,
             ..LoweringFunctionPlan::default()
         };
-        let parameter_flags =
-            (if self.child_function_is_nested() || !self.symbols.free_names.is_empty() {
-                CO_NESTED
-            } else {
-                0
-            }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
+        // A class can capture an enclosing class's cells without a function scope.
+        let parameter_flags = (if self.child_function_is_nested() {
+            CO_NESTED
+        } else {
+            0
+        }) | (self.unit.flags & SUPPORTED_FUTURE_FLAGS);
         let mut child = Self::function(
             Rc::clone(&self.context),
             "__annotate__",

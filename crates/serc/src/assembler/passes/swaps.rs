@@ -676,6 +676,12 @@ impl OptimizationPipeline {
         let retired_labels = &self
             .exception_owner_provenance
             .retired_normal_try_copy_labels;
+        let original_boundaries = &self.exception_owner_provenance.block_boundaries;
+        let unchanged_join = |items: &[Item], label: Label, expected: Instruction| {
+            matches!(items, [Item::Label(head), aliases @ .., Item::Instruction(jump)]
+                if *head == label && *jump == expected
+                    && aliases.iter().all(|item| matches!(item, Item::Label(_))))
+        };
         let graph = &mut self.graph;
         // Resolve original labels only within this pass. A saved item offset could
         // otherwise name a different store after earlier graph rewrites.
@@ -694,8 +700,11 @@ impl OptimizationPipeline {
                     if retired_labels.contains(&origin.predecessor)
                         || graph[pair[0]].first_label() != Some(origin.predecessor)
                         || graph[pair[0]].last_instruction() != Some(&origin.store)
-                        || !matches!(graph[pair[1]].items(), [Item::Label(head), Item::Instruction(jump)]
-                            if *head == label && *jump == origin.jump)
+                        || !unchanged_join(graph[pair[1]].items(), label, origin.jump)
+                        || graph[pair[1]].items().iter().skip(1).any(|item| {
+                            matches!(item, Item::Label(alias)
+                                if !original_boundaries.contains(alias) || retired_labels.contains(alias))
+                        })
                     {
                         return None;
                     }
@@ -763,6 +772,19 @@ impl OptimizationPipeline {
                     && last_store.is_none()
                     && !capture_cleanup_swaps.contains(&positions[index])
                 {
+                    // A multiline pattern can donate a different line to a slot
+                    // retained by a handler. Keep that protected rotation intact.
+                    let line = swap.location.line;
+                    let single_line = swap.single_line_capture_swap.is_some_and(|single_line| {
+                        single_line || self.exception_regions.is_empty()
+                    }) && line >= 0
+                        && [
+                            swap.location,
+                            first_instruction.location,
+                            last_instruction.location,
+                        ]
+                        .iter()
+                        .all(|loc| loc.line == line && loc.end_line == line);
                     // A complete conditional-fallthrough capture rotation proves both pop
                     // records are identical and its compacted-slot count is known at emission.
                     let rotation = index
@@ -771,7 +793,7 @@ impl OptimizationPipeline {
                         .map(|positions| {
                             std::array::from_fn::<_, 6, _>(|index| *graph.item(positions[index]))
                         });
-                    if !rotation.as_ref().is_some_and(|rotation| {
+                    if !single_line && !rotation.as_ref().is_some_and(|rotation| {
                         matches!(rotation[0], Item::Instruction(marker) if marker.opcode == NOT_TAKEN)
                             && single_capture_cleanup_vacancies(rotation).is_some()
                     }) {
@@ -802,8 +824,7 @@ impl OptimizationPipeline {
                     if let Some((label, origin)) = join_stores.get(&positions[last])
                         && origin.store == last_instruction
                         && graph.label_block(*label).is_some_and(|block| {
-                            matches!(graph[block].items(), [Item::Label(head), Item::Instruction(jump)]
-                                if *head == *label && *jump == origin.jump)
+                            unchanged_join(graph[block].items(), *label, origin.jump)
                         })
                     {
                         // The original assignment store really moves in this exchange.
@@ -813,17 +834,12 @@ impl OptimizationPipeline {
                             .normal_try_copy_join_donors
                             .insert(*label, (origin.jump, last_instruction.location));
                     }
-                }
-                if self.python_version >= crate::PythonVersion::Py313
-                    && first_instruction.local_policy.may_store_null()
-                    && last_instruction.opcode == STORE_FAST
-                    && !last_instruction.local_policy.may_store_null()
-                {
-                    // Native resolves unlocated successors before exchanging the target
-                    // store with a comprehension restore. Retain that original origin.
+                    // Native resolves unlocated successors before the stores change order.
+                    // They inherit the original final store, including after a copied finalizer.
                     for position in &positions[last + 1..] {
                         let Some(next) = graph.instruction_mut(*position) else {
-                            break;
+                            // Labels inside a swap partition have no independent predecessor.
+                            continue;
                         };
                         if next.location.line >= 0 || next.no_location_policy.preserves_location() {
                             break;

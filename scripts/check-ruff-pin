@@ -9,6 +9,9 @@ import sys
 from pathlib import Path
 
 CRATES_IO = "registry+https://github.com/rust-lang/crates.io-index"
+# This 0.0.15 backport changes only the parser manifest and parser source.
+PARSER_BACKPORT = "9d0f58b1d2fb1cf1062d3ff99b18ebf293563f6f"
+PARSER_RELEASE = "0be08a206f9c3180afd3e93bcc792ed5cb1f4db1"
 
 
 def git(root: Path, *args: str) -> str:
@@ -57,6 +60,27 @@ def check_dependencies(root: Path, revision: str) -> None:
         raise ValueError("Cargo metadata has no Ruff dependencies")
     if len({package["version"] for package in packages}) != 1:
         raise ValueError("Ruff dependencies must resolve to one release")
+    if revision == PARSER_BACKPORT:
+        parsers = [p for p in packages if p["name"] == "ruff_python_parser"]
+        if len(parsers) != 1:
+            raise ValueError("Ruff corpus requires its pinned parser backport")
+        parser = parsers[0]
+        expected = f"git+https://github.com/astral-sh/ruff?rev={revision}#{revision}"
+        if parser.get("source") != expected:
+            raise ValueError(
+                "ruff_python_parser must resolve to the pinned Ruff Git revision"
+            )
+        source = Path(parser["manifest_path"]).parent
+        if (
+            git(source, "rev-parse", "--show-prefix") != "crates/ruff_python_parser/"
+            or git(source, "rev-parse", "HEAD") != revision
+            or git(source, "status", "--porcelain", "--untracked-files=all", "--", ".")
+        ):
+            raise ValueError(
+                "ruff_python_parser checkout does not match the pinned source"
+            )
+        packages.remove(parser)
+        revision = PARSER_RELEASE
     for package in packages:
         name = package["name"]
         if package.get("source") != CRATES_IO:
@@ -84,7 +108,7 @@ def main() -> int:
         print(f"error: {error}", file=sys.stderr)
         return 1
     print(
-        f"Ruff crates.io dependencies, lockfile, gitlink, and clean submodule agree on {revision}"
+        f"Ruff dependencies and lockfile match the clean corpus submodule at {revision}"
     )
     return 0
 

@@ -30,3 +30,15 @@ fn normal_finally_attribute_none_preserves_distinct_entry_boundaries() {
         assert_matches_cpython_marshal(&source, "normal_finally_attribute_none_boundaries.py");
     }
 }
+
+#[test]
+fn normal_finally_subscript_markers_follow_the_surviving_pop() {
+    for handler in ["break", "raise", "pass", "if ready: break"] {
+        for test in ["state.items[key]", "state[key]"] {
+            let source = format!(
+                "async def f(manager, ready, state, key):\n    async with manager:\n        while ready:\n            try:\n                read()\n            except Error:\n                {handler}\n            finally:\n                if not {test}:\n                    work()\n"
+            );
+            assert_matches_cpython_marshal(&source, "normal_finally_subscript_marker.py");
+        }
+    }
+}

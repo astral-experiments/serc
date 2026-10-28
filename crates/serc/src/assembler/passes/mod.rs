@@ -2,7 +2,7 @@
 use rustc_hash::FxHashMap;
 use smallvec::SmallVec;
 
-use super::block_graph::BlockGraph;
+use super::block_graph::{BasicBlockId, BlockGraph};
 use super::exception_owners::OwnerLabelPositions;
 use super::fusion_owner_slots::FusionOwnerCertificates;
 use super::layout::{backward_argument, label_position};
@@ -24,6 +24,92 @@ mod locals;
 mod normal_try_copies;
 mod normal_try_copy_plan;
 mod swaps;
+
+/// Finds the private return that CPython gives a conditional edge before folding its test.
+fn folded_condition_return(
+    graph: &BlockGraph,
+    source: BasicBlockId,
+    target: BasicBlockId,
+    regions: &[super::ir::ExceptionRegion],
+) -> Option<(usize, [Instruction; 2])> {
+    use crate::target::opcodes::{LOAD_COMMON_CONSTANT, LOAD_CONST, RAISE_VARARGS, RETURN_VALUE};
+
+    let position = graph.order().iter().position(|block| *block == target)?;
+    let return_pair = |block: BasicBlockId| {
+        let [Item::Label(_), load, ret] = graph[block].items() else {
+            return None;
+        };
+        Some([*load.as_instruction()?, *ret.as_instruction()?])
+    };
+    let [load, ret] = return_pair(target)?;
+    if load != Instruction::new(LOAD_CONST, load.operand(), SourceLocation::NONE, Some(1))
+        || ret
+            != Instruction::new(
+                RETURN_VALUE,
+                Operand::Value(0),
+                SourceLocation::NONE,
+                Some(0),
+            )
+    {
+        return None;
+    }
+    let falling_return = regions.is_empty()
+        && graph.order()[..position]
+            .last_chunk()
+            .is_some_and(|[body, body_exit]| {
+                let (Some([body_load, body_ret]), Some(last)) =
+                    (return_pair(*body_exit), graph[*body].last_instruction())
+                else {
+                    return false;
+                };
+                // The falling body has already received its own return copy.
+                graph[*body].successors().0
+                    && last.location.line >= 0
+                    && body_load.opcode == LOAD_CONST
+                    && body_load.operand() == load.operand()
+                    && body_ret.opcode == RETURN_VALUE
+                    && body_load.location == last.location
+                    && body_ret.location == last.location
+            });
+    if !falling_return {
+        let start = graph.order().iter().position(|id| *id == source)?;
+        let failure = graph.order().get(start + 1..position)?;
+        let first = *failure.first()?;
+        let last = graph[*failure.last()?].last_instruction()?;
+        let mut entry = graph[first].items().iter().filter_map(Item::as_instruction);
+        let error = entry.next()?;
+        if error.opcode != LOAD_COMMON_CONSTANT
+            || error.value_argument()
+                != Some(crate::target::operands::CommonConstant::ASSERTIONERROR.argument())
+            || last.opcode != RAISE_VARARGS
+            || last.value_argument() != Some(1)
+            || error.pre_fusion_width() + entry.map(Instruction::pre_fusion_width).sum::<usize>()
+                <= 4
+        {
+            return None;
+        }
+        // A large assertion failure stays between the folded edge and the shared return.
+        // Ignore unrelated protection, such as an earlier comprehension's cleanup.
+        let label_position = |label| {
+            let block = graph.label_block(label)?;
+            graph.order().iter().position(|id| *id == block)
+        };
+        for region in regions {
+            if label_position(region.start)? <= position && label_position(region.end)? > start {
+                return None;
+            }
+        }
+    }
+    // Both original conditionals jump to the unlocated return. The literal
+    // takes its copy before the other conditional in CPython's insertion order.
+    let mut incoming = graph.iter().filter_map(|(id, block)| {
+        let edge = block.last_instruction()?;
+        (id != source && graph.label_block(edge.jump_target()?) == Some(target)).then_some(edge)
+    });
+    let other = incoming.next()?;
+    (crate::target::is_conditional_jump(other.opcode) && incoming.next().is_none())
+        .then_some((position, [load, ret]))
+}
 
 #[cfg(any(test, debug_assertions))]
 fn validate_structure(
@@ -296,7 +382,7 @@ impl Assembler {
                 }
             });
         }
-        for (entry, original) in self.folded_arm_exit_origins {
+        for (entry, original, kind) in self.folded_arm_exit_origins {
             let Some(target) = original.forward_target() else {
                 continue;
             };
@@ -317,7 +403,8 @@ impl Assembler {
                 continue;
             }
             // A folded successful arm can thread through an original unlocated
-            // branch exit. The remaining runtime test then owns that exit's line.
+            // branch exit. With a live fallthrough predecessor the shared exit stays
+            // unlocated. After a raise the remaining runtime test supplies its line.
             // A folded success jump in a protected assertion also loses its owner.
             let folded_join = (|| {
                 use crate::target::opcodes::{
@@ -356,13 +443,59 @@ impl Assembler {
                 let source_position = order.iter().position(|block| *block == source)?;
                 let target_position = order.iter().position(|block| *block == target)?;
                 let end_position = order.iter().position(|block| *block == end)?;
+                let previous = &graph[*order.get(target_position.checked_sub(1)?)?];
+                let predecessor = previous.last_instruction()?;
+                let live_fallthrough =
+                    !protected && previous.successors().0 && predecessor.location.line >= 0;
                 if !(source_position < target_position && target_position < end_position)
-                    || graph[*order.get(target_position.checked_sub(1)?)?]
-                        .last_instruction()?
-                        .opcode
-                        != RAISE_VARARGS
+                    || (!live_fallthrough && predecessor.opcode != RAISE_VARARGS)
                 {
                     return None;
+                }
+                if kind == super::ir::FoldedGuardExit::BooleanOperand {
+                    let [.., Item::Instruction(error), Item::Instruction(raise)] =
+                        graph[order[target_position - 1]].items()
+                    else {
+                        return None;
+                    };
+                    if protected
+                        || error.opcode != crate::target::opcodes::LOAD_COMMON_CONSTANT
+                        || error.value_argument()
+                            != Some(
+                                crate::target::operands::CommonConstant::ASSERTIONERROR.argument(),
+                            )
+                        || raise.value_argument() != Some(1)
+                        || graph[end]
+                            .items()
+                            .iter()
+                            .filter_map(Item::as_instruction)
+                            .map(Instruction::pre_fusion_width)
+                            .sum::<usize>()
+                            <= 4
+                    {
+                        return None;
+                    }
+                    let reachable = graph.reachable_blocks(&self.exception_regions);
+                    if !reachable[source.index()]
+                        || order[source_position + 1..target_position]
+                            .iter()
+                            .any(|block| reachable[block.index()])
+                        || graph.iter().any(|(id, block)| {
+                            id != source
+                                && reachable[id.index()]
+                                && block
+                                    .successors()
+                                    .1
+                                    .and_then(|label| graph.label_block(label))
+                                    == Some(target)
+                        })
+                    {
+                        return None;
+                    }
+                    // Only this folded success edge still reaches the assertion exit. Its
+                    // larger continuation could not have been copied onto the bridge.
+                    initial_reachable = None;
+                    return Some((bridge.operand(), false, false));
                 }
                 if protected {
                     let position = |label| {
@@ -418,7 +551,7 @@ impl Assembler {
                 } else {
                     return None;
                 };
-                let is_condition = if protected {
+                let is_condition = if protected || live_fallthrough {
                     matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
                 } else {
                     matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
@@ -440,9 +573,9 @@ impl Assembler {
                 {
                     return None;
                 }
-                Some((bridge.operand(), protected))
+                Some((bridge.operand(), protected, live_fallthrough))
             })();
-            if let Some((destination, protected)) = folded_join {
+            if let Some((destination, protected, live_fallthrough)) = folded_join {
                 let folded = graph
                     .instructions_mut(source)
                     .next()
@@ -451,53 +584,77 @@ impl Assembler {
                 if protected {
                     folded.set_exception_policy(super::ExceptionPolicy::EXCLUDE_ALWAYS);
                 }
-                graph
-                    .instructions_mut(target)
+                if !live_fallthrough {
+                    graph
+                        .instructions_mut(target)
+                        .next()
+                        .expect("exact original join")
+                        .no_location_policy
+                        .clear_preserved_location();
+                }
+                continue;
+            }
+            if kind == super::ir::FoldedGuardExit::ConditionalArm
+                && let Some((position, mut exit)) =
+                    folded_condition_return(&graph, source, target, &self.exception_regions)
+            {
+                let label = Label::from_u32(self.next_label);
+                self.next_label += 1;
+                for instruction in &mut exit {
+                    instruction.location = original.location;
+                }
+                graph.insert_block(
+                    position,
+                    vec![
+                        Item::Label(label),
+                        Item::Instruction(exit[0]),
+                        Item::Instruction(exit[1]),
+                    ],
+                );
+                if let Some(reachable) = &mut initial_reachable {
+                    reachable.push(reachable[source.index()]);
+                }
+                let jump = graph
+                    .instructions_mut(source)
                     .next()
-                    .expect("exact original join")
-                    .no_location_policy
-                    .clear_preserved_location();
+                    .expect("exact folded arm");
+                jump.retarget(Operand::Forward(label));
+                jump.jump_policy.prevent_small_exit_inlining();
                 continue;
             }
             let mut instructions = graph[target]
                 .items()
                 .iter()
+                .rev()
                 .filter_map(Item::as_instruction);
-            let (Some(first), Some(second)) = (instructions.next(), instructions.next()) else {
+            let (Some(ret), Some(value)) = (instructions.next(), instructions.next()) else {
                 continue;
             };
-            let (marker, load, ret) = if first.opcode == NOP {
-                let Some(ret) = instructions.next() else {
-                    continue;
-                };
-                (Some(first), second, ret)
-            } else {
-                (None, first, second)
-            };
-            if instructions.next().is_some()
-                // A literal return emits this plain marker at the expression's
-                // original location before loading its constant. It is not an
-                // arbitrary NOP or a location donated to an implicit return.
-                || marker.is_some_and(|marker| {
-                    load.opcode != crate::target::opcodes::LOAD_CONST
-                        || load.location != ret.location
-                        || load.depth_after() != Some(1)
-                        || ret.depth_after() != Some(0)
-                        || *marker
-                            != Instruction::new(NOP, Operand::Value(0), load.location, Some(0))
-                })
-                || !matches!(
-                    load.opcode,
-                    crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_CONST
-                )
-                || ret.opcode != crate::target::opcodes::RETURN_VALUE
-                || load.location.line < 0
+            if ret.opcode != crate::target::opcodes::RETURN_VALUE
                 || ret.location.line < 0
-                || [load, ret].iter().any(|instruction| {
+                || value.location.line < 0
+                || [ret, value].iter().any(|instruction| {
                     instruction.pre_fold_extra_instructions() != 0
                         || instruction.local_policy.hidden_exception_owner_slots() != 0
                 })
             {
+                continue;
+            }
+            let simple_return = match value.opcode {
+                crate::target::opcodes::CALL => true,
+                crate::target::opcodes::LOAD_FAST => instructions.next().is_none(),
+                crate::target::opcodes::LOAD_CONST => instructions.next().is_none_or(|marker| {
+                    // An explicit literal return can still have its original leading NOP.
+                    value.location == ret.location
+                        && value.depth_after() == Some(1)
+                        && ret.depth_after() == Some(0)
+                        && *marker
+                            == Instruction::new(NOP, Operand::Value(0), value.location, Some(0))
+                        && instructions.next().is_none()
+                }),
+                _ => false,
+            };
+            if !simple_return {
                 continue;
             }
             // CPython's earlier small-exit pass still sees the arm's original
@@ -563,12 +720,14 @@ impl Assembler {
                         if instruction.jump_target().is_some())
                 })
         );
-        exception_owner_provenance.bind_normal_try_borrow_exits(
-            &graph,
-            &self.preserved_block_boundaries,
-            &self.exception_regions,
-            &self.folded_loop_exit_anchors,
-        );
+        if self.python_version == crate::PythonVersion::Py314 {
+            exception_owner_provenance.bind_normal_try_borrow_exits(
+                &graph,
+                &self.preserved_block_boundaries,
+                &self.exception_regions,
+                &self.folded_loop_exit_anchors,
+            );
+        }
         if graph.features().has_jump() {
             for item in graph.iter_items() {
                 if let Item::Instruction(instruction) = item
@@ -628,6 +787,7 @@ impl Assembler {
             borrow_finally_jump_sources: rustc_hash::FxHashMap::default(),
             borrow_block_aliases: self.borrow_block_aliases,
             conditional_threading_targets: self.conditional_threading_targets,
+            none_filter_locations: self.none_filter_locations,
             comprehension_assignment_exits: self.comprehension_assignment_exits,
             match_join_store_origins: self.match_join_store_origins,
             original_nop_targets: self.original_nop_targets,
@@ -717,6 +877,7 @@ impl OptimizationPipeline {
             }
             original_owners.retain_pipeline(&self);
         }
+        let handler_return_bridges = self.original_handler_return_bridges();
         self.record_original_jump_heads();
         self.capture_normal_try_break_pop_owners();
         original_owners.retain_pipeline(&self);
@@ -732,6 +893,7 @@ impl OptimizationPipeline {
         original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableInitial)?;
+        let nested_try_returns = self.nested_try_branch_returns();
         self.prepare_normal_try_copy_plan();
         self.prepare_plain_tuple_copy_plan();
         self.prepare_conditional_normal_try_joins();
@@ -754,7 +916,8 @@ impl OptimizationPipeline {
         original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::OptimizeBooleanConversions)?;
-        let threaded_normal_try_joins = self.capture_threaded_normal_try_joins();
+        let threaded_normal_try_joins =
+            self.capture_threaded_normal_try_joins(handler_return_bridges);
         let threaded_jumps = !assertion_side_exits && self.thread_forward_jumps();
         self.borrow_threaded_jump_targets.clear();
         original_owners.retain_pipeline(&self);
@@ -812,6 +975,7 @@ impl OptimizationPipeline {
                     .map(|constants| &mut **constants as &mut dyn ConstantTable),
             )?
         };
+        self.restore_nested_try_branch_returns(nested_try_returns);
         self.replay_copied_comprehension_swaps(copied_comprehension_swaps);
         self.borrow_threaded_jump_entries.clear();
         self.borrow_authored_finally_break_origins =
@@ -835,11 +999,19 @@ impl OptimizationPipeline {
         for (before, after) in &copied_exit_owner_retargets {
             // Duplicating the exit retargets the surviving guard. Preserve that exact
             // substitution only for a unique captured and live instruction.
-            let mut returns = self
-                .exception_owner_provenance
+            let provenance = &mut self.exception_owner_provenance;
+            let mut returns = provenance
                 .copied_return_guards
                 .iter_mut()
-                .filter(|origin| origin.condition == *before);
+                .map(|origin| &mut origin.condition)
+                .chain(
+                    provenance
+                        .copied_cleanup_return_none_prefixes
+                        .iter_mut()
+                        .filter(|prefix| prefix.managed_iterator)
+                        .map(|prefix| &mut prefix.condition),
+                )
+                .filter(|condition| **condition == *before);
             if let Some(origin) = returns.next()
                 && returns.next().is_none()
                 && self
@@ -849,7 +1021,7 @@ impl OptimizationPipeline {
                     .count()
                     == 1
             {
-                origin.condition = *after;
+                *origin = *after;
             }
 
             if self
@@ -1399,7 +1571,7 @@ impl OptimizationPipeline {
             &self.exception_owner_provenance,
             &self.preserved_block_boundaries,
         );
-        Ok(LayoutAssembler {
+        let mut layout = LayoutAssembler {
             python_version: self.python_version,
             legacy_uniform_jump_seed: self.legacy_uniform_jump_seed,
             items,
@@ -1409,7 +1581,9 @@ impl OptimizationPipeline {
             removed_max_depth,
             next_label: self.next_label,
             has_next_location: self.has_next_location,
-        })
+        };
+        layout.restore_surviving_normal_try_jump_owners();
+        Ok(layout)
     }
 }
 
@@ -1725,19 +1899,19 @@ impl LayoutAssembler {
                 instruction
                     .legacy_initial_jump_width()
                     .expect("all native jumps are certified")
-            } else if self
-                .exception_owner_provenance
-                .legacy_original_jump_operands_fit
-                && (crate::target::is_conditional_jump(instruction.opcode)
-                    || instruction.opcode == crate::target::opcodes::FOR_ITER
-                    || (instruction.opcode == crate::target::opcodes::JUMP_FORWARD
-                        && instruction.location.line >= 0)
-                    || (instruction.opcode == crate::target::opcodes::JUMP_BACKWARD
-                        && instruction.jump_target().is_some_and(|target| {
-                            self.exception_owner_provenance
-                                .legacy_for_headers
-                                .contains(&target)
-                        })))
+            } else if (crate::target::is_conditional_jump(instruction.opcode)
+                || instruction.opcode == crate::target::opcodes::FOR_ITER)
+                && (origins.legacy_original_jump_operands_fit
+                    || origins
+                        .legacy_short_loop_tests
+                        .contains(&instruction.location))
+                || (origins.legacy_original_jump_operands_fit
+                    && instruction.opcode == crate::target::opcodes::JUMP_FORWARD
+                    && instruction.location.line >= 0)
+                || (instruction.opcode == crate::target::opcodes::JUMP_BACKWARD
+                    && instruction
+                        .jump_target()
+                        .is_some_and(|target| origins.legacy_for_headers.contains(&target)))
             {
                 // Threading and conditional inversion preserve the original operand.
                 // A forward cold bridge has no line donor. A normalized loop

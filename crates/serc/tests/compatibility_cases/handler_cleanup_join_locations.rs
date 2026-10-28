@@ -1,6 +1,47 @@
 use crate::common;
 
 #[test]
+fn nested_handler_copies_keep_the_line_of_the_inner_cleanup() {
+    for outer in ["TypeError", "TypeError as outer_error"] {
+        let source = format!(
+            "def run(flag, other):
+    try:
+        start()
+    except {outer}:
+        try:
+            work()
+        except ValueError as error:
+            if flag:
+                if other:
+                    pass
+            else:
+                raise
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "named_outer_cleanup.py");
+    }
+    common::assert_matches_cpython_marshal(
+        r"def run(flag, value):
+    try:
+        first()
+    except TypeError:
+        try:
+            second()
+        except ValueError:
+            try:
+                third()
+            except LookupError:
+                if flag:
+                    pass
+                else:
+                    value = 1
+    consume(value)
+",
+        "unnamed_outer_cleanup.py",
+    );
+}
+
+#[test]
 fn matches_cpython_nested_handler_fallthrough_cleanup_copies() {
     for (definition, prologue) in [("def", ""), ("async def", ""), ("def", "    yield None\n")] {
         for binding in ["", " as error"] {

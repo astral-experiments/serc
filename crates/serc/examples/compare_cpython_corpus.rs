@@ -2,6 +2,7 @@
 
 use std::any::Any;
 use std::collections::BTreeMap;
+use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 use std::time::Instant;
@@ -107,6 +108,9 @@ struct Options {
     /// Use a fresh minimal CPython reference process for each source file.
     #[arg(long, value_name = "PATH")]
     reference: PathBuf,
+    /// Require the final release of the target patch version, including CPython 3.15.0.
+    #[arg(long)]
+    final_reference: bool,
     /// Compile at this optimization level in the minimal reference process and Serc.
     #[arg(long, default_value_t = OptimizationLevel::default(), value_name = "0|1|2")]
     optimize: OptimizationLevel,
@@ -136,6 +140,9 @@ struct Options {
     examples: usize,
     #[arg(long, value_name = "DIR")]
     dump_mismatches: Option<PathBuf>,
+    /// Write the path, outcome, and CPython rejection flag for every input to a new JSONL file.
+    #[arg(long, value_name = "PATH")]
+    outcomes_jsonl: Option<PathBuf>,
 }
 
 impl Options {
@@ -167,7 +174,11 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
-    if let Err(message) = verify_reference(&options.reference, options.python_version) {
+    if let Err(message) = verify_reference(
+        &options.reference,
+        options.python_version,
+        options.final_reference,
+    ) {
         eprintln!("{message}");
         return ExitCode::from(2);
     }
@@ -251,6 +262,13 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+
+    if let Some(path) = &options.outcomes_jsonl
+        && let Err(error) = write_outcomes(path, &outcomes)
+    {
+        eprintln!("failed to write {}: {error}", path.display());
+        return ExitCode::FAILURE;
+    }
 
     let mut counts = BTreeMap::<OutcomeKind, usize>::new();
     for outcome in &outcomes {
@@ -358,6 +376,42 @@ fn main() -> ExitCode {
     }
 }
 
+/// Write outcomes in discovery order, preserving non-UTF-8 filenames as native bytes.
+fn write_outcomes(path: &Path, outcomes: &[Outcome]) -> std::io::Result<()> {
+    #[derive(serde::Serialize)]
+    #[serde(untagged)]
+    enum Filename<'a> {
+        Text(&'a str),
+        Bytes(&'a [u8]),
+    }
+
+    #[derive(serde::Serialize)]
+    struct Row<'a> {
+        path: Filename<'a>,
+        outcome: &'static str,
+        cpython_rejected: bool,
+    }
+
+    let file = fs_err::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)?;
+    let mut writer = BufWriter::new(file);
+    for result in outcomes {
+        let name = result.path.as_os_str();
+        let row = Row {
+            path: name
+                .to_str()
+                .map_or_else(|| Filename::Bytes(name.as_encoded_bytes()), Filename::Text),
+            outcome: result.kind.name(),
+            cpython_rejected: result.oracle_rejected,
+        };
+        serde_json::to_writer(&mut writer, &row)?;
+        writer.write_all(b"\n")?;
+    }
+    writer.flush()
+}
+
 fn validate_outcome_counts(
     counts: &BTreeMap<OutcomeKind, usize>,
     cpython_rejected: usize,
@@ -424,11 +478,13 @@ struct ReferenceIdentity {
 }
 
 impl ReferenceIdentity {
-    fn matches(&self, version: PythonVersion) -> bool {
+    fn matches(&self, version: PythonVersion, final_reference: bool) -> bool {
         let target = version.target();
-        let (release_level, release_serial) = match version {
-            PythonVersion::Py312 | PythonVersion::Py313 | PythonVersion::Py314 => ("final", 0),
-            PythonVersion::Py315 => ("candidate", 2),
+        let (release_level, release_serial) = if version == PythonVersion::Py315 && !final_reference
+        {
+            ("candidate", 2)
+        } else {
+            ("final", 0)
         };
         self.protocol == "minimal-v2"
             && self.implementation == target.implementation
@@ -440,7 +496,11 @@ impl ReferenceIdentity {
 }
 
 /// Checks the protocol and linked runtime of the executable used for compilation.
-fn verify_reference(reference: &Path, python_version: PythonVersion) -> Result<(), String> {
+fn verify_reference(
+    reference: &Path,
+    python_version: PythonVersion,
+    final_reference: bool,
+) -> Result<(), String> {
     let output = Command::new(reference)
         .arg("--identity")
         .output()
@@ -452,13 +512,17 @@ fn verify_reference(reference: &Path, python_version: PythonVersion) -> Result<(
             one_line(&output.stderr)
         )
     })?;
-    if output.status.success() && identity.matches(python_version) {
+    if output.status.success() && identity.matches(python_version, final_reference) {
         Ok(())
     } else {
         Err(format!(
             "{} is {identity:?}; the reference requires minimal-v2 and {} with magic {}",
             reference.display(),
-            python_version.target().tag,
+            if final_reference {
+                python_version.target().version_string()
+            } else {
+                python_version.target().tag.to_string()
+            },
             python_version.target().magic_hex()
         ))
     }
@@ -770,6 +834,40 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_records_outcomes_without_ambiguity() {
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("results.jsonl");
+        let make = |path, kind, rejected| super::Outcome {
+            path,
+            kind,
+            detail: String::new(),
+            oracle_rejected: rejected,
+            mismatch_bytes: None,
+        };
+        let rows = [
+            make("quoted\"\n.py".into(), OutcomeKind::Exact, false),
+            make("bad.py".into(), OutcomeKind::MatchedRejection, true),
+        ];
+        super::write_outcomes(&output, &rows).unwrap();
+        let records: Vec<serde_json::Value> = fs::read_to_string(&output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            records,
+            [
+                serde_json::json!({"path": "quoted\"\n.py", "outcome": "exact", "cpython_rejected": false}),
+                serde_json::json!({"path": "bad.py", "outcome": "matched-rejection", "cpython_rejected": true}),
+            ]
+        );
+        assert_eq!(
+            super::write_outcomes(&output, &rows).unwrap_err().kind(),
+            std::io::ErrorKind::AlreadyExists,
+        );
+    }
+
+    #[test]
     fn default_corpus_and_explicit_roots() {
         let options = parse_options(&[]).unwrap();
         assert_eq!(options.roots, super::default_roots());
@@ -802,11 +900,11 @@ mod tests {
             "magic": PythonVersion::Py314.target().magic_hex(),
         });
         let identity: super::ReferenceIdentity = serde_json::from_value(value.clone()).unwrap();
-        assert!(identity.matches(PythonVersion::Py314));
-        assert!(!identity.matches(PythonVersion::Py313));
+        assert!(identity.matches(PythonVersion::Py314, false));
+        assert!(!identity.matches(PythonVersion::Py313, false));
         value["protocol"] = "minimal-v1".into();
         let identity: super::ReferenceIdentity = serde_json::from_value(value.clone()).unwrap();
-        assert!(!identity.matches(PythonVersion::Py314));
+        assert!(!identity.matches(PythonVersion::Py314, false));
         value.as_object_mut().unwrap().remove("protocol");
         assert!(serde_json::from_value::<super::ReferenceIdentity>(value).is_err());
     }
@@ -831,7 +929,7 @@ mod tests {
     fn assert_reference_matches(reference: &Path, python_version: PythonVersion) {
         use serc::OptimizationLevel;
 
-        super::verify_reference(reference, python_version).unwrap();
+        super::verify_reference(reference, python_version, false).unwrap();
         let options = CompileOptions {
             python_version,
             ..CompileOptions::default()
@@ -1084,23 +1182,35 @@ mod tests {
                 release_serial,
                 magic: target.magic_hex(),
             };
-            assert!(identity.matches(python_version));
+            assert!(identity.matches(python_version, false));
+            assert_eq!(
+                identity.matches(python_version, true),
+                release_level == "final"
+            );
+            if python_version == PythonVersion::Py315 {
+                identity.release_level = "final".to_string();
+                identity.release_serial = 0;
+                assert!(identity.matches(python_version, true));
+                assert!(!identity.matches(python_version, false));
+                identity.release_level = release_level.to_string();
+                identity.release_serial = release_serial;
+            }
             for other in [
                 PythonVersion::Py312,
                 PythonVersion::Py313,
                 PythonVersion::Py314,
                 PythonVersion::Py315,
             ] {
-                assert_eq!(identity.matches(other), other == python_version);
+                assert_eq!(identity.matches(other, false), other == python_version);
             }
             identity.release_serial += 1;
-            assert!(!identity.matches(python_version));
+            assert!(!identity.matches(python_version, false));
             identity.release_serial = release_serial;
             identity.release_level = "alpha".to_string();
-            assert!(!identity.matches(python_version));
+            assert!(!identity.matches(python_version, false));
             identity.release_level = release_level.to_string();
             identity.magic = "wrong magic".to_string();
-            assert!(!identity.matches(python_version));
+            assert!(!identity.matches(python_version, false));
         }
     }
 

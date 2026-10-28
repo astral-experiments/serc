@@ -803,7 +803,7 @@ fn deferred_name_return_requires_a_noncopyable_original_target() {
             let boundary = assembler.label();
             assembler.mark(boundary);
             if case == "erased pop" {
-                assembler.record_name_return_pop_boundary(boundary, 1);
+                assembler.record_name_return_pop_boundary(boundary, 1, SourceLocation::NONE);
             } else if case == "original block" {
                 assembler.preserved_block_boundaries.insert(boundary);
             }
@@ -1009,7 +1009,7 @@ fn deferred_name_return_materialized_pop_requires_exact_label_prefix() {
                 assembler.preserved_block_boundaries.insert(aliases[1]);
             }
             "omitted pop collision" => {
-                assembler.record_name_return_pop_boundary(aliases[1], 1);
+                assembler.record_name_return_pop_boundary(aliases[1], 1, SourceLocation::NONE);
             }
             _ => {}
         }
@@ -3007,6 +3007,43 @@ fn fallthrough_termination_accounts_for_jumps_to_any_trailing_label() {
 }
 
 #[test]
+fn records_identical_named_handler_exits_once() {
+    let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
+    let entry = assembler.label();
+    let target = assembler.label();
+    let cleanup_end = assembler.label();
+    assembler.record_exception_owner_block_boundary(entry);
+    assembler.mark(entry);
+    assembler.set_location(SourceLocation::new(2, 2, 4, 9));
+    assembler.emit_with_depth(NOP, 0, 1, ExceptionPolicy::EXCLUDE_ALWAYS);
+    let unwind = assembler.item_count();
+    for (opcode, arg, depth) in [
+        (POP_EXCEPT, 0, 0),
+        (LOAD_CONST, 0, 1),
+        (STORE_FAST, 1, 0),
+        (DELETE_FAST, 1, 0),
+    ] {
+        assembler.emit_with_depth(opcode, arg, depth, ExceptionPolicy::default());
+    }
+    assembler.mark(cleanup_end);
+    assembler.set_location(SourceLocation::new(4, 4, 7, 11));
+    assembler.emit_with_depth(LOAD_FAST, 2, 1, ExceptionPolicy::default());
+    assembler.emit_with_depth(TO_BOOL, 0, 1, ExceptionPolicy::default());
+    assembler.emit_forward_with_depth(POP_JUMP_IF_FALSE, target, 0, ExceptionPolicy::default());
+    assembler.emit_with_depth(NOT_TAKEN, 0, 0, ExceptionPolicy::NoneDynamicCondition);
+
+    assembler.record_copied_named_break_truth_prefix(unwind);
+    assembler.record_copied_named_break_truth_prefix(unwind);
+    assert_eq!(
+        assembler
+            .exception_owner_provenance
+            .copied_named_break_truth_prefixes
+            .len(),
+        1
+    );
+}
+
+#[test]
 fn copied_finalizer_guard_accepts_only_a_converted_pre_manager_pop() {
     for converted in [false, true] {
         let mut assembler = Assembler::with_python_version(crate::PythonVersion::Py314);
@@ -3283,7 +3320,6 @@ fn fusion_preserves_each_typed_instruction_policy() {
     first.local_policy = LocalPolicy::for_load(true, false);
     first.local_policy.mark_maybe_null_comprehension_restore();
     first.no_location_policy.allow_block_inlining();
-    first.no_location_policy.make_first_copy_interruptible();
     first.no_location_policy.mark_artificial_eval_break();
     first
         .no_location_policy
@@ -3330,11 +3366,6 @@ fn fusion_preserves_each_typed_instruction_policy() {
     expected_local_policy.add_hidden_exception_owner_slots(4);
     assert_eq!(fused.local_policy, expected_local_policy);
     assert!(fused.no_location_policy.allows_block_inlining());
-    assert!(
-        fused
-            .no_location_policy
-            .first_copy_is_interruptible_backward()
-    );
     assert!(fused.no_location_policy.is_artificial_eval_break());
     assert!(fused.no_location_policy.copy_inherits_shared_predecessor());
     assert!(fused.no_location_policy.preserves_location());

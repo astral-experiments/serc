@@ -59,3 +59,9 @@ fn preserves_pass_markers_inside_protected_async_managers() {
         }
     }
 }
+
+#[test]
+fn matches_the_manager_owner_after_a_generator_loop_exits() {
+    let source = "async def events(manager, ready, close):\n    async with manager:\n        try:\n            while ready():\n                yield ready\n        finally:\n            if close is not None:\n                await close()\n";
+    common::assert_matches_cpython_marshal(source, "generator_loop_finally_owner.py");
+}

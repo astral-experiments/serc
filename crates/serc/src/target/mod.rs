@@ -24,9 +24,11 @@ pub(crate) fn source_codec_strings(
                 SourceCodec::Ascii => $module::ASCII,
                 SourceCodec::Latin1 => $module::LATIN_1,
                 SourceCodec::Iso885915 => $module::ISO8859_15,
+                SourceCodec::Big5 => $module::BIG5,
                 SourceCodec::EucJp => $module::EUC_JP,
                 SourceCodec::Koi8R => $module::KOI8_R,
                 SourceCodec::Windows1251 => $module::CP1251,
+                SourceCodec::Windows1252 => $module::CP1252,
             }
         };
     }

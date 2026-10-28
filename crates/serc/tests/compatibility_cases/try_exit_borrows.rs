@@ -2,6 +2,84 @@ use crate::common;
 use crate::common::indent as indent_finally_borrow_case;
 
 #[test]
+fn a_guard_bypasses_an_unreachable_try_exit() {
+    let source = r"def scan(item, enabled):
+    try:
+        if enabled:
+            try:
+                while True:
+                    read()
+            except LookupError:
+                pass
+    except ValueError:
+        pass
+    finally:
+        item.value = None
+";
+    common::assert_matches_cpython_marshal(source, "guarded_try_exit.py");
+}
+
+#[test]
+fn terminal_try_arm_stops_borrow_fallthrough() {
+    for arm in [
+        "return result",
+        "if flag:\n                    return result\n                step()",
+    ] {
+        let source = format!(
+            r"def run(value, flag):
+    try:
+        result = decode(value)
+    except Error:
+        if flag:
+            try:
+                {arm}
+            except Other:
+                pass
+        result = value
+    return finish(result)
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "terminal_try_return.py");
+    }
+    for arm in ["break", "step()"] {
+        let source = format!(
+            r"def run(value):
+    index = 0
+    while True:
+        try:
+            if ready(index):
+                index += 1
+            else:
+                {arm}
+        except Error:
+            break
+    return finish(index)
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "terminal_try_break.py");
+    }
+}
+
+#[test]
+fn guarded_iterator_exhaustion_keeps_the_copied_try_exit_boundary() {
+    let source = r"def run(value, ready, items):
+    try:
+        try:
+            return prepare()
+        finally:
+            try:
+                if ready:
+                    for item in items:
+                        pass
+            except ValueError:
+                pass
+    finally:
+        consume(value)
+";
+    common::assert_matches_cpython_marshal(source, "guarded_iterator_exit.py");
+}
+
+#[test]
 fn conditional_nested_pass_recovery_reaches_following_loads() {
     for (scope, call) in [
         ("def", "operation(item)"),
@@ -75,6 +153,19 @@ fn matches_cpython_completed_handler_for_borrowing() {
                 common::assert_matches_cpython_marshal(&source, "completed_handler_for.py");
             }
         }
+    }
+}
+
+#[test]
+fn nested_loop_arms_keep_the_original_backedge_populated() {
+    for inner in [
+        "use(item)",
+        "if check(item):\n                    use(item)\n                else:\n                    save(item)",
+    ] {
+        let source = format!(
+            "def visit(items, key, flag):\n    try:\n        start()\n    except Error:\n        for item in items:\n            if flag:\n                {inner}\n            else:\n                keep(item)\n    if key is not None:\n        use(key)\n",
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_handler_loop_backedge.py");
     }
 }
 
@@ -2009,6 +2100,91 @@ fn matches_cpython_partial_terminal_match_handler_borrow_entries() {
 }
 
 #[test]
+fn unnamed_handler_cleanup_stops_borrow_fallthrough() {
+    for source in [
+        "def run(value, flag):\n    if flag:\n        try:\n            if ready():\n                return value\n        except E:\n            try:\n                recover()\n            except F:\n                pass\n            pass\n        consume(value)\n    return value\n",
+        "def run(value, flag):\n    try:\n        step()\n    except E:\n        match flag:\n            case 1 | 2:\n                raise A()\n            case 3:\n                raise B()\n            case _:\n                raise\n    if enabled():\n        consume(value)\n",
+        "def run(value):\n    try:\n        prepare()\n        try:\n            result = step()\n        except E:\n            return None\n        return result\n    except F as error:\n        raise G() from error\n    finally:\n        obj.attr = value\n        finish(value)\n",
+        "async def run(value, flag):\n    try:\n        await step()\n    except A:\n        if flag:\n            return\n    finally:\n        if value:\n            try:\n                await value.close()\n            except F:\n                raise\n            except G:\n                pass\n",
+    ] {
+        common::assert_matches_cpython_marshal(source, "unnamed_handler_cleanup.py");
+    }
+}
+
+#[test]
+fn named_handler_cleanup_stops_borrow_fallthrough() {
+    for source in [
+        "def run(value, items):\n    for item in items:\n        try:\n            value = step(item)\n        except ValueError as error:\n            match error.info:\n                case key if key == item:\n                    continue\n                case _:\n                    raise\n        consume(value)\n        return value\n",
+        "def run(value, limit):\n    try:\n        step()\n    except ValueError:\n        while limit:\n            try:\n                take()\n            except OverflowError as error:\n                amount = error.size\n                continue\n            work()\n        recover()\n    consume(value)\n",
+        "def run(value, flag):\n    try:\n        step()\n    except ValueError as error:\n        if flag:\n            return\n        consume(error)\n    consume(value)\n",
+    ] {
+        common::assert_matches_cpython_marshal(source, "named_handler_cleanup.py");
+    }
+}
+
+#[test]
+fn unlocated_handler_jump_stops_borrow_fallthrough() {
+    for body in [
+        "if flag:\n    try:\n        step()\n    except OtherError:\n        pass\n    else:\n        return",
+        "if flag:\n    if mode:\n        with context:\n            step()\n    else:\n        fallback()\nelse:\n    fallback()",
+        "if flag:\n    if mode:\n        step()\n    else:\n        raise\nelse:\n    fallback()",
+    ] {
+        let protected = format!(
+            "try:\n    before()\nexcept ValueError:\n{}\n    recover()",
+            indent_finally_borrow_case(body)
+        );
+        for suite in [
+            protected.clone(),
+            format!("if flag:\n{}", indent_finally_borrow_case(&protected)),
+        ] {
+            let source = format!(
+                "def run(value, flag, mode, context):\n{}\n    consume(value)\n",
+                indent_finally_borrow_case(&suite)
+            );
+            common::assert_matches_cpython_marshal(&source, "unlocated_handler_jump.py");
+        }
+    }
+}
+
+#[test]
+fn copied_manager_reraise_stops_borrow_fallthrough() {
+    for tail in [
+        "saved = item.value",
+        "del registry.value",
+        "saved = item.value.extra",
+        "saved = next_value()",
+    ] {
+        let source = format!(
+            r"def run(value, resource):
+    try:
+        prepare()
+    finally:
+        with resource as item:
+            work(item)
+        {tail}
+    consume(value)
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "copied_manager_reraise.py");
+    }
+}
+
+#[test]
+fn copied_comprehension_restore_stops_borrow_fallthrough() {
+    for cleanup in [
+        "result = [work(x) for x in items]",
+        "[work(x) for x in items]",
+        "result = [work(x, y) for x, y in items]",
+        "result = list([work(x) for x in items])",
+    ] {
+        let source = format!(
+            "def run(value, items):\n    try:\n        prepare()\n    except ValueError:\n        recover()\n    finally:\n        {cleanup}\n    consume(value)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "comprehension_restore.py");
+    }
+}
+
+#[test]
 fn preserves_copied_pass_recovery_borrow_fallthrough_and_independent_jumps() {
     let source = r"def f(flag, value):
     try:
@@ -2361,4 +2537,195 @@ fn terminal_deletion_preserves_original_return_boundary() {
         );
         common::assert_matches_cpython_marshal(&source, "terminal_deletion_return.py");
     }
+}
+
+#[test]
+fn matches_cpython_borrows_after_copied_try_continuations() {
+    for raised in ["value", "value.a.b", "value.a.b.c"] {
+        let source = format!(
+            r"def f(value, flag):
+    try:
+        first()
+    except Root as error:
+        if flag:
+            try:
+                second()
+            except Other:
+                pass
+            raise {raised}
+    consume(value)
+"
+        );
+        common::assert_matches_cpython_marshal(&source, "small_try_raise.py");
+    }
+    common::assert_matches_cpython_marshal(
+        r"def f(value, flag):
+    try:
+        try:
+            first()
+        except Root:
+            if flag:
+                return None
+            consume(value)
+        finish(value)
+    finally:
+        try:
+            if flag:
+                second()
+        except Other:
+            pass
+",
+        "small_try_return.py",
+    );
+}
+
+#[test]
+fn borrows_after_a_guarded_recovery_in_a_protected_body() {
+    for prefix in ["", "async "] {
+        let source = format!(
+            "{prefix}def resolve(key, retry):\n    try:\n        value = None\n        try:\n            value = parse(key)\n        except Error:\n            if retry:\n                try:\n                    value = parse(key)\n                except Error as exc:\n                    log(exc)\n        if value is not None:\n            save(value)\n    except Error:\n        report(key)\n",
+        );
+        common::assert_matches_cpython_marshal(&source, "protected_guarded_recovery.py");
+    }
+}
+
+#[test]
+fn borrows_finalizer_locals_after_generator_for_exhaustion() {
+    for scope in ["def", "async def"] {
+        let source = format!(
+            "{scope} values(manager, items, target):\n    with manager:\n        try:\n            for item in items:\n                if usable(item):\n                    yield item\n        except Error as error:\n            if fatal(error):\n                raise Failure() from error\n        finally:\n            if target is not None:\n                target.close()\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "generator_loop_cleanup.py");
+    }
+}
+
+#[test]
+fn borrows_a_runtime_while_finalizer_with_local_breaks() {
+    let source = "def read(key, items, flag):\n    try:\n        while flag:\n            try:\n                item = next(items)\n            except End:\n                break\n            use(item)\n    except Error as exc:\n        save(exc)\n    finally:\n        if key is not None:\n            use(key)\n        while flag:\n            try:\n                close()\n                break\n            except Retry:\n                pass\n";
+    common::assert_matches_cpython_marshal(source, "cleanup_local_break.py");
+}
+
+#[test]
+fn borrows_finalizer_locals_after_a_managed_nested_guard() {
+    let source = "def finish(manager, item, ready, retry):\n    with manager:\n        try:\n            if ready:\n                if retry:\n                    process(item)\n            else:\n                skip(item)\n        except Error:\n            raise\n        finally:\n            if item is not None:\n                item.close()\n";
+    common::assert_matches_cpython_marshal(source, "managed_nested_guard.py");
+}
+
+#[test]
+fn borrows_finalizer_locals_on_the_false_edge_of_an_iterator_break() {
+    let source = "def find(items, stream):\n    found = None\n    for item in items:\n        try:\n            if item.accepts(stream):\n                found = item.name\n                break\n        except Error:\n            pass\n        finally:\n            if hasattr(stream, 'rewind'):\n                stream.rewind()\n    return found\n";
+    common::assert_matches_cpython_marshal(source, "iterator_break_false_edge.py");
+}
+
+#[test]
+fn borrows_locals_when_a_yield_resumes_into_guarded_cleanup() {
+    for transfer in ["return", "raise", "continue"] {
+        let source = format!(
+            "def values(manager, items, enabled, strict):\n    with manager:\n        for item in items:\n            try:\n                yield item\n            except Error as error:\n                if strict:\n                    {transfer}\n            finally:\n                if enabled:\n                    close(item)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "resumed_yield_cleanup.py");
+    }
+}
+
+#[test]
+fn borrows_cleanup_locals_after_nested_reraise_guards() {
+    let protected = "try:\n    item.save()\nexcept Error as error:\n    if enabled:\n        if fatal(error):\n            raise\nfinally:\n    item.close()\n";
+    for body in [
+        protected.to_owned(),
+        format!(
+            "try:\n{}finally:\n    done(item)\n",
+            indent_finally_borrow_case(protected)
+        ),
+    ] {
+        let source = format!(
+            "def save(item, enabled):\n{}",
+            indent_finally_borrow_case(&body)
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_reraise_cleanup.py");
+    }
+}
+
+#[test]
+fn copies_both_iterator_exits_of_a_guarded_handler_break() {
+    let source = "def values(manager, items, enabled, strict):\n    with manager:\n        for item in items:\n            try:\n                yield item\n            except Error as error:\n                if strict:\n                    break\n            finally:\n                if enabled:\n                    close(item)\n";
+    common::assert_matches_cpython_marshal(source, "managed_iterator_handler_break.py");
+}
+
+#[test]
+fn borrows_locals_after_a_conditional_jumps_to_a_finally_pass() {
+    for (arm, otherwise, tail) in [
+        ("use(first)", "use(second)", "return first, second"),
+        (
+            "if True:\n    return\nuse(first)",
+            "pass",
+            "use(first)\nreturn first",
+        ),
+    ] {
+        let source = format!(
+            "def choose(ready, first, second):\n    try:\n        if ready:\n{}        else:\n            {otherwise}\n    except Error as err:\n        recover(err)\n    finally:\n        pass\n{}",
+            indent_finally_borrow_case(&indent_finally_borrow_case(&indent_finally_borrow_case(
+                arm
+            ))),
+            indent_finally_borrow_case(tail)
+        );
+        common::assert_matches_cpython_marshal(&source, "conditional_finally_pass.py");
+    }
+}
+
+#[test]
+fn retains_original_call_slots_for_a_copied_handler_break() {
+    for call in [
+        "logger.record(item)",
+        "record(item)",
+        "record(item, enabled)",
+    ] {
+        let source = format!(
+            "def values(manager, items, enabled, strict, logger):\n    with manager:\n        for item in items:\n            try:\n                yield item\n            except Error as error:\n                if strict:\n                    {call}\n                    break\n            finally:\n                if enabled:\n                    close(item)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "guarded_break_after_call.py");
+    }
+}
+
+#[test]
+fn borrows_after_nested_handler_exits_jump_to_a_finally_pass() {
+    let mut body = "if ready:\n    use(first)\nelse:\n    use(second)\n".to_owned();
+    for _ in 0..2 {
+        body = format!(
+            "try:\n{}except Inner as error:\n    recover(error)\n",
+            indent_finally_borrow_case(&body)
+        );
+        let source = format!(
+            "def choose(ready, first, second):\n    try:\n{}    except Error:\n        pass\n    finally:\n        pass\n    return first, second\n",
+            indent_finally_borrow_case(&indent_finally_borrow_case(&body))
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_handler_finally_pass.py");
+    }
+}
+
+#[test]
+fn borrows_on_synchronous_iterator_fallthrough_in_an_async_generator() {
+    for alternative in ["for", "async for"] {
+        let source = format!(
+            "async def stream(rows, asynchronous):\n    try:\n        if asynchronous:\n            async for row in rows:\n                yield row\n        else:\n            {alternative} row in rows:\n                yield row\n    except Error as error:\n        yield error\n    finally:\n        close(rows)\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "generator_iterator_fallthrough.py");
+    }
+}
+
+#[test]
+fn borrows_after_an_async_generators_guarded_manager_exit() {
+    let source = "async def stream(item, manager):\n    try:\n        yield item\n    except Error:\n        raise\n    else:\n        if item is not None:\n            with manager:\n                await flush(item)\n    finally:\n        try:\n            if item is not None:\n                await close(item)\n        finally:\n            finish(item)\n";
+    common::assert_matches_cpython_marshal(source, "guarded_manager_else_exit.py");
+}
+
+#[test]
+fn short_circuit_manager_else_keeps_its_separate_borrow_boundary() {
+    let source = "async def stream(item, ready, flag, manager):\n    try:\n        try:\n            yield item\n        except Error:\n            raise\n        else:\n            if ready and flag:\n                with manager as stream:\n                    await flush(stream)\n        finally:\n            try:\n                use(item)\n            finally:\n                finish(item)\n    except Other:\n        raise\n";
+    common::assert_matches_cpython_marshal(source, "guarded_manager_else_exit.py");
+}
+
+#[test]
+fn borrows_after_a_managed_generator_arm_jumps_over_delegation() {
+    let source = "def stream(owner, enabled, ready, manager):\n    try:\n        if enabled and ready:\n            with manager:\n                yield from read(owner)\n        else:\n            yield from read(owner)\n    except Error:\n        raise\n    finally:\n        owner.state = finish()\n";
+    common::assert_matches_cpython_marshal(source, "managed_generator_arm.py");
 }
