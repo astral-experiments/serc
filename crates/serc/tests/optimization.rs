@@ -8177,6 +8177,32 @@ fn erased_branches_preserve_nested_finalizer_loop_exits() {
 }
 
 #[test]
+fn terminal_pattern_guard_restarts_the_loop_after_storing_captures() {
+    for body in ["return value", "pass"] {
+        let source = format!(
+            "def run(values, expected, ready):
+    for value in values:
+        if ready:
+            visit(value)
+        else:
+            match value:
+                case (Entry(active=True), item) if item is expected:
+                    {body}
+"
+        );
+        assert_matches_cpython(&source, "guarded_loop_capture.py", &LEVELS);
+    }
+    let literal = "def run(values, ready):
+    for value in values:
+        if ready:
+            match value:
+                case [1, 2] if ready:
+                    pass
+";
+    assert_matches_cpython(literal, "guarded_loop_literal.py", &LEVELS);
+}
+
+#[test]
 fn copied_finalizer_guard_preserves_each_continue_backedge() {
     for cleanup in ["pass", "release(item)"] {
         let source = format!(

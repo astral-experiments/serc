@@ -66,9 +66,9 @@ use super::source::{
     statement_execution_range, strip_expression_comments, synthetic_condition_exit_range,
 };
 use super::statement::{
-    NestedIfExitLocation, condition_jump_target_count, final_chained_comparison_jump,
-    final_terminating_arm_fallthrough_test, is_wildcard_pattern, nested_if_exit_location,
-    suite_has_linear_borrow_fallthrough, suite_terminates,
+    NestedIfExitLocation, condition_jump_target_count, expression_contains_inline_branch,
+    final_chained_comparison_jump, final_terminating_arm_fallthrough_test, is_wildcard_pattern,
+    nested_if_exit_location, suite_has_linear_borrow_fallthrough, suite_terminates,
     terminal_for_break_exit_inherits_predecessor, unique_condition_jump_target,
 };
 use super::symbol::{
@@ -722,7 +722,7 @@ impl Compiler<'_> {
                     .set_location(self.source_location(case.pattern.range()));
                 self.store_name_id(name)?;
             }
-            let mut guard_always_false = false;
+            let mut skip_case_body = false;
             let mut irrefutable_true_guard = false;
             if let Some(guard) = &case.guard {
                 if let Some(truthiness) = early_condition_truthiness(guard) {
@@ -836,7 +836,7 @@ impl Compiler<'_> {
                             // CPython's edge is still conditional during small-exit copying.
                             self.assembler.prevent_jump_inlining(failure);
                         }
-                        guard_always_false = true;
+                        skip_case_body = true;
                     }
                 } else {
                     let failure = self.ensure_match_fail_pop(&mut context, 0);
@@ -856,7 +856,41 @@ impl Compiler<'_> {
                             .set_location(self.source_location(case.pattern.range()));
                         self.emit(NOP, 0, 0)?;
                     }
-                    if !copied_subject
+                    if self.context.python_version >= PythonVersion::Py314
+                        && !copied_subject
+                        && !has_default
+                        && !context.stores.is_empty()
+                        && context.fail_pop.len() > 1
+                        && self.control.loops.non_final_match_tail != Some(statement.range)
+                        && self.control.generators.generator_region_start.is_none()
+                        && self
+                            .control
+                            .exceptions
+                            .active_exception_region_exclusions
+                            .is_empty()
+                        && self.control.withs.active_with_region_exclusions.is_empty()
+                        && let [body @ (Stmt::Return(_) | Stmt::Pass(_))] = case.body.as_slice()
+                        && !expression_contains_inline_branch(guard)
+                        && let Some(restart) = self.control.terminal_loop_continue_label()
+                    {
+                        // Captures have already been stored. A failed guard skips the
+                        // pattern's stack cleanup and returns directly to the loop.
+                        let success = self.assembler.label();
+                        self.compile_jump_if(guard, true, success)?;
+                        self.emit_jump_backward_with_exception_policy(
+                            JUMP_BACKWARD,
+                            restart,
+                            0,
+                            ExceptionPolicy::EXCLUDE_ALWAYS,
+                        )?;
+                        self.assembler.mark(success);
+                        if matches!(body, Stmt::Pass(_)) {
+                            self.assembler
+                                .set_location(self.source_location(body.range()));
+                            self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+                            skip_case_body = true;
+                        }
+                    } else if !copied_subject
                         || self.can_copy_match_guard_subject_return(
                             &case.pattern,
                             guard,
@@ -871,7 +905,7 @@ impl Compiler<'_> {
                     }
                 }
             }
-            if !guard_always_false {
+            if !skip_case_body {
                 let body_is_elided = case
                     .body
                     .iter()
