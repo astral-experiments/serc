@@ -39793,7 +39793,8 @@ impl<'source> Compiler<'source> {
                     && statement.handlers.is_empty()
                     && let Some(index) = statement.finalbody.iter().position(|stmt| matches!(stmt, Stmt::If(_)))
                     && let (prefix, [Stmt::If(guard), ..]) = statement.finalbody.split_at(index)
-                    && suite_has_linear_borrow_fallthrough(prefix)
+                    && (suite_has_linear_borrow_fallthrough(prefix)
+                        || (prefix.is_empty() && compiler.control.withs.active_with_exits.last().is_some_and(|manager| manager.is_async)))
                     && prefix.iter().all(|stmt| matches!(stmt, Stmt::Expr(expr) if matches!(expr.value.as_ref(), Expr::Call(_)))
                         || matches!(stmt, Stmt::AnnAssign(assign) if matches!(assign.value.as_deref(), Some(Expr::List(list)) if matches!(list.elts.as_slice(), [Expr::Starred(_)]))))
                     && guard.elif_else_clauses.is_empty()
@@ -39802,7 +39803,8 @@ impl<'source> Compiler<'source> {
                         && matches!(c.operands.first(), Some(Expr::Name(_) | Expr::Attribute(_)))
                         && matches!(c.comparators()[0], Expr::NoneLiteral(_)))
                 {
-                    // The folded None test reuses a protected slot after these statements.
+                    // The folded None test reuses a protected slot after the prefix
+                    // or at the start of the async manager's normal finalizer.
                     NormalFinallyWithMarkers::Condition(compiler.source_location(guard.test.range()))
                 } else {
                     NormalFinallyWithMarkers::Exclude
