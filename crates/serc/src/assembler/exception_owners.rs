@@ -11199,14 +11199,29 @@ impl LayoutAssembler {
                         && tail.late_removals == 0
                         && tail.insertions == 0
                         && tail.post_compaction_fusions == 0
-                        && let Some(owner) = self.copied_return_guard_owner(
-                            instruction_index,
-                            original_array_start,
-                            tail,
-                            &indexed_instructions,
-                            &label_positions,
-                            &jump_targets,
-                        )
+                        && let Some(owner) = self
+                            .copied_return_guard_owner(
+                                instruction_index,
+                                original_array_start,
+                                tail,
+                                &indexed_instructions,
+                                &label_positions,
+                                &jump_targets,
+                            )
+                            .or_else(|| {
+                                let (start, _, _) = protected_suffix?;
+                                self.try_else_store_owner(
+                                    original_array_start..instruction_index,
+                                    start,
+                                    tail.early_removals,
+                                    &indexed_instructions,
+                                    &label_positions,
+                                    &retained_setup_nops,
+                                )
+                                .map(|region| {
+                                    ExceptionOwnerDecision::override_with_region(Some(region))
+                                })
+                            })
                     {
                         owners.insert(instruction_index, owner);
                     }
@@ -14913,6 +14928,73 @@ impl LayoutAssembler {
         (!owner.is_scope_fallback && !owner.preserve_lasti && current_owner_matches).then_some(
             ExceptionOwnerDecision::override_with_region(owns_cleanup_record.then_some(region)),
         )
+    }
+
+    /// Locates the protected store reused by a guard after two ordinary try bodies.
+    fn try_else_store_owner(
+        &self,
+        array: std::ops::Range<usize>,
+        inner: usize,
+        early_removals: usize,
+        instructions: &[&Instruction],
+        positions: &OwnerLabelPositions,
+        retained_setups: &FxHashSet<usize>,
+    ) -> Option<usize> {
+        use crate::target::opcodes::{
+            LOAD_DEREF, LOAD_FAST, LOAD_FAST_BORROW, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE,
+            STORE_FAST, TO_BOOL,
+        };
+
+        let marker = instructions[array.end];
+        let [.., store, load, to_bool, condition] = instructions.get(inner..array.end)? else {
+            return None;
+        };
+        // The append is four cells after STORE_FAST. The try
+        // POP folds into the guard load, so four other records must have been removed.
+        if store.opcode != STORE_FAST
+            || early_removals != 5
+            || !matches!(
+                load.opcode,
+                LOAD_FAST | LOAD_FAST_BORROW | LOAD_GLOBAL | LOAD_DEREF
+            )
+            || load.local_policy.hidden_exception_owner_slots() != 1
+            || to_bool.opcode != TO_BOOL
+            || !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE)
+            || condition.forward_target().is_none()
+            || condition.location != marker.location
+            || !matches!(
+                marker.exception_policy().owner(),
+                NormalizedExceptionOwner::Present | NormalizedExceptionOwner::DynamicCondition
+            )
+            || instructions.get(array.start.checked_sub(1)?)?.opcode != FOR_ITER
+            || instructions[array.start].opcode != STORE_FAST
+            || inner <= array.start + 2
+            || !retained_setups.contains(&(array.start + 1))
+            || !retained_setups.contains(&(inner - 1))
+            || instructions[inner - 2].opcode != STORE_FAST
+        {
+            return None;
+        }
+        // Both retained SETUPs and their normal exits share the iterator's array.
+        let ordinary_body = |start, end| {
+            let index = self.uniform_exception_owner(start, end, positions)?;
+            let region = self.exception_regions[index];
+            let setup = self
+                .exception_owner_provenance
+                .ordinary_try_setups
+                .iter()
+                .any(|(setup, target)| {
+                    positions.get(setup) == Some(&start) && *target == region.target
+                });
+            (setup
+                && !region.is_scope_fallback
+                && !region.preserve_lasti
+                && positions.get(&region.start) == Some(&start)
+                && positions.get(&region.end) == Some(&end))
+            .then_some(index)
+        };
+        ordinary_body(array.start + 2, inner - 1)?;
+        ordinary_body(inner, array.end - 3)
     }
 
     /// Projects an appended guard through the original return cleanup and its final POP.
