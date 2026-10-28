@@ -15,6 +15,27 @@ use serc::{
 };
 
 #[test]
+fn a_constant_line_and_unary_return_share_the_exit_copy_budget() {
+    for (marker, expression) in [
+        ("'marker'", "-value"),
+        ("'marker'", "not value"),
+        ("1 + 2", "-value"),
+    ] {
+        let source = format!(
+            "def finish(flag, value):
+    if flag:
+        value = first()
+    else:
+        value = second()
+    {marker}
+    return {expression}
+"
+        );
+        assert_matches_cpython(&source, "marked_unary_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

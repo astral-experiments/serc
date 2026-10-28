@@ -3130,7 +3130,10 @@ impl<'source> Compiler<'source> {
                             }))
                         || matches!(&body[index + 1..], [Stmt::Return(returned)]
                         if returned.value.as_deref().is_none_or(|value| {
-                            matches!(value, Expr::Name(_)) || is_literal_constant(value)
+                            matches!(value, Expr::Name(_))
+                                || (is_literal_constant(&expression.value)
+                                    && matches!(value, Expr::UnaryOp(unary) if matches!(unary.operand.as_ref(), Expr::Name(_))))
+                                || is_literal_constant(value)
                         }))
                     {
                         // Keep a literal-constant or simple-return footer in one block
