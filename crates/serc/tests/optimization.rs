@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn normal_try_jump_reaches_the_named_cleanup_on_its_second_visit() {
+    let source = r"def recover(value, retry):
+    try:
+        prepare()
+    except OSError as error:
+        if retry:
+            try:
+                value = read()
+            except ValueError as detail:
+                report(detail)
+        else:
+            value = fallback(error)
+    return value
+";
+    assert_matches_cpython(source, "nested_handler.py", &LEVELS);
+}
+
+#[test]
 fn handler_branches_keep_their_jump_when_a_tuple_return_enlarges_the_cleanup() {
     for handler in ["except ValueError:", "except ValueError as exc:"] {
         let source = format!(
