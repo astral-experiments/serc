@@ -31240,6 +31240,20 @@ impl<'source> Compiler<'source> {
                 self.assembler
                     .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
             }
+            // The non-raising edge of an or-guard in an else suite retains the
+            // located try-exit jump. Once handlers move cold its NOP falls
+            // through to the first instruction after the try.
+            if self.context.python_version == crate::PythonVersion::Py314
+                && !statement.is_star
+                && statement.finalbody.is_empty()
+                && matches!(statement.orelse.as_slice(), [Stmt::If(guard)]
+                    if guard.elif_else_clauses.is_empty()
+                        && matches!(guard.test.as_ref(), Expr::BoolOp(test) if test.op == BoolOp::Or)
+                        && matches!(guard.body.as_slice(), [Stmt::Raise(_)]))
+            {
+                self.assembler
+                    .mark_retained_nop_borrow_fallthrough_if_unblocked(normal_exit);
+            }
             if guarded_recovery_exit.is_some() {
                 self.assembler
                     .preserve_redundant_jump_nop_after_threading(normal_exit);

@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn a_raising_else_guard_reaches_the_continuation_after_recovery() {
+    let source = r"def process(entries, key, ready, value):
+    try:
+        value = entries[key]
+    except KeyError:
+        if ready or empty():
+            value = 1
+        else:
+            value = 0
+    else:
+        if not valid(value) or value < 0:
+            raise ValueError
+    for entry in entries:
+        consume(value, entry)
+";
+    assert_matches_cpython(source, "raising_else_guard.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
