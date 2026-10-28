@@ -28,8 +28,8 @@ use crate::assembler::legacy_native_labels::LegacyInstructionArrays;
 use crate::target::{
     is_conditional_jump, is_unconditional_jump,
     opcodes::{
-        CALL, CALL_KW, END_FOR, GET_AWAITABLE, GET_ITER, LOAD_GLOBAL, POP_JUMP_IF_FALSE,
-        POP_JUMP_IF_NONE, STORE_ATTR, TO_BOOL,
+        CALL, CALL_KW, END_FOR, GET_AWAITABLE, GET_ITER, JUMP_FORWARD, LOAD_GLOBAL,
+        POP_JUMP_IF_FALSE, POP_JUMP_IF_NONE, STORE_ATTR, TO_BOOL,
     },
 };
 
@@ -4395,9 +4395,37 @@ impl OptimizationPipeline {
                                                 }
                                         })
                             });
+                    // A removed normal exit stops fallthrough from the preceding array.
+                    // A surviving arm jump can still enter the continuation directly.
+                    // Marked cleanup entries use the original jump checks above.
+                    let surviving_protected_arm = borrow_unreachable_blocks[target]
+                        && last.opcode == JUMP_FORWARD
+                        && target > block + 1
+                        && !exception_regions.is_empty()
+                        && !jump_entry_blocks.get(target).copied().unwrap_or(false)
+                        && last.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Barrier
+                        && !last.jump_policy.borrow_empty_block()
+                        && items[blocks[target - 1].clone()]
+                            .iter()
+                            .rev()
+                            .filter_map(Item::as_instruction)
+                            .find(|record| {
+                                // A synthetic empty array has no native instruction.
+                                !(record.opcode == NOP
+                                    && record.location.line < 0
+                                    && record.jump_policy.borrow_empty_block())
+                            })
+                            .is_none_or(|record| {
+                                record.opcode == NOP
+                                    && record.jump_policy.always_retains_nop()
+                                    && record.no_location_policy.borrow_fallthrough()
+                                        == BorrowFallthrough::Barrier
+                            });
                     pending.push((
                         target,
-                        for_cleanup_entry
+                        surviving_protected_arm
+                            || for_cleanup_entry
                             || conditional_entry
                             || shared_break
                             || independent_loop_entry

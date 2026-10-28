@@ -25969,6 +25969,38 @@ fn nested_finalizer_guard_recovers_the_earlier_call_handler() {
 }
 
 #[test]
+fn forward_arm_jumps_reach_borrowed_locals_after_nested_try_exits() {
+    let source = r"def prepare(value, flag):
+    try:
+        try:
+            if flag:
+                pass
+            else:
+                result = 1
+        except ValueError:
+            pass
+    except LookupError:
+        pass
+    use(value, 1)
+
+def update(value, first, second):
+    try:
+        try:
+            if first:
+                if second:
+                    mark()
+            elif second:
+                store()
+        except ValueError:
+            recover()
+    except LookupError:
+        pass
+    value.update()
+";
+    assert_matches_cpython(source, "nested_try_arm_borrowing.py", &LEVELS);
+}
+
+#[test]
 fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
     let source = r"def check(manager, value, size):
     with manager, manager, manager, manager, manager, manager:
