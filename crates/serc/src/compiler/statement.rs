@@ -39123,9 +39123,17 @@ impl<'source> Compiler<'source> {
                         .filter(|origin| compiler.assembler.item_count() == origin.end_item_count);
                     Ok((has_instructions, async_for_end_pop))
                 } else {
+                    // The terminal try in the else suite reaches the same normal finalizer
+                    // as the outer handlers. Its bridge and their direct exits can all
+                    // copy the short POP_BLOCK, return marker, value and RETURN_VALUE array.
+                    let short_return_join = compiler.context.python_version >= crate::PythonVersion::Py314
+                        && matches!(statement.finalbody.as_slice(), [Stmt::Return(returned)]
+                            if returned.value.as_deref().is_none_or(is_literal_constant))
+                        && matches!(statement.orelse.last(), Some(Stmt::Try(nested))
+                            if !nested.is_star && !nested.handlers.is_empty() && nested.finalbody.is_empty());
                     compiler.with_control_override(
                         |control| &mut control.exceptions.prevent_try_exit_inlining,
-                        true,
+                        !short_return_join,
                         |compiler| {
                             compiler.compile_try_except(
                                 statement,
