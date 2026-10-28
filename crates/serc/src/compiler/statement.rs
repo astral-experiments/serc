@@ -6708,7 +6708,10 @@ impl<'source> Compiler<'source> {
                         true
                     }
                     _ => {
+                        // A copied finalizer resumes the pending exit after the call.
+                        // Its conditional argument may inline that shorter continuation.
                         if self.control.statements.in_terminal_if_branch_suite
+                            && self.control.finally.active_copied_finally_bodies == 0
                             && self.control.generators.generator_region_start.is_none()
                             && !self.control.statements.context.has_following
                             && !self.assembler.has_exception_regions()
