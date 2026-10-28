@@ -139,3 +139,24 @@ def finalizer_barrier(manager, value):
 ";
     common::assert_matches_cpython_marshal(source, "handler_store_source_barriers.py");
 }
+
+#[test]
+fn copied_nested_unwinds_keep_the_assignment_location() {
+    use std::fmt::Write as _;
+
+    for depth in [6, 7] {
+        let mut source = String::from("def rewrite(value, flag, chosen):\n    if chosen:\n");
+        let mut indent = "        ".to_owned();
+        for _ in 1..depth {
+            writeln!(
+                source,
+                "{indent}try:\n{indent}    pass\n{indent}except Failure:"
+            )
+            .unwrap();
+            indent.push_str("    ");
+        }
+        writeln!(source, "{indent}try:\n{indent}    if flag:\n{indent}        pass\n{indent}    else:\n{indent}        value = convert(value)\n{indent}except Failure:\n{indent}    pass").unwrap();
+        source.push_str("    if value and chosen:\n        finish(value)\n");
+        common::assert_matches_cpython_pop_except_positions(&source, "nested_unwind.py");
+    }
+}
