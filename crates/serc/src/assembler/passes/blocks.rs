@@ -1137,6 +1137,28 @@ fn metadata_split_exit_chain<'a>(
     &order[start..=end]
 }
 
+/// A conditional discard, its handler pop and its jump share a single unlocated array.
+fn conditional_handler_discard_jump(
+    graph: &BlockGraph,
+    blocks: &[BasicBlockId],
+    conditional_predecessors: &[usize],
+) -> bool {
+    // A conditional expression joins the two completed values. A short-circuit
+    // Boolean can instead jump directly to the discard from its value test.
+    if blocks.len() < 2 || conditional_predecessors[blocks[0].index()] != 0 {
+        return false;
+    }
+    let mut records = blocks
+        .iter()
+        .flat_map(|&block| graph[block].items())
+        .filter_map(Item::as_instruction);
+    matches!((records.next(), records.next(), records.next(), records.next()),
+        (Some(pop), Some(handler), Some(jump), None)
+        if pop.opcode == POP_TOP && pop.no_location_policy.copy_inherits_shared_predecessor()
+        && handler.opcode == POP_EXCEPT && is_unconditional_jump(jump.opcode)
+        && [pop, handler, jump].iter().all(|record| record.location.line < 0))
+}
+
 struct ExitBlockAnalysis {
     positions: Vec<usize>,
     predecessors: Vec<usize>,
@@ -1474,7 +1496,9 @@ fn exit_block_analysis(
                     && target_last.no_location_policy.allows_block_inlining(),
                 shared_exit: predecessors[target.index()] > 1
                     && ((target_has_no_location
-                        && (ends_scope(target_last.opcode) || has_jump_eval_check(target_last)))
+                        && (ends_scope(target_last.opcode)
+                            || has_jump_eval_check(target_last)
+                            || conditional_handler_discard_jump(graph, target_blocks, &conditional_predecessors)))
                         || target_last.no_location_policy.is_artificial_eval_break()),
             }
         });
@@ -5285,7 +5309,7 @@ impl OptimizationPipeline {
             positions,
             predecessors,
             jump_predecessors: _,
-            conditional_predecessors: _,
+            conditional_predecessors,
             exception_handler_blocks,
             requires_copy: _,
         } = analysis;
@@ -5950,8 +5974,9 @@ impl OptimizationPipeline {
                             || unlocated_discard
                     }
                 });
-            exit_without_unique_predecessor[block.index()] =
-                unlocated_scope_exit || artificial_eval_break;
+            exit_without_unique_predecessor[block.index()] = unlocated_scope_exit
+                || artificial_eval_break
+                || conditional_handler_discard_jump(graph, exit_blocks, &conditional_predecessors);
         }
 
         let mut inline_copies = FxHashMap::<_, Vec<Vec<Item>>>::default();
@@ -6220,6 +6245,8 @@ impl OptimizationPipeline {
                 &exception_split_labels,
             );
             let target_chain_end = target_position + target_blocks.len() - 1;
+            let split_discard_jump =
+                conditional_handler_discard_jump(graph, target_blocks, &conditional_predecessors);
             let target_exit = *target_blocks.last().expect("target chain is nonempty");
             let target_terminal_opcode = target_blocks
                 .iter()
@@ -8046,6 +8073,7 @@ impl OptimizationPipeline {
                         }
                         let end = if membership.contains(&positions[target.index()]) {
                             (target_has_preserved_boundary_alias
+                                || split_discard_jump
                                 || (matches!(
                                     target_terminal_opcode,
                                     Some(RETURN_VALUE | JUMP_BACKWARD)

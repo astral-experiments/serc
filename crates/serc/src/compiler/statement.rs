@@ -6795,6 +6795,17 @@ impl<'source> Compiler<'source> {
                         .set_location(self.source_location(last.range()));
                 }
                 self.emit(POP_TOP, 0, -1)?;
+                if self.context.python_version >= crate::PythonVersion::Py314
+                    && !self.control.statements.context.has_following
+                    && self.control.in_exception_handler()
+                    && matches!(expression.value.as_ref(), Expr::If(conditional) if early_condition_truthiness(&conditional.test).is_none())
+                {
+                    // The value arms end before the shared discard and handler cleanup.
+                    // Each private copy takes its own value's source position.
+                    self.assembler.preserve_last_no_location();
+                    self.assembler
+                        .make_last_no_location_copy_inherit_shared_predecessor();
+                }
                 // Allow copied conditional discards to inherit their branch's location.
                 // A folded true branch retains its separate unlocated join.
                 if preserve_no_location

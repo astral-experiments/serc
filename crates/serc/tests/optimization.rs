@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn discarded_conditional_values_copy_their_handler_exit() {
+    for expression in [
+        "left(value) if flag else right(value)",
+        "left(value) or right(value)",
+    ] {
+        let source = format!(
+            "async def run(flag, value):
+    try:
+        work()
+    except ValueError:
+        {expression}
+    finally:
+        finish()
+"
+        );
+        assert_matches_cpython(&source, "handler_value_discard.py", &LEVELS);
+    }
+}
+
+#[test]
 fn short_circuit_handler_discards_copy_their_return_cleanup() {
     let source = r"def recover(enabled, item):
     try:
