@@ -25969,6 +25969,28 @@ fn nested_finalizer_guard_recovers_the_earlier_call_handler() {
 }
 
 #[test]
+fn named_handler_loop_exit_copies_each_false_operands_position() {
+    let source = r"def retry(pending, ready, enabled):
+    while pending and ready:
+        try:
+            run()
+        except LookupError as error:
+            while enabled and ready:
+                handle(error)
+
+def scan(start, stop, ready):
+    while start < stop:
+        try:
+            start = advance(start)
+        except ValueError as error:
+            while start < stop and ready:
+                start += 1
+    return start
+";
+    assert_matches_cpython(source, "named_handler_loop_exit.py", &LEVELS);
+}
+
+#[test]
 fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
     let source = r"def check(manager, value, size):
     with manager, manager, manager, manager, manager, manager:
