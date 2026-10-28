@@ -15755,6 +15755,25 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn conditional_augmented_assignment_rejoins_before_the_arm_exit() {
+    let source = r"def jumping(active, ready, saved):
+    if active:
+        saved += 1 if ready else 2
+    else:
+        finish()
+
+def falling(active, ready, saved):
+    if active:
+        saved += 1 if ready else 2
+";
+    assert_matches_cpython(
+        source,
+        "conditional_augmented_assignment_footer.py",
+        &LEVELS,
+    );
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
