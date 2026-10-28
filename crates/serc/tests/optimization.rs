@@ -10697,6 +10697,28 @@ fn conditional_manager_finally_copies_iterator_cleanup() {
 }
 
 #[test]
+fn nested_branches_keep_the_copy_limit_for_binary_returns() {
+    for expression in ["left + right", "left ^ right", "left[right]"] {
+        let source = format!(
+            "def sample(outer, middle, inner, left, right):
+    if outer:
+        if middle:
+            if inner:
+                left = first()
+            else:
+                left = second()
+        else:
+            left = third()
+    else:
+        raise ValueError
+    return {expression}
+"
+        );
+        assert_matches_cpython(&source, "nested_binary_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_manager_preserves_shared_subscript_return() {
     let source = r"def sample(key, root, cache):
     try:
