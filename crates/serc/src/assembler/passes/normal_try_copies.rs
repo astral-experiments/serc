@@ -904,11 +904,15 @@ impl OptimizationPipeline {
             let Some((jump, prefix)) = target_instructions.split_last() else {
                 return false;
             };
-            // Persistent located work prevents no-line copying. Its replaced jump
-            // plus the eventual four-slot return also exceeds MAX_COPY_SIZE.
+            // A located prefix prevents no-line copying. Four persistent instructions
+            // already put the jump past MAX_COPY_SIZE. For a shorter literal arm, the
+            // replaced jump and eventual four-slot tuple return also exceed the limit.
+            let wide = prefix.len() >= 4 && prefix.iter().all(|op| op.opcode != NOP);
+            let literal_arm = matches!(prefix, [value] | [value, _]
+                if matches!(value.opcode, LOAD_CONST | LOAD_SMALL_INT))
+                && (prefix.len() == 1 || prefix[1].opcode == STORE_FAST);
             if jump.opcode != JUMP_FORWARD
-                || !matches!(prefix, [value] | [value, _] if matches!(value.opcode, LOAD_CONST | LOAD_SMALL_INT))
-                || (prefix.len() == 2 && prefix[1].opcode != STORE_FAST)
+                || !(wide || literal_arm)
                 || prefix.iter().any(|instruction| {
                     instruction.location.line < 0
                         || instruction.pre_fold_extra_instructions() != 0
