@@ -953,6 +953,15 @@ impl Compiler<'_> {
         )
     }
 
+    /// Short-circuit edges disappear before graph folding. Only the original
+    /// operands reserve constants, with nested scopes retaining their own pools.
+    pub(super) fn pre_register_short_circuited_operand(
+        &mut self,
+        expression: &Expr,
+    ) -> Result<(), CompileError> {
+        self.pre_register_suite_names_with_folds(&[], true, false, None, Some(expression))
+    }
+
     pub(super) fn pre_register_discarded_expression(
         &mut self,
         expression: &Expr,

@@ -2680,7 +2680,7 @@ impl Compiler<'_> {
             self.assembler.set_location(origin_location);
             self.emit_folded_constant(origin, constant)?;
             for value in operands {
-                self.pre_register_discarded_expression(value, None)?;
+                self.pre_register_short_circuited_operand(value)?;
             }
             if boolean.values.len() > 1
                 && (boolean.values.len() > 2
