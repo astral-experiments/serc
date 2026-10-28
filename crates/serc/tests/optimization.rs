@@ -23684,6 +23684,30 @@ fn nested_pass_exit_successors_match_cpython() {
 }
 
 #[test]
+fn a_try_else_keeps_a_shared_conditional_exit_unlocated() {
+    let source = r"def update(active, first, ready, target):
+    try:
+        prepare()
+    except ValueError:
+        pass
+    else:
+        if active or ready:
+            if first:
+                pass
+            else:
+                if ready:
+                    if first:
+                        pass
+                    else:
+                        target[0] = ready
+        else:
+            pass
+    finish()
+";
+    assert_matches_cpython(source, "shared_try_else_exit.py", &LEVELS);
+}
+
+#[test]
 fn nonterminal_pass_finally_preserves_handler_for_all_targets() {
     for (function, trailer) in [
         ("def", ""),
