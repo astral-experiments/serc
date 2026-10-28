@@ -13123,6 +13123,24 @@ fn repeated_try_predecessor_keeps_the_finalizer_pop_unlocated() {
 }
 
 #[test]
+fn manager_pop_follows_the_shared_exit_of_a_conditional_finalizer() {
+    let source = r"def run(manager, ready, value):
+    with manager:
+        try:
+            work()
+        finally:
+            if ready:
+                if value is None:
+                    pass
+                else:
+                    finish(value)
+            else:
+                raise ValueError
+";
+    assert_matches_cpython(source, "manager_finalizer_exit.py", &LEVELS);
+}
+
+#[test]
 fn repeated_manager_guard_keeps_normal_exit_unlocated() {
     let source = r"def run(manager, first, second, ready):
     with manager:
