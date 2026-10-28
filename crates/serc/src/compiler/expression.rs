@@ -9760,7 +9760,7 @@ impl Compiler<'_> {
                     // blocks. Stop borrowing at their destination while preserving the
                     // constant NOP and any earlier edge that could alias this entry.
                     if jump_constant_truthiness(value) == Some(matches!(boolean.op, BoolOp::Or)) {
-                        self.assembler.record_folded_condition_borrow_entry(label);
+                        self.assembler.record_folded_short_circuit_exit(label);
                     }
                     if preserve_leading_protected_loop_owner && operand_index == 0 {
                         self.assembler.preserve_last_not_taken_exception_owner();
@@ -9798,7 +9798,7 @@ impl Compiler<'_> {
                         }
                         if jump_constant_truthiness(value) == Some(matches!(boolean.op, BoolOp::Or))
                         {
-                            compiler.assembler.record_folded_condition_borrow_entry(end);
+                            compiler.assembler.record_folded_short_circuit_exit(end);
                         }
                         if preserve_leading_protected_loop_owner && operand_index == 0 {
                             compiler.assembler.preserve_last_not_taken_exception_owner();

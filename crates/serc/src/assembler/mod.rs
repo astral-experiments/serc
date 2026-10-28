@@ -4608,6 +4608,23 @@ impl Assembler {
             > 1
     }
 
+    /// Records the original conditional edge before a Boolean operand short-circuits.
+    pub(crate) fn record_folded_short_circuit_exit(&mut self, target: Label) {
+        if self.python_version >= crate::PythonVersion::Py314
+            && let [.., Item::Label(entry), Item::Instruction(jump)] = self.linear_items()
+        {
+            // The remaining operands become unreachable only after the original
+            // conditional has missed the early small-exit copy pass.
+            self.record_folded_guard_exit(
+                *entry,
+                target,
+                jump.location,
+                ir::FoldedGuardExit::BooleanOperand,
+            );
+        }
+        self.record_folded_condition_borrow_entry(target);
+    }
+
     /// Records an empty folded-condition entry without confusing pending label aliases.
     pub(crate) fn record_folded_condition_borrow_entry(&mut self, target: Label) {
         let labels = self
@@ -8915,6 +8932,17 @@ impl Assembler {
         target: Label,
         location: SourceLocation,
     ) {
+        self.record_folded_guard_exit(entry, target, location, ir::FoldedGuardExit::ConditionalArm);
+    }
+
+    /// Binds the sole conditional edge to the original kind of guard that emitted it.
+    fn record_folded_guard_exit(
+        &mut self,
+        entry: Label,
+        target: Label,
+        location: SourceLocation,
+        kind: ir::FoldedGuardExit,
+    ) {
         let [.., Item::Label(actual_entry), Item::Instruction(jump)] = self.linear_items() else {
             return;
         };
@@ -8936,7 +8964,7 @@ impl Assembler {
         // The destination is still being emitted. Bind this exact source record
         // to its original return array before any copied exit receives a location.
         let original = *jump;
-        self.folded_arm_exit_origins.push((entry, original));
+        self.folded_arm_exit_origins.push((entry, original, kind));
     }
 
     pub(crate) fn prevent_jump_inlining(&mut self, emitted: EmittedJump) {
