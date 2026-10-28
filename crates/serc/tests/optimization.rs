@@ -25936,6 +25936,16 @@ fn specialized_comparison_keeps_its_try_else_guard_handler() {
 }
 
 #[test]
+fn manager_exits_copy_a_short_normal_finalizer_return() {
+    for value in ["value", "value.method()"] {
+        let source = format!(
+            "def run(manager, value):\n    try:\n        with manager:\n            work()\n    except ValueError:\n        recover()\n    finally:\n        return {value}\n"
+        );
+        assert_matches_cpython(&source, "manager_finalizer_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertions_keep_the_finally_call_argument_guard_protected() {
     let source = r"def check(manager, handle, data, ok):
     with manager:

@@ -701,6 +701,52 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
         && instructions.next().is_none()
 }
 
+/// Checks a normal or suppressed manager exit and its original three-slot finalizer.
+fn manager_copies_local_return(
+    preceding: &[Item],
+    source: &[Item],
+    target: &[Item],
+    manager_locations: &[SourceLocation],
+) -> bool {
+    let [labels @ .., Item::Instruction(jump)] = source else {
+        return false;
+    };
+    if jump.opcode != JUMP_FORWARD
+        || jump.location.line < 0
+        || !labels.iter().all(|item| matches!(item, Item::Label(_)))
+        || !manager_locations.contains(&jump.location)
+    {
+        return false;
+    }
+    let start = target
+        .iter()
+        .take_while(|item| matches!(item, Item::Label(_)))
+        .count();
+    let [Item::Instruction(pop), returned @ ..] = &target[start..] else {
+        return false;
+    };
+    if pop.opcode != NOP
+        || pop.location.line >= 0
+        || !pop.fusion_policy.is_converted_pop_block()
+        || !super::normal_try_copies::original_local_return(returned)
+    {
+        return false;
+    }
+    // Both cleanup tails reach the finalizer's POP_BLOCK and local return through
+    // the same empty try exit. The copies retain their separate block entries.
+    let records = preceding.iter().filter_map(Item::as_instruction);
+    records
+        .clone()
+        .all(|record| record.location == jump.location)
+        && (records
+            .clone()
+            .map(|record| record.opcode)
+            .eq([LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP])
+            || records
+                .map(|record| record.opcode)
+                .eq([POP_EXCEPT, POP_TOP, POP_TOP, POP_TOP]))
+}
+
 /// Recognizes a named-handler cleanup followed by a short, located value return.
 fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> bool {
     let cleanup = graph[target]
@@ -6299,10 +6345,26 @@ impl OptimizationPipeline {
                         && (target_chain_end == target_position
                             || matches!(opcode, RAISE_VARARGS | RETURN_VALUE))
                 });
-            let source_allows_small_exit_inlining = (target_chain_end == target_position
-                && target_terminal_opcode == Some(RAISE_VARARGS)
-                && (block_is_bare_raise(graph[target].items(), &self.original_nop_targets)
-                    || block_is_local_raise(graph[target].items(), &self.original_nop_targets)))
+            let manager_return = self.python_version >= crate::PythonVersion::Py314
+                && target_chain_end == target_position
+                && target_pre_fusion_size == 3
+                && target_terminal_opcode == Some(RETURN_VALUE)
+                && source_position.checked_sub(1).is_some_and(|index| {
+                    manager_copies_local_return(
+                        graph[order[index]].items(),
+                        graph[source].items(),
+                        graph[target].items(),
+                        &self.exception_owner_provenance.with_context_locations,
+                    )
+                });
+            let source_allows_small_exit_inlining = manager_return
+                || (target_chain_end == target_position
+                    && target_terminal_opcode == Some(RAISE_VARARGS)
+                    && (block_is_bare_raise(graph[target].items(), &self.original_nop_targets)
+                        || block_is_local_raise(
+                            graph[target].items(),
+                            &self.original_nop_targets,
+                        )))
                 || graph[source]
                     .last_instruction()
                     .is_some_and(|instruction| instruction.jump_policy.inline_small_exit());
