@@ -32517,8 +32517,8 @@ impl<'source> Compiler<'source> {
                 && self.control.finally.active_copied_finally_bodies == 0
                 && matches!(handler.body.last(), Some(Stmt::If(tail))
                     if tail.elif_else_clauses.is_empty()
-                        && condition_has_only_runtime_tests(&tail.test)
-                        && matches!(tail.body.as_slice(), [Stmt::For(loop_)]
+                        && (condition_has_only_runtime_tests(&tail.test) || early_condition_truthiness(&tail.test) == Some(true))
+                        && matches!(tail.body.last(), Some(Stmt::For(loop_))
                             if !loop_.is_async
                                 && loop_.orelse.is_empty()
                                 && suite_contains_loop_break(&loop_.body)

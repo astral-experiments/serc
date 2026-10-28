@@ -3989,6 +3989,26 @@ fn folded_while_breaks_copy_unnamed_handler_cleanup() {
 }
 
 #[test]
+fn guarded_for_break_copies_handler_cleanup_after_a_prefix() {
+    for test in ["ready", "True"] {
+        let source = format!(
+            "def run(values, ready):
+    for value in values:
+        try:
+            work(value)
+        except LookupError:
+            if {test}:
+                step()
+                for element in values:
+                    break
+        finish(value)
+"
+        );
+        assert_matches_cpython(&source, "guarded_for_handler.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_none_while_break_copies_cleanup() {
     for prefix in ["", "async "] {
         for condition in ["value", "value is None", "value is not None"] {
