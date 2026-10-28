@@ -21771,6 +21771,23 @@ fn optimized_empty_manager_bodies_match_cpython() {
 }
 
 #[test]
+fn awaited_return_restores_the_outer_guard_pop_after_inner_cleanup() {
+    let source = r"async def run(task, flag, owner):
+    try:
+        try:
+            return await task()
+        except ValueError:
+            pass
+        finally:
+            owner.inner.close(flag)
+    finally:
+        if flag is not None:
+            finish()
+";
+    assert_matches_cpython_versions(source, "await_cleanup.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
 fn return_through_inner_finally_keeps_outer_guard_slot() {
     let source = r"async def sample(value):
     try:

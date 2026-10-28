@@ -12779,13 +12779,27 @@ impl<'source> Compiler<'source> {
                                     && handler.try_body_depth == ordinary_pops
                                     && handler.exception_region_depth == handler.try_body_depth + 1
                             });
+                    // An ordinary try inside the copied inner finally unwinds at the
+                    // end of the await, before the cleanup expression and outer POP.
+                    let awaited_inner_cleanup = preserve_tos
+                        && matches!(statement.value.as_deref(), Some(Expr::Await(_)))
+                        && handler_count == 0
+                        && ordinary_pops == 1
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.withs.active_with_exits.is_empty()
+                        && matches!(return_finally_contexts.as_slice(), [_, inner]
+                            if inner.try_body_depth == 0 && inner.exception_region_depth == 1
+                                && inner.handler_depth == 0 && inner.loop_depth == 0 && inner.with_depth == 0
+                                && matches!(inner.body, [Stmt::Expr(expr)] if matches!(expr.value.as_ref(), Expr::Call(_))
+                                    && !expression_contains_inline_branch(&expr.value)
+                                    && !expression_suspends_current_scope(&expr.value)));
                     let return_guard_pops = (self.context.python_version
                         == crate::PythonVersion::Py314
                         && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == CO_COROUTINE
                         && !return_is_overridden
                         && context_index == 0
-                        && return_finally_contexts.len() == 1
+                        && (return_finally_contexts.len() == 1 || awaited_inner_cleanup)
                         && finally_context.handler_depth == 0
                         && finally_context.loop_depth == 0
                         && finally_context.try_body_depth == 0
@@ -12804,8 +12818,8 @@ impl<'source> Compiler<'source> {
                             .exceptions
                             .active_exception_region_exclusions
                             .len()
-                            == 1 + handler_count + ordinary_pops
-                        && (direct_cleanup || nested_named_handler)
+                            == return_finally_contexts.len() + handler_count + ordinary_pops
+                        && (direct_cleanup || nested_named_handler || awaited_inner_cleanup)
                         && iterators.next().is_none()
                         && iterator.is_none_or(|context| {
                             context.iterator_cleanup == IteratorCleanup::Sync
