@@ -15,6 +15,12 @@ use serc::{
 };
 
 #[test]
+fn erased_else_assertion_preserves_the_final_try_guard_location() {
+    let source = "def scan(rows, flag):\n    for row in rows:\n        try:\n            if row == 1:\n                one()\n            elif row == 2:\n                two()\n            else:\n                assert False\n        except LookupError:\n            if flag:\n                recover()\n";
+    assert_matches_cpython(source, "erased_else_guard.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
