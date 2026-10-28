@@ -3535,7 +3535,11 @@ impl Assembler {
     }
 
     /// Certifies the single original false edge after a direct returning arm.
-    pub(crate) fn original_return_guard_has_false_donor(&self, location: SourceLocation) -> bool {
+    pub(crate) fn original_return_guard_has_false_donor(
+        &self,
+        location: SourceLocation,
+        iterator_slots: u32,
+    ) -> bool {
         let items = self.linear_items();
         let labels = trailing_labels(items).collect::<Vec<_>>();
         if labels.is_empty()
@@ -3565,11 +3569,18 @@ impl Assembler {
         let Some(edge) = incoming.next() else {
             return false;
         };
+        // A same-line return disposes of the loop iterator. The false edge
+        // retains its slots and still supplies the guard's line to this exit.
+        let same_line_iterator_return = previous.location.line == location.line
+            && edge
+                .depth_after()
+                .zip(previous.depth_after())
+                .is_some_and(|(edge, returned)| edge.checked_sub(returned) == Some(iterator_slots));
         incoming.next().is_none()
             && edge.opcode == POP_JUMP_IF_FALSE
             && location.line >= 0
             && edge.location == location
-            && edge.depth_after() == previous.depth_after()
+            && (edge.depth_after() == previous.depth_after() || same_line_iterator_return)
             && matches!(edge.operand(), Operand::Forward(target)
                 if self.exception_owner_provenance.source_boundaries.contains(&target)
                     && self.exception_owner_provenance.block_boundaries.contains(&target))
