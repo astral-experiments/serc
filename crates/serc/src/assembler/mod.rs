@@ -1969,10 +1969,10 @@ impl Assembler {
             })
     }
 
-    /// Checks the live call suffix of the current original source array.
-    pub(crate) fn current_original_block_ends_with_discarded_call(&self) -> bool {
+    /// Checks whether the current original array discards the result of this opcode.
+    pub(crate) fn current_original_block_ends_with_discarded(&self, opcode: Opcode) -> bool {
         let mut items = self.linear_items().iter().rev();
-        for expected in [POP_TOP, crate::target::opcodes::CALL] {
+        for expected in [POP_TOP, opcode] {
             loop {
                 match items.next() {
                     Some(Item::Label(label))
@@ -14683,6 +14683,7 @@ impl Assembler {
         pop_item: usize,
         unnamed_handler: bool,
         retained_inner_try: bool,
+        discarded_await: bool,
     ) {
         use crate::target::opcodes::CALL;
 
@@ -14778,11 +14779,10 @@ impl Assembler {
             [pop, load, to_bool, condition, marker] if to_bool.opcode == TO_BOOL => {
                 (pop, load, Some(to_bool), condition, marker)
             }
-            // The unnamed-handler and retained inner-try cleanup can precede a local
-            // None comparison. Its three fused condition records are modeled by replay;
-            // only the separately captured adjacent inner POP proves its own epoch.
+            // A local None comparison fuses three condition records. The captured
+            // handler, inner POP, or discarded await fixes the start of its cleanup.
             [pop, load, condition, marker, ..]
-                if (unnamed_handler || retained_inner_try)
+                if (unnamed_handler || retained_inner_try || discarded_await)
                     && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE) =>
             {
                 (pop, load, None, condition, marker)
