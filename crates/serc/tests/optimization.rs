@@ -25936,6 +25936,29 @@ fn specialized_comparison_keeps_its_try_else_guard_handler() {
 }
 
 #[test]
+fn named_cleanup_continuation_inherits_the_remaining_handler_arm() {
+    let source = r"async def run(manager, enabled, flag, item):
+    async with manager:
+        try:
+            if enabled:
+                try:
+                    work()
+                except ValueError as error:
+                    if flag or item:
+                        work()
+                    else:
+                        recover(
+                            error,
+                        )
+        except OSError:
+            raise
+        except Exception as outer:
+            raise Failure() from outer
+";
+    assert_matches_cpython(source, "guarded_handler_continuation.py", &LEVELS);
+}
+
+#[test]
 fn erased_assertions_keep_the_finally_call_argument_guard_protected() {
     let source = r"def check(manager, handle, data, ok):
     with manager:
