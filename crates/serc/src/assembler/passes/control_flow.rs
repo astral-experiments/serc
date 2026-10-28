@@ -6059,11 +6059,27 @@ impl OptimizationPipeline {
                                 })
                         });
 
+                    // The authored break marker precedes the manager unwind. A jump
+                    // appended to its exit call does not carry a second line event.
+                    let unwound_manager_break = finalize_borrow_empty_blocks
+                        && self.python_version >= crate::PythonVersion::Py314
+                        && instruction.fusion_policy.is_authored_break()
+                        && self
+                            .exception_owner_provenance
+                            .with_context_locations
+                            .contains(&instruction.location)
+                        && graph[block].items()[..offset]
+                            .last()
+                            .and_then(Item::as_instruction)
+                            .is_some_and(|pop| {
+                                pop.opcode == POP_TOP && pop.location == instruction.location
+                            });
                     if !preserves_original_fallthrough_nop
                         && !preserves_compound_fallthrough_nop
                         && !preserves_copied_finally_break_nop
                         && (!instruction.jump_policy.always_retains_nop()
-                            || absorbed_normal_try_exit)
+                            || absorbed_normal_try_exit
+                            || unwound_manager_break)
                         && (instruction.location.line < 0
                             || (!original_async_for_join
                                 && !original_manager_break_join
