@@ -703,6 +703,8 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
 
 /// Recognizes a named-handler cleanup followed by a short, located value return.
 fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> bool {
+    use crate::target::opcodes::{DELETE_DEREF, STORE_DEREF};
+
     let cleanup = graph[target]
         .items()
         .iter()
@@ -713,8 +715,10 @@ fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> b
     };
     if pop.opcode != POP_EXCEPT
         || value.opcode != LOAD_CONST
-        || store.opcode != STORE_FAST
-        || delete.opcode != DELETE_FAST
+        || !matches!(
+            (store.opcode, delete.opcode),
+            (STORE_FAST, DELETE_FAST) | (STORE_DEREF, DELETE_DEREF)
+        )
         || store.operand() != delete.operand()
         || jump.opcode != JUMP_FORWARD
         || cleanup.iter().any(|instruction| {
