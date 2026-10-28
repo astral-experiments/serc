@@ -25969,6 +25969,15 @@ fn nested_finalizer_guard_recovers_the_earlier_call_handler() {
 }
 
 #[test]
+fn same_line_return_omits_the_marker_before_manager_cleanup() {
+    for sep in ["; ", "\n        "] {
+        let source =
+            format!("def run(manager):\n    with manager:\n        process(){sep}return True\n");
+        assert_matches_cpython(&source, "manager_same_line_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
     let source = r"def check(manager, value, size):
     with manager, manager, manager, manager, manager, manager:

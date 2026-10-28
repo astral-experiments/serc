@@ -7005,6 +7005,20 @@ impl OptimizationPipeline {
                                     || is_unconditional_jump(previous.opcode))
                         }))
                     || setup_nop_predecessor
+                    // A return on the preceding statement's line contributes no line
+                    // event before the manager's None arguments start the unwind.
+                    || (self.python_version >= crate::PythonVersion::Py314
+                        && !instruction.fusion_policy.is_converted_pop_block()
+                        && preceding_labels.is_empty()
+                        && previous_graph_block == Some(graph_block)
+                        && previous.is_some_and(|previous| {
+                            !previous.fusion_policy.location_from_next()
+                                && previous.location.line == instruction.location.line
+                        })
+                        && next.is_some_and(|next| {
+                            matches!(next.opcode, LOAD_CONST | LOAD_COMMON_CONSTANT)
+                                && self.exception_owner_provenance.with_context_locations.contains(&next.location)
+                        }))
                     || (previous_graph_block == Some(graph_block)
                         && previous.is_some_and(|previous| {
                             self.exception_owner_provenance
