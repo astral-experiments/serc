@@ -30281,6 +30281,20 @@ impl<'source> Compiler<'source> {
                     exception_policy,
                 )?
             };
+            // Relocating a nested handler can leave the normal jump at fallthrough.
+            // Keep the line it inherited from the protected suite's final pass.
+            if self.context.python_version >= crate::PythonVersion::Py314
+                && !statement.is_star
+                && statement.orelse.is_empty()
+                && statement.finalbody.is_empty()
+                && (handler_contains_nested_handler_cold_join
+                    || handler_contains_terminal_nested_try)
+                && matches!(statement.body.last(), Some(Stmt::Pass(pass))
+                    if self.assembler.location() == self.source_location(pass.range))
+            {
+                self.assembler
+                    .preserve_redundant_jump_nop_after_threading(normal_exit);
+            }
             // Break edges bypass the loop's else suite. After threading those
             // edges, the try's normal jump retains the physical else fallthrough's line.
             if self.context.python_version >= crate::PythonVersion::Py314
