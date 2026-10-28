@@ -4758,6 +4758,12 @@ fn finalizer_copies_named_handler_cleanup_onto_elif_exits() {
 }
 
 #[test]
+fn copied_return_finalizer_drops_a_line_supplied_by_the_operand() {
+    let source = "def choose(item):\n    try:\n        return item.value if item is not None else None\n    finally:\n        del item\n";
+    assert_matches_cpython(source, "copied_return_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn nested_handler_raise_keeps_empty_outer_exit() {
     for scope in ["def", "async def"] {
         for binding in ["", " as parse_error"] {
