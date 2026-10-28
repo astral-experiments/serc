@@ -4670,6 +4670,13 @@ impl<'source> Compiler<'source> {
         statement: &ruff_python_ast::StmtIf,
         preserve_protected_folded_nop: bool,
     ) -> Result<(), CompileError> {
+        // Both arms leave the scope explicitly. The comparison's cleanup edge can
+        // copy a short else suite even when this if is itself a terminal branch.
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && self.compile_terminating_if_chained_compare_with_else(statement)?
+        {
+            return Ok(());
+        }
         // The legacy optimizer copies small exits and then resolves their locations.
         // On newer targets, erasing a statement after a nested if/else exposes the
         // same shared footer when a nested test or arm still branches into it.
@@ -6203,8 +6210,20 @@ impl<'source> Compiler<'source> {
     fn compile_terminating_if_chained_compare_with_else(
         &mut self,
         statement: &ruff_python_ast::StmtIf,
-        comparison: &ruff_python_ast::ExprCompare,
-    ) -> Result<(), CompileError> {
+    ) -> Result<bool, CompileError> {
+        let Expr::Compare(comparison) = statement.test.as_ref() else {
+            return Ok(false);
+        };
+        let [clause] = statement.elif_else_clauses.as_slice() else {
+            return Ok(false);
+        };
+        if comparison.ops.len() < 2
+            || clause.test.is_some()
+            || !suite_terminates(&statement.body)
+            || !suite_terminates(&clause.body)
+        {
+            return Ok(false);
+        }
         let base_depth = self.control.stack.depth;
         let cleanup = self.assembler.label();
         let body = self.assembler.label();
@@ -6262,12 +6281,9 @@ impl<'source> Compiler<'source> {
 
         self.assembler.mark(otherwise);
         self.set_depth(base_depth);
-        let [clause] = statement.elif_else_clauses.as_slice() else {
-            unreachable!("terminal chained comparison specialization requires one else clause");
-        };
         self.compile_suite(&clause.body)?;
         self.set_depth(base_depth);
-        Ok(())
+        Ok(true)
     }
 
     fn compile_terminal_if_expression(
@@ -15234,13 +15250,8 @@ impl<'source> Compiler<'source> {
         let expression_suspends_current_scope = |expression: &Expr| {
             module_can_suspend && super::expression::expression_suspends_current_scope(expression)
         };
-        if let Expr::Compare(comparison) = statement.test.as_ref()
-            && comparison.ops.len() > 1
-            && suite_terminates(&statement.body)
-            && matches!(statement.elif_else_clauses.as_slice(), [clause]
-                if clause.test.is_none() && suite_terminates(&clause.body))
-        {
-            return self.compile_terminating_if_chained_compare_with_else(statement, comparison);
+        if self.compile_terminating_if_chained_compare_with_else(statement)? {
+            return Ok(());
         }
         // Legacy CFG passes still see a terminating arm's false continuation.
         // Folded false edges must also survive until jump threading and exit copying.
