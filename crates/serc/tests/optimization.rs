@@ -15788,6 +15788,19 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn folded_handler_preserves_the_managed_assertion_exit() {
+    let source = "def check(manager, value):
+    with manager:
+        try:
+            prepare(value)
+            assert valid(value)
+        except ValueError as error:
+            assert False, error
+";
+    assert_matches_cpython(source, "managed_assertion_exit.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
