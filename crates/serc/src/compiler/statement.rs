@@ -42631,23 +42631,24 @@ impl<'source> Compiler<'source> {
                         Stmt::Try(statement)
                             if !statement.is_star && statement.finalbody.is_empty() =>
                         {
-                            !manager_fallthrough_removed_by_folding(&statement.body)
-                                && !manager_fallthrough_removed_by_folding(&statement.orelse)
-                                // A folded handler edge still shares the manager POP_BLOCK
-                                // with the successful assertion when native assigns locations.
-                                // Its retained jump keeps the enclosing manager's handler.
-                                && !(statement.orelse.is_empty()
-                                    && statement.body.last().is_some_and(|tail| {
-                                        !self.context.is_elided_statement(tail)
-                                            && matches!(tail, Stmt::Assert(assertion)
-                                                if early_condition_truthiness(&assertion.test).is_none()
-                                                    && original_condition_has_unique_jump_target(&assertion.test, true))
+                            // Before folding, the successful assertion and the handler can
+                            // both reach the manager POP_BLOCK. The assertion's retained
+                            // jump keeps the enclosing manager's exception handler.
+                            let shared_assertion_exit = statement.orelse.is_empty()
+                                && statement.body.last().is_some_and(|tail| {
+                                    !self.context.is_elided_statement(tail)
+                                        && matches!(tail, Stmt::Assert(assertion)
+                                            if early_condition_truthiness(&assertion.test).is_none()
+                                                && original_condition_has_unique_jump_target(&assertion.test, true))
+                                })
+                                && statement.handlers.iter().any(|handler| {
+                                    handler.as_except_handler().is_some_and(|handler| {
+                                        manager_fallthrough_removed_by_folding(&handler.body)
                                     })
-                                    && statement.handlers.iter().any(|handler| {
-                                        handler.as_except_handler().is_some_and(|handler| {
-                                            manager_fallthrough_removed_by_folding(&handler.body)
-                                        })
-                                    }))
+                                });
+                            !(shared_assertion_exit
+                                || manager_fallthrough_removed_by_folding(&statement.body)
+                                || manager_fallthrough_removed_by_folding(&statement.orelse))
                         }
                         Stmt::With(manager) => {
                             !manager_fallthrough_removed_by_folding(&manager.body)
