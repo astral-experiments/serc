@@ -10186,6 +10186,59 @@ impl LayoutAssembler {
                             );
                         }
                     }
+                    // A literal folded before a retained try setup can move the marker
+                    // past the setup's original NULL cell into the coroutine fallback.
+                    if self.python_version == crate::PythonVersion::Py314
+                        && instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneDynamicCondition
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.insertions == 0
+                        && tail.late_removals == 0
+                        && tail.post_compaction_fusions == 0
+                        && owners
+                            .get(instruction_index)
+                            .is_none_or(|owner| !owner.is_definitive())
+                        && let Some((start, setup_tail, setup)) = protected_suffix
+                        && setup_tail.early_removals == tail.early_removals
+                        && self
+                            .exception_owner_provenance
+                            .ordinary_try_setups
+                            .contains_key(&setup)
+                        && let Some(nop) = start.checked_sub(1)
+                        && original_array_start < nop
+                        && retained_setup_nops.contains(&nop)
+                        && instruction_index - nop < tail.early_removals
+                        && let prefix = &indexed_instructions[original_array_start..nop]
+                        && prefix.iter().enumerate().all(|(offset, record)| {
+                            let index = original_array_start + offset;
+                            record.exception_policy() == super::ExceptionPolicy::NoneUnchanged
+                                && !owners.contains_key(index)
+                                && (record.local_policy.hidden_exception_owner_slots() == 0
+                                    || original_uniform_folds.contains(&index))
+                        })
+                        && prefix
+                            .iter()
+                            .map(|record| {
+                                usize::from(record.local_policy.hidden_exception_owner_slots())
+                            })
+                            .sum::<usize>()
+                            == tail.early_removals
+                        && let Some(region) = self.uniform_exception_owner(
+                            original_array_start,
+                            nop,
+                            &label_positions,
+                        )
+                        && self.exception_regions[region].is_scope_fallback
+                        && self.exception_regions[region].depth == 0
+                        && self.exception_regions[region].preserve_lasti
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
                     // One earlier fold selects the first outer POP; with none the
                     // marker lands on the second. Both array slots are unowned.
                     if instruction.opcode == NOT_TAKEN
@@ -20180,11 +20233,12 @@ mod tests {
         use crate::assembler::{
             Assembler, ExceptionPolicy, Instruction, Item, Operand, SourceLocation,
         };
-        use crate::target::opcodes::{LIST_EXTEND, LOAD_CONST, NOP, SET_UPDATE};
+        use crate::target::opcodes::{LIST_EXTEND, LOAD_CONST, LOAD_SMALL_INT, NOP, SET_UPDATE};
 
         for (opcode, operand) in [
             (LIST_EXTEND, Operand::Value(1)),
             (SET_UPDATE, Operand::Value(1)),
+            (LOAD_SMALL_INT, Operand::Value(7)),
             (LOAD_CONST, Operand::Deferred(OperandPatchId::from_u32(0))),
         ] {
             for count in [4, 9, 28, 30] {

@@ -4465,6 +4465,31 @@ fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
 }
 
 #[test]
+fn a_folded_bitmask_keeps_its_coroutine_owner_before_a_try_guard() {
+    for operator in ["|", "&"] {
+        let source = format!(
+            "async def run(item):
+    value = await item()
+    flags = ((1 << 12)
+             {operator} (1 << 13)
+             {operator} (1 << 14))
+    try:
+        if item and item.ready:
+            emit(value, flags)
+    except LookupError:
+        recover()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "folded_try_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn multiline_string_additions_keep_their_owner_before_a_try_guard() {
     let source = r#"def render(value):
     with acquire():

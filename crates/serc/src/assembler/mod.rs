@@ -8212,6 +8212,8 @@ impl Assembler {
                     crate::target::opcodes::LIST_EXTEND | crate::target::opcodes::SET_UPDATE,
                     Operand::Value(1),
                 ) => true,
+                // Integer expressions may fold directly to LOAD_SMALL_INT.
+                (LOAD_SMALL_INT, Operand::Value(0..=255)) => true,
                 // Larger tuples use LIST_APPEND and have a different original slot count.
                 (LOAD_CONST, Operand::Deferred(_)) => count <= 30,
                 _ => false,
