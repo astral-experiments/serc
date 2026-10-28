@@ -15755,6 +15755,29 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn wide_comparison_arm_keeps_other_tuple_return_copies_in_order() {
+    let source = r"def choose(low, value, high, first, outer, inner, selected, left, right):
+    if first:
+        if low < value < high:
+            left = low + value
+        else:
+            left = low
+    elif outer:
+        if inner:
+            if selected:
+                right = high
+            else:
+                right = low + left
+        else:
+            right = low
+    else:
+        right = high
+    return left, right
+";
+    assert_matches_cpython(source, "wide_comparison_arm.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
