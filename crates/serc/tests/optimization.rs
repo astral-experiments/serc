@@ -15,6 +15,20 @@ use serc::{
 };
 
 #[test]
+fn an_empty_finally_copies_its_local_return() {
+    let source = r"def read(fetch):
+    try:
+        value = fetch()
+    except ValueError:
+        raise
+    finally:
+        assert fetch.ready
+    return value
+";
+    assert_matches_cpython(source, "empty_finally_return.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

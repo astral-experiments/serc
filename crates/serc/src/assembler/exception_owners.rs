@@ -56,13 +56,16 @@ fn copyable_comprehension_reraise(items: &[Item], original: &[Instruction]) -> b
 }
 
 /// A small local return can be copied into the warm try exit before dead handlers empty.
-fn copyable_local_return<'a>(mut ops: impl Iterator<Item = &'a Instruction>) -> bool {
+fn copyable_local_return<'a>(
+    mut ops: impl Iterator<Item = &'a Instruction>,
+    prefix_slots: usize,
+) -> bool {
     use crate::target::opcodes::{LOAD_FAST, RETURN_VALUE};
 
     let Some(load) = ops.next().filter(|op| op.opcode == LOAD_FAST) else {
         return false;
     };
-    let mut slots = 1 + usize::from(load.pre_fold_extra_instructions());
+    let mut slots = prefix_slots + 1 + usize::from(load.pre_fold_extra_instructions());
     for op in ops {
         slots += 1 + usize::from(op.pre_fold_extra_instructions());
         if slots > 4 {
@@ -588,6 +591,50 @@ impl ExceptionOwnerProvenance {
             && self.ordinary_try_setups.get(setup) == Some(target)
     }
 
+    /// Checks whether an erased finally and its local return fit in one copied exit.
+    fn erased_finally_copies_local_return(
+        graph: &super::block_graph::BlockGraph,
+        entry: BasicBlockId,
+    ) -> bool {
+        use crate::target::opcodes::{JUMP_FORWARD, PUSH_EXC_INFO, RERAISE};
+        let Some((Item::Instruction(jump), labels)) = graph[entry].items().split_last() else {
+            return false;
+        };
+        // The unlocated POP_BLOCK and JUMP occupy two original instruction slots.
+        if jump.opcode != JUMP_FORWARD
+            || jump.location.line >= 0
+            || jump.pre_fold_extra_instructions() != 1
+            || !labels.iter().all(|item| matches!(item, Item::Label(_)))
+        {
+            return false;
+        }
+        let Some(target) = jump
+            .forward_target()
+            .and_then(|label| graph.label_block(label))
+        else {
+            return false;
+        };
+        let Some(pair) = graph.order().windows(2).find(|pair| pair[0] == entry) else {
+            return false;
+        };
+        let mut handler = graph[pair[1]]
+            .items()
+            .iter()
+            .filter_map(Item::as_instruction);
+        handler.next().is_some_and(|op| op.opcode == PUSH_EXC_INFO)
+            && handler
+                .next()
+                .is_some_and(|op| op.opcode == RERAISE && op.value_argument() == Some(0))
+            && handler.next().is_none()
+            && copyable_local_return(
+                graph[target]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction),
+                2,
+            )
+    }
+
     /// Finds original exits copied into all their unconditional predecessors.
     fn bind_copied_borrow_exits(
         &mut self,
@@ -644,6 +691,7 @@ impl ExceptionOwnerProvenance {
                             .iter()
                             .flat_map(|block| graph[*block].items())
                             .filter_map(Item::as_instruction),
+                        0,
                     )
                 })
                 .map(|(_, block)| *block)
@@ -653,10 +701,10 @@ impl ExceptionOwnerProvenance {
                     continue;
                 };
                 let mut ops = graph[block].items().iter().filter_map(Item::as_instruction);
-                if graph
-                    .label_block(target)
-                    .is_some_and(|block| copied_returns.contains(&block))
-                {
+                if graph.label_block(target).is_some_and(|block| {
+                    copied_returns.contains(&block)
+                        || Self::erased_finally_copies_local_return(graph, block)
+                }) {
                     continue;
                 }
                 if ops
