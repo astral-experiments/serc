@@ -15755,6 +15755,23 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn small_match_return_is_copied_before_handler_jump_locations() {
+    let source = r"
+def choose(subject, first, second):
+    match subject:
+        case ():
+            if first and second:
+                try:
+                    run()
+                    return True
+                except ValueError:
+                    pass
+    return False
+";
+    assert_matches_cpython(source, "short_match_return.py", &LEVELS);
+}
+
+#[test]
 fn match_case_copies_each_short_circuit_condition_exit() {
     let source = r"
 def copied(outer, inner, marker, item):
