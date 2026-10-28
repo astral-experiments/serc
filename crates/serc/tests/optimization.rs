@@ -25995,3 +25995,30 @@ fn async_manager_none_guard_keeps_its_inner_handler() {
 ";
     assert_matches_cpython(source, "managed_frame_guard.py", &LEVELS);
 }
+
+#[test]
+fn managed_none_guard_counts_slots_released_before_its_try() {
+    for calls in [2, 3] {
+        let prefix = "        work()\n".repeat(calls);
+        let source = format!(
+            "async def run(ready):
+    async with manager() as value:
+        if ready:
+            return
+{prefix}        try:
+            if value is None:
+                await send()
+            else:
+                await save()
+        except LookupError:
+            pass
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_guard_prefix.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
