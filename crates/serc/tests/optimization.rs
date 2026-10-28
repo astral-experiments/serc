@@ -4754,6 +4754,27 @@ fn finalizer_copies_named_handler_cleanup_onto_elif_exits() {
 }
 
 #[test]
+fn nested_handler_pop_uses_its_only_live_predecessor() {
+    let source = "def work(value, condition):
+    try:
+        save()
+    except ValueError:
+        try:
+            save()
+        except ValueError:
+            try:
+                save()
+            except ValueError:
+                try:
+                    save()
+                except KeyError as cause:
+                    pass
+    return value
+";
+    assert_matches_cpython(source, "nested_handler_live_exit.py", &LEVELS);
+}
+
+#[test]
 fn nested_handler_raise_keeps_empty_outer_exit() {
     for scope in ["def", "async def"] {
         for binding in ["", " as parse_error"] {

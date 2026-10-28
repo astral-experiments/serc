@@ -1645,8 +1645,8 @@ fn restore_shared_pop_block_locations(
 
 // A copied cleanup can leave its dropped original in the inlining predecessor count.
 // CPython recounts reachable edges before propagating lines. Repair only the unresolved
-// converted POP_BLOCK heads affected by such a copy, after all copies and revivals exist.
-fn restore_copied_pop_block_locations(
+// POP_BLOCK and POP_EXCEPT heads affected by such a copy, after all copies and revivals exist.
+fn restore_copied_cleanup_locations(
     graph: &mut BlockGraph,
     exception_regions: &[ExceptionRegion],
     heads: &[Label],
@@ -1703,8 +1703,8 @@ fn restore_copied_pop_block_locations(
         };
         if location.line >= 0
             && let Some(first) = graph.instructions_mut(target).next()
-            && first.opcode == NOP
-            && first.fusion_policy.is_converted_pop_block()
+            && ((first.opcode == NOP && first.fusion_policy.is_converted_pop_block())
+                || first.opcode == POP_EXCEPT)
             && first.location.line < 0
             && !first.no_location_policy.preserves_location()
         {
@@ -1825,7 +1825,7 @@ fn restore_pop_block_head_locations(
     copied_heads: &[Label],
 ) {
     restore_shared_pop_block_locations(graph, exception_regions, shared_heads);
-    restore_copied_pop_block_locations(graph, exception_regions, copied_heads);
+    restore_copied_cleanup_locations(graph, exception_regions, copied_heads);
 }
 
 /// Recognizes a retained, located SETUP record in its exact original one-slot range.
@@ -8934,18 +8934,12 @@ impl OptimizationPipeline {
         }
         self.exception_regions.extend(copied_exception_regions);
 
-        let copied_pop_block_heads = order
+        let copied_cleanup_heads = order
             .iter()
             .copied()
             .filter_map(|target| {
                 if exception_handler_blocks[target.index()]
                     || remaining_predecessors[target.index()] <= 1
-                    || !jump_sources[target.index()].iter().any(|source| {
-                        drop_blocks[source.index()]
-                            && block_jump_target(graph[*source].items())
-                                .and_then(|label| graph.label_block(label))
-                                == Some(target)
-                    })
                 {
                     return None;
                 }
@@ -8953,12 +8947,38 @@ impl OptimizationPipeline {
                     .items()
                     .iter()
                     .find_map(Item::as_instruction)?;
-                (first.opcode == NOP
-                    && first.fusion_policy.is_converted_pop_block()
-                    && first.location.line < 0
-                    && !first.no_location_policy.preserves_location())
-                .then(|| graph[target].first_label())
-                .flatten()
+                let handler_pop = self.python_version >= crate::PythonVersion::Py314
+                    && first.opcode == POP_EXCEPT;
+                if first.location.line >= 0
+                    || first.no_location_policy.preserves_location()
+                    || !(handler_pop
+                        || (first.opcode == NOP && first.fusion_policy.is_converted_pop_block()))
+                {
+                    return None;
+                }
+                // A copied handler exit may keep its POP_EXCEPT and jump after its
+                // original predecessor disappears. Recount live edges after copying.
+                let retired_source = jump_sources[target.index()].iter().any(|source| {
+                    let items = graph[*source].items();
+                    if block_jump_target(items).and_then(|label| graph.label_block(label))
+                        != Some(target)
+                    {
+                        return false;
+                    }
+                    let mut ops = items.iter().filter_map(Item::as_instruction);
+                    drop_blocks[source.index()]
+                        || (handler_pop
+                            && ops.next().is_some_and(|pop| {
+                                pop.opcode == POP_EXCEPT && pop.location.line < 0
+                            })
+                            && ops.next().is_some_and(|jump| {
+                                jump.opcode == JUMP_FORWARD && jump.location.line < 0
+                            })
+                            && ops.next().is_none())
+                });
+                retired_source
+                    .then(|| graph[target].first_label())
+                    .flatten()
             })
             .collect::<Vec<_>>();
 
@@ -9540,7 +9560,7 @@ impl OptimizationPipeline {
             graph,
             &self.exception_regions,
             &shared_pop_block_heads,
-            &copied_pop_block_heads,
+            &copied_cleanup_heads,
         );
         restore_retained_pop_block_locations(
             graph,
@@ -10695,7 +10715,7 @@ mod copied_pop_block_location_tests {
             expected.instructions_mut(block).next().unwrap().location =
                 SourceLocation::new(line, line, 12, 17);
         }
-        restore_copied_pop_block_locations(&mut actual, regions, heads);
+        restore_copied_cleanup_locations(&mut actual, regions, heads);
         // Check all labels, ordering, operands, and instruction policies as well as
         // the complete four-part locations; only the listed head locations may change.
         assert_eq!(
