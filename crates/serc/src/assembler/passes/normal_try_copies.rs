@@ -4257,12 +4257,29 @@ impl OptimizationPipeline {
             // does not provide this additional entry certificate. A match-success
             // fallthrough block may have no label; its compiler-emitted edge carries
             // the same original-entry evidence without adding a CFG boundary.
+            // Suppression exits from WITH_EXCEPT_START pop the restored exception
+            // and the three manager stack entries before entering the inner cleanup.
+            let nested_suppression = || {
+                use crate::target::opcodes::POP_TOP;
+
+                jump.forward_target()
+                    .and_then(|label| graph.label_block(label))
+                    .and_then(|inner| exits.get(&inner))
+                    .is_some_and(|(_, outer, pass)| pass.is_none() && exits.contains_key(outer))
+                    && graph[source]
+                        .items()
+                        .iter()
+                        .filter_map(Item::as_instruction)
+                        .map(|instruction| instruction.opcode)
+                        .eq([POP_EXCEPT, POP_TOP, POP_TOP, POP_TOP, JUMP_FORWARD])
+            };
             let ordinary_branch_entry = jump.opcode == JUMP_FORWARD
                 && jump.jump_policy.inline_small_exit()
                 && !jump.jump_policy.always_retains_nop()
                 && jump.pre_fold_extra_instructions() == 0
                 && !exits.contains_key(&source)
                 && (jump.jump_policy.is_original_match_success()
+                    || nested_suppression()
                     || graph[source].items().iter().any(|item| {
                         matches!(item, Item::Label(label)
                             if self.exception_owner_provenance.block_boundaries.contains(label))
