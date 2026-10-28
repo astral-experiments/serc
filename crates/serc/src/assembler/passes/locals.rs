@@ -4397,10 +4397,12 @@ impl OptimizationPipeline {
                             });
                     // A removed normal exit stops fallthrough from the preceding array.
                     // A surviving arm jump can still enter the continuation directly.
+                    // Marked cleanup entries use the original jump checks above.
                     let surviving_protected_arm = borrow_unreachable_blocks[target]
                         && last.opcode == JUMP_FORWARD
                         && target > block + 1
                         && !exception_regions.is_empty()
+                        && !jump_entry_blocks.get(target).copied().unwrap_or(false)
                         && last.no_location_policy.borrow_fallthrough()
                             == BorrowFallthrough::Barrier
                         && !last.jump_policy.borrow_empty_block()
