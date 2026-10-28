@@ -28992,6 +28992,18 @@ impl<'source> Compiler<'source> {
                 )
             },
         )?;
+        // The folded guard threads its false edge through the normal try-else exit.
+        // Removing the redundant replacement jump leaves its unprotected NOP.
+        let folded_try_else_exit = self.context.python_version >= crate::PythonVersion::Py314
+            && !statement.is_star
+            && statement.finalbody.is_empty()
+            && self.assembler.instruction_count() > orelse_instruction_count
+            && self.assembler.last_instruction_is_nop()
+            && matches!(statement.orelse.last(), Some(Stmt::If(guard))
+                if guard.elif_else_clauses.is_empty()
+                    && self.context.fold_constant(&guard.test).is_some_and(|constant| !constant.is_truthy())
+                    && !suite_terminates(&guard.body)
+                    && self.assembler.last_instruction_location() == Some(self.source_location(guard.test.range())));
         if deferred_try_pop_block
             && !removed_shared_try_pop_block
             && !statement.is_star
@@ -29963,7 +29975,7 @@ impl<'source> Compiler<'source> {
                         .context
                         .followed_by_name_assignment_or_deletion
                     || self.control.statements.context.followed_by_direct_name_if);
-            let exception_policy = if !loop_tail_inherits_outer_owner
+            let unprotected_normal_exit = !loop_tail_inherits_outer_owner
                 && !direct_nested_pass_exit_in_outer_try
                 && !coroutine_nested_pass_exit
                 && (exclude_nested_normal_exit
@@ -29983,8 +29995,8 @@ impl<'source> Compiler<'source> {
                             .active_exception_region_exclusions
                             .is_empty()
                         && (self.control.finally.active_finally_try_bodies == 0
-                            || (handlers_terminate && !statement.finalbody.is_empty()))))
-            {
+                            || (handlers_terminate && !statement.finalbody.is_empty()))));
+            let exception_policy = if folded_try_else_exit || unprotected_normal_exit {
                 ExceptionPolicy::EXCLUDE_ALWAYS
             } else {
                 ExceptionPolicy::default()
