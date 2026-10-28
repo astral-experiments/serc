@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn branched_handler_exits_share_a_local_attribute_return() {
+    let source = r"def lookup(obj, outer, inner):
+    try:
+        if outer:
+            if inner:
+                take()
+            else:
+                release()
+    except LookupError:
+        if inner:
+            recover()
+        else:
+            reset()
+    return obj.value
+";
+    assert_matches_cpython(source, "handler_attribute_return.py", &LEVELS);
+}
+
+#[test]
 fn nested_try_exits_share_a_local_attribute_return() {
     let source = r"def fetch(obj, outer, inner):
     try:

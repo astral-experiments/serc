@@ -4064,7 +4064,14 @@ impl OptimizationPipeline {
                     .contains(&label)
                 || (!exits.contains_key(&target)
                     && !guarded_handler_joins.contains_key(&target)
-                    && !matches!(returns.get(&target), Some(OriginalTail::LocalTupleReturn { .. } | OriginalTail::ConstantReturn { .. })))
+                    && !matches!(
+                        returns.get(&target),
+                        Some(
+                            OriginalTail::LocalTupleReturn { .. }
+                                | OriginalTail::ConstantReturn { .. }
+                                | OriginalTail::ComputedReturn { width: 3 }
+                        )
+                    ))
                 || positions[&block] >= positions[&target]
                 || !items[..head_len].iter().any(|item| {
                     matches!(item, Item::Label(label)
