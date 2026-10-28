@@ -25977,3 +25977,18 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn match_guard_failures_share_the_enclosing_branch_exit() {
+    let source = r"def check(value, enabled, ready):
+    if active:
+        match value:
+            case Node(data) if enabled and ready:
+                return data
+    else:
+        skip()
+    record(value)
+    finish()
+";
+    assert_matches_cpython(source, "match_guard_branch.py", &LEVELS);
+}
