@@ -3883,6 +3883,88 @@ impl OptimizationPipeline {
         // absent line without authorizing NOP retention from conditional donors;
         // current singleton shape alone is insufficient.
         let mut joins = FxHashMap::default();
+        // The first empty original join can lead through more branches than fit in a
+        // single small-exit copy. Replay their original arrays in the existing scheduler
+        // so each branch sees the target width from its own visit.
+        let mut nested_normals = FxHashSet::default();
+        let mut nested_prefixes = FxHashMap::default();
+        for &normal in order {
+            let Some(&(_, first, None)) = exits.get(&normal) else {
+                continue;
+            };
+            if !graph[first].last_instruction().is_some_and(|op| {
+                op.location == SourceLocation::NONE && op.jump_policy.borrow_empty_block()
+            }) {
+                continue;
+            }
+            let mut path = Vec::new();
+            let mut block = first;
+            while let Some((Item::Instruction(jump), head)) = graph[block].items().split_last() {
+                let Some(label) = jump.forward_target() else {
+                    break;
+                };
+                let Some(target) = graph.label_block(label) else {
+                    break;
+                };
+                if !head.iter().all(|item| matches!(item, Item::Label(_)))
+                    || jump.opcode != JUMP_FORWARD
+                    || jump.pre_fusion_width() != 1
+                    || jump.local_policy.hidden_exception_owner_slots() != 0
+                    || !jump.jump_policy.inline_small_exit()
+                    || !jump.jump_policy.allows_threading_target()
+                    || positions[&target] <= positions[&block]
+                {
+                    break;
+                }
+                path.push((block, target));
+                if let Some(tail @ OriginalTail::ConstantReturn { .. }) =
+                    original_return_tail(label)
+                    && path.len() >= 4
+                {
+                    nested_normals.insert(normal);
+                    // An independently entered empty arm can share its physical head with
+                    // the following join. The cleanup enters after the arm's located Pass.
+                    for &(from, join) in &path {
+                        let record = graph[join]
+                            .last_instruction()
+                            .expect("original join or return");
+                        if record.jump_policy.retained_nop()
+                            != super::super::ir::RetainedJumpNop::DirectTarget
+                            || record.location.line < 0
+                        {
+                            continue;
+                        }
+                        let entry = graph[from]
+                            .last_instruction()
+                            .and_then(Instruction::forward_target);
+                        let Some(split) = graph[join].items().iter().position(
+                            |item| matches!(item, Item::Label(label) if Some(*label) == entry),
+                        ) else {
+                            continue;
+                        };
+                        let prefix = &graph[join].items()[..split];
+                        if !prefix.is_empty()
+                            && prefix.iter().all(|item| matches!(item, Item::Label(_)))
+                            && order.iter().any(|source| {
+                                graph[*source].last_instruction().is_some_and(|jump| {
+                                    super::super::is_conditional_jump(jump.opcode)
+                                        && jump.forward_target().is_some_and(|label| {
+                                            prefix.contains(&Item::Label(label))
+                                        })
+                                })
+                            })
+                        {
+                            nested_prefixes
+                                .insert(join, (split, record.location, record.depth_after()));
+                        }
+                    }
+                    joins.extend(path);
+                    returns.insert(target, tail);
+                    break;
+                }
+                block = target;
+            }
+        }
         for &block in order {
             if exits.contains_key(&block) {
                 continue;
@@ -4245,6 +4327,7 @@ impl OptimizationPipeline {
         // Reject partial paths. Region-end coincidence, cycles and arbitrary jump heads
         // do not certify an original POP_BLOCK or an intact original return array.
         let mut entry_returns = FxHashSet::default();
+        let mut nested_branch_locations = Vec::new();
         for &source in order {
             let Some(jump) = graph[source].last_instruction() else {
                 continue;
@@ -4257,18 +4340,34 @@ impl OptimizationPipeline {
             // does not provide this additional entry certificate. A match-success
             // fallthrough block may have no label; its compiler-emitted edge carries
             // the same original-entry evidence without adding a CFG boundary.
+            let nested_branch_location = jump
+                .forward_target()
+                .and_then(|label| graph.label_block(label))
+                .filter(|normal| nested_normals.contains(normal))
+                .and_then(|_| positions[&source].checked_sub(1))
+                .and_then(|index| graph[order[index]].last_instruction())
+                .filter(|op| {
+                    op.opcode == crate::target::opcodes::POP_TOP
+                        && op.location == jump.location
+                        && op.location.line >= 0
+                })
+                .map(|op| op.location);
             let ordinary_branch_entry = jump.opcode == JUMP_FORWARD
                 && jump.jump_policy.inline_small_exit()
                 && !jump.jump_policy.always_retains_nop()
                 && jump.pre_fold_extra_instructions() == 0
                 && !exits.contains_key(&source)
                 && (jump.jump_policy.is_original_match_success()
+                    || nested_branch_location.is_some()
                     || graph[source].items().iter().any(|item| {
                         matches!(item, Item::Label(label)
                             if self.exception_owner_provenance.block_boundaries.contains(label))
                     }));
             if !authored_break && !ordinary_branch_entry {
                 continue;
+            }
+            if let Some(location) = nested_branch_location {
+                nested_branch_locations.push((source, location));
             }
             let Some(label) = jump.forward_target() else {
                 continue;
@@ -4773,6 +4872,22 @@ impl OptimizationPipeline {
             .copied()
             .filter(|block| sources.contains(block) || selected_returns.contains(block))
             .collect::<Vec<_>>();
+        // Split only after the complete native copy schedule was accepted. Insertion
+        // in reverse layout order preserves the recorded original block positions.
+        for block in ordered_joins.iter().rev() {
+            if let Some(&(split, location, depth)) = nested_prefixes.get(block) {
+                let mut prefix = (0..split)
+                    .map(|_| self.graph.remove_item_at(*block, 0))
+                    .collect::<Vec<_>>();
+                prefix.push(Item::Instruction(Instruction::synthetic(
+                    NOP,
+                    Operand::Value(0),
+                    location,
+                    depth,
+                )));
+                self.graph.insert_block(positions[block], prefix);
+            }
+        }
         for block in blocks {
             let label = if let Some(label) = self.graph[block].first_label() {
                 label
@@ -4907,6 +5022,11 @@ impl OptimizationPipeline {
             self.exception_regions
                 .push(ExceptionRegion { start, ..region });
         }
+        self.exception_owner_provenance
+            .normal_try_copy_branch_locations = nested_branch_locations
+            .into_iter()
+            .filter_map(|(block, location)| Some((*labels.get(&block)?, location)))
+            .collect();
         self.exception_owner_provenance.normal_try_copy_blocks =
             sources.iter().map(|block| labels[block]).collect();
         self.exception_owner_provenance.normal_try_copy_pop_ranges = pop_intervals;
