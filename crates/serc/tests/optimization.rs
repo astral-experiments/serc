@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn guarded_cases_keep_the_wildcard_store_location() {
+    let source = r"def select(item, value, fallback, ready):
+    try:
+        match item:
+            case Entry() as entry if ready:
+                value = turn(value)
+            case _:
+                value = fallback
+    except Failure as error:
+        recover(error)
+    try:
+        inspect(value)
+    except OtherError:
+        pass
+";
+    assert_matches_cpython(source, "guarded_case_wildcard_store.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
