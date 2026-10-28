@@ -9761,6 +9761,41 @@ fn boolean_returns_preserve_enclosing_named_handler_owners() {
 }
 
 #[test]
+fn nested_handlers_protect_saved_return_values_after_iterator_cleanup() {
+    let source = r"def choose(value, items):
+    try:
+        first()
+    except ValueError:
+        try:
+            second()
+        except LookupError:
+            try:
+                for item in items:
+                    return value
+            except TypeError:
+                pass
+";
+    assert_matches_cpython(source, "nested_handlers_iterator_return.py", &LEVELS);
+}
+
+#[test]
+fn unnamed_handler_return_preserves_the_copied_finalizer_guard() {
+    let source = r"async def recover(value):
+    try:
+        try:
+            read()
+        except LookupError:
+            return fallback()
+    except ValueError:
+        pass
+    finally:
+        if value is None:
+            pass
+";
+    assert_matches_cpython(source, "handler_return_finalizer_guard.py", &LEVELS);
+}
+
+#[test]
 fn resumed_handler_return_preserves_a_copied_finalizer_guard() {
     let source = r"async def recover(value):
     try:
