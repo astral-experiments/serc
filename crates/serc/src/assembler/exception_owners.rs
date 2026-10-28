@@ -10186,6 +10186,53 @@ impl LayoutAssembler {
                             );
                         }
                     }
+                    // At a closure entry, COPY_FREE_VARS consumes one of the two cells
+                    // left by the inner try's SETUP and POP. The else guard's marker
+                    // therefore reuses its conditional jump under the outer finalizer.
+                    if self.python_version == crate::PythonVersion::Py314
+                        && instruction.opcode == NOT_TAKEN
+                        && instruction.exception_policy() == super::ExceptionPolicy::EXCLUDE_ALWAYS
+                        && original_array_start == 0
+                        && owner_history_exact
+                        && pop_slot_epoch_known
+                        && tail.early_removals == 1
+                        && tail.insertions == 1
+                        && tail.late_removals == 1
+                        && tail.post_compaction_fusions == 0
+                        && matches!(indexed_instructions.get(..3), Some([copy, resume, setup])
+                            if copy.opcode == COPY_FREE_VARS && resume.opcode == crate::target::opcodes::RESUME && setup.opcode == NOP
+                                && retained_setup_nops.contains(&2))
+                        && late_setup_positions.len() == 1
+                        && late_setup_positions[0] < instruction_index
+                        && provenance
+                            .ordinary_try_setups
+                            .keys()
+                            .any(|entry| label_positions.get(entry) == Some(&3))
+                        && previous.is_some_and(|condition| {
+                            matches!(
+                                condition.opcode,
+                                crate::target::opcodes::POP_JUMP_IF_TRUE
+                                    | crate::target::opcodes::POP_JUMP_IF_FALSE
+                            ) && condition.exception_policy()
+                                == super::ExceptionPolicy::NoneUnchanged
+                                && condition.location == instruction.location
+                        })
+                        && owners
+                            .get(instruction_index)
+                            .is_none_or(|owner| !owner.is_definitive())
+                        && let Some(region) = self.uniform_exception_owner(
+                            instruction_index - 1,
+                            instruction_index + 1,
+                            &label_positions,
+                        )
+                        && !self.exception_regions[region].is_scope_fallback
+                        && !self.exception_regions[region].preserve_lasti
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
                     // One earlier fold selects the first outer POP; with none the
                     // marker lands on the second. Both array slots are unowned.
                     if instruction.opcode == NOT_TAKEN
