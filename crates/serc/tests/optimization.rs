@@ -1100,6 +1100,25 @@ fn negated_comparison_keeps_the_nonfinal_loop_branch() {
 }
 
 #[test]
+fn a_successful_chained_assertion_leaves_the_loop_body_handler() {
+    let source = r"def scan(values, manager, active):
+    with manager:
+        for value in values:
+            try:
+                if active:
+                    assert 0 <= measure(value) <= 10
+            except ValueError:
+                pass
+";
+    assert_matches_cpython_versions(
+        source,
+        "chained_assertion_try_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn chained_assertions_copy_the_loop_exit_for_each_success() {
     let source = r"def run(items, low, high, ready):
     for value in items:
