@@ -19441,6 +19441,23 @@ fn named_handler_loop_cleanup_after_elided_assertions_matches_cpython() {
 }
 
 #[test]
+fn normal_finally_inlines_a_small_overriding_return() {
+    for result in ["True", "finish()"] {
+        let source = format!(
+            "def sample(reader, value):
+    try:
+        found = reader.lookup(value)
+    except LookupError:
+        return False
+    finally:
+        return {result}
+"
+        );
+        assert_matches_cpython(&source, "copied_finally_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn exceptional_finally_return_unwinds_managers_in_order() {
     const FINALLY: &str = r"def f(outer, inner, work, cleanup):
     with outer:
