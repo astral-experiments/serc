@@ -5519,6 +5519,7 @@ impl Assembler {
     pub(crate) fn current_normal_finally_condition_slot_owner(
         &self,
         with_exclusions: &[Vec<(Label, Label)>],
+        sole_try_exit: bool,
     ) -> Option<bool> {
         use crate::target::opcodes::{
             CALL, LOAD_ATTR, LOAD_DEREF, POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, TO_BOOL,
@@ -5834,6 +5835,42 @@ impl Assembler {
                     instructions.push(*instruction);
                 }
             }
+        }
+        // The normal finally entry follows the handler's RERAISE. Its POP_BLOCK
+        // takes the incoming line; with no folds in the subscript test, the
+        // marker appends to an unused slot instead of reusing a protected one.
+        if self.python_version == crate::PythonVersion::Py314
+            && sole_try_exit
+            && truth
+            && let [pop, operands @ .., subscript, boolean, condition] = instructions.as_slice()
+            && pop.opcode == NOP
+            && pop.fusion_policy.is_converted_pop_block()
+            && pop.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            && items[..begin]
+                .iter()
+                .rev()
+                .find_map(Item::as_instruction)
+                .is_some_and(|reraise| {
+                    reraise.opcode == RERAISE && reraise.value_argument() == Some(1)
+                })
+            && subscript.opcode == crate::target::opcodes::BINARY_OP
+            && subscript.value_argument()
+                == Some(crate::target::operands::BinaryOperation::SUBSCR.argument())
+            && boolean.opcode == TO_BOOL
+            && boolean.location == condition.location
+            && operands.iter().all(|record| {
+                matches!(
+                    record.opcode,
+                    LOAD_FAST | LOAD_DEREF | LOAD_GLOBAL | LOAD_CONST | LOAD_SMALL_INT | LOAD_ATTR
+                )
+            })
+            && instructions.iter().all(|record| {
+                record.pre_fold_extra_instructions() == 0
+                    && record.local_policy.hidden_exception_owner_slots() == 0
+            })
+            && !self.current_block_has_dynamic_exception_owner()
+        {
+            return Some(false);
         }
         // Removing the unprotected POP_BLOCK and folding PUSH_NULL into a global
         // call leave its following truth marker inside the protected suffix.

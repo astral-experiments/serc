@@ -376,6 +376,7 @@ pub(super) struct ComprehensionState {
 pub(super) enum NormalFinallyWithMarkers {
     #[default]
     Exclude,
+    SoleTryExit,
     Include,
     Condition(SourceLocation),
 }
@@ -39804,6 +39805,18 @@ impl<'source> Compiler<'source> {
                 {
                     // The folded None test reuses a protected slot after these statements.
                     NormalFinallyWithMarkers::Condition(compiler.source_location(guard.test.range()))
+                } else if compiler.context.python_version == crate::PythonVersion::Py314
+                    && !statement.is_star
+                    && statement.orelse.is_empty()
+                    && !statement.handlers.is_empty()
+                    && statement.handlers.iter().all(|handler| {
+                        handler.as_except_handler().is_some_and(|handler| suite_terminates(&handler.body))
+                    })
+                    && (matches!(statement.body.as_slice(), [Stmt::Pass(_)])
+                        || suite_has_nonsuspending_linear_fallthrough(&statement.body))
+                {
+                    // Only the try body supplies a line to the converted normal POP_BLOCK.
+                    NormalFinallyWithMarkers::SoleTryExit
                 } else {
                     NormalFinallyWithMarkers::Exclude
                 };

@@ -9095,6 +9095,10 @@ impl Compiler<'_> {
             && !self.control.withs.force_terminal_with_marker_ownerless
             && let Some(owns_slot) = self.assembler.current_normal_finally_condition_slot_owner(
                 &self.control.withs.active_with_region_exclusions,
+                matches!(
+                    self.control.withs.normal_finally_with_markers,
+                    super::statement::NormalFinallyWithMarkers::SoleTryExit
+                ),
             )
         {
             // The loop exit's excluded NOP does not split the original array.
@@ -9133,7 +9137,8 @@ impl Compiler<'_> {
             self.control.finally.active_normal_finally_bodies > 0
                 && !self.control.withs.active_with_region_exclusions.is_empty()
                 && match self.control.withs.normal_finally_with_markers {
-                    super::statement::NormalFinallyWithMarkers::Exclude => true,
+                    super::statement::NormalFinallyWithMarkers::Exclude
+                    | super::statement::NormalFinallyWithMarkers::SoleTryExit => true,
                     super::statement::NormalFinallyWithMarkers::Include => false,
                     super::statement::NormalFinallyWithMarkers::Condition(location) => {
                         self.assembler.location() != location
