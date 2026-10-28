@@ -727,6 +727,24 @@ fn terminal_while_else_keeps_its_handler_break_position() {
 }
 
 #[test]
+fn compacted_exception_type_expressions_keep_the_handler_owner() {
+    let source = "def recover():\n    try:\n        work()\n    except KeyError:\n        raise\n    except TYPES:\n        return\n";
+    for types in [
+        "(ValueError,) + extra_errors()",
+        "(ValueError, *extra_errors())",
+        "extra_errors() + other_errors()",
+        "extra_errors(*arguments)",
+        "[KeyError, ValueError, IndexError][1 + 1]",
+    ] {
+        assert_matches_cpython(
+            &source.replace("TYPES", types),
+            "compacted_exception_types.py",
+            &LEVELS,
+        );
+    }
+}
+
+#[test]
 fn handler_dispatch_keeps_resolved_constant_operands() {
     for fallback in ["()", "None"] {
         let source = format!(
