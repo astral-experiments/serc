@@ -5951,7 +5951,7 @@ impl OptimizationPipeline {
         let mut copied_entry_labels = Vec::new();
         let mut copied_exit_or_eval_entry_labels = FxHashSet::default();
         let mut retained_unlocated_join_blocks = FxHashSet::default();
-        let mut target_copies = FxHashMap::<_, Vec<Vec<Item>>>::default();
+        let mut target_copies = FxHashMap::<_, Vec<(usize, Vec<Item>)>>::default();
         let mut copied_split_eval_starts = FxHashMap::default();
         let mut copied_region_exclusions =
             vec![Vec::<(Label, Label)>::new(); self.exception_regions.len()];
@@ -7427,8 +7427,8 @@ impl OptimizationPipeline {
                     &self.exception_regions,
                     inline_copies
                         .values()
-                        .chain(target_copies.values())
                         .flatten()
+                        .chain(target_copies.values().flatten().map(|(_, copy)| copy))
                         .flatten(),
                 );
             let generic_original_copy = generic_original_arrays
@@ -8722,7 +8722,27 @@ impl OptimizationPipeline {
                     self.original_jump_head_targets.remove(&copied_label);
                 }
                 // Keep copies after the complete array and its exception-range splits.
-                target_copies.entry(target_exit).or_default().push(copied);
+                let copies = target_copies.entry(target_exit).or_default();
+                // CPython visits conditional sources in block order when assigning
+                // locations to a shared iterator return. Early inlining can revisit
+                // an inner condition first. Emit later source copies nearest the target.
+                if self.python_version == crate::PythonVersion::Py315
+                    && !copies.is_empty()
+                    && exit_without_unique_predecessor[target.index()]
+                    && target == target_exit
+                    && graph[target]
+                        .items()
+                        .iter()
+                        .filter_map(Item::as_instruction)
+                        .map(|instruction| instruction.opcode)
+                        .eq([POP_TOP, POP_TOP, LOAD_CONST, RETURN_VALUE])
+                {
+                    let position =
+                        copies.partition_point(|(position, _)| *position < source_position);
+                    copies.insert(position, (source_position, copied));
+                } else {
+                    copies.push((source_position, copied));
+                }
             } else {
                 inline_copies.entry(source).or_default().push(copied);
             }
@@ -8797,7 +8817,7 @@ impl OptimizationPipeline {
                                 .into_iter()
                                 .flatten()
                                 .rev()
-                                .flatten(),
+                                .flat_map(|(_, copy)| copy),
                         )
                 })
                 .enumerate()
@@ -9400,8 +9420,8 @@ impl OptimizationPipeline {
             .chain(
                 inline_copies
                     .values()
-                    .chain(target_copies.values())
                     .flatten()
+                    .chain(target_copies.values().flatten().map(|(_, copy)| copy))
                     .flatten(),
             )
             .filter_map(jump_target)
@@ -9505,7 +9525,7 @@ impl OptimizationPipeline {
                     graph.allocate_blocks_from_items(copied, &self.preserved_block_boundaries),
                 );
             }
-            for copied in target_copies
+            for (_, copied) in target_copies
                 .remove(&block)
                 .unwrap_or_default()
                 .into_iter()
