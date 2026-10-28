@@ -15,6 +15,20 @@ use serc::{
 };
 
 #[test]
+fn terminal_named_handler_keeps_its_imports_eager() {
+    let source = r"try:
+    import primary
+except ImportError as error:
+    if enabled:
+        import secondary
+        from helpers import fallback
+    else:
+        pass
+";
+    assert_matches_cpython(source, "handler_imports.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
