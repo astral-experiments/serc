@@ -3205,6 +3205,11 @@ impl OptimizationPipeline {
                 SourceLocation::NONE,
                 Some(depth),
             );
+            // A surrounding finally keeps the normal jump out of an isolated
+            // small exit. It still belongs to the value discard's original block.
+            if compound.contains(&(*end, target)) && !jump.jump_policy.inline_small_exit() {
+                expected.jump_policy.prevent_small_exit_inlining();
+            }
             if jump.no_location_policy.borrow_fallthrough() == BorrowFallthrough::Barrier {
                 expected
                     .no_location_policy
