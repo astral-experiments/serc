@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn nested_handlers_copy_the_sole_fallthrough_cleanup() {
+    let source = r"def recover(enabled, valid, value):
+    try:
+        if enabled:
+            try:
+                validate(value)
+            except LookupError:
+                if valid and value:
+                    pass
+                else:
+                    raise ValueError from cause
+    except TypeError:
+        report()
+";
+    assert_matches_cpython(source, "sole_handler_exit.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
