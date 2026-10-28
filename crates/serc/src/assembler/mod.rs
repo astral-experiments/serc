@@ -2380,7 +2380,8 @@ impl Assembler {
         if labels.is_empty()
             || self.join_labels_have_authored_location(&labels)
             || labels.iter().any(|label| {
-                (Some(*label) != folded_guard_label && self.folded_away_condition_targets.contains(label))
+                (Some(*label) != folded_guard_label
+                    && self.folded_away_condition_targets.contains(label))
                     || self.folded_away_loop_else_targets.contains(label)
             })
         {
