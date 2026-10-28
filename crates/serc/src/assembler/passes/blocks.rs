@@ -7521,52 +7521,62 @@ impl OptimizationPipeline {
             // An exception split can end inside the copied cleanup even when its region began in
             // the predecessor's handler body. Preserve that leading intersection in the copy;
             // inner exclusions still divide the successive POP_EXCEPT instructions below.
-            copied_exception_regions.extend(self.exception_regions.iter().enumerate().filter_map(
-                |(index, region)| {
-                    // Empty or inverted ranges protect no instructions. In particular,
-                    // a copied start alias must not resurrect such a region across the
-                    // copied cleanup when its original end lies outside the array.
-                    if empty_regions[index] {
-                        return None;
+            inherited_conditional_exclusions
+                .sort_unstable_by_key(|(_, start, _)| copied_instruction_positions[start]);
+            'regions: for (index, region) in self.exception_regions.iter().enumerate() {
+                // A copied start alias cannot give an empty or inverted range any coverage.
+                if empty_regions[index] {
+                    continue;
+                }
+                let Some(start) = copied_labels.get(&region.start).copied().or_else(|| {
+                    (target_chain_end > target_position
+                        && region_memberships[index].contains(&target_position))
+                    .then_some(copied_label)
+                }) else {
+                    continue;
+                };
+                let Some(&end) = copied_labels.get(&region.end) else {
+                    continue;
+                };
+                let mut fragment = ExceptionRegion {
+                    start,
+                    end,
+                    target: copied_handler_labels
+                        .get(&region.target)
+                        .copied()
+                        .unwrap_or(region.target),
+                    ..*region
+                };
+                // A second copy retains the gaps from the first. An outer handler
+                // can still cover the initial POP_EXCEPT before a later gap.
+                for &(origin, hole_start, hole_end) in &inherited_conditional_exclusions {
+                    if origin != index
+                        || copied_instruction_positions[&hole_end]
+                            <= copied_instruction_positions[&fragment.start]
+                        || copied_instruction_positions[&fragment.end]
+                            <= copied_instruction_positions[&hole_start]
+                    {
+                        continue;
                     }
-                    let start = copied_labels.get(&region.start).copied().or_else(|| {
-                        (target_chain_end > target_position
-                            && region_memberships[index].contains(&positions[target.index()]))
-                        .then_some(copied_label)
-                    })?;
-                    let end = *copied_labels.get(&region.end)?;
-                    if inherited_conditional_exclusions.iter().any(
-                        |(origin, hole_start, hole_end)| {
-                            *origin == index
-                                && matches!(
-                                    (
-                                        copied_instruction_positions.get(hole_start),
-                                        copied_instruction_positions.get(&start),
-                                        copied_instruction_positions.get(&end),
-                                        copied_instruction_positions.get(hole_end),
-                                    ),
-                                    (Some(hole_start), Some(start), Some(end), Some(hole_end))
-                                        if hole_start <= start && end <= hole_end
-                                )
-                        },
-                    ) {
-                        return None;
+                    if copied_instruction_positions[&fragment.start]
+                        < copied_instruction_positions[&hole_start]
+                    {
+                        copied_exception_regions.push(ExceptionRegion {
+                            end: hole_start,
+                            ..fragment
+                        });
+                        protected_fragment_origins.insert(index);
                     }
-                    protected_fragment_origins.insert(index);
-                    Some(ExceptionRegion {
-                        start,
-                        end,
-                        target: copied_handler_labels
-                            .get(&region.target)
-                            .copied()
-                            .unwrap_or(region.target),
-                        depth: region.depth,
-                        preserve_lasti: region.preserve_lasti,
-                        is_scope_fallback: region.is_scope_fallback,
-                        priority: region.priority,
-                    })
-                },
-            ));
+                    if copied_instruction_positions[&hole_end]
+                        >= copied_instruction_positions[&fragment.end]
+                    {
+                        continue 'regions;
+                    }
+                    fragment.start = hole_end;
+                }
+                copied_exception_regions.push(fragment);
+                protected_fragment_origins.insert(index);
+            }
             // CPython labels the original return before copying it. A previous
             // cleanup copy can leave a hole in the destination's scope fallback;
             // preserve the complete return target's own fallback inside that hole.
@@ -7602,13 +7612,9 @@ impl OptimizationPipeline {
                     }));
                 }
             }
-            // A copied fragment only replaces the holes for its own original region.
-            // Other enclosing regions still need the copied exclusions even when this
-            // cleanup also introduces a separate protected fragment.
+            // The copy can still lie inside its original enclosing region.
             for (index, start, end) in inherited_conditional_exclusions {
-                if !protected_fragment_origins.contains(&index) {
-                    copied_region_exclusions[index].push((start, end));
-                }
+                copied_region_exclusions[index].push((start, end));
             }
             if planned_copy || generic_original_copy {
                 // Keep the original jump slot until the ordinary NOP-removal pass.
