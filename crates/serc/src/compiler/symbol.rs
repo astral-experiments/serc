@@ -1563,9 +1563,7 @@ impl Compiler<'_> {
                         return;
                     }
                     Stmt::ImportFrom(import) => {
-                        let register_legacy_literals =
-                            self.legacy_compiler.is_some() && self.register_literals;
-                        if self.record_string_origins || register_legacy_literals {
+                        if self.record_string_origins || self.register_literals {
                             let names = Constant::Tuple(
                                 import
                                     .names
@@ -1573,8 +1571,10 @@ impl Compiler<'_> {
                                     .map(|alias| Constant::String(alias.name.to_string()))
                                     .collect(),
                             );
-                            if register_legacy_literals {
-                                self.constants.push(Constant::Int(u64::from(import.level)));
+                            if self.register_literals {
+                                if self.legacy_compiler.is_some() {
+                                    self.constants.push(Constant::Int(u64::from(import.level)));
+                                }
                                 self.constants.push(names.clone());
                             }
                             if self.record_string_origins {

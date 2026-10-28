@@ -19284,6 +19284,19 @@ fn elided_assertion_after_simple_if_preserves_finally_borrow_boundary() {
 }
 
 #[test]
+fn discarded_from_import_reserves_reused_names_before_handler_constants() {
+    let source = "record('start')
+try:
+    raise ImportError
+    from early import apple, pear
+except ImportError:
+    record('middle')
+    from late import apple, pear
+";
+    assert_matches_cpython(source, "discarded_from_import.py", &LEVELS);
+}
+
+#[test]
 fn discarded_imports_preserve_none_admission_order() {
     for (index, import) in [
         "import package",
