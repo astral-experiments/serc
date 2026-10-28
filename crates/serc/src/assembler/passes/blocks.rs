@@ -1070,7 +1070,13 @@ fn unnamed_cleanup_has_short_return(
                 if instruction.local_policy.hidden_exception_owner_slots() != 0)
         });
     }
-    is_short_cleanup_return(graph, label)
+    // A return copied onto an earlier jump carries the removed slot on its first
+    // instruction. The cleanup's predecessors visit it before that return is copied.
+    returned
+        .iter()
+        .find_map(Item::as_instruction)
+        .is_some_and(|first| first.pre_fold_extra_instructions() == 0)
+        && is_short_cleanup_return(graph, label)
 }
 
 // Every restored POP_BLOCK is outside ordinary handlers but inside the scope fallback.
