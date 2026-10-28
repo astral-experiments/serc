@@ -35,6 +35,28 @@ fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
 }
 
 #[test]
+fn attribute_guards_reuse_the_stored_value_before_the_normal_finalizer() {
+    let source = r"def run(value):
+    with resource:
+        state = value
+        assert value
+        first = prepare()
+        second = prepare()
+        value = prepare()
+        third = prepare()
+        last = prepare()
+        try:
+            item = prepare()
+        finally:
+            if state.config.enabled:
+                work()
+            clean()
+        return item
+";
+    assert_matches_cpython(source, "finalizer_attribute_guard.py", &LEVELS);
+}
+
+#[test]
 fn nested_finally_guard_inherits_the_preceding_calls_handler() {
     let source = r"def run(group):
     try:

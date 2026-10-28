@@ -9693,34 +9693,52 @@ impl LayoutAssembler {
                         && tail.insertions == 0
                         && tail.late_removals == 0
                         && tail.post_compaction_fusions == 0
-                        && instruction_index >= 2
+                        && let Some((load, _, 1)) = ended_pop_slot
+                        && load < instruction_index
                         && ended_owned_prefix.is_some_and(|(start, end, _, _)| {
-                            start >= original_array_start && end == instruction_index - 2
+                            start >= original_array_start && end == load
                         })
-                        && ended_pop_slot.is_some_and(|(start, _, width)| {
-                            start == instruction_index - 2 && width == 1
-                        })
-                        && self
-                            .exception_owner_provenance
-                            .normal_finally_truth_prefixes
-                            .iter()
-                            .filter(|[_, original_load, original_to_bool, original_condition]| {
-                                let load = *indexed_instructions[instruction_index - 2];
-                                let mut expected_load = *original_load;
-                                expected_load
-                                    .local_policy
-                                    .add_hidden_exception_owner_slots(1);
-                                if load.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
-                                    expected_load.opcode = load.opcode;
-                                }
-                                load == expected_load
-                                    && *indexed_instructions[instruction_index - 1]
-                                        == *original_to_bool
-                                    && instruction == original_condition
-                            })
-                            .count()
-                            == 1
-                    {
+                        && (if instruction_index - load == 2 {
+                            self.exception_owner_provenance
+                                .normal_finally_truth_prefixes
+                                .iter()
+                                .filter(
+                                    |[_, original_load, original_to_bool, original_condition]| {
+                                        let load = *indexed_instructions[load];
+                                        let mut expected_load = *original_load;
+                                        expected_load
+                                            .local_policy
+                                            .add_hidden_exception_owner_slots(1);
+                                        if load.opcode == crate::target::opcodes::LOAD_FAST_BORROW {
+                                            expected_load.opcode = load.opcode;
+                                        }
+                                        load == expected_load
+                                            && *indexed_instructions[instruction_index - 1]
+                                                == *original_to_bool
+                                            && instruction == original_condition
+                                    },
+                                )
+                                .count()
+                                == 1
+                        } else {
+                            // Pure attribute loads preserve the receiver's stack depth.
+                            // They delay the guard without consuming any old POP slots.
+                            matches!(&indexed_instructions[load..instruction_index], [receiver, attrs @ .., truth]
+                                if !attrs.is_empty()
+                                    && matches!(receiver.opcode, crate::target::opcodes::LOAD_DEREF | crate::target::opcodes::LOAD_FAST | crate::target::opcodes::LOAD_FAST_BORROW)
+                                    && receiver.local_policy.hidden_exception_owner_slots() == 1
+                                    && attrs.iter().all(|record| record.opcode == crate::target::opcodes::LOAD_ATTR
+                                        && record.value_argument().is_some_and(|arg| arg & 1 == 0)
+                                        && record.local_policy.hidden_exception_owner_slots() == 0)
+                                    && truth.opcode == crate::target::opcodes::TO_BOOL && truth.location == instruction.location)
+                                && indexed_instructions[load..=instruction_index].iter().all(
+                                    |record| {
+                                        record.exception_policy()
+                                            == super::ExceptionPolicy::NoneUnchanged
+                                            && record.pre_fold_extra_instructions() == 0
+                                    },
+                                )
+                        }) {
                         indexed_instructions
                             .get(instruction_index + 1)
                             .filter(|marker| marker.opcode == NOT_TAKEN)
