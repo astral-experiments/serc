@@ -5727,7 +5727,9 @@ impl<'source> Compiler<'source> {
         body.iter()
             .rfind(|statement| !self.context.is_elided_statement(statement))
             .filter(|statement| matches!(statement, Stmt::Assign(assignment)
-                if matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                if (matches!(assignment.targets.as_slice(), [Expr::Name(_)])
+                    || matches!(assignment.targets.as_slice(), [Expr::Attribute(attribute)]
+                        if matches!(attribute.value.as_ref(), Expr::Name(_))))
                     && matches!(assignment.value.as_ref(), Expr::ListComp(_) | Expr::SetComp(_) | Expr::DictComp(_))))
     }
 
