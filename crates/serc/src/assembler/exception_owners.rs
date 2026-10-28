@@ -413,7 +413,7 @@ pub(super) struct ExceptionOwnerProvenance {
     pub(super) normal_try_exits: Vec<(Label, Label)>,
     pub(super) borrow_normal_try_exits: Vec<(Label, Instruction)>,
     pub(super) initial_borrow_normal_try_exits: Vec<NormalTryBorrowExit>,
-    pub(super) cold_handler_borrow_jumps: Vec<(Label, Label)>,
+    pub(super) cold_handler_borrow_jumps: Vec<(Label, Label, Option<Label>)>,
     // The following cold blocks locate emptied originals through relocation.
     pub(super) copied_borrow_exit_anchors: Vec<Label>,
     pub(super) retired_normal_try_exits: Vec<RetiredNormalTryExit>,
@@ -541,7 +541,7 @@ impl ExceptionOwnerProvenance {
         enum Exit<'a> {
             NormalTry(Label),
             Comprehension(&'a [Instruction]),
-            HandlerJump(Label),
+            HandlerJump(Label, Option<Label>),
         }
         let mut entries = self
             .borrow_normal_try_exits
@@ -566,18 +566,18 @@ impl ExceptionOwnerProvenance {
             }
         }
         if !self.cold_handler_borrow_jumps.is_empty() {
-            for &(entry, target) in &self.cold_handler_borrow_jumps {
+            for &(entry, target, handler) in &self.cold_handler_borrow_jumps {
                 if let Some(block) = graph.label_block(entry) {
                     // A lone handler jump can be unreachable from the outset. Every
                     // remaining unconditional predecessor copies the unlocated jump.
                     entries
                         .entry(block)
-                        .or_insert((Exit::HandlerJump(target), true));
+                        .or_insert((Exit::HandlerJump(target, handler), true));
                 }
             }
             for region in regions {
                 if let Some(block) = graph.label_block(region.target)
-                    && matches!(entries.get(&block), Some((Exit::HandlerJump(_), _)))
+                    && matches!(entries.get(&block), Some((Exit::HandlerJump(..), _)))
                 {
                     entries.remove(&block);
                 }
@@ -659,13 +659,26 @@ impl ExceptionOwnerProvenance {
                     }
                     handler(&cleanup_handlers)
                 }
-                Exit::HandlerJump(target) => {
-                    if !super::ends_scope(previous.opcode)
-                        || single_jump().and_then(Instruction::forward_target) != Some(*target)
-                    {
+                Exit::HandlerJump(target, normal_try_handler) => {
+                    if single_jump().and_then(Instruction::forward_target) != Some(*target) {
                         continue;
                     }
-                    graph[following].first_label()
+                    if let Some(handler) = normal_try_handler {
+                        // The implicit POP_BLOCK and jump follow a terminated try arm.
+                        // Their empty array stays warm when the handler moves cold.
+                        if !(super::ends_scope(previous.opcode)
+                            || super::is_unconditional_jump(previous.opcode))
+                            || graph.label_block(*handler) != Some(following)
+                            || !first.is_some_and(|op| op.opcode == PUSH_EXC_INFO)
+                        {
+                            continue;
+                        }
+                        Some(*handler)
+                    } else if super::ends_scope(previous.opcode) {
+                        graph[following].first_label()
+                    } else {
+                        None
+                    }
                 }
             };
             if let Some(anchor) = anchor {

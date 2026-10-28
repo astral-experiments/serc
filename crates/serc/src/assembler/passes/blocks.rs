@@ -3493,6 +3493,35 @@ impl OptimizationPipeline {
                     stranded = true;
                 } else if temperatures[block.index()] == WARM_BLOCK && std::mem::take(&mut stranded)
                 {
+                    // A guard can jump past the empty array to its own located exit.
+                    // With no warm fallthrough into that array, it cannot block the
+                    // guard from reaching the continuation after cold relocation.
+                    let previous_warm = order[..positions[block.index()]]
+                        .iter()
+                        .rev()
+                        .find(|b| temperatures[b.index()] == WARM_BLOCK);
+                    if previous_warm.is_some_and(|b| !graph[*b].successors().0)
+                        && let Some((Item::Instruction(jump), labels)) =
+                            graph[block].items().split_last()
+                        && labels.iter().all(|item| matches!(item, Item::Label(_)))
+                        && jump.opcode == JUMP_FORWARD
+                        && jump.location.line >= 0
+                        && jump.jump_policy.retained_nop()
+                            == super::super::ir::RetainedJumpNop::DirectTarget
+                        && order.iter().any(|&source| {
+                            temperatures[source.index()] == WARM_BLOCK
+                                && graph[source].last_instruction().is_some_and(|guard| {
+                                    is_conditional_jump(guard.opcode)
+                                        && guard.location == jump.location
+                                        && guard
+                                            .forward_target()
+                                            .and_then(|target| graph.label_block(target))
+                                            == Some(block)
+                                })
+                        })
+                    {
+                        continue;
+                    }
                     // Cold ordering leaves the emptied original in the warm sequence.
                     copied_exit_successors.push(block);
                 }

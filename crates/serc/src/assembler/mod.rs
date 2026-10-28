@@ -9017,7 +9017,11 @@ impl Assembler {
     }
 
     /// Retains a one-slot implicit jump after a handler path that cannot fall through.
-    pub(crate) fn record_unlocated_handler_jump(&mut self, emitted: EmittedJump) {
+    pub(crate) fn record_unlocated_handler_jump(
+        &mut self,
+        emitted: EmittedJump,
+        normal_try_handler: Option<Label>,
+    ) {
         let index = usize::try_from(emitted.instruction().item_index)
             .expect("emitted instruction index should fit in usize");
         let items = self.linear_items();
@@ -9030,12 +9034,13 @@ impl Assembler {
         let Some(jump) = items[index].as_instruction() else {
             return;
         };
-        if ends_scope(previous.opcode)
+        if (ends_scope(previous.opcode)
+            || (normal_try_handler.is_some() && is_unconditional_jump(previous.opcode)))
             && let Some(target) = jump.forward_target()
         {
             self.exception_owner_provenance
                 .cold_handler_borrow_jumps
-                .push((entry, target));
+                .push((entry, target, normal_try_handler));
         }
     }
 
