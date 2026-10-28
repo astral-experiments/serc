@@ -25977,3 +25977,16 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn terminal_nested_handlers_copy_their_implicit_return() {
+    for inner in [
+        "        if ready:\n            use_result()\n        else:\n            raise\n",
+        "        try:\n            try:\n                use_result()\n            except KeyError:\n                pass\n        except ValueError:\n            pass\n",
+    ] {
+        let source = format!(
+            "try:\n    first()\nexcept LookupError:\n    try:\n        second()\n    except OSError:\n{inner}"
+        );
+        assert_matches_cpython(&source, "nested_handler_return.py", &LEVELS);
+    }
+}

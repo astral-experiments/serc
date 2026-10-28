@@ -3926,29 +3926,37 @@ impl<'source> Compiler<'source> {
             })
     }
 
-    pub(super) fn emit_deferred_implicit_return(&mut self) -> Result<(), CompileError> {
-        // Terminal handler lowering can distribute this cleanup into an original
-        // nested-try join. Retain the same unconditional-copy permission as the
-        // handler's own unlocated cleanup, even after only one predecessor remains.
-        let copy_unlocated_handler_join = self
-            .control
-            .exceptions
-            .unwind_exception_handlers_for_implicit_return
-            && self.assembler.location() == SourceLocation::NONE
-            && self.assembler.at_original_unconditional_join()
-            && self.control.exceptions.active_exception_group_handlers == 0
-            && self.control.exceptions.active_try_marker_slots.is_empty()
+    /// Whether an original jump can copy the handler cleanups and their implicit return.
+    fn at_copyable_implicit_handler_join(&self, emitting_unnamed_cleanup: bool) -> bool {
+        let exceptions = &self.control.exceptions;
+        let handlers = exceptions.active_exception_handlers.as_slice();
+        let named =
+            !emitting_unnamed_cleanup && matches!(handlers, [handler] if handler.name.is_some());
+        // Each unnamed handler contributes its own POP_BLOCK, POP_EXCEPT, and jump.
+        // CPython copies these short blocks successively, before combining their exits.
+        let nested_unnamed = self.context.python_version >= crate::PythonVersion::Py314
+            && !handlers.is_empty()
+            && (emitting_unnamed_cleanup || handlers.len() > 1)
+            && handlers.iter().all(|handler| handler.name.is_none());
+        (named || nested_unnamed)
+            && exceptions.unwind_exception_handlers_for_implicit_return
+            && exceptions.active_exception_group_handlers == 0
+            && exceptions.active_try_marker_slots.is_empty()
             && self.control.withs.active_with_exits.is_empty()
             && self.control.loops.contexts.is_empty()
             && self.control.finally.active_finally_try_bodies == 0
             && self.control.finally.active_normal_finally_bodies == 0
             && self.control.finally.active_copied_finally_bodies == 0
             && self.control.finally.active_finally_end_blocks == 0
-            && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [handler]
-                if handler.name.is_some()
-                    && handler.with_depth == 0
-                    && handler.loop_depth == 0
-                    && handler.finally_end_depth == 0);
+            && handlers.iter().all(|handler| {
+                handler.with_depth == 0 && handler.loop_depth == 0 && handler.finally_end_depth == 0
+            })
+            && self.assembler.at_original_unconditional_join()
+    }
+
+    pub(super) fn emit_deferred_implicit_return(&mut self) -> Result<(), CompileError> {
+        let copy_unlocated_handler_join = self.assembler.location() == SourceLocation::NONE
+            && self.at_copyable_implicit_handler_join(false);
         let initialized_locals = self
             .control
             .exceptions
@@ -33622,6 +33630,15 @@ impl<'source> Compiler<'source> {
                                     .active_exception_region_exclusions
                                     .len()
                     });
+                let copy_nested_handler_return = terminal
+                    && handler.name.is_none()
+                    && (self.assembler.location() == SourceLocation::NONE
+                        || handler_ends_with_preordered_cleanup)
+                    && self.at_copyable_implicit_handler_join(true);
+                if copy_nested_handler_return {
+                    // The sole normal arm supplies its location after its cleanup is copied.
+                    self.assembler.set_location(SourceLocation::NONE);
+                }
                 let outer_cleanup_start = outer_cleanup.map(|_| {
                     let start = self.assembler.label();
                     self.assembler.mark(start);
@@ -33765,6 +33782,9 @@ impl<'source> Compiler<'source> {
                     }
                 } else if terminal {
                     self.emit_deferred_implicit_return()?;
+                    if copy_nested_handler_return {
+                        self.assembler.allow_last_unconditional_block_inlining();
+                    }
                     if (handler_ends_with_preordered_cleanup
                         || handler_ends_with_named_conditional_cleanup
                         || handler_ends_with_nonterminal_with
