@@ -4121,8 +4121,17 @@ impl OptimizationPipeline {
             let Some(target) = graph.label_block(label) else {
                 continue;
             };
+            // The compiler can restrict this jump to unconditional copies after
+            // recording the original cleanup. Its predecessors still belong in the plan.
+            let mut expected = original;
+            if graph[block]
+                .last_instruction()
+                .is_some_and(Instruction::only_allows_unconditional_inlining)
+            {
+                expected[4].allow_unconditional_block_inlining();
+            }
             if !items[..head_len].contains(&Item::Label(entry))
-                || items[head_len..].iter().copied().ne(original.map(Item::Instruction))
+                || items[head_len..].iter().copied().ne(expected.map(Item::Instruction))
                 || positions[&block] >= positions[&target]
                 || !original[4].jump_policy.inline_small_exit()
                 || original[4].jump_policy.retains_nop_for(original[4].operand())

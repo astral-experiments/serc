@@ -11350,6 +11350,26 @@ fn saved_return_in_named_handler_replays_inner_try_slots() {
 }
 
 #[test]
+fn named_handler_cleanup_is_copied_before_its_explicit_return() {
+    let source = r"def resolve(active, enabled):
+    try:
+        if active:
+            if enabled:
+                pass
+        else:
+            return 1
+    except ValueError as error:
+        if active:
+            try:
+                pass
+            except LookupError:
+                pass
+    return None
+";
+    assert_matches_cpython(source, "named_cleanup_return.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_returns_preserve_outer_finalizer_owners() {
     let source = r"def named_nested(choice, item, owner, operation, cleanup, recover):
     value = None
