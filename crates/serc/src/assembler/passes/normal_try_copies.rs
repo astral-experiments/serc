@@ -2243,15 +2243,19 @@ impl OptimizationPipeline {
                 // The intermediate jump originally precedes POP_BLOCK. If the frontend
                 // excluded it in anticipation of copying the cleanup, restore its saved
                 // protected range so threading its predecessor copies the right owner.
-                for (&(start, _), owners) in &self.exception_owner_provenance.normal_try_jump_owners
-                {
-                    if self
-                        .graph
-                        .label_block(start)
-                        .is_some_and(|bridge| shared_arms.contains(&bridge))
-                    {
-                        self.exception_regions.extend(owners.iter().copied());
-                    }
+                let mut bridges: Vec<_> = self
+                    .exception_owner_provenance
+                    .normal_try_jump_owners
+                    .iter()
+                    .filter(|((start, _), _)| {
+                        self.graph
+                            .label_block(*start)
+                            .is_some_and(|bridge| shared_arms.contains(&bridge))
+                    })
+                    .collect();
+                bridges.sort_unstable_by_key(|((start, end), _)| (start.as_u32(), end.as_u32()));
+                for (_, owners) in bridges {
+                    self.exception_regions.extend(owners.iter().copied());
                 }
 
                 let jump = self
