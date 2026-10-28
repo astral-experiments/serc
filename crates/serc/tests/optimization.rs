@@ -25937,7 +25937,7 @@ fn specialized_comparison_keeps_its_try_else_guard_handler() {
 
 #[test]
 fn named_cleanup_continuation_inherits_the_remaining_handler_arm() {
-    let source = r#"async def run(manager, enabled, flag, item):
+    let source = r"async def run(manager, enabled, flag, item):
     async with manager:
         try:
             if enabled:
@@ -25954,7 +25954,7 @@ fn named_cleanup_continuation_inherits_the_remaining_handler_arm() {
             raise
         except Exception as outer:
             raise Failure() from outer
-"#;
+";
     assert_matches_cpython(source, "guarded_handler_continuation.py", &LEVELS);
 }
 
