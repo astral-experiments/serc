@@ -2800,6 +2800,39 @@ impl OptimizationPipeline {
         .then_some(location)
     }
 
+    /// Recognizes a literal global assignment followed by the unlocated implicit return.
+    fn is_global_store_implicit_return(&self, items: &[Item]) -> bool {
+        use crate::target::opcodes::{LOAD_CONST, LOAD_SMALL_INT, RETURN_VALUE, STORE_GLOBAL};
+
+        let [
+            Item::Label(_),
+            Item::Instruction(value),
+            Item::Instruction(store),
+            Item::Instruction(empty),
+            Item::Instruction(ret),
+        ] = items
+        else {
+            return false;
+        };
+        matches!(value.opcode, LOAD_CONST | LOAD_SMALL_INT)
+            && value.value_argument().is_some()
+            && value.location.line >= 0
+            && value.depth_after() == Some(1)
+            && store.opcode == STORE_GLOBAL
+            && store.value_argument().is_some()
+            && store.location.line == value.location.line
+            && store.depth_after() == Some(0)
+            && empty.opcode == LOAD_CONST
+            && empty.value_argument().is_some()
+            && empty.location == SourceLocation::NONE
+            && empty.depth_after() == Some(1)
+            && ret.opcode == RETURN_VALUE
+            && ret.value_argument() == Some(0)
+            && ret.location == SourceLocation::NONE
+            && ret.depth_after() == Some(0)
+            && !self.return_array_has_rewritten_items(items)
+    }
+
     /// Keeps original jumps until their shared try exit can copy its return.
     fn preserve_shared_try_return_joins(&mut self) {
         use crate::target::opcodes::RETURN_VALUE;
@@ -2842,9 +2875,10 @@ impl OptimizationPipeline {
             if graph[tail]
                 .last_instruction()
                 .is_none_or(|op| op.opcode != RETURN_VALUE)
-                || !instructions
+                || (!instructions
                     .clone()
                     .all(|op| op.location != SourceLocation::NONE)
+                    && !self.is_global_store_implicit_return(graph[tail].items()))
                 || instructions
                     .map(Instruction::pre_fusion_width)
                     .sum::<usize>()
