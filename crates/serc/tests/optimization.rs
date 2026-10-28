@@ -4465,6 +4465,30 @@ fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
 }
 
 #[test]
+fn an_inner_finalizer_unwinds_before_the_manager_of_a_saved_return() {
+    let source = r"async def run(value, flag, active):
+    try:
+        with use():
+            try:
+                if active:
+                    return value
+            finally:
+                record(value)
+    except LookupError:
+        pass
+    finally:
+        if flag is not None:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "inner_finalizer_manager.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn handler_and_iterator_returns_reuse_the_final_cleanup_pop() {
     for source in [
         r"async def sample(value, flag):

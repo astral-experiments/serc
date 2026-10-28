@@ -12554,10 +12554,10 @@ impl<'source> Compiler<'source> {
                             }
                             // The inner finally has already run. Its own POP is in
                             // the prefix before the manager rather than after it.
-                            ([_, inner], Some(2), Some(0)) => {
+                            ([_, inner], Some(regions), Some(ordinary @ 0..=1)) if regions == ordinary + 2 => {
                                 self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == CO_COROUTINE
-                                    && inner.with_depth == 1 && inner.try_body_depth == 0
-                                    && inner.exception_region_depth == 1
+                                    && inner.with_depth == 1 && inner.try_body_depth == ordinary
+                                    && inner.exception_region_depth == ordinary + 1
                                     && self.control.withs.active_with_exits.len() == 1
                                     && self.control.loops.contexts.is_empty()
                             }
