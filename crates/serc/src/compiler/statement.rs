@@ -711,7 +711,7 @@ pub(super) struct StatementContext {
     // The statement ends a suite that falls directly through to the function's implicit return.
     followed_by_implicit_return: bool,
     // This exact statement reaches a source successor without crossing a compound
-    // statement's cleanup. Only conditional arms inherit that continuation.
+    // statement's cleanup. Conditional arms and a try's normal else exit can inherit it.
     same_region_continuation: Option<TextRange>,
     // This exact conditional finishes a direct try-body tail through conditional arms.
     direct_try_tail_continuation: Option<TextRange>,
@@ -28986,7 +28986,22 @@ impl<'source> Compiler<'source> {
                             }
                             Ok(())
                         } else {
-                            compiler.compile_suite(&statement.orelse)
+                            // Without a finalizer, the normal else exit shares the
+                            // try statement's continuation with its final conditional.
+                            let continuation = if compiler.context.python_version >= crate::PythonVersion::Py314
+                                && statement.finalbody.is_empty()
+                                && compiler.control.statements.context.same_region_continuation == Some(statement.range)
+                                && let Some(Stmt::If(tail)) = statement.orelse.last()
+                            {
+                                Some(tail.range)
+                            } else {
+                                None
+                            };
+                            compiler.with_control_override(
+                                |control| &mut control.statements.context.same_region_continuation,
+                                continuation,
+                                |compiler| compiler.compile_suite(&statement.orelse),
+                            )
                         }
                     },
                 )
