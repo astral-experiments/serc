@@ -4465,6 +4465,43 @@ fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
 }
 
 #[test]
+fn nested_manager_returns_keep_the_outer_discard_on_the_finally_guard() {
+    for source in [
+        r"def run(items, flag):
+    try:
+        with first(), second():
+            for item in items:
+                if item:
+                    return
+    finally:
+        if flag is not None:
+            finish()
+",
+        r"def run(items, flag):
+    for value in items:
+        try:
+            with first():
+                try:
+                    with second():
+                        if value:
+                            return
+                except LookupError:
+                    pass
+        finally:
+            if flag is not None:
+                finish()
+",
+    ] {
+        assert_matches_cpython_versions(
+            source,
+            "nested_manager_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn handler_and_iterator_returns_reuse_the_final_cleanup_pop() {
     for source in [
         r"async def sample(value, flag):

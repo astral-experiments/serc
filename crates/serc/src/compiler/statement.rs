@@ -12193,6 +12193,40 @@ impl<'source> Compiler<'source> {
                             self.assembler.mark_last_as_converted_pop_block();
                         }
                     }
+                    // Each exited manager omits a POP before its cleanup. Only ordinary
+                    // tries entered inside the outermost manager precede that last exit.
+                    let managers = &self.control.withs.active_with_exits;
+                    let nested_manager_return = (self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && !preserve_tos
+                        && !return_is_overridden
+                        && context_index == 0
+                        && return_finally_contexts.len() == 1
+                        && finally_context.exception_region_depth == 0
+                        && finally_context.with_depth == 0
+                        && finally_context.handler_depth == 0
+                        && finally_context.try_body_depth == 0
+                        && self.control.finally.active_normal_finally_bodies == 0
+                        && self.control.finally.active_copied_finally_bodies == 0
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.exceptions.active_exception_handlers.is_empty()
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && managers.len() >= 2
+                        && managers[0].exception_region_depth == 1
+                        && managers
+                            .iter()
+                            .all(|manager| !manager.is_async && manager.normal_finally_depth == 0)
+                        && with_unwind_starts
+                            .iter()
+                            .map(|unwind| unwind.index)
+                            .eq((0..managers.len()).rev()))
+                    .then(|| {
+                        (
+                            self.assembler.item_count(),
+                            managers.len(),
+                            self.control.exceptions.active_try_marker_slots.len(),
+                        )
+                    });
                     // Capture constant returns through one synchronous manager without
                     // changing the omitted POP records or the emitted instruction stream.
                     let copied_constant_manager_pop = if !preserve_tos
@@ -13640,6 +13674,16 @@ impl<'source> Compiler<'source> {
                             self.assembler
                                 .record_copied_return_pop_prefix(first_pop_item);
                         }
+                    }
+                    if result.is_ok()
+                        && let Some((pop_item, managers, try_pops)) = nested_manager_return
+                    {
+                        self.assembler.record_nested_manager_return_guard(
+                            copied_handler_return_item,
+                            pop_item,
+                            managers,
+                            try_pops,
+                        );
                     }
                     if result.is_ok()
                         && let Some((pop_item, named_handler, missing_null_pops, outer_try_pops)) =

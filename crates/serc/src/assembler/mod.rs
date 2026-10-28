@@ -14626,10 +14626,102 @@ impl Assembler {
         {
             return;
         }
-        let mut suffix = items[pop_item..].iter().filter_map(|item| match item {
-            Item::Instruction(instruction) => Some(*instruction),
-            Item::Label(_) => None,
-        });
+        self.record_constant_manager_guard(
+            pop_item,
+            cleanup,
+            outer_try_pops,
+            exception_owners::ConstantManagerReturnPrefix {
+                authored_nop: authored,
+                retained_authored: false,
+                retained_inner_try_pop: None,
+                handler_pop,
+                instructions: prelude.to_vec(),
+                missing_null_pops,
+            },
+        );
+    }
+
+    /// Records the original manager POPs before the outermost exit of a constant return.
+    pub(crate) fn record_nested_manager_return_guard(
+        &mut self,
+        return_item: usize,
+        pop_item: usize,
+        manager_count: usize,
+        try_pops: usize,
+    ) {
+        use crate::target::opcodes::CALL;
+
+        let prefix: Vec<_> = self.linear_items()[return_item..pop_item]
+            .iter()
+            .filter_map(Item::as_instruction)
+            .copied()
+            .collect();
+        let Some((authored, tail)) = prefix.split_first() else {
+            return;
+        };
+        let (iterator, managers) = match tail.split_first() {
+            Some((pop, rest)) if pop.opcode == POP_TOP && pop.location == authored.location => {
+                (true, rest)
+            }
+            _ => (false, tail),
+        };
+        let (exits, rest) = managers.as_chunks::<5>();
+        if authored.opcode != NOP
+            || authored.fusion_policy.is_converted_pop_block()
+            || authored.location.line < 0
+            || exits.len() != manager_count
+            || !rest.is_empty()
+            || prefix.iter().any(|op| {
+                op.local_policy.hidden_exception_owner_slots() != 0
+                    || op.pre_fold_extra_instructions() != 0
+                    || op.value_argument().is_none()
+                    || op.exception_policy() != ExceptionPolicy::NoneUnchanged
+            })
+            || exits.iter().any(|exit| {
+                exit.iter()
+                    .map(|op| op.opcode)
+                    .ne([LOAD_CONST, LOAD_CONST, LOAD_CONST, CALL, POP_TOP])
+                    || exit[0].operand() != exit[1].operand()
+                    || exit[1].operand() != exit[2].operand()
+                    || exit[3].value_argument() != Some(3)
+                    || exit[4].value_argument() != Some(0)
+                    || exit.iter().any(|op| op.location != exit[0].location)
+            })
+        {
+            return;
+        }
+        let Some(cleanup) = exits.last() else { return };
+        // The iterator's discard takes the return NOP's line when that NOP is removed.
+        // With no iterator the NOP can survive at the beginning of this original array.
+        self.record_constant_manager_guard(
+            pop_item,
+            cleanup,
+            0,
+            exception_owners::ConstantManagerReturnPrefix {
+                authored_nop: *authored,
+                retained_authored: !iterator,
+                retained_inner_try_pop: None,
+                handler_pop: None,
+                instructions: prefix[usize::from(iterator)..prefix.len() - 5].to_vec(),
+                missing_null_pops: manager_count - 1 + try_pops,
+            },
+        );
+    }
+
+    /// Associates a captured manager exit with the copied finalizer's local None test.
+    fn record_constant_manager_guard(
+        &mut self,
+        pop_item: usize,
+        cleanup: &[Instruction],
+        outer_try_pops: usize,
+        prefix: exception_owners::ConstantManagerReturnPrefix,
+    ) {
+        let mut suffix = self.linear_items()[pop_item..]
+            .iter()
+            .filter_map(|item| match item {
+                Item::Instruction(instruction) => Some(*instruction),
+                Item::Label(_) => None,
+            });
         let (Some(pop), Some(load), Some(condition)) =
             (suffix.next(), suffix.next(), suffix.next())
         else {
@@ -14658,16 +14750,7 @@ impl Assembler {
                     earlier_cleanups: Vec::new(),
                     awaited_exit: None,
                     named_handler_cleanup: None,
-                    constant_return_prefix: Some(exception_owners::ConstantManagerReturnPrefix {
-                        authored_nop: authored,
-                        retained_authored: false,
-                        retained_inner_try_pop: None,
-                        handler_pop,
-                        instructions: prelude.to_vec(),
-                        // Captured frontend nesting certifies the POPs before cleanup.
-                        // The manager POP is counted separately in replay.
-                        missing_null_pops,
-                    }),
+                    constant_return_prefix: Some(prefix),
                     to_bool: None,
                     pop,
                     load,

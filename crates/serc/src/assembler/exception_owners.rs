@@ -9530,8 +9530,8 @@ impl LayoutAssembler {
                         {
                             owners.insert(instruction_index, decision);
                         }
-                        // This exact adjacent authored-NOP/inner-try-POP pair certifies the
-                        // retained NULL cell independently of the generic POP epoch.
+                        // A fully preserved return prefix can identify the stale cell even
+                        // when the generic POP epoch has been invalidated.
                         if instruction.exception_policy() == super::ExceptionPolicy::NonePresent
                             && owner_history_exact
                             && tail.insertions == 0
@@ -14527,7 +14527,7 @@ impl LayoutAssembler {
         instructions: &[&Instruction],
         positions: &OwnerLabelPositions,
         jump_targets: &FxHashSet<Label>,
-        retained_inner_try_only: bool,
+        retained_prefix_only: bool,
     ) -> Option<ExceptionOwnerDecision> {
         use crate::target::opcodes::LOAD_FAST_BORROW;
 
@@ -14537,13 +14537,6 @@ impl LayoutAssembler {
             .exception_owner_provenance
             .copied_manager_return_compactions
             .iter()
-            .filter(|origin| {
-                !retained_inner_try_only
-                    || origin
-                        .constant_return_prefix
-                        .as_ref()
-                        .is_some_and(|prefix| prefix.retained_inner_try_pop.is_some())
-            })
             .filter_map(|origin| {
                 let load_index = marker.checked_sub(2 + usize::from(origin.to_bool.is_some()))?;
                 let load = *instructions.get(load_index)?;
@@ -14569,6 +14562,18 @@ impl LayoutAssembler {
                             .named_handler_cleanup
                             .map_or(0, |prefix| prefix.len()),
                 )?;
+                // A retained return NOP followed by complete manager exits also
+                // identifies the original array, independently of the generic POP history.
+                if retained_prefix_only {
+                    let prefix = origin.constant_return_prefix.as_ref()?;
+                    let retained_manager_nop = prefix_start == array_start
+                        && prefix.retained_authored
+                        && prefix.instructions.first() == Some(&prefix.authored_nop)
+                        && prefix.instructions.last().is_some_and(|op| op.opcode == POP_TOP);
+                    if prefix.retained_inner_try_pop.is_none() && !retained_manager_nop {
+                        return None;
+                    }
+                }
                 if array_start > prefix_start
                     || jump_targets
                         .iter()
