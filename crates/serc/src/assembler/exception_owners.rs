@@ -10725,6 +10725,44 @@ impl LayoutAssembler {
                                     Some((instruction_index + 1, Some(region)));
                                 continue;
                             }
+                            // A return in a try's else can follow a store. The erased
+                            // try POP lands on the stored constant, while the return's
+                            // two later POPs leave the saved value just before them.
+                            if paired
+                                && pop_slot_epoch_known
+                                && original_pop_slot == Some(instruction_index + 3)
+                                && let Some(start) = load_index.checked_sub(3)
+                                && original_array_start <= start
+                                && matches!(&indexed_instructions[start..load_index], [value, store, saved]
+                                    if value.opcode == LOAD_CONST && value.local_policy.hidden_exception_owner_slots() == 1
+                                        && store.opcode == crate::target::opcodes::STORE_FAST
+                                        && matches!(saved.opcode, crate::target::opcodes::LOAD_FAST | LOAD_GLOBAL)
+                                        && store.local_policy.hidden_exception_owner_slots() == 0
+                                        && saved.local_policy.hidden_exception_owner_slots() == 0)
+                                && indexed_instructions[start..load_index]
+                                    .iter()
+                                    .all(|record| {
+                                        record.pre_fold_extra_instructions() == 0
+                                            && record.exception_policy()
+                                                == super::ExceptionPolicy::NoneUnchanged
+                                    })
+                                && !jump_targets.iter().any(|label| {
+                                    label_positions
+                                        .get(label)
+                                        .is_some_and(|&pos| start < pos && pos <= load_index)
+                                })
+                                && let Some(region) = self.uniform_exception_owner(
+                                    start,
+                                    load_index,
+                                    &label_positions,
+                                )
+                                && !self.exception_regions[region].is_scope_fallback
+                                && !self.exception_regions[region].preserve_lasti
+                            {
+                                pending_normal_none_owner =
+                                    Some((instruction_index + 1, Some(region)));
+                                continue;
+                            }
                             // With both original POPs erased, earlier folds can put the
                             // appended marker before either NULL cell. The captured pair
                             // fixes their positions; only a uniformly protected original
