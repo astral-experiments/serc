@@ -578,6 +578,7 @@ struct FallbackCertificate {
     interval: Certificate,
     removed_slots: usize,
     observed_local_fusion: bool,
+    incoming_jump_block: Option<Label>,
 }
 
 /// An authored singleton's entire original fallthrough array, with no vacant-slot reuse.
@@ -758,7 +759,8 @@ impl FallbackCertificate {
             return None;
         };
         key(condition, marker)?;
-        let owner = before.post_try_fusion_array(start, condition_index, marker_index, false)?;
+        let (owner, prior_removed) =
+            before.post_try_fusion_array(start, condition_index, marker_index, false, None)?;
         let Item::Label(anchor) = before.items[start] else {
             return None;
         };
@@ -784,8 +786,13 @@ impl FallbackCertificate {
         if !matches!(&before.items[start + prefix..start + prefix + 2],
             [Item::Instruction(first), Item::Instruction(second)]
                 if first.opcode == LOAD_FAST && second.opcode == LOAD_FAST)
-            || after.post_try_fusion_array(after_start, after_condition, after_marker, true)?
-                != owner
+            || after.post_try_fusion_array(
+                after_start,
+                after_condition,
+                after_marker,
+                true,
+                None,
+            )? != (owner, prior_removed + 1)
         {
             return None;
         }
@@ -802,7 +809,8 @@ impl FallbackCertificate {
                 boundaries,
                 setups: before.provenance.setups.clone(),
             },
-            removed_slots: 1,
+            incoming_jump_block: None,
+            removed_slots: prior_removed + 1,
             observed_local_fusion: true,
         };
         result.valid(after, false)?;
@@ -840,7 +848,7 @@ impl FallbackCertificate {
             == ExceptionPolicy::AlwaysAbsentPostTryCondition
             && matches!(anchor, Anchor::Label(_))
         {
-            before.post_try_fold_array(start, condition_index, marker_index)?
+            before.post_try_fold_array(start, condition_index, marker_index, None)?
         } else {
             if marker.exception_policy().exclusion() != ExceptionExclusion::None
                 || !matches!(
@@ -867,6 +875,7 @@ impl FallbackCertificate {
             },
             removed_slots,
             observed_local_fusion: false,
+            incoming_jump_block: None,
         };
         Some(result)
     }
@@ -960,13 +969,35 @@ impl FallbackCertificate {
         Some(())
     }
 
+    /// Cold layout can place a complete, unlocated jump block directly before
+    /// the certified array. Remember the edge before the jump is erased.
+    fn record_incoming_jump(&mut self, view: &View<'_>) {
+        if self.incoming_jump_block.is_some()
+            || self.interval.marker.exception_policy()
+                != ExceptionPolicy::AlwaysAbsentPostTryCondition
+        {
+            return;
+        }
+        if let Anchor::Label(anchor) = self.interval.anchor
+            && let Some(&index) = view.label_index(anchor)
+            && let Some([Item::Label(source), Item::Instruction(jump)]) =
+                view.items.get(index.saturating_sub(2)..index)
+            && view.provenance.block_boundaries.contains(source)
+            && view.provenance.source_boundaries.contains(source)
+            && jump.opcode == crate::target::opcodes::JUMP_FORWARD
+            && jump.location.line < 0
+            && jump.forward_target() == Some(anchor)
+        {
+            self.incoming_jump_block = Some(*source);
+        }
+    }
+
     fn valid(&self, view: &View<'_>, borrow: bool) -> Option<(usize, Owner)> {
         let marker = self.interval.valid(view, borrow)?;
         let (start, condition, _) = self.interval.range(view, borrow)?;
         let (owner, removed) = match self.interval.anchor {
             Anchor::Label(_) => {
                 let folded_try_entry = borrow
-                    && self.observed_local_fusion
                     && self.interval.marker.exception_policy()
                         == ExceptionPolicy::AlwaysAbsentPostTryCondition;
                 if !folded_try_entry && view.original_array_start(start)? != start {
@@ -975,13 +1006,11 @@ impl FallbackCertificate {
                 if self.interval.marker.exception_policy()
                     == ExceptionPolicy::AlwaysAbsentPostTryCondition
                 {
+                    let incoming = borrow.then_some(self.incoming_jump_block).flatten();
                     if self.observed_local_fusion {
-                        (
-                            view.post_try_fusion_array(start, condition, marker, true)?,
-                            1,
-                        )
+                        view.post_try_fusion_array(start, condition, marker, true, incoming)?
                     } else {
-                        view.post_try_fold_array(start, condition, marker)?
+                        view.post_try_fold_array(start, condition, marker, incoming)?
                     }
                 } else {
                     view.uniform_fallback_slots(start, condition)?
@@ -1007,7 +1036,8 @@ impl View<'_> {
         condition: usize,
         marker: usize,
         fused: bool,
-    ) -> Option<Owner> {
+        incoming_jump_block: Option<Label>,
+    ) -> Option<(Owner, usize)> {
         if start > condition || condition >= marker || marker >= self.items.len() {
             return None;
         }
@@ -1015,7 +1045,7 @@ impl View<'_> {
             return None;
         };
         if (self.original_array_start(start) != Some(start)
-            && !(fused && self.has_adjacent_ordinary_try_end(start, anchor)))
+            && !self.has_adjacent_post_try_entry(start, anchor, incoming_jump_block, fused))
             || !self.provenance.source_boundaries.contains(&anchor)
             || self.items[start + 1..=marker].iter().any(|item| {
                 matches!(item,
@@ -1026,13 +1056,18 @@ impl View<'_> {
         {
             return None;
         }
-        let (owner, removed) = self.uniform_fallback_interval(start, condition, fused)?;
-        (removed == usize::from(fused)).then_some(owner)
+        self.uniform_fallback_interval(start, condition, fused)
     }
 
-    /// Jump removal can leave the end of the preceding ordinary try directly
-    /// before a source entry that was distinct when local-load fusion occurred.
-    fn has_adjacent_ordinary_try_end(&self, start: usize, anchor: Label) -> bool {
+    /// Removing the recorded fallthrough jump can make its source label and the
+    /// captured array entry adjacent without changing any cell in that array.
+    fn has_adjacent_post_try_entry(
+        &self,
+        start: usize,
+        anchor: Label,
+        incoming: Option<Label>,
+        fused: bool,
+    ) -> bool {
         if !self.provenance.block_boundaries.contains(&anchor) {
             return false;
         }
@@ -1047,7 +1082,12 @@ impl View<'_> {
         let (Some(end), None) = (boundaries.next(), boundaries.next()) else {
             return false;
         };
-        self.provenance.source_boundaries.contains(&end)
+        if Some(end) == incoming {
+            return true;
+        }
+        // The end of the preceding ordinary try may also join a local-load fusion.
+        fused
+            && self.provenance.source_boundaries.contains(&end)
             && self.regions.iter().any(|region| {
                 region.end == end
                     && !region.is_scope_fallback
@@ -1066,6 +1106,7 @@ impl View<'_> {
         start: usize,
         condition: usize,
         marker: usize,
+        incoming_jump_block: Option<Label>,
     ) -> Option<(Owner, usize)> {
         if start > condition || condition >= marker || marker >= self.items.len() {
             return None;
@@ -1075,7 +1116,8 @@ impl View<'_> {
         else {
             return None;
         };
-        if self.original_array_start(start)? != start
+        if (self.original_array_start(start) != Some(start)
+            && !self.has_adjacent_post_try_entry(start, anchor, incoming_jump_block, false))
             || !self.provenance.source_boundaries.contains(&anchor)
             || self.items[start + 1..=marker].iter().any(|item| {
                 matches!(item,
@@ -2686,8 +2728,13 @@ impl FusionOwnerCertificates {
             .retain(|c| c.valid(view, false).is_some());
         self.manager_setup_certificates
             .retain(|certificate| certificate.valid(view, false).is_some());
-        self.fallback_certificates
-            .retain(|c| c.valid(view, false).is_some());
+        self.fallback_certificates.retain_mut(|certificate| {
+            if certificate.valid(view, false).is_none() {
+                return false;
+            }
+            certificate.record_incoming_jump(view);
+            true
+        });
         self.fresh_singleton_certificates
             .retain(|certificate| certificate.valid(view, false).is_some());
         self.folded_assert_success_certificates
