@@ -23790,7 +23790,9 @@ impl<'source> Compiler<'source> {
                         if guard.elif_else_clauses.is_empty()
                             && condition_has_linear_runtime_leaves(&guard.test)
                             && !expression_suspends_current_scope(&guard.test)
-                            && suite_has_nonsuspending_linear_fallthrough(&guard.body));
+                            && (suite_has_nonsuspending_linear_fallthrough(&guard.body)
+                                || (suite_has_nonsuspending_conditional_work(&guard.body)
+                                    && self.assembler.emitted_region_has_final_fallthrough(arm_start))));
                 let copied_exit =
                     shared_match_failure || copied_erased_branch_exit || copied_loop_else;
                 let linear_exit_body = |body: &[Stmt]| {
