@@ -16102,6 +16102,12 @@ fn folded_comprehension_and_tail_preserves_borrow_boundary() {
 }
 
 #[test]
+fn copied_conditional_return_uses_the_guard_before_an_erased_else() {
+    let source = "def sample(value, enabled, ready):\n    if value == 1:\n        if enabled:\n            pass\n        else:\n            if ready:\n                pass\n            elif value == 2:\n                pass\n            elif value:\n                result = value\n            else:\n                assert False\n    elif value == 4:\n        pass\n    return result\n";
+    assert_matches_cpython(source, "guard_return.py", &LEVELS);
+}
+
+#[test]
 fn linear_prefix_and_elided_suffix_preserve_nested_if_join() {
     let source = "def update(state):\n    if state.ready():\n        item = state.next()\n        if available(item):\n            apply(item)\n        else:\n            discard(item)\n        assert state.valid()\n    else:\n        assert state.valid()\n    result = state.finish()\n    assert result\n";
     for source in [
