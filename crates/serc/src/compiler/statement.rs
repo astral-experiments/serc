@@ -43110,6 +43110,16 @@ impl<'source> Compiler<'source> {
         {
             region_exclusions.clear();
         }
+        if self.context.python_version >= crate::PythonVersion::Py314
+            && remaining.is_empty()
+            && let Some(range) = async_with_iterator_exit_location(body)
+        {
+            // Exhaustion jumps past the raising arms. CPython keeps that jump's
+            // position inside the manager when it becomes a NOP.
+            self.assembler.set_location(self.source_location(range));
+            self.emit(NOP, 0, 0)?;
+            self.assembler.preserve_last_nop();
+        }
         self.assembler.mark(protected_end);
         if outer_exception_owns_exit && !terminal {
             self.control
@@ -44901,6 +44911,30 @@ fn with_body_has_folded_while_predecessor(body: &[Stmt]) -> bool {
     };
     (infinite_loop(&statement.body) && suite_has_linear_borrow_fallthrough(&otherwise.body))
         || (infinite_loop(&otherwise.body) && suite_has_linear_borrow_fallthrough(&statement.body))
+}
+
+/// Finds the sole async-iterator exhaustion edge past an explicit raising alternative.
+fn async_with_iterator_exit_location(body: &[Stmt]) -> Option<TextRange> {
+    let Stmt::If(branch) = body.last()? else {
+        return None;
+    };
+    let otherwise = branch.elif_else_clauses.last()?;
+    if otherwise.test.is_some() || !suite_has_linear_raise_exit(&otherwise.body) {
+        return None;
+    }
+    let mut arms = if_suites(branch);
+    let Stmt::For(iterator) = arms.find(|arm| !suite_has_linear_raise_exit(arm))?.last()? else {
+        return None;
+    };
+    (iterator.is_async
+        && iterator.orelse.is_empty()
+        && !suite_contains_loop_break(&iterator.body)
+        // A later suspension leaves the raising continuation in place. The
+        // exhausted iterator then falls through directly to the manager exit.
+        && arms.all(|arm| {
+            suite_has_linear_raise_exit(arm) && !suite_contains_suspending_expression(arm)
+        }))
+    .then(|| iterator.iter.range())
 }
 
 // A complete conditional with one terminal arm leaves the other arm as the sole
