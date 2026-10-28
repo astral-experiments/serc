@@ -3217,7 +3217,12 @@ impl OptimizationPipeline {
             }
             if *jump == expected
                 && *pop
-                    == Instruction::new(POP_TOP, Operand::Value(0), SourceLocation::NONE, Some(depth))
+                    == Instruction::new(
+                        POP_TOP,
+                        Operand::Value(0),
+                        SourceLocation::NONE,
+                        Some(depth),
+                    )
                 && (recorded.contains(&(*end, target)) || compound.contains(&(*end, target)))
                 && self.preserved_block_boundaries.contains(join)
                 && self
