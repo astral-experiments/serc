@@ -25977,3 +25977,23 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn handler_copies_the_unlocated_jump_before_its_return_expands() {
+    for arguments in ["", "alternate"] {
+        let source = format!(
+            "def read(source, enabled, alternate, manager):
+    if enabled:
+        try:
+            with manager:
+                pass
+        except ValueError:
+            handle()
+    elif alternate:
+        handle()
+    return source.result({arguments})
+"
+        );
+        assert_matches_cpython(&source, "handler_return_bridge.py", &LEVELS);
+    }
+}

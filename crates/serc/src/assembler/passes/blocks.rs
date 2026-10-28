@@ -701,6 +701,56 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
         && instructions.next().is_none()
 }
 
+/// A direct handler visits an unlocated jump before its four-instruction return is copied.
+fn handler_reaches_short_return_bridge(
+    graph: &BlockGraph,
+    source: BasicBlockId,
+    target: BasicBlockId,
+) -> bool {
+    if !graph[source]
+        .items()
+        .iter()
+        .filter_map(Item::as_instruction)
+        .map(|i| i.opcode)
+        .eq([POP_EXCEPT, JUMP_FORWARD])
+    {
+        return false;
+    }
+    let mut bridge = graph[target]
+        .items()
+        .iter()
+        .filter_map(Item::as_instruction);
+    let (Some(jump), None) = (bridge.next(), bridge.next()) else {
+        return false;
+    };
+    if jump.opcode != JUMP_FORWARD
+        || jump.location != SourceLocation::NONE
+        || jump.pre_fusion_width() != 1
+    {
+        return false;
+    }
+    let Some(successor) = jump
+        .forward_target()
+        .and_then(|label| graph.label_block(label))
+    else {
+        return false;
+    };
+    let mut returned = graph[successor]
+        .items()
+        .iter()
+        .filter_map(Item::as_instruction);
+    let [Some(first), Some(second), Some(third), Some(last)] =
+        std::array::from_fn(|_| returned.next())
+    else {
+        return false;
+    };
+    returned.next().is_none()
+        && last.opcode == RETURN_VALUE
+        && [first, second, third, last]
+            .iter()
+            .all(|i| i.pre_fusion_width() == 1 && i.location.line >= 0)
+}
+
 /// Recognizes a named-handler cleanup followed by a short, located value return.
 fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> bool {
     let cleanup = graph[target]
@@ -6374,7 +6424,11 @@ impl OptimizationPipeline {
                     .last_instruction()
                     .is_some_and(|instruction| {
                         instruction.no_location_policy.allows_block_inlining()
-                    });
+                    })
+                || (target_has_no_location
+                    && !source_has_fallthrough
+                    && target_blocks.len() == 1
+                    && handler_reaches_short_return_bridge(graph, source, target));
             let target_has_unlocated_jump_eval_check = target_has_no_location
                 && graph[target_exit]
                     .last_instruction()
