@@ -15755,6 +15755,24 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn folded_conditional_guard_keeps_each_falling_return_location() {
+    let source = r"
+def falls_through(ready, item):
+    if check(item) if not ready else None:
+        emit(item)
+
+def returns(ready, item):
+    if check(item) if not ready else None:
+        return item
+
+def raises(ready, item):
+    if check(item) if ready else None:
+        raise ValueError()
+";
+    assert_matches_cpython(source, "folded_guard_returns.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
