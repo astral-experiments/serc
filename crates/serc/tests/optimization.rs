@@ -25936,6 +25936,23 @@ fn specialized_comparison_keeps_its_try_else_guard_handler() {
 }
 
 #[test]
+fn conditional_attribute_store_keeps_its_return_boundary_with_an_annotation() {
+    let source = r"def run(obj, value, enabled):
+    if enabled:
+        obj.result: str = compute(value) if value else None
+    else:
+        obj.result = value
+";
+    for source in [
+        source.to_owned(),
+        source.replace(": str", ""),
+        source.replace("    else:\n        obj.result = value\n", ""),
+    ] {
+        assert_matches_cpython(&source, "conditional_attribute_store.py", &LEVELS);
+    }
+}
+
+#[test]
 fn erased_assertions_keep_the_finally_call_argument_guard_protected() {
     let source = r"def check(manager, handle, data, ok):
     with manager:
