@@ -32958,7 +32958,16 @@ impl<'source> Compiler<'source> {
                     unique_condition_jump_target(test, false)
                         .is_some_and(|test| jump_constant_truthiness(test).is_none())
                 })
-                && self.assembler.at_original_unconditional_join();
+                // A named cleanup can also start at a fallthrough from the last arm.
+                // Earlier arms copy it only if their original jump still enters the join.
+                && (self.assembler.at_original_unconditional_join()
+                    || (self.context.python_version >= crate::PythonVersion::Py314
+                        && handler.name.is_some()
+                        && matches!(handler.body.last(), Some(Stmt::If(tail))
+                            if self.assembler.at_original_shared_handler_join()
+                                || (cleanup_has_small_return_successor
+                                    && if_suites(tail).any(|body| matches!(body.last(), Some(Stmt::If(_))))
+                                    && self.assembler.original_join_has_unconditional_edge(true)))));
             let handler_match_failure_location = (handler.name.is_some()
                 && matches!(handler.body.last(), Some(Stmt::Match(_))))
             .then(|| self.assembler.original_match_failure_location())
