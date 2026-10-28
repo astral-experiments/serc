@@ -707,6 +707,31 @@ fn iterators_keep_an_unlocated_join_after_a_named_finalizer_handler() {
 }
 
 #[test]
+fn loop_exhaustion_on_a_try_else_exit_keeps_its_condition_location() {
+    let suite = r"    try:
+        prepare()
+    except LookupError:
+        raise
+    else:
+        while len(items) < limit:
+            items.append(next_item())
+";
+    for manager in [false, true] {
+        let mut source = String::from("def collect(items, limit, resource):\n");
+        if manager {
+            source.push_str("    with resource:\n");
+            for line in suite.lines() {
+                writeln!(source, "    {line}").unwrap();
+            }
+        } else {
+            source.push_str(suite);
+        }
+        source.push_str("    return items\n");
+        assert_matches_cpython(&source, "try_else_while_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn terminal_while_else_keeps_its_handler_break_position() {
     let source = r"def sample(active):
     if active:
