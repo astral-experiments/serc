@@ -38131,10 +38131,47 @@ impl<'source> Compiler<'source> {
                             && context.finally_end_depth == 0
                             && context.exception_region_depth == 0))
                     && managed_guarded_raise_has_finally_route(statement)));
+        // A successful terminal guard jumps to the normal try exit. That exit is
+        // still a located instruction after the exception handlers move cold.
+        let successful_guard_reaches_finally = self.context.python_version
+            == crate::PythonVersion::Py314
+            && matches!(self.unit.scope, Scope::Function { .. })
+            && !statement.is_star
+            && !statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && statement.body.split_last().is_some_and(|(last, prefix)| {
+                if self.context.is_elided_statement(last)
+                    && matches!(last, Stmt::Global(global) if global.names.is_empty())
+                {
+                    return matches!(prefix.last(), Some(Stmt::Expr(work))
+                        if matches!(work.value.as_ref(), Expr::Call(_) | Expr::Await(_)))
+                        && matches!(statement.handlers.as_slice(), [handler]
+                            if handler.as_except_handler().is_some_and(|handler|
+                                handler.name.is_some()
+                                    && matches!(handler.body.as_slice(), [Stmt::If(guard)]
+                                        if guard.elif_else_clauses.is_empty()
+                                            && matches!(guard.body.as_slice(), [Stmt::Raise(_)]))));
+                }
+                let test = match last {
+                    Stmt::Assert(assertion) => &assertion.test,
+                    Stmt::If(guard)
+                        if guard.elif_else_clauses.is_empty()
+                            && matches!(guard.body.as_slice(), [Stmt::Raise(_)]) =>
+                    {
+                        &guard.test
+                    }
+                    _ => return false,
+                };
+                self.context.fold_constant(test).is_none()
+                    && (!expression_suspends_current_scope(test)
+                        || matches!(test.as_ref(), Expr::Await(_)))
+                    && original_condition_has_unique_jump_target(test, true)
+            });
         let normal_finally_is_borrow_reachable = (simple_fallthrough_handlers_reach_finally
             || compound_fallthrough_handlers_reach_finally
             || runtime_while_handlers_reach_finally)
             && (!has_empty_handler_or_else_exit || else_bypasses_empty_handler_exit)
+            || successful_guard_reaches_finally
             || managed_runtime_while_return_reaches_finally
             || runtime_retry_break_reaches_finally
             || conditional_body_reaches_finally

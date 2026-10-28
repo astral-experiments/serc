@@ -15,6 +15,40 @@ use serc::{
 };
 
 #[test]
+fn successful_guards_reach_the_normal_finalizer_after_cold_handlers() {
+    let guarded = r"def run(value, ready):
+    try:
+        if not ready():
+            raise ValueError
+    except KeyError as err:
+        report(err)
+    except LookupError as err:
+        repair()
+    finally:
+        try:
+            value.close()
+        except OSError:
+            report()
+        value.flush()
+";
+    assert_matches_cpython(guarded, "guarded_finalizer.py", &LEVELS);
+
+    let awaited = r"async def run(value, ready):
+    async with scope():
+        try:
+            await value.prepare()
+            assert await ready()
+        except OSError as err:
+            if value.failed or retry():
+                raise err
+        finally:
+            if value.active:
+                await value.close()
+";
+    assert_matches_cpython(awaited, "asserted_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
