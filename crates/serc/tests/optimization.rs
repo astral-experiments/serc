@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn nested_recovery_preserves_the_shared_global_store() {
+    let source = r"def update():
+    global dirty
+    try:
+        try:
+            process()
+        except LookupError:
+            try:
+                record()
+            except ValueError:
+                pass
+    except OSError:
+        pass
+    dirty = False
+";
+    assert_matches_cpython(source, "recovery_global_store.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
