@@ -9683,7 +9683,15 @@ fn threaded_handler_booleans_append_an_unowned_marker() {
             or second
         ) or other
 ";
-    for source in [source.to_owned(), source.replace(" or ", " and ")] {
+    let same_line = source.replace(
+        "(\n            first\n            or second\n        )",
+        "(first or second)",
+    );
+    for source in [
+        source.to_owned(),
+        source.replace(" or ", " and "),
+        same_line,
+    ] {
         assert_matches_cpython_versions(
             &source,
             "threaded_handler_boolean.py",

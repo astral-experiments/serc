@@ -8840,7 +8840,6 @@ impl Compiler<'_> {
                 && !exception_group_handler
                 && nested_leading_group
                 && operand_index == 0
-                && original_location.line != location.line
                 && !marker_reuses_exception_owner;
             let exclude_from_all_owners = exclude_exception_type_owner
                 || exclude_inlined_comprehension_owner
