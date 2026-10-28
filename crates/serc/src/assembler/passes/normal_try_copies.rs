@@ -12,6 +12,14 @@ use super::super::{
 use super::normal_try_copy_plan::{OriginalNode, OriginalTail, PrefixSlot, plan_normal_try_copies};
 use crate::target::opcodes::{JUMP_BACKWARD, JUMP_FORWARD, NOP, POP_EXCEPT};
 
+/// An original branch that reaches an unprotected constant return through two try exits.
+pub(super) struct NestedTryBranchReturn {
+    source: Label,
+    outer: Label,
+    location: SourceLocation,
+    tail: [Instruction; 2],
+}
+
 /// Exposes the owned discard at the end of a try or handler as a copyable range.
 fn split_discard_owner_regions(
     regions: &mut Vec<ExceptionRegion>,
@@ -2780,6 +2788,139 @@ impl OptimizationPipeline {
             && donor.opcode == JUMP_FORWARD
             && donor.location.line >= 0)
             .then_some(donor.location)
+    }
+
+    /// Captures the three jump arrays that a located branch copies before the outer return.
+    pub(super) fn nested_try_branch_returns(&self) -> Vec<NestedTryBranchReturn> {
+        use super::super::ir::RetainedJumpNop;
+
+        let exits = &self.exception_owner_provenance.normal_try_exits;
+        if self.python_version < crate::PythonVersion::Py314
+            || exits.len() < 2
+            || !self.graph.features().has_forward_conditional()
+        {
+            return Vec::new();
+        }
+        let graph = &self.graph;
+        let unlocated_jump = |entry| {
+            let block = graph.label_block(entry)?;
+            let (Item::Instruction(jump), head) = graph[block].items().split_last()? else {
+                return None;
+            };
+            if !head.iter().all(|item| matches!(item, Item::Label(_)))
+                || jump.opcode != JUMP_FORWARD
+                || jump.location != SourceLocation::NONE
+                || jump.depth_after() != Some(0)
+                || jump.pre_fusion_width() != 1
+                || !jump.jump_policy.inline_small_exit()
+                || head.iter().any(|item| matches!(item, Item::Label(label)
+                    if self.exception_owner_provenance.omitted_nop_counts.contains_key(label)
+                        || self.exception_owner_provenance.omitted_nop_locations.contains_key(label)))
+            {
+                return None;
+            }
+            jump.forward_target()
+        };
+        let normal = exits
+            .iter()
+            .filter_map(|&(entry, target)| {
+                (unlocated_jump(entry) == Some(target))
+                    .then_some((graph.label_block(entry)?, target))
+            })
+            .collect::<FxHashMap<_, _>>();
+        let routes = normal
+            .iter()
+            .filter_map(|(&inner, &middle)| {
+                let outer = unlocated_jump(middle)?;
+                let footer = *normal.get(&graph.label_block(outer)?)?;
+                super::control_flow::is_original_constant_return(graph, footer)
+                    .then_some((inner, (outer, footer)))
+            })
+            .collect::<FxHashMap<_, _>>();
+        if routes.is_empty() {
+            return Vec::new();
+        }
+        let positions = graph
+            .order()
+            .iter()
+            .enumerate()
+            .map(|(position, &block)| (block, position))
+            .collect::<FxHashMap<_, _>>();
+        graph
+            .iter()
+            .filter_map(|(source, block)| {
+                let (Item::Instruction(jump), labels) = block.items().split_last()? else {
+                    return None;
+                };
+                let inner = graph.label_block(jump.forward_target()?)?;
+                let &(outer, footer) = routes.get(&inner)?;
+                let returned = graph.label_block(footer)?;
+                let [.., Item::Instruction(load), Item::Instruction(ret)] = graph[returned].items()
+                else {
+                    return None;
+                };
+                if positions[&source] >= positions[&inner]
+                    || jump.opcode != JUMP_FORWARD
+                    || jump.location.line < 0
+                    || jump.depth_after() != Some(0)
+                    || jump.pre_fold_extra_instructions() > 1
+                    || jump.fusion_policy.is_authored_break()
+                    || jump.jump_policy.retained_nop() != RetainedJumpNop::DirectTarget
+                    || !labels.iter().all(|item| matches!(item, Item::Label(_)))
+                    || self.exception_regions.iter().any(|region| {
+                        // The return has no interior labels. Reject a footer covered by
+                        // an outer handler or by a scope fallback.
+                        graph
+                            .label_block(region.start)
+                            .zip(graph.label_block(region.end))
+                            .is_none_or(|(start, end)| {
+                                (positions[&start]..positions[&end]).contains(&positions[&returned])
+                            })
+                    })
+                {
+                    return None;
+                }
+                Some(NestedTryBranchReturn {
+                    source: block.first_label()?,
+                    outer,
+                    location: jump.location,
+                    tail: [*load, *ret],
+                })
+            })
+            .collect()
+    }
+
+    /// Copies the outer return after ordinary threading settles the neighboring edges.
+    pub(super) fn restore_nested_try_branch_returns(&mut self, copies: Vec<NestedTryBranchReturn>) {
+        for copy in copies {
+            let Some(block) = self.graph.label_block(copy.source) else {
+                continue;
+            };
+            let Some(jump) = self.graph.instructions_mut(block).next_back() else {
+                continue;
+            };
+            // The branch must still be the located skip to the same outer try exit.
+            // Earlier predecessors may have threaded past its array independently.
+            if jump.opcode != JUMP_FORWARD
+                || jump.forward_target() != Some(copy.outer)
+                || jump.location != copy.location
+                || jump.depth_after() != Some(0)
+            {
+                continue;
+            }
+            let mut marker = Instruction::synthetic(NOP, Operand::Value(0), copy.location, Some(0));
+            // Both POP_BLOCKs have already unwound. The surviving line marker and
+            // the footer that follows it are all outside those protected ranges.
+            marker.set_exception_policy(super::super::ExceptionPolicy::EXCLUDE_ALWAYS);
+            *jump = marker;
+            self.graph.append_to_block(
+                block,
+                copy.tail.map(|mut instruction| {
+                    instruction.set_exception_policy(super::super::ExceptionPolicy::EXCLUDE_ALWAYS);
+                    Item::Instruction(instruction)
+                }),
+            );
+        }
     }
 
     /// Keeps original jumps until their shared try exit can copy its return.

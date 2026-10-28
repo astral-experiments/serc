@@ -732,6 +732,7 @@ impl OptimizationPipeline {
         original_owners.retain_pipeline(&self);
         #[cfg(any(test, debug_assertions))]
         self.validate_structure(AssemblerStage::RemoveUnreachableInitial)?;
+        let nested_try_returns = self.nested_try_branch_returns();
         self.prepare_normal_try_copy_plan();
         self.prepare_plain_tuple_copy_plan();
         self.prepare_conditional_normal_try_joins();
@@ -812,6 +813,7 @@ impl OptimizationPipeline {
                     .map(|constants| &mut **constants as &mut dyn ConstantTable),
             )?
         };
+        self.restore_nested_try_branch_returns(nested_try_returns);
         self.replay_copied_comprehension_swaps(copied_comprehension_swaps);
         self.borrow_threaded_jump_entries.clear();
         self.borrow_authored_finally_break_origins =
