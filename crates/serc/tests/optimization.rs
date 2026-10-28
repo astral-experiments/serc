@@ -10360,6 +10360,20 @@ fn named_finalizer_elif_recovery_keeps_owned_continuation() {
 }
 
 #[test]
+fn terminal_named_handler_cleanup_keeps_each_conditions_false_edge() {
+    for condition in [
+        "enabled and any(value for value in values)",
+        "enabled and accept([value for value in values])",
+        "enabled or any(value for value in values)",
+    ] {
+        let source = format!(
+            "def run(enabled, values, accept):\n    try:\n        yield\n    except LookupError as error:\n        if {condition}:\n            accept(error)\n"
+        );
+        assert_matches_cpython(&source, "named_handler_false_edges.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_elif_cleanup_retains_recovery_and_conditional_suffix() {
     for managed in [false, true] {
         for condition in ["ready", "result is not None and not result.failed"] {
