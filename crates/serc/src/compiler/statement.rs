@@ -10394,20 +10394,21 @@ impl<'source> Compiler<'source> {
                             self.assembler.mark_last_as_converted_pop_block();
                         }
                         if preserve_tos {
-                            // SWAP precedes the handler's POP_BLOCK. A lone unnamed
-                            // handler already covers it with its body region.
+                            // SWAP precedes POP_BLOCK. A lone unnamed handler's body
+                            // covers it even when an outer try surrounds the handler.
                             let cleanup_start = (name.is_some()
+                                || handler_count > 1
                                 || self
                                     .control
                                     .exceptions
                                     .active_exception_region_exclusions
                                     .len()
-                                    > 1)
-                            .then(|| {
-                                let start = self.assembler.label();
-                                self.assembler.mark(start);
-                                start
-                            });
+                                    > region_depth + 1)
+                                .then(|| {
+                                    let start = self.assembler.label();
+                                    self.assembler.mark(start);
+                                    start
+                                });
                             self.emit(SWAP, 2, 0)?;
                             if shared_manager_return_cleanup {
                                 self.assembler.preserve_last_no_location();
