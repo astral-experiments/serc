@@ -1857,6 +1857,30 @@ fn comprehension_subscript_store_preserves_guarded_cleanup_entry() {
 }
 
 #[test]
+fn break_after_manager_threads_a_terminal_normal_try_exit() {
+    for successor in ["", "        observe()\n"] {
+        let source = format!(
+            "def sample(manager, value, ready):
+    try:
+        while True:
+            if value:
+                with manager:
+                    walk(value)
+                break
+            with manager:
+                if ready:
+                    break
+{successor}    except Error:
+        raise
+    finally:
+        done()
+"
+        );
+        assert_matches_cpython(&source, "manager_break_try_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn managed_loop_break_bypasses_erased_recovery_exit() {
     let source = "def sample(owner, active, cleanup):\n    count = 0\n    while active:\n        claimed = False\n        try:\n            with owner.pop() as item:\n                claimed = item is not None\n                if item is None:\n                    break\n                count += 1\n            if cleanup and item is not None:\n                try:\n                    if item.exists():\n                        owner.remove(item)\n                except Error as error:\n                    owner.warning(error)\n        except Error as error:\n            if claimed:\n                owner.failed()\n            owner.warning(error)\n            if not claimed:\n                if not owner.retryable(error):\n                    owner.close()\n                    raise\n    owner.close()\n    owner.report(count)\n";
     for source in [
