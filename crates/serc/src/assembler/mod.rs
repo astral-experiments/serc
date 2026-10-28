@@ -3643,6 +3643,26 @@ impl Assembler {
         })
     }
 
+    /// Checks that a guard and its physical fallthrough reach the same empty join.
+    pub(crate) fn original_guard_and_body_reach_join(&self, guard: SourceLocation) -> bool {
+        let items = self.linear_items();
+        let labels = trailing_labels(items).collect::<Vec<_>>();
+        let Some(previous) = items.iter().rev().find_map(Item::as_instruction) else {
+            return false;
+        };
+        !labels.is_empty()
+            && !ends_scope(previous.opcode)
+            && !is_unconditional_jump(previous.opcode)
+            && items.iter().filter_map(Item::as_instruction).any(|jump| {
+                is_conditional_jump(jump.opcode)
+                    && jump.location == guard
+                    && jump.depth_after() == previous.depth_after()
+                    && jump
+                        .forward_target()
+                        .is_some_and(|label| labels.contains(&label))
+            })
+    }
+
     /// Certifies an empty source join with multiple original conditional exits.
     pub(crate) fn at_original_shared_conditional_join(&self) -> bool {
         self.original_shared_conditional_join(false, false)

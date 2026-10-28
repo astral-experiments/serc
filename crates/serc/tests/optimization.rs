@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn nested_partial_else_keeps_each_loop_predecessors_line() {
+    let source = r"def scan():
+    while ready():
+        if enabled():
+            if available():
+                update()
+            else:
+                if permitted():
+                    if pending():
+                        record()
+        else:
+            if retry():
+                refresh()
+            else:
+                break
+";
+    assert_matches_cpython(source, "nested_guard_loop.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

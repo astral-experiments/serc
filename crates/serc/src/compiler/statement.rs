@@ -16975,7 +16975,16 @@ impl<'source> Compiler<'source> {
                             .len()
                             == 1
                         && self.control.finally.active_finally_try_bodies == 0;
-                    if protected_shared_join {
+                    let shared_loop_join = self.context.python_version
+                        >= crate::PythonVersion::Py314
+                        && self.control.in_loop()
+                        && body_has_original_empty_block
+                        && nested_else_fallthrough_test(body).is_some_and(|test| {
+                            self.assembler.original_guard_and_body_reach_join(
+                                self.source_location(condition_fallthrough_range(test)),
+                            )
+                        });
+                    if protected_shared_join || shared_loop_join {
                         self.assembler.set_location(SourceLocation::NONE);
                     }
                     let branch_exit = if exclude_direct_try_body_exit
@@ -17066,7 +17075,7 @@ impl<'source> Compiler<'source> {
                         // as the simple constant-true branch with an else suite.
                         self.assembler.mark_folded_condition_exit(branch_exit);
                     }
-                    if protected_shared_join {
+                    if protected_shared_join || shared_loop_join {
                         self.assembler.preserve_shared_jump_no_location(branch_exit);
                     } else if inherited_shared_if_exit {
                         self.assembler.defer_shared_jump_no_location(branch_exit);
@@ -52056,6 +52065,22 @@ fn false_yield_shared_try_exit(statement: &ruff_python_ast::StmtTry) -> Option<T
         && linear_calls(recovery)
         && direct_call(&finalizer.value))
     .then_some(tail.test.range())
+}
+
+/// Returns the final guard when both its false edge and its body leave a nested else.
+fn nested_else_fallthrough_test(body: &[Stmt]) -> Option<&Expr> {
+    let Stmt::If(branch) = body.last()? else {
+        return None;
+    };
+    let fallback = branch.elif_else_clauses.last()?;
+    let Stmt::If(tail) = fallback.body.last()? else {
+        return None;
+    };
+    let (test, suite) = match tail.elif_else_clauses.last() {
+        Some(clause) => (clause.test.as_ref()?, &clause.body),
+        None => (tail.test.as_ref(), &tail.body),
+    };
+    (fallback.test.is_none() && suite_has_normal_fallthrough(suite)).then_some(test)
 }
 
 pub(super) fn nested_if_exit_location(
