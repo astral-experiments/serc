@@ -8239,11 +8239,27 @@ impl OptimizationPipeline {
                 self.original_jump_head_targets
                     .retain(|label| graph.label_block(*label) != Some(source));
                 copied_entry_labels.push(copied_label);
-                // CPython resolves locations across inlined scope exits and eval-check blocks.
+                // Each copied POP_EXCEPT unwinds another handler on the same branch.
+                // Propagate its line through the whole unwind, including the final jump.
+                let copied_handler_unwind = self.python_version >= crate::PythonVersion::Py314
+                    && target_has_no_location
+                    && target_terminal_opcode == Some(JUMP_FORWARD)
+                    && {
+                        let mut prefix = target_blocks
+                            .iter()
+                            .rev()
+                            .flat_map(|block| graph[*block].items().iter().rev())
+                            .filter_map(Item::as_instruction)
+                            .map(|instruction| instruction.opcode)
+                            .skip(1);
+                        prefix.next() == Some(POP_EXCEPT)
+                            && prefix.all(|opcode| opcode == POP_EXCEPT)
+                    };
                 // Other copied continuations can still represent a shared, unlocated join.
                 if target_terminal_opcode
                     .is_some_and(|opcode| ends_scope(opcode) || opcode == JUMP_BACKWARD)
                     || target_has_artificial_eval_break
+                    || copied_handler_unwind
                 {
                     copied_exit_or_eval_entry_labels.insert(copied_label);
                     // A later copy of this array must also cross copied interior
