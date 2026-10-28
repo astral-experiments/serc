@@ -4465,6 +4465,26 @@ fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
 }
 
 #[test]
+fn handler_return_guards_reuse_the_original_exception_slots() {
+    for (value, guard) in [
+        ("(1, 2, 3)", "flag"),
+        ("(1, 2)", "flag is not None"),
+        ("(1, 2, 3, 4)", "flag"),
+        ("(first(), second(), third())", "flag"),
+    ] {
+        let source = format!(
+            "def run(items, flag):\n    for item in items:\n        try:\n            work(item)\n        except LookupError:\n            return {value}\n        finally:\n            if {guard}:\n                finish()\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "handler_return_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn handler_and_iterator_returns_reuse_the_final_cleanup_pop() {
     for source in [
         r"async def sample(value, flag):

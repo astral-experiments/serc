@@ -14986,6 +14986,15 @@ impl LayoutAssembler {
         if pop_slot == marker {
             return Some(ExceptionOwnerDecision::override_with_region(None));
         }
+        // A handler return restores the exception immediately before the final
+        // POP. A marker in that preceding cell keeps POP_EXCEPT's handler.
+        if origin.cleanup.opcode == crate::target::opcodes::POP_EXCEPT
+            && origin.omitted_pops == 0
+            && pop_slot == marker.checked_add(1)?
+        {
+            let region = self.uniform_exception_owner(previous, load, positions)?;
+            return Some(ExceptionOwnerDecision::override_with_region(Some(region)));
+        }
         // A saved return's manager POP comes before CALL and POP_TOP. A marker
         // one or two cells before the final POP instead inherits their handler.
         let call = previous.checked_sub(1)?;

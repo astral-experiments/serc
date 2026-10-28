@@ -12753,6 +12753,7 @@ impl<'source> Compiler<'source> {
                         .loops
                         .contexts
                         .iter()
+                        .skip(finally_context.loop_depth)
                         .filter(|context| context.iterator_cleanup != IteratorCleanup::None);
                     let iterator = iterators.next();
                     let nested_named_handler = preserve_tos
@@ -12779,15 +12780,25 @@ impl<'source> Compiler<'source> {
                                     && handler.try_body_depth == ordinary_pops
                                     && handler.exception_region_depth == handler.try_body_depth + 1
                             });
+                    // A loop enclosing the finally still holds its iterator throughout this copy.
+                    let ordinary_handler_return =
+                        self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR) == 0
+                            && handler_count == 1
+                            && ordinary_pops == 0
+                            && !emitted_named_handler_pops;
                     let return_guard_pops = (self.context.python_version
                         == crate::PythonVersion::Py314
-                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                        && (self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
                             == CO_COROUTINE
+                            || ordinary_handler_return)
                         && !return_is_overridden
                         && context_index == 0
                         && return_finally_contexts.len() == 1
                         && finally_context.handler_depth == 0
-                        && finally_context.loop_depth == 0
+                        && (finally_context.loop_depth == 0
+                            || ordinary_handler_return
+                                && finally_context.loop_depth
+                                    == self.control.loops.contexts.len())
                         && finally_context.try_body_depth == 0
                         && finally_context.exception_region_depth == 0
                         && finally_context.with_depth
