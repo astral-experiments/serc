@@ -19713,12 +19713,16 @@ impl<'source> Compiler<'source> {
         }
         if self.context.python_version == crate::PythonVersion::Py314
             && !has_terminating_else
-            && statement
-                .elif_else_clauses
-                .last()
-                .is_some_and(|clause| clause.test.is_none())
+            && let Some(clause) = statement.elif_else_clauses.last()
+            && clause.test.is_none()
             && if_normal_exit_count(statement) == 1
-            && !self.assembler.at_empty_borrow_block()
+            // A loop without an else leaves an empty exit. A located POP_BLOCK
+            // NOP for the enclosing cleanup belongs to the continuation.
+            && !self.assembler.at_empty_borrow_block_without_nops(
+                clause.body.last().and_then(Stmt::as_while_stmt)
+                    .filter(|loop_| loop_.orelse.is_empty())
+                    .map(|loop_| self.source_location(while_condition_exit_range(&loop_.test)).line),
+            )
         {
             // A terminating earlier arm loses its jump to the join. The final
             // else still ends its own instruction array before the continuation.

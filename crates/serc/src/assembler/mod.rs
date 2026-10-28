@@ -1923,7 +1923,7 @@ impl Assembler {
         self.at_empty_borrow_block_without_nops(None)
     }
 
-    /// Whether only redundant NOPs on a folded condition's own line precede it.
+    /// Whether the original block is empty after ignoring NOPs on the given line.
     pub(crate) fn at_empty_borrow_block_without_nops(&self, nop_line: Option<i32>) -> bool {
         for item in self.linear_items().iter().rev() {
             match item {
