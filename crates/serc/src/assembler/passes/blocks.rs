@@ -1645,7 +1645,7 @@ fn restore_shared_pop_block_locations(
 
 // A copied cleanup can leave its dropped original in the inlining predecessor count.
 // CPython recounts reachable edges before propagating lines. Repair only the unresolved
-// converted POP_BLOCK heads affected by such a copy, after all copies and revivals exist.
+// POP_BLOCK heads and named-handler cleanups after all copies and revivals exist.
 fn restore_copied_pop_block_locations(
     graph: &mut BlockGraph,
     exception_regions: &[ExceptionRegion],
@@ -1701,6 +1701,20 @@ fn restore_copied_pop_block_locations(
         let (1, Some(location)) = incoming[target.index()] else {
             continue;
         };
+        if location.line >= 0
+            && graph[target]
+                .items()
+                .iter()
+                .find_map(Item::as_instruction)
+                .is_some_and(|op| op.opcode == POP_EXCEPT)
+        {
+            for op in graph.instructions_mut(target).take_while(|op| {
+                op.location == SourceLocation::NONE && !op.no_location_policy.preserves_location()
+            }) {
+                op.location = location;
+            }
+            continue;
+        }
         if location.line >= 0
             && let Some(first) = graph.instructions_mut(target).next()
             && first.opcode == NOP
@@ -8953,8 +8967,24 @@ impl OptimizationPipeline {
                     .items()
                     .iter()
                     .find_map(Item::as_instruction)?;
-                (first.opcode == NOP
-                    && first.fusion_policy.is_converted_pop_block()
+                (((first.opcode == NOP && first.fusion_policy.is_converted_pop_block())
+                    || (first.opcode == POP_EXCEPT
+                        && self.python_version >= crate::PythonVersion::Py314
+                        && self
+                            .exception_owner_provenance
+                            .original_named_handler_cleanup_joins
+                            .iter()
+                            .any(|(label, array)| {
+                                graph.label_block(*label) == Some(target)
+                                    && array[4]
+                                        .forward_target()
+                                        .and_then(|returned| graph.label_block(returned))
+                                        .is_some_and(|returned| {
+                                            super::normal_try_copies::original_local_return(
+                                                graph[returned].items(),
+                                            )
+                                        })
+                            })))
                     && first.location.line < 0
                     && !first.no_location_policy.preserves_location())
                 .then(|| graph[target].first_label())
