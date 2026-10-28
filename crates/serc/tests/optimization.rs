@@ -15755,6 +15755,39 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn normal_try_exit_copies_keep_the_width_of_a_folded_return_operand() {
+    let source = r"
+def choose(ready, other, box, manager):
+    try:
+        if ready:
+            with manager as value:
+                pass
+        elif other:
+            box.value = 1
+            return box.value
+    except ValueError:
+        pass
+    return -1
+
+def choose_with_pass(ready, other, box, manager):
+    try:
+        if other:
+            if ready:
+                with manager as value:
+                    pass
+            elif other:
+                box.value = 1
+                return box.value
+        else:
+            pass
+    except ValueError:
+        pass
+    return -1
+";
+    assert_matches_cpython(source, "normal_try_folded_return.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:
