@@ -25977,3 +25977,20 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn chained_comparison_uses_its_own_handler_cleanup_exit() {
+    for handler in ["Error", "Error as error"] {
+        let source = format!(
+            "def transform(value):
+    try:
+        work()
+    except {handler}:
+        if 0 <= value <= 9:
+            value = convert(value)
+    finish()
+"
+        );
+        assert_matches_cpython(&source, "handler_comparison_cleanup.py", &LEVELS);
+    }
+}

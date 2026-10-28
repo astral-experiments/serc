@@ -17856,6 +17856,19 @@ impl Assembler {
             .push((cleanup, end, records));
     }
 
+    /// Whether a chained comparison's subject-pop arm jumps to this cleanup entry.
+    pub(crate) fn at_original_comparison_cleanup_join(&self) -> bool {
+        self.exception_owner_provenance
+            .original_comparison_fallthroughs
+            .iter()
+            .rev()
+            .any(|(_, _, [_, _, _, _, _, cleanup])| {
+                cleanup.forward_target().is_some_and(|target| {
+                    trailing_labels(self.linear_items()).any(|label| label == target)
+                })
+            })
+    }
+
     /// Records the original jump into a comprehension's normal restore array.
     pub(crate) fn record_original_comprehension_normal_exit(
         &mut self,
