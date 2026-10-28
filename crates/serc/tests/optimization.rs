@@ -15,6 +15,36 @@ use serc::{
 };
 
 #[test]
+fn recovery_suffix_keeps_the_assigned_try_exit_reachable_for_borrowing() {
+    for recovery in [
+        r"            try:
+                repair()
+            except KeyError:
+                repair()",
+        r"            for item in items:
+                try:
+                    repair()
+                except KeyError:
+                    repair()",
+    ] {
+        let source = format!(
+            r"async def process(record, ready, items):
+    try:
+        result = await fetch()
+    except ValueError as error:
+        if ready:
+{recovery}
+        record.flush()
+    finally:
+        record.flush()
+    record.finish()
+"
+        );
+        assert_matches_cpython(&source, "assigned_try_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

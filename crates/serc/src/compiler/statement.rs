@@ -30775,12 +30775,28 @@ impl<'source> Compiler<'source> {
                 && !statement.finalbody.is_empty()
                 && handler_contains_nested_handler_cold_join
                 && runtime_while_has_sole_exit;
+            // A final store and a non-looping handler suffix both survive cold-block
+            // ordering. Removing the normal jump leaves fallthrough into the continuation.
+            let assigned_exit_with_handler_suffix = unowned_guarded_recovery
+                && handler_contains_nested_handler_cold_join
+                && matches!(normal_exit_suite.last(), Some(Stmt::Assign(store))
+                    if matches!(store.targets.as_slice(), [Expr::Name(_)])
+                        && !expression_contains_inline_branch(&store.value))
+                && statement.handlers.iter().all(|handler| {
+                    handler.as_except_handler().is_some_and(|handler| {
+                        !suite_contains_loop(&handler.body)
+                            && handler.body.last().is_some_and(|last| {
+                                !suite_contains_nested_handler_cold_join(std::slice::from_ref(last))
+                            })
+                    })
+                });
             if (normal_exit_starts_in_empty_block
                 && !retained_while_finally_exit
                 && borrow_exit_has_source_successor
                 && !nonempty_finally_normal_source
                 && !populated_guarded_handler_suffix
                 && !live_guarded_recovery_cleanup
+                && !assigned_exit_with_handler_suffix
                 && !populated_async_recovery_else)
                 || matches!(normal_exit_suite.last(), Some(Stmt::Assert(assertion))
                     if assertion_has_only_runtime_tests(&assertion.test)
