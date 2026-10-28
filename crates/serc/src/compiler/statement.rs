@@ -39402,7 +39402,17 @@ impl<'source> Compiler<'source> {
                         if otherwise.test.is_none()
                             && if_suites(branch).all(|suite| !suite_terminates_before_constant_folding(suite))
                             && if_suites(branch).any(suite_terminates)));
-        if folded_pass_finally_exit || folded_conditional_exit {
+        // Both arms reach POP_BLOCK before a constant true test removes the else.
+        // The shared exit keeps its absent line when the surviving arm is located.
+        let shared_folded_finally_exit = self.context.python_version >= crate::PythonVersion::Py313
+            && statement.handlers.is_empty()
+            && statement.orelse.is_empty()
+            && pass_finally_location.is_none()
+            && matches!(statement.body.last(), Some(Stmt::If(branch))
+                if early_condition_truthiness(&branch.test) == Some(true)
+                    && branch.elif_else_clauses.last().is_some_and(|clause| clause.test.is_none())
+                    && if_suites(branch).all(|body| !suite_terminates_before_constant_folding(body)));
+        if folded_pass_finally_exit || folded_conditional_exit || shared_folded_finally_exit {
             self.assembler.preserve_last_no_location();
         }
         if (statement.handlers.is_empty()
