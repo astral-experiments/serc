@@ -4296,7 +4296,8 @@ impl OptimizationPipeline {
                     instruction.opcode != JUMP_FORWARD
                 });
                 let &(source, label, condition) = conditions.next()?;
-                if condition.opcode != POP_JUMP_IF_FALSE || conditions.next().is_some() {
+                if !matches!(condition.opcode, POP_JUMP_IF_FALSE | POP_JUMP_IF_TRUE
+                    | POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE) || conditions.next().is_some() {
                     return None;
                 }
                 let (Item::Instruction(jump), labels) = self.graph[block].items().split_last()? else {
@@ -4326,17 +4327,40 @@ impl OptimizationPipeline {
                 }
                 let end = success.forward_target()?;
                 let continuation = self.graph.label_block(end)?;
+                let position = order.iter().position(|candidate| *candidate == block)?;
+                let previous = *order.get(position.checked_sub(1)?)?;
+                let last = self.graph[previous].last_instruction()?;
+                // The return guard reaches an empty case-success array. It copies
+                // the enclosing match's unlocated jump before either array gets
+                // a source line, unless the outer continuation is itself small.
+                let wide_nested_return = self.python_version >= crate::PythonVersion::Py314
+                    && last.opcode == RETURN_VALUE
+                    && self.exception_owner_provenance.original_match_join_boundaries.contains(&target_label)
+                    && jump.jump_policy.is_original_empty_join()
+                    && if ends_scope(self.graph[continuation].last_instruction()?.opcode) {
+                        self.graph[continuation].items().iter().filter_map(Item::as_instruction)
+                            .map(Instruction::pre_fusion_width).sum::<usize>() > 4
+                    } else {
+                        !targets_small_scope_exit(&self.graph, end)
+                    };
                 // The existing return-copy certificates handle small return targets.
                 // This route requires an original match end with a live continuation.
                 if !self.exception_owner_provenance.original_match_join_boundaries.contains(&end)
-                    || ends_scope(self.graph[continuation].last_instruction()?.opcode)
+                    || (!wide_nested_return && (condition.opcode != POP_JUMP_IF_FALSE
+                        || ends_scope(self.graph[continuation].last_instruction()?.opcode)))
                     || [block, target].contains(&continuation)
                     || incoming.iter().map(|(_, _, instruction)| instruction)
                         .chain([jump, success]).any(|instruction| {
                             instruction.location.line < 0
                                 || instruction.forward_target().is_none()
                                 || instruction.pre_fold_extra_instructions() != 0
-                                || instruction.local_policy.hidden_exception_owner_slots() != 0
+                                // The None test folds LOAD_CONST, IS_OP, and TO_BOOL
+                                // into its original conditional. These slots precede
+                                // the empty case-success array, outside any handler.
+                                || (instruction.local_policy.hidden_exception_owner_slots() != 0
+                                    && !(wide_nested_return && *instruction == condition
+                                        && matches!(condition.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                                        && instruction.local_policy.hidden_exception_owner_slots() == 3))
                                 || instruction.no_location_policy.preserves_location()
                                 || instruction.exception_policy() != super::super::ExceptionPolicy::default()
                                 || instruction.depth_after() != jump.depth_after()
@@ -4344,9 +4368,6 @@ impl OptimizationPipeline {
                 {
                     return None;
                 }
-                let position = order.iter().position(|candidate| *candidate == block)?;
-                let previous = *order.get(position.checked_sub(1)?)?;
-                let last = self.graph[previous].last_instruction()?;
                 let fallthrough = super::super::block_has_fallthrough(self.graph[previous].items());
                 if last.depth_after() != jump.depth_after()
                     || if fallthrough {
@@ -4356,7 +4377,7 @@ impl OptimizationPipeline {
                             || self.conditional_threading_targets.contains_key(&label)
                     } else {
                         incoming.len() != 1
-                            || last.opcode != RAISE_VARARGS
+                            || (last.opcode != RAISE_VARARGS && !wide_nested_return)
                             || !jump.jump_policy.is_original_empty_join()
                             || jump.location != condition.location
                             || self.conditional_threading_targets.get(&label) != Some(&condition.location)
