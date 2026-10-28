@@ -25977,3 +25977,21 @@ fn short_circuit_value_after_manager_entries_uses_the_prior_handler() {
 ";
     assert_matches_cpython(source, "manager_value_guard.py", &LEVELS);
 }
+
+#[test]
+fn async_iterator_exhaustion_keeps_its_line_before_an_async_with_exit() {
+    let source = r"async def stream(manager, items, enabled):
+    async with manager:
+        if enabled:
+            async for item in items:
+                yield item
+        else:
+            raise ValueError
+";
+    assert_matches_cpython_versions(
+        source,
+        "async_iterator_exit.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
