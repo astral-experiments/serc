@@ -457,21 +457,13 @@ fn normalize_unmoved_interruptible_jumps(graph: &mut BlockGraph) {
     }
 }
 
-// Dispose of a shared cleanup's stack values, optionally preserving a pending value.
+// A shared cleanup can discard stack values or clear a handler's exception name.
 // Deferred source locations must resolve through their own writers, which do not all
 // honor PRESERVE.
 fn is_unlocated_value_cleanup_prefix(items: &[Item], python_version: crate::PythonVersion) -> bool {
     let mut instructions = items.iter().filter_map(Item::as_instruction);
     let Some(first) = instructions.next() else {
         return false;
-    };
-    let slots = match (first.opcode, first.operand()) {
-        (SWAP, Operand::Value(2)) => 1,
-        // Python 3.15 keeps an iterator index beside the iterator itself.
-        (SWAP, Operand::Value(3)) if python_version == crate::PythonVersion::Py315 => 2,
-        // A literal return has no pending value to preserve across those two pops.
-        (POP_TOP, Operand::Value(0)) if python_version == crate::PythonVersion::Py315 => 1,
-        _ => return false,
     };
     let unlocated = |instruction: &Instruction| {
         instruction.location.line < 0
@@ -481,6 +473,31 @@ fn is_unlocated_value_cleanup_prefix(items: &[Item], python_version: crate::Pyth
     if !unlocated(first) {
         return false;
     }
+    // Leaving a named handler also clears its exception variable. This prefix and a
+    // located finalizer can belong to one original block across a region boundary.
+    if first.opcode == POP_EXCEPT && python_version >= crate::PythonVersion::Py314 {
+        let (Some(load), Some(store), Some(delete)) = (
+            instructions.next(),
+            instructions.next(),
+            instructions.next(),
+        ) else {
+            return false;
+        };
+        return instructions.next().is_none()
+            && load.opcode == LOAD_CONST
+            && store.opcode == STORE_FAST
+            && delete.opcode == DELETE_FAST
+            && store.operand() == delete.operand()
+            && [load, store, delete].into_iter().all(unlocated);
+    }
+    let slots = match (first.opcode, first.operand()) {
+        (SWAP, Operand::Value(2)) => 1,
+        // Python 3.15 keeps an iterator index beside the iterator itself.
+        (SWAP, Operand::Value(3)) if python_version == crate::PythonVersion::Py315 => 2,
+        // A literal return has no pending value to preserve across those two pops.
+        (POP_TOP, Operand::Value(0)) if python_version == crate::PythonVersion::Py315 => 1,
+        _ => return false,
+    };
     for _ in 0..slots {
         let Some(discard) = instructions.next() else {
             return false;
