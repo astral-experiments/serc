@@ -1,6 +1,7 @@
 use std::cmp::Reverse;
 
 use rustc_hash::{FxHashMap, FxHashSet};
+use smallvec::SmallVec;
 
 use super::super::block_graph::{BasicBlockId, ItemPosition};
 use super::super::exception_owners::TupleJoinLocationOrigin;
@@ -2156,6 +2157,115 @@ impl OptimizationPipeline {
         }
     }
 
+    /// Restores the shared cleanup's line and its predecessor's owner before exit copying.
+    fn restore_shared_small_return_locations(&mut self) {
+        if self.python_version < crate::PythonVersion::Py314 {
+            return;
+        }
+        let mut jump_sources = None;
+        for &(entry, target) in &self.exception_owner_provenance.normal_try_exits {
+            let (Some(block), Some(exit)) = (
+                self.graph.label_block(entry),
+                self.graph.label_block(target),
+            ) else {
+                continue;
+            };
+            let single_jump = |block| {
+                let mut records = self.graph[block]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction);
+                let jump = records.next()?;
+                (records.next().is_none() && jump.opcode == JUMP_FORWARD).then_some(jump)
+            };
+            let Some(jump) = single_jump(block) else {
+                continue;
+            };
+            if jump.forward_target() != Some(target)
+                || jump.location.line < 0
+                || !self.graph[exit]
+                    .last_instruction()
+                    .is_some_and(|instruction| {
+                        instruction.opcode == crate::target::opcodes::RETURN_VALUE
+                    })
+                || self.graph[exit]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction)
+                    .take(5)
+                    .map(Instruction::pre_fusion_width)
+                    .sum::<usize>()
+                    > 4
+            {
+                continue;
+            }
+            let sources = jump_sources.get_or_insert_with(|| {
+                let mut sources: FxHashMap<_, SmallVec<[BasicBlockId; 2]>> = FxHashMap::default();
+                for (source, instructions) in self.graph.iter() {
+                    if let Some(target) = instructions
+                        .last_instruction()
+                        .and_then(Instruction::jump_target)
+                        .and_then(|label| self.graph.label_block(label))
+                    {
+                        sources.entry(target).or_default().push(source);
+                    }
+                }
+                sources
+            });
+            let Some(incoming) = sources.get(&block) else {
+                continue;
+            };
+            // One conditional edge lands beside an unlocated normal jump with its own
+            // incoming jump. Inlining copies the return before either edge can donate
+            // its location to the original protected exit.
+            let mut guard = false;
+            let mut shared_arms = SmallVec::<[BasicBlockId; 2]>::new();
+            for &source in incoming {
+                let edge = self.graph[source]
+                    .last_instruction()
+                    .expect("incoming jump");
+                guard |= super::super::is_conditional_jump(edge.opcode)
+                    && edge.location == jump.location;
+                if edge.location.line < 0
+                    && single_jump(source).is_some()
+                    && sources.get(&source).is_some_and(|arms| {
+                        arms.iter().any(|&arm| {
+                            self.graph[arm]
+                                .last_instruction()
+                                .is_some_and(|branch| branch.opcode == JUMP_FORWARD)
+                        })
+                    })
+                {
+                    shared_arms.push(source);
+                }
+            }
+            if guard && !shared_arms.is_empty() {
+                // The intermediate jump originally precedes POP_BLOCK. If the frontend
+                // excluded it in anticipation of copying the cleanup, restore its saved
+                // protected range so threading its predecessor copies the right owner.
+                for (&(start, _), owners) in &self.exception_owner_provenance.normal_try_jump_owners
+                {
+                    if self
+                        .graph
+                        .label_block(start)
+                        .is_some_and(|bridge| shared_arms.contains(&bridge))
+                    {
+                        self.exception_regions.extend(owners.iter().copied());
+                    }
+                }
+
+                let jump = self
+                    .graph
+                    .instructions_mut(block)
+                    .next_back()
+                    .expect("original normal jump");
+                jump.location = SourceLocation::NONE;
+                jump.no_location_policy.preserve_location();
+                self.shared_jump_copy_location_blocks.insert(entry);
+            }
+        }
+    }
+
     /// Restores a shared original cleanup before its successful edges are copied.
     pub(in crate::assembler) fn prepare_conditional_normal_try_joins(&mut self) {
         // A scheduled original-array plan owns this graph's copy order.
@@ -2168,6 +2278,7 @@ impl OptimizationPipeline {
         }
         self.prepare_unlocated_normal_try_discards();
         self.restore_empty_try_jump_owners();
+        self.restore_shared_small_return_locations();
         let mut selected = Vec::new();
         for &(entry, target) in &self.exception_owner_provenance.normal_try_exits {
             let (Some(block), Some(target_block)) = (

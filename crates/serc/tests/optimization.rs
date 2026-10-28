@@ -1924,6 +1924,16 @@ fn nested_finalizer_keeps_shared_subscript_store() {
 }
 
 #[test]
+fn shared_try_exit_respects_the_original_return_width() {
+    for argument in ["", "first"] {
+        let source = format!(
+            "def choose(group, first, second, target):\n    try:\n        if group:\n            if first: pass\n            elif second: pass\n        else:\n            if first: return second\n    except Failure:\n        pass\n    return target.finish({argument})\n"
+        );
+        assert_matches_cpython(&source, "shared_try_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn finalizer_copies_named_cleanup_after_an_elif() {
     let source = "def sample(ready, flag, prior):
     try:
