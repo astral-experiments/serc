@@ -29398,28 +29398,37 @@ impl<'source> Compiler<'source> {
                                 Some(NestedIfExitLocation::Unlocated)
                             )
                     );
-            // A guard beside a returning finalizer or terminating loop else can be the
-            // only edge left after exit copying. A following call or try is its own
-            // block. A short return can be copied onto the original jump.
+            let context = &self.control.statements.context;
+            let separate_successor = context.followed_by_try
+                || context.followed_by_call_expression
+                || context.followed_by_attribute_or_call_assignment;
+            let while_backedge = !context.has_following
+                && statement.orelse.is_empty()
+                && self.control.in_loop_tail_without_nested_cleanup()
+                && self
+                    .control
+                    .loops
+                    .contexts
+                    .last()
+                    .is_some_and(|context| context.iterator_cleanup == IteratorCleanup::None);
+            // Only the guard remains when the normal arm has copied the exit.
+            // A small following return may itself be copied onto the original jump.
             let detached_guard_exit = shared_conditional_exit
                 && self.context.python_version >= crate::PythonVersion::Py314
                 && !statement.is_star
                 && statement.finalbody.is_empty()
-                && (self.control.statements.context.followed_by_try
-                    || self.control.statements.context.followed_by_call_expression
-                    || self
-                        .control
-                        .statements
-                        .context
-                        .followed_by_attribute_or_call_assignment)
                 && matches!(normal_exit_join_suite.last(), Some(Stmt::If(branch))
                 if branch.elif_else_clauses.is_empty()
                     && original_condition_has_unique_jump_target(&branch.test, false)
                     && match branch.body.last() {
                         Some(Stmt::Try(cleanup)) => cleanup.handlers.is_empty()
                             && cleanup.orelse.is_empty() && !cleanup.finalbody.is_empty()
-                            && matches!(cleanup.body.last(), Some(Stmt::Return(_))),
-                        Some(Stmt::For(iterator)) => !iterator.is_async
+                            && ((separate_successor && matches!(cleanup.body.last(), Some(Stmt::Return(_))))
+                                // The iterator exhausts onto its own copy of the while backedge.
+                                || (while_backedge && matches!(cleanup.finalbody.last(), Some(Stmt::For(iterator))
+                                    if !iterator.is_async && iterator.orelse.is_empty()
+                                        && !suite_contains_loop_break(&iterator.body)))),
+                        Some(Stmt::For(iterator)) => separate_successor && !iterator.is_async
                             && suite_terminates_before_constant_folding(&iterator.orelse)
                             && suite_contains_loop_break(&iterator.body),
                         _ => false,

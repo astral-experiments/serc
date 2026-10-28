@@ -15,6 +15,26 @@ use serc::{
 };
 
 #[test]
+fn a_loop_tail_guard_survives_iterator_cleanup() {
+    let source = r"def drain(running, ready, retry, items):
+    while running:
+        try:
+            if ready:
+                try:
+                    read()
+                finally:
+                    for item in items:
+                        release(item)
+        except ValueError as error:
+            if retry:
+                pass
+            else:
+                break
+";
+    assert_matches_cpython(source, "loop_tail_guard.py", &LEVELS);
+}
+
+#[test]
 fn a_guard_can_locate_a_surviving_normal_try_exit() {
     for continuation in ["notify()", "return ready"] {
         let source = format!(
