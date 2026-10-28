@@ -2132,7 +2132,7 @@ impl OptimizationPipeline {
         Some(tails)
     }
 
-    /// Records a jump reached only by falling through a twice-queued conditional.
+    /// Records a jump reached only by falling through a twice-queued block.
     fn record_repeated_conditional_fallthroughs(
         &self,
         arrays: &LegacyInstructionArrays,
@@ -2149,7 +2149,8 @@ impl OptimizationPipeline {
         let order = self.graph.order();
         for (index, &[first, second, exit]) in order.array_windows().enumerate() {
             if conditional_target(first) != Some(second)
-                || conditional_target(second).is_none_or(|target| target == exit)
+                || !block_has_fallthrough(self.graph[second].items())
+                || conditional_target(second) == Some(exit)
             {
                 continue;
             }
@@ -2199,7 +2200,7 @@ impl OptimizationPipeline {
                 continue;
             }
             // The first conditional queues its target and fallthrough before
-            // either is marked visited. Each pop of the second conditional
+            // either is marked visited. Each pop of the second block
             // charges its fallthrough; the jump therefore has two predecessors.
             let mut expected = *jump;
             if let Some(target) = jump

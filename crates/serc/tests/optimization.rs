@@ -18587,6 +18587,23 @@ async def run(record, select, ready):
 }
 
 #[test]
+fn a_twice_visited_guard_keeps_its_fallthrough_jump_unlocated() {
+    let loop_body = "    for item in items:\n        if enabled:\n            if ready:\n                assert value\n            use(value)\n";
+    let branch_body = "    if first:\n        pass\n    elif second:\n        if enabled:\n            if ready:\n                assert value\n            use(value)\n    elif False:\n        pass\n";
+    for body in [loop_body, branch_body] {
+        let source = format!(
+            "def run(items, first, second, enabled, ready, value):\n{body}    if False:\n        return None\n    else:\n        return value\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "repeated_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn erased_loop_branches_preserve_terminal_returns() {
     let source = r"
 def run(data, items, consume, flag):
