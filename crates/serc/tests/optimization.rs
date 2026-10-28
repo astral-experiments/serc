@@ -4465,6 +4465,33 @@ fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
 }
 
 #[test]
+fn managed_finally_guards_reuse_the_condition_after_one_fusion() {
+    for guard in ["check(value, limit)", "value == limit.current()"] {
+        let source = format!(
+            "def run(value, limit):
+    try:
+        with acquire():
+            try:
+                return value
+            except ValueError:
+                pass
+            finally:
+                if {guard}:
+                    record()
+    finally:
+        finish()
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "managed_finally_guard.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn handler_and_iterator_returns_reuse_the_final_cleanup_pop() {
     for source in [
         r"async def sample(value, flag):

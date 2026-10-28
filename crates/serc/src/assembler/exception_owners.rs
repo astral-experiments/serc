@@ -11195,6 +11195,23 @@ impl LayoutAssembler {
                     }
                     if instruction.opcode == NOT_TAKEN
                         && owner_history_exact
+                        && tail.early_removals == 1
+                        && tail.late_removals == 0
+                        && tail.insertions == 0
+                        && tail.post_compaction_fusions == 0
+                        && let Some(region) = self.managed_finally_condition_owner(
+                            original_array_start..instruction_index,
+                            &indexed_instructions,
+                            &label_positions,
+                        )
+                    {
+                        owners.insert(
+                            instruction_index,
+                            ExceptionOwnerDecision::override_with_region(Some(region)),
+                        );
+                    }
+                    if instruction.opcode == NOT_TAKEN
+                        && owner_history_exact
                         && pop_slot_epoch_known
                         && tail.late_removals == 0
                         && tail.insertions == 0
@@ -14913,6 +14930,62 @@ impl LayoutAssembler {
         (!owner.is_scope_fallback && !owner.preserve_lasti && current_owner_matches).then_some(
             ExceptionOwnerDecision::override_with_region(owns_cleanup_record.then_some(region)),
         )
+    }
+
+    /// Finds a managed finalizer's conditional before one fusion frees its original slot.
+    fn managed_finally_condition_owner(
+        &self,
+        array: std::ops::Range<usize>,
+        instructions: &[&Instruction],
+        positions: &OwnerLabelPositions,
+    ) -> Option<usize> {
+        use crate::target::opcodes::{
+            POP_JUMP_IF_FALSE, POP_JUMP_IF_TRUE, PUSH_EXC_INFO, WITH_EXCEPT_START,
+        };
+
+        let [pop, operands @ .., condition] = instructions.get(array.clone())? else {
+            return None;
+        };
+        if pop.opcode != NOP
+            || !pop.fusion_policy.is_converted_pop_block()
+            || pop.exception_policy().exclusion() != super::ExceptionExclusion::Always
+            || pop.local_policy.hidden_exception_owner_slots() != 0
+            || pop.pre_fold_extra_instructions() != 0
+            || !matches!(condition.opcode, POP_JUMP_IF_TRUE | POP_JUMP_IF_FALSE)
+            || condition.forward_target().is_none()
+            || condition.location != instructions[array.end].location
+        {
+            return None;
+        }
+        let mut guard = ExceptionOwnerTail::default();
+        for operand in operands {
+            if operand.location.line != condition.location.line
+                || operand.value_argument().is_none()
+                || operand.opcode == NOP
+                || operand.local_policy.hidden_exception_owner_slots() != 0
+                || operand.pre_fold_extra_instructions() != 0
+                || operand.exception_policy() != super::ExceptionPolicy::NoneUnchanged
+            {
+                return None;
+            }
+            guard.instruction(operand, None);
+        }
+        // A fused call flag or comparison shifts the conditional left one cell.
+        // NOT_TAKEN reuses the conditional's original manager handler.
+        if guard.early_removals != 1 {
+            return None;
+        }
+        let region = self.uniform_exception_owner(array.start + 1, array.end, positions)?;
+        let body = self.exception_regions[region];
+        let handler = *positions.get(&body.target)?;
+        let [push, enter] = instructions.get(handler..handler + 2)? else {
+            return None;
+        };
+        (body.preserve_lasti
+            && !body.is_scope_fallback
+            && push.opcode == PUSH_EXC_INFO
+            && enter.opcode == WITH_EXCEPT_START)
+            .then_some(region)
     }
 
     /// Projects an appended guard through the original return cleanup and its final POP.
