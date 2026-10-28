@@ -15,6 +15,25 @@ use serc::{
 };
 
 #[test]
+fn unlocated_exit_of_a_nested_named_handler_keeps_its_jump() {
+    let source = r"def read(value, gate):
+    try:
+        prepare()
+    except OSError as error:
+        if gate:
+            try:
+                retry()
+            except LookupError as error:
+                if gate:
+                    value = recover()
+        else:
+            report()
+    return value
+";
+    assert_matches_cpython(source, "nested_named_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn normal_try_jump_reaches_the_named_cleanup_on_its_second_visit() {
     let source = r"def recover(value, retry):
     try:
