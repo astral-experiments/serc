@@ -39993,6 +39993,21 @@ impl<'source> Compiler<'source> {
                             .or_else(|| self.elided_else_exit_location(statement)),
                         _ => None,
                     });
+            // The terminating else cannot donate its line to the manager pop.
+            // It follows the two normal exits of the nested conditional instead.
+            if capture_manager_pop
+                && preserve_exit_nop
+                && self.context.python_version >= crate::PythonVersion::Py314
+                && matches!(statement.finalbody.last(), Some(Stmt::If(branch))
+                    if matches!(branch.elif_else_clauses.as_slice(), [other]
+                        if other.test.is_none() && suite_terminates(&other.body))
+                    && matches!(branch.body.last(), Some(Stmt::If(inner))
+                        if inner.elif_else_clauses.last().is_some_and(|other| other.test.is_none())
+                            && if_normal_exit_count(inner) > 1))
+                && self.assembler.at_original_unconditional_join()
+            {
+                conditional_exit = Some(NestedIfExitLocation::Unlocated);
+            }
             // An awaited guard can be the sole donor after nested cleanup jumps
             // past this empty normal exit. Require both original incoming edges.
             if self.context.python_version >= crate::PythonVersion::Py314
