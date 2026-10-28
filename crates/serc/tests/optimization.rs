@@ -3989,6 +3989,27 @@ fn folded_while_breaks_copy_unnamed_handler_cleanup() {
 }
 
 #[test]
+fn nested_handlers_keep_the_try_bridge_before_a_local_return() {
+    let source = r"def run(ready, value):
+    if ready:
+        try:
+            pass
+        except OSError:
+            try:
+                pass
+            except ValueError:
+                try:
+                    pass
+                except LookupError:
+                    pass
+    else:
+        pass
+    return value
+";
+    assert_matches_cpython(source, "nested_handler_local_return.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_none_while_break_copies_cleanup() {
     for prefix in ["", "async "] {
         for condition in ["value", "value is None", "value is not None"] {

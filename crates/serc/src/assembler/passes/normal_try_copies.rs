@@ -2820,6 +2820,19 @@ impl OptimizationPipeline {
             let Some(tail) = unlocated_jump(join) else {
                 continue;
             };
+            // The normal edge copies this bridge while the handler still points at
+            // its unlocated jump. Threading directly to the return makes the
+            // handler's cleanup too large for its own predecessors to copy.
+            if self.python_version >= crate::PythonVersion::Py314
+                && self
+                    .exception_owner_provenance
+                    .original_handler_cleanup_join_exits
+                    .contains(&join_label)
+                && original_local_return(graph[tail].items())
+            {
+                joins.push((join, None));
+                continue;
+            }
             let instructions = graph[tail].items().iter().filter_map(Item::as_instruction);
             if graph[tail]
                 .last_instruction()
