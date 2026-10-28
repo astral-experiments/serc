@@ -15755,6 +15755,21 @@ fn discarded_conditions_copy_the_pop_with_its_try_owner() {
 }
 
 #[test]
+fn folded_guard_drops_its_nop_before_an_implicit_return() {
+    let source = r#"
+def choose(ready):
+    if ready:
+        if not "ready":
+            return False
+
+
+if __debug__ and 0:
+    run()
+"#;
+    assert_matches_cpython(source, "folded_guard_return.py", &LEVELS);
+}
+
+#[test]
 fn final_elif_after_recovery_keeps_each_false_backedge() {
     let source = "def sample(items, selected, first, second):
     for item in items:

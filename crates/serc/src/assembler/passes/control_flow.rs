@@ -699,6 +699,14 @@ impl OptimizationPipeline {
                         .forward_target()
                         .and_then(|label| graph.label_block(label))
                         == Some(block)
+                    // A terminal constant return has no local loads or successor
+                    // to visit. Its folded jump can retain the ordinary NOP policy.
+                    && !graph[block]
+                        .items()
+                        .iter()
+                        .filter_map(Item::as_instruction)
+                        .map(|instruction| instruction.opcode)
+                        .eq([LOAD_CONST, RETURN_VALUE])
                 {
                     // The folded jump becomes a NOP, but the original skipped
                     // arm still lies between that NOP and its destination.
