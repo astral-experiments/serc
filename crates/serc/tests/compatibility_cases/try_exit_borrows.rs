@@ -2009,6 +2009,24 @@ fn matches_cpython_partial_terminal_match_handler_borrow_entries() {
 }
 
 #[test]
+fn a_guard_bypasses_an_unreachable_try_exit() {
+    let source = r"def scan(item, enabled):
+    try:
+        if enabled:
+            try:
+                while True:
+                    read()
+            except LookupError:
+                pass
+    except ValueError:
+        pass
+    finally:
+        item.value = None
+";
+    common::assert_matches_cpython_marshal(source, "guarded_try_exit.py");
+}
+
+#[test]
 fn terminal_try_arm_stops_borrow_fallthrough() {
     for arm in [
         "return result",
