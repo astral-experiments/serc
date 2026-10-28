@@ -15,6 +15,12 @@ use serc::{
 };
 
 #[test]
+fn a_final_else_pass_uses_the_finalizers_pop_block() {
+    let source = "def update(error, sent):\n    try:\n        if sent:\n            raise error\n        else:\n            pass\n    finally:\n        cleanup()\n";
+    assert_matches_cpython(source, "passing_finally.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

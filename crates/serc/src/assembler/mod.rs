@@ -3308,7 +3308,10 @@ impl Assembler {
     ///
     /// Folded edges, range-only labels, handler entries, and authored NOPs cannot
     /// certify this predecessor. A jump predecessor must use later CFG propagation.
-    pub(crate) fn original_fallthrough_join_location(&self) -> Option<SourceLocation> {
+    pub(crate) fn original_fallthrough_join_location(
+        &self,
+        pass: Option<SourceLocation>,
+    ) -> Option<SourceLocation> {
         let items = self.linear_items();
         let labels = trailing_labels(items).collect::<Vec<_>>();
         if !labels.iter().any(|label| {
@@ -3330,7 +3333,7 @@ impl Assembler {
             return None;
         };
         (previous.location.line >= 0
-            && previous.opcode != NOP
+            && (previous.opcode != NOP || pass == Some(previous.location))
             && !ends_scope(previous.opcode)
             && previous.value_argument().is_some()
             && previous.pre_fold_extra_instructions() == 0
