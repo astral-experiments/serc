@@ -23474,6 +23474,35 @@ fn final_pass_before_terminal_match_default_threads_to_outer_exit() {
 }
 
 #[test]
+fn nested_try_exits_copy_a_shared_tuple_return_once() {
+    let source = r"def run(value, flag, option):
+    try:
+        if flag:
+            try:
+                work()
+            except LookupError:
+                recover()
+        else:
+            if option:
+                pass
+            else:
+                return 1
+    except ValueError:
+        pass
+    return True, value
+";
+    assert_matches_cpython(source, "nested_try_tuple_return.py", &LEVELS);
+
+    // A second handler leaves one incoming jump unlocated. Its surviving
+    // marker inherits the peer handler's call span.
+    let nested = source.replace(
+        "                work()",
+        "                try:\n                    work()\n                except IndexError:\n                    fallback()",
+    );
+    assert_matches_cpython(&nested, "nested_handler_tuple_return.py", &LEVELS);
+}
+
+#[test]
 fn protected_tuple_returns_copy_onto_conditional_call_arms() {
     for element in ["transform(node.key)", "transform(node)", "default_value"] {
         let source = format!(

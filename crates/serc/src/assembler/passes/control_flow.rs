@@ -3115,6 +3115,66 @@ impl OptimizationPipeline {
                 .then_some((source_index, join))
             })
             .collect::<FxHashMap<_, _>>();
+        // The normal POP_BLOCK/JUMP after a located return can reuse its exact span.
+        // A full four-record return is copied here before the earlier branch jumps
+        // are threaded. The jump itself contributes no second event for that span.
+        let mut tuple_return_handlers = FxHashMap::default();
+        if self.python_version >= crate::PythonVersion::Py314 {
+            let instruction_at = |index: usize| {
+                let &(block, offset) = instruction_positions.get(index)?;
+                graph[block].items()[offset].as_instruction()
+            };
+            for &entry in &normal_try_exits {
+                let Some(previous) = entry.checked_sub(1).and_then(instruction_at) else {
+                    continue;
+                };
+                let jump = instruction_at(entry).expect("validated ordinary try exit");
+                if !jump.jump_policy.is_original_empty_join()
+                    || jump.location.line < 0
+                    || previous.opcode != RETURN_VALUE
+                    || previous.location != jump.location
+                    || !instruction_at(entry + 1)
+                        .is_some_and(|next| next.opcode == crate::target::opcodes::PUSH_EXC_INFO)
+                {
+                    continue;
+                }
+                let Some(target) = jump
+                    .forward_target()
+                    .and_then(|label| graph.label_block(label))
+                else {
+                    continue;
+                };
+                let mut records = graph[target]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction);
+                if [
+                    crate::target::opcodes::LOAD_CONST,
+                    crate::target::opcodes::LOAD_FAST,
+                    crate::target::opcodes::BUILD_TUPLE,
+                    RETURN_VALUE,
+                ]
+                .iter()
+                .all(|&opcode| {
+                    records.next().is_some_and(|record| {
+                        record.opcode == opcode
+                            && record.pre_fusion_width() == 1
+                            && (opcode != crate::target::opcodes::BUILD_TUPLE
+                                || record.value_argument() == Some(2))
+                    })
+                }) && records.next().is_none()
+                    && let Some(depth) = jump.depth_after()
+                    && self.exception_regions.iter().any(|region| {
+                        label_offsets[&region.target] == entry + 1
+                            && region.depth == depth
+                            && !region.preserve_lasti
+                            && !region.is_scope_fallback
+                    })
+                {
+                    tuple_return_handlers.insert(entry, (depth, false, None));
+                }
+            }
+        }
         // Build this lazily for a match-success jump that needs it. A removed
         // original NOP can be recorded under any co-located label alias.
         let mut original_nop_offsets = None;
@@ -3288,6 +3348,51 @@ impl OptimizationPipeline {
                 }
                 target = next;
             }
+            if threaded_jump_count == 1
+                && !tuple_return_handlers.is_empty()
+                && let entry = label_offsets[&target]
+                && let Some((depth, unlocated_copy, shared_location)) =
+                    tuple_return_handlers.get_mut(&entry)
+                && let Some(bridge) = copied_owner
+                && bridge == label_offsets[&original_target]
+                && source_index < bridge
+                && bridge < entry
+                && (instruction.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+                    || instruction.exception_policy() == ExceptionPolicy::default())
+            {
+                if original_jump.location.line < 0 {
+                    *unlocated_copy = true;
+                } else if let Some(location) = shared_location {
+                    if *location != original_jump.location {
+                        *location = SourceLocation::NONE;
+                    }
+                } else {
+                    *shared_location = Some(original_jump.location);
+                }
+                // The inner POP_BLOCK is absent from our graph. The following
+                // record witnesses the enclosing handler on the jump after that pop.
+                let mut owners = self
+                    .exception_regions
+                    .iter()
+                    .zip(&region_ranges)
+                    .filter(|(_, range)| range.contains(&(bridge + 1)))
+                    .map(|(region, _)| region);
+                if let Some(owner) = owners.next()
+                    && owner.depth == *depth
+                    && !owner.preserve_lasti
+                    && !owner.is_scope_fallback
+                    && label_offsets[&owner.target] == entry + 1
+                    && owners.all(|other| {
+                        other.target == owner.target
+                            && other.depth == owner.depth
+                            && !other.preserve_lasti
+                            && !other.is_scope_fallback
+                    })
+                {
+                    copied_owner = Some(bridge + 1);
+                    instruction.set_exception_policy(ExceptionPolicy::default());
+                }
+            }
             changed |= target != original_target;
             // CPython inlines these unlocated jump blocks before threading. Their replaced
             // jumps remain NOP slots until after the repeated small-exit copy pass.
@@ -3397,6 +3502,24 @@ impl OptimizationPipeline {
                     .set_borrow_fallthrough(BorrowFallthrough::Barrier);
             }
         });
+        for (entry, (_, unlocated_copy, shared_location)) in tuple_return_handlers {
+            if let Some(shared_location) = shared_location
+                && (!unlocated_copy || shared_location.line >= 0)
+            {
+                // Each located replacement reports its own line. If one copy has
+                // no location, its peer supplies the join's line when unambiguous.
+                let location = if unlocated_copy {
+                    shared_location
+                } else {
+                    SourceLocation::NONE
+                };
+                let (block, offset) = instruction_positions[entry];
+                graph
+                    .instruction_mut(ItemPosition::new(block, offset))
+                    .expect("validated ordinary try exit")
+                    .location = location;
+            }
+        }
         if !copied_owners.is_empty() {
             // A synthetic normal-exit block begins with POP_BLOCK in CPython. Inlining
             // replaces the source jump with the target jump, including its exception owner.
