@@ -15,6 +15,19 @@ use serc::{
 };
 
 #[test]
+fn a_folded_condition_skips_the_shared_fallthrough_jump() {
+    let source = r"def pick(enabled, take, value, alternate):
+    if enabled:
+        if value if take else False:
+            apply()
+    elif alternate:
+        fallback()
+    finish()
+";
+    assert_matches_cpython(source, "folded_fallthrough_jump.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
