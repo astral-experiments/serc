@@ -950,6 +950,18 @@ impl ControlFlowState<'_> {
             .is_some_and(|context| context.iterator_cleanup != IteratorCleanup::None)
     }
 
+    /// Returns the loop header reached by a terminal suite without intermediate cleanup.
+    pub(super) fn terminal_loop_continue_label(&self) -> Option<Label> {
+        if self.falls_through_to_loop_backedge() && self.in_loop_tail_without_nested_cleanup() {
+            self.loops
+                .contexts
+                .last()
+                .map(|context| context.continue_label)
+        } else {
+            None
+        }
+    }
+
     /// Whether the loop backedge is reached without crossing a nested cleanup.
     fn in_loop_tail_without_nested_cleanup(&self) -> bool {
         self.loops.contexts.last().is_some_and(|context| {
@@ -48050,7 +48062,7 @@ fn expression_has_linear_generator_creation(
     }
 }
 
-fn expression_contains_inline_branch(expression: &Expr) -> bool {
+pub(super) fn expression_contains_inline_branch(expression: &Expr) -> bool {
     #[derive(Default)]
     struct InlineBranchDetector {
         found: bool,
