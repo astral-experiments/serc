@@ -30262,9 +30262,16 @@ impl<'source> Compiler<'source> {
                 && !statement.is_star
                 && statement.finalbody.is_empty()
                 && let Some(Stmt::Match(matched)) = normal_exit_suite.last()
-                && match_has_multiple_normal_case_exits(matched)
-                && let Some(case) = matched.cases.last()
+                && let Some((case, earlier)) = matched.cases.split_last()
+                && case.guard.is_none()
                 && is_wildcard_pattern(&case.pattern)
+                && suite_has_normal_fallthrough(&case.body)
+                // A failed earlier guard goes to the next pattern, while a
+                // successful case jumps past the wildcard's physical exit.
+                && earlier.iter().any(|case| {
+                    case.guard.as_deref().and_then(early_condition_truthiness) != Some(false)
+                        && suite_has_normal_fallthrough(&case.body)
+                })
                 && self.assembler.at_original_match_join()
                 && matches!(
                     (
