@@ -4395,9 +4395,32 @@ impl OptimizationPipeline {
                                                 }
                                         })
                             });
+                    // A located first arm can jump straight past the alternate arm and
+                    // the later empty handler exits. Its surviving edge reaches the
+                    // join even when the ordinary fallthrough stops at those exits.
+                    let direct_arm = python_version == crate::PythonVersion::Py314
+                        && last.opcode == crate::target::opcodes::JUMP_FORWARD
+                        && last.jump_policy.retained_nop()
+                            == crate::assembler::ir::RetainedJumpNop::DirectTarget
+                        && target > block + 1
+                        && borrow_unreachable_blocks[target]
+                        && !last.jump_policy.borrow_empty_block()
+                        && block.checked_sub(1).is_some_and(|preceding| {
+                            items[blocks[preceding].clone()]
+                                .iter()
+                                .filter_map(Item::as_instruction)
+                                .map(|op| op.opcode)
+                                .eq([NOT_TAKEN])
+                        })
+                        && items[blocks[block].clone()]
+                            .iter()
+                            .filter_map(Item::as_instruction)
+                            .map(|op| op.opcode)
+                            .eq([crate::target::opcodes::JUMP_FORWARD]);
                     pending.push((
                         target,
-                        for_cleanup_entry
+                        direct_arm
+                            || for_cleanup_entry
                             || conditional_entry
                             || shared_break
                             || independent_loop_entry

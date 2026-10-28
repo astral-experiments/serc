@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn a_direct_arm_reaches_the_receiver_after_nested_handler_cleanup() {
+    let source = r"def process(value, flag):
+    try:
+        while flag:
+            if value:
+                break
+            work()
+    except LookupError:
+        try:
+            repair()
+        finally:
+            value.close()
+    value.ready()
+";
+    assert_matches_cpython(source, "handler_loop_receiver.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
