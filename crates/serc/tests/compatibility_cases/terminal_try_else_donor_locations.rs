@@ -33,3 +33,16 @@ fn matches_cpython_terminal_try_else_break_donors() {
         }
     }
 }
+
+#[test]
+fn copies_loop_exits_for_both_arms_of_a_conditional_expression() {
+    for condition in [
+        "compute(item) if ready else item",
+        "item if ready else other",
+    ] {
+        let source = format!(
+            "def f(items, ready, other):\n    for item in items:\n        try:\n            if {condition}:\n                return True\n        except Error:\n            return True\n    return False\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "conditional_try_loop_exit.py");
+    }
+}

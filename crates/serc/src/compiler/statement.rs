@@ -24055,9 +24055,21 @@ impl<'source> Compiler<'source> {
                     || (self.context.python_version >= crate::PythonVersion::Py314
                         && independent_original_fallthrough))
                 && condition_jump_target_count(fallthrough_test, false) > 1
-                && let Expr::BoolOp(boolean) = fallthrough_test
             {
-                Some(boolean)
+                match fallthrough_test {
+                    Expr::BoolOp(boolean) => boolean.values.last(),
+                    // Both arms of a runtime conditional expression can take a
+                    // false edge. The else arm remains the physical predecessor.
+                    Expr::If(conditional)
+                        if early_condition_truthiness(&conditional.test).is_none()
+                            && condition_has_linear_runtime_leaves(&conditional.test)
+                            && condition_has_linear_runtime_leaves(&conditional.body)
+                            && condition_has_linear_runtime_leaves(&conditional.orelse) =>
+                    {
+                        Some(conditional.orelse.as_ref())
+                    }
+                    _ => None,
+                }
             } else {
                 None
             };
@@ -24065,14 +24077,10 @@ impl<'source> Compiler<'source> {
             // surviving original must also inherit its remaining predecessor's location.
             let fallthrough_location = copied_protected_fallthrough.map_or_else(
                 || self.source_location(condition_fallthrough_range(fallthrough_test)),
-                |boolean| {
-                    boolean
-                        .values
-                        .last()
-                        .and_then(|last| unique_condition_jump_target(last, false))
-                        .map_or(SourceLocation::NONE, |last| {
-                            self.source_location(last.range())
-                        })
+                |last| {
+                    unique_condition_jump_target(last, false).map_or(SourceLocation::NONE, |test| {
+                        self.source_location(test.range())
+                    })
                 },
             );
             self.assembler.set_location(fallthrough_location);
