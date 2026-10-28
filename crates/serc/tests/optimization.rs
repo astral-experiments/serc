@@ -8713,6 +8713,7 @@ fn while_break_keeps_fallthrough_else_exception_owner() {
                     "result = ready",
                     "pass",
                     "if ready:\n            return ready",
+                    "if ready:\n            resource.closed()\n        return ready",
                 ] {
                     let source = format!(
                         "{coroutine}def sample(resource, items, ready):\n    try:\n        while {condition}:\n            {prefix}if not ready:\n                break\n    except CancelledError:\n        raise\n    except Error as error:\n        resource.failed(error)\n    else:\n        {otherwise}\n"
