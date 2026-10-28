@@ -14208,8 +14208,18 @@ impl Assembler {
             .iter()
             .rev()
             .filter_map(Item::as_instruction);
-        let Some(&cleanup) = preceding.next() else {
+        let Some(&last) = preceding.next() else {
             return;
+        };
+        // An ordinary try and the finalizer can emit adjacent, identical POPs.
+        let (cleanup, ordinary_pop) = if ordinary_pops == 1
+            && last.opcode == NOP
+            && let Some(&exit) = preceding.next()
+            && exit.opcode == POP_EXCEPT
+        {
+            (exit, Some(last))
+        } else {
+            (last, None)
         };
         let omitted_pops = if nested_named_handler {
             // The outer named handler omits a POP before its SWAP and POP_EXCEPT.
@@ -14250,6 +14260,7 @@ impl Assembler {
             || !pop.fusion_policy.is_converted_pop_block()
             || pop.exception_policy() != ExceptionPolicy::EXCLUDE_ALWAYS
             || pop.local_policy.hidden_exception_owner_slots() != 0
+            || ordinary_pop.is_some_and(|preceding| preceding != pop)
         {
             return;
         }
@@ -14289,6 +14300,7 @@ impl Assembler {
                 condition,
                 marker,
                 omitted_pops,
+                guard_pop_slots: 1 + u16::from(ordinary_pop.is_some()),
             },
         );
     }

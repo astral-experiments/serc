@@ -1363,6 +1363,8 @@ pub(super) struct CopiedReturnGuard {
     pub(super) condition: Instruction,
     pub(super) marker: Instruction,
     pub(super) omitted_pops: usize,
+    /// Original POP records that fold into the guard’s first operand.
+    pub(super) guard_pop_slots: u16,
 }
 
 /// An original saved-value return array with two omitted named-handler POP cells.
@@ -14965,7 +14967,9 @@ impl LayoutAssembler {
         for (offset, mut expected) in origin.operands.iter().copied().enumerate() {
             let actual = instructions[load + offset];
             if offset == 0 {
-                expected.local_policy.add_hidden_exception_owner_slots(1);
+                expected
+                    .local_policy
+                    .add_hidden_exception_owner_slots(origin.guard_pop_slots);
                 if expected.opcode == crate::target::opcodes::LOAD_FAST
                     && actual.opcode == crate::target::opcodes::LOAD_FAST_BORROW
                 {

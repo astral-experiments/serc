@@ -4465,6 +4465,29 @@ fn nested_finalizers_reuse_unowned_setup_slots_after_manager_returns() {
 }
 
 #[test]
+fn a_handler_return_folds_the_ordinary_try_and_finalizer_pops_together() {
+    let source = r"async def run(value, flag):
+    try:
+        try:
+            check()
+        except ValueError:
+            await visit(value)
+            return make(value)
+    except TypeError:
+        report()
+    finally:
+        if flag:
+            finish()
+";
+    assert_matches_cpython_versions(
+        source,
+        "adjacent_cleanup_pops.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn handler_and_iterator_returns_reuse_the_final_cleanup_pop() {
     for source in [
         r"async def sample(value, flag):
