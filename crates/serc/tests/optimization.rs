@@ -23638,6 +23638,27 @@ fn loop_breaks_preserve_shared_try_exit_positions() {
 }
 
 #[test]
+fn a_guarded_raise_donates_its_false_edge_to_enclosing_branches() {
+    let source = r"def choose(first, second, third, keep):
+    if first:
+        pass
+    elif second:
+        if third:
+            pass
+        else:
+            if keep:
+                if accept():
+                    pass
+                else:
+                    raise ValueError
+    else:
+        pass
+    finish()
+";
+    assert_matches_cpython(source, "nested_guarded_raise_exit.py", &LEVELS);
+}
+
+#[test]
 fn a_nested_elided_else_leaves_its_condition_on_the_outer_jump() {
     let source = r"def select(enabled, ready, first, value):
     if enabled:
