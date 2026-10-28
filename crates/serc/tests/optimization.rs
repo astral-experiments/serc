@@ -14880,6 +14880,18 @@ fn erased_nested_branches_preserve_async_iterator_join() {
 }
 
 #[test]
+fn erased_elif_comparison_keeps_each_implicit_return() {
+    let source = r"def sample(flag, lower, value, upper):
+    if flag:
+        pass
+    elif lower < value < upper:
+        assert value
+    assert upper
+";
+    assert_matches_cpython(source, "erased_elif_comparison.py", &LEVELS);
+}
+
+#[test]
 fn erased_coroutine_comparison_arms_preserve_shared_cleanup() {
     for prefix in ["", "    await worker()\n"] {
         let source = format!(
