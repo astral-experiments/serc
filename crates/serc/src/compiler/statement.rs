@@ -23005,6 +23005,7 @@ impl<'source> Compiler<'source> {
                             |compiler| {
                                 let test = if matches!(compiler.unit.scope, Scope::Module)
                                     && !non_final_branch
+                                    && statement.elif_else_clauses.is_empty()
                                     && body
                                         .iter()
                                         .all(|part| compiler.context.is_elided_statement(part))
@@ -23012,8 +23013,8 @@ impl<'source> Compiler<'source> {
                                     && boolean.op == BoolOp::Or
                                     && let Some((last, leading)) = boolean.values.split_last()
                                 {
-                                    // With the assertion removed, each true operand
-                                    // reaches its own copy of the loop backedge.
+                                    // Without an else, each true operand reaches its own
+                                    // backedge. An authored else keeps the shared true edge.
                                     for operand in leading {
                                         let next = compiler.assembler.label();
                                         compiler.compile_loop_tail_condition_atom(
