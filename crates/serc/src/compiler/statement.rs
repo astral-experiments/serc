@@ -32952,13 +32952,15 @@ impl<'source> Compiler<'source> {
             // nested finalizers and manager suppression. Existing cleanup routes stay intact.
             let handler_cleanup_from_original_join = !handler_ends_with_inlineable_cleanup
                 && cold_with_cleanup_location.is_none()
-                // A terminating nested try can leave unreachable jumps into this join.
-                // The surviving sole condition edge locates POP_EXCEPT after folding.
-                && !handler_cleanup_fallthrough.is_some_and(|test| {
-                    unique_condition_jump_target(test, false)
-                        .is_some_and(|test| jump_constant_truthiness(test).is_none())
-                })
-                && self.assembler.at_original_unconditional_join();
+                // The comparison's subject-pop block jumps to this same unlocated
+                // cleanup even when its successful arm reaches it by fallthrough.
+                && ((!terminal && self.assembler.at_original_comparison_cleanup_join())
+                    // A terminating nested try can leave unreachable jumps into this join.
+                    // The surviving sole condition edge locates POP_EXCEPT after folding.
+                    || (!handler_cleanup_fallthrough.is_some_and(|test| {
+                        unique_condition_jump_target(test, false)
+                            .is_some_and(|test| jump_constant_truthiness(test).is_none())
+                    }) && self.assembler.at_original_unconditional_join()));
             let handler_match_failure_location = (handler.name.is_some()
                 && matches!(handler.body.last(), Some(Stmt::Match(_))))
             .then(|| self.assembler.original_match_failure_location())
