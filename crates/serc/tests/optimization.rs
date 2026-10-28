@@ -15,6 +15,19 @@ use serc::{
 };
 
 #[test]
+fn erased_loop_arm_keeps_its_backedges_before_branching_elif_tests() {
+    for check in [
+        "any(value for value in row)",
+        "check(left if choose else right)",
+    ] {
+        let source = format!(
+            "def scan(rows, left, right, choose):\n    for row in rows:\n        if left or right:\n            assert row\n        elif {check}:\n            record(row)\n"
+        );
+        assert_matches_cpython(&source, "erased_arm_before_elif.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

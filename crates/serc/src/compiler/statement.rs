@@ -23762,10 +23762,12 @@ impl<'source> Compiler<'source> {
                     && body
                         .iter()
                         .all(|statement| self.context.is_elided_statement(statement))
-                    && statement.elif_else_clauses.iter().all(|clause| {
+                    && statement.elif_else_clauses.iter().enumerate().all(|(index, clause)| {
                         clause.test.as_ref().is_none_or(|test| {
+                            // A later condition cannot reach this arm’s empty backedge,
+                            // even when it builds a separate graph for a generator call.
                             condition_has_only_runtime_tests(test)
-                                && condition_has_linear_runtime_leaves(test)
+                                && (index >= branch_index || condition_has_linear_runtime_leaves(test))
                                 && !expression_suspends_current_scope(test)
                         })
                     });
