@@ -701,15 +701,14 @@ fn block_is_local_raise(items: &[Item], original_nop_targets: &FxHashSet<Label>)
         && instructions.next().is_none()
 }
 
-/// Recognizes a named-handler cleanup followed by a short, located value return.
-fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> bool {
-    let cleanup = graph[target]
-        .items()
+/// Returns the jump from an intact, unexpanded named-handler cleanup.
+fn named_cleanup_jump(items: &[Item]) -> Option<&Instruction> {
+    let cleanup = items
         .iter()
         .filter_map(Item::as_instruction)
         .collect::<Vec<_>>();
     let [pop, value, store, delete, jump] = cleanup.as_slice() else {
-        return false;
+        return None;
     };
     if pop.opcode != POP_EXCEPT
         || value.opcode != LOAD_CONST
@@ -722,8 +721,16 @@ fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> b
                 || instruction.local_policy.hidden_exception_owner_slots() != 0
         })
     {
-        return false;
+        return None;
     }
+    Some(jump)
+}
+
+/// Recognizes a named-handler cleanup followed by a short, located value return.
+fn named_cleanup_has_short_return(graph: &BlockGraph, target: BasicBlockId) -> bool {
+    let Some(jump) = named_cleanup_jump(graph[target].items()) else {
+        return false;
+    };
     let Some(label) = jump.forward_target() else {
         return false;
     };
@@ -6678,6 +6685,31 @@ impl OptimizationPipeline {
                     })
                     .unwrap_or(SourceLocation::NONE)
             };
+            let named_cleanup_fallthrough = if self.python_version >= crate::PythonVersion::Py314
+                && source_location.line < 0
+                && inline_no_location_block
+                && target_chain_end == target_position
+                && target_pre_fusion_size == 2
+                && predecessors[source.index()] > 1
+                && remaining_predecessors[source.index()] == 1
+                && graph[target]
+                    .items()
+                    .iter()
+                    .filter_map(Item::as_instruction)
+                    .map(|instruction| instruction.opcode)
+                    .eq([NOP, JUMP_FORWARD])
+                && named_cleanup_jump(graph[source].items()).is_some()
+                && let Some(previous) = source_position.checked_sub(1).map(|index| order[index])
+                && block_has_fallthrough(graph[previous].items())
+                && let Some(donor) = graph[previous].last_instruction()
+                && donor.location.line >= 0
+            {
+                // After earlier predecessors copy the cleanup, its remaining fallthrough
+                // supplies the position for the original and the continuation it copies.
+                Some(donor.location)
+            } else {
+                None
+            };
             let source_location = if source_location == SourceLocation::NONE
                 && inline_small_exit
                 && target_pre_fusion_size == 4
@@ -7904,6 +7936,11 @@ impl OptimizationPipeline {
                         Item::Label(_) => {}
                     }
                 }
+            }
+            if let Some(donor) = named_cleanup_fallthrough
+                && let Some(jump) = copied.iter_mut().rev().find_map(Item::as_instruction_mut)
+            {
+                jump.location = donor;
             }
             if copy_shared_match_exit {
                 // This exact array contains only the former case jump's NOP and
