@@ -15,6 +15,21 @@ use serc::{
 };
 
 #[test]
+fn a_conditional_value_reuses_the_unprotected_setup_after_nested_managers() {
+    for prefix in [
+        "",
+        "    pass\n",
+        "    result = None\n",
+        "    if other:\n        work()\n",
+    ] {
+        let source = format!(
+            "def choose(value, other):\n{prefix}    with first(), second(), third():\n        try:\n            result = take() if value is None else other\n        except ValueError:\n            pass\n    return other\n"
+        );
+        assert_matches_cpython(&source, "nested_conditional_value.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:

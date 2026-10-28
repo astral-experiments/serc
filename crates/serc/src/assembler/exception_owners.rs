@@ -5533,8 +5533,11 @@ impl LayoutAssembler {
                         if marker.opcode == NOT_TAKEN
                             && marker.value_argument() == Some(0)
                             && marker.location == condition.location
-                            && marker.exception_policy().owner()
-                                == NormalizedExceptionOwner::Present
+                            && matches!(
+                                marker.exception_policy().owner(),
+                                NormalizedExceptionOwner::Present
+                                    | NormalizedExceptionOwner::OverridePresent
+                            )
                             && marker.exception_policy().exclusion()
                                 == super::ExceptionExclusion::None
                             && marker.local_policy.hidden_exception_owner_slots() == 0
@@ -13041,6 +13044,14 @@ impl LayoutAssembler {
                                 == super::ExceptionExclusion::None
                             && (instruction.exception_policy().owner()
                                 == NormalizedExceptionOwner::Present
+                                // Conditional expressions request a present owner before
+                                // compaction; the retained SETUP still has a NULL handler.
+                                || (instruction.exception_policy().owner()
+                                    == NormalizedExceptionOwner::OverridePresent
+                                    && instruction_index.checked_sub(1).is_some_and(|index| {
+                                        matches!(indexed_instructions[index].opcode,
+                                            POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+                                    }))
                                 || (instruction.exception_policy().owner()
                                     == NormalizedExceptionOwner::DynamicCondition
                                     && instruction_index.checked_sub(1).is_some_and(|index| {
@@ -15170,7 +15181,20 @@ impl LayoutAssembler {
             || instructions[..marker]
                 .iter()
                 .enumerate()
-                .any(|(index, instruction)| instruction.opcode == NOP && !retained.contains(&index))
+                .any(|(index, instruction)| {
+                    // A source NOP before the first removed SETUP shifts every
+                    // later position together and cannot be the retained donor.
+                    instruction.opcode == NOP
+                        && !retained.contains(&index)
+                        && !(index < removed_positions[0]
+                            && instruction.value_argument() == Some(0)
+                            && instruction.location.line > 0
+                            && instruction.local_policy.hidden_exception_owner_slots() == 0
+                            && instruction.pre_fold_extra_instructions() == 0
+                            && !instruction.fusion_policy.is_converted_pop_block()
+                            && instruction.exception_policy()
+                                == super::ExceptionPolicy::NoneUnchanged)
+                })
         {
             return false;
         }
