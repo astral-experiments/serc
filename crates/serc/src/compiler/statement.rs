@@ -34541,15 +34541,11 @@ impl<'source> Compiler<'source> {
                     if !statement.is_async && !suite_terminates(&statement.body))
                 || matches!(body.last(), Some(Stmt::Try(nested))
                 if !nested.is_star
-                    && nested.orelse.is_empty()
+                    && !suite_terminates(&nested.orelse)
                     && nested.finalbody.is_empty()
                     && !suite_terminates(&nested.body)
                     && matches!(nested.handlers.as_slice(), [handler]
-                        if handler.as_except_handler().is_some_and(|handler| {
-                            (handler.name.is_some()
-                                || matches!(handler.body.as_slice(), [Stmt::Pass(_)]))
-                                && !suite_terminates(&handler.body)
-                        }))))
+                        if handler.as_except_handler().is_some_and(|handler| !suite_terminates(&handler.body)))))
                 && self.assembler.at_original_unconditional_join();
             // A complete nested conditional has an authored jump and fallthrough into
             // the same cleanup. Keep that original array unlocated for early copying.
@@ -34631,7 +34627,10 @@ impl<'source> Compiler<'source> {
             )?);
             if inline_join_cleanup {
                 self.assembler.allow_last_no_location_block_inlining();
-                self.assembler.allow_last_unconditional_block_inlining();
+                // The normal else suite can also fall through from a conditional.
+                if !matches!(body.last(), Some(Stmt::Try(nested)) if !nested.orelse.is_empty()) {
+                    self.assembler.allow_last_unconditional_block_inlining();
+                }
             }
 
             if let Some(next) = next {
