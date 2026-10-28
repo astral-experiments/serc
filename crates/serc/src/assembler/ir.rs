@@ -1686,7 +1686,7 @@ pub(crate) struct Assembler {
     pub(super) legacy_native_labels: Option<Box<super::legacy_native_labels::LegacyNativeLabels>>,
     pub(super) location: SourceLocation,
     pub(super) exception_regions: Vec<ExceptionRegion>,
-    /// Original tail location retained when lowering emits an already-reordered restore.
+    /// Original tail location retained across reordered restores or eliminated discards.
     pub(super) original_fallthrough_location: Option<(EmittedInstruction, SourceLocation)>,
     /// Source-authored match end awaiting its first emitted instruction.
     pub(super) original_match_join: Option<Label>,

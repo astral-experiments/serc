@@ -28089,8 +28089,8 @@ impl<'source> Compiler<'source> {
                     self.compile_expression(&subscript.value)?;
                     self.assembler
                         .set_location(self.source_location(subscript.value.range()));
-                    self.emit(POP_TOP, 0, -1)?;
-                    self.compile_discarded_annotation_slice(&subscript.slice)?;
+                    let mut last_discard = self.emit_instruction(POP_TOP, 0)?;
+                    self.compile_discarded_annotation_slice(&subscript.slice, &mut last_discard)?;
                 }
                 _ => return Err(unsupported("annotated assignment target")),
             }
@@ -28111,11 +28111,12 @@ impl<'source> Compiler<'source> {
     fn compile_discarded_annotation_slice(
         &mut self,
         expression: &Expr,
+        last_discard: &mut EmittedInstruction,
     ) -> Result<(), CompileError> {
         match expression {
             Expr::Tuple(tuple) => {
                 for element in &tuple.elts {
-                    self.compile_discarded_annotation_slice(element)?;
+                    self.compile_discarded_annotation_slice(element, last_discard)?;
                 }
             }
             Expr::Slice(slice) => {
@@ -28127,19 +28128,26 @@ impl<'source> Compiler<'source> {
                 .into_iter()
                 .flatten()
                 {
-                    self.compile_discarded_annotation_slice(element)?;
+                    self.compile_discarded_annotation_slice(element, last_discard)?;
                 }
             }
             _ if self.context.fold_constant(expression).is_some() => {
                 if let Some(constant) = first_literal_constant(expression) {
                     self.add_constant(constant)?;
                 }
+                if self.context.python_version >= crate::PythonVersion::Py313 {
+                    // The folded index's POP_TOP can still locate a copied implicit return.
+                    self.assembler.record_original_fallthrough_location(
+                        *last_discard,
+                        self.source_location(expression.range()),
+                    );
+                }
             }
             _ => {
                 self.compile_expression(expression)?;
                 self.assembler
                     .set_location(self.source_location(expression.range()));
-                self.emit(POP_TOP, 0, -1)?;
+                *last_discard = self.emit_instruction(POP_TOP, 0)?;
             }
         }
         Ok(())
