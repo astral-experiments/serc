@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn copied_raises_fuse_adjacent_local_loads_under_the_same_handler() {
+    let source = r"def explicit(value, fallback, flag):
+    try:
+        run()
+    except ValueError as err:
+        err.detail = value if flag else fallback
+        raise err
+
+def reraising(box, value, flag):
+    try:
+        return run()
+    finally:
+        box.value = value if flag else None
+";
+    assert_matches_cpython(source, "copied_raise_loads.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
