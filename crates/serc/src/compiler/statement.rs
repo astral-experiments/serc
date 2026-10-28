@@ -21502,7 +21502,8 @@ impl<'source> Compiler<'source> {
                 return self.compile_loop_tail_chained_assert(statement, comparison, restart);
             }
             self.compile_assert(statement)?;
-            self.emit_jump_backward(JUMP_BACKWARD, restart, 0)?;
+            // The successful assertion reaches the loop after leaving an ordinary try.
+            self.emit_loop_tail_backedge(restart, false)?;
             return Ok(());
         }
         // CPython copies the failure block for these direct final loop branches. Keep call
