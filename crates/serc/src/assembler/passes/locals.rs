@@ -4113,6 +4113,28 @@ impl OptimizationPipeline {
                     {
                         pending.push((finally_block, true));
                     }
+                    // A completed call can jump to the ordinary try join that now
+                    // shares a physical entry with the outer finalizer. Its own
+                    // label and located CALL/POP_TOP still prove that route.
+                    let call_exits_inner_try = python_version == crate::PythonVersion::Py314
+                        && last.opcode == crate::target::opcodes::JUMP_FORWARD
+                        && last.location.line >= 0
+                        && target > block + 1
+                        && borrow_unreachable_blocks[target]
+                        && !borrow_unreachable_labels.contains(&label)
+                        && original_block_boundaries.contains(&label)
+                        && jump_entry_blocks.get(target).copied().unwrap_or(false)
+                        && last.no_location_policy.borrow_fallthrough()
+                            == BorrowFallthrough::Barrier
+                        && {
+                            let mut ops = items[blocks[block].clone()]
+                                .iter()
+                                .filter_map(Item::as_instruction)
+                                .rev();
+                            matches!((ops.nth(1), ops.next()), (Some(pop), Some(call))
+                                if pop.opcode == POP_TOP && call.opcode == crate::target::opcodes::CALL
+                                    && pop.location == last.location && call.location == last.location)
+                        };
                     let for_cleanup_entry = for_iter_enters_original_cleanup(
                         last,
                         label,
@@ -4397,7 +4419,8 @@ impl OptimizationPipeline {
                             });
                     pending.push((
                         target,
-                        for_cleanup_entry
+                        call_exits_inner_try
+                            || for_cleanup_entry
                             || conditional_entry
                             || shared_break
                             || independent_loop_entry
