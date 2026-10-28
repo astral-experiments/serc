@@ -112,6 +112,33 @@ fn continued_named_handlers_keep_copied_value_guard_slots() {
 }
 
 #[test]
+fn a_named_inner_handler_return_leaves_the_outer_pop_unprotected() {
+    let source = r"async def collect(item):
+    try:
+        try:
+            check()
+        except KeyError:
+            try:
+                fetch()
+            except ValueError as cause:
+                try:
+                    save(cause)
+                except OSError:
+                    pass
+                return 7
+    finally:
+        if item is None:
+            close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "nested_handler_clear.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn async_bare_returns_keep_enclosing_try_pop_slots() {
     let source = r"async def first(value, item):
     try:

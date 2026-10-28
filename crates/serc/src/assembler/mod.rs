@@ -12621,6 +12621,85 @@ impl Assembler {
         }
     }
 
+    /// A constant return clears the inner handler name before restoring the outer
+    /// handler. The copied finalizer's local None test reuses the intervening POP.
+    pub(crate) fn exclude_inner_handler_finally_none_marker(&mut self, return_item: usize) {
+        let items = self.linear_items();
+        let Some(Item::Label(entry)) = return_item
+            .checked_sub(1)
+            .and_then(|index| items.get(index))
+        else {
+            return;
+        };
+        let provenance = &self.exception_owner_provenance;
+        if !provenance.block_boundaries.contains(entry)
+            || !provenance.source_boundaries.contains(entry)
+        {
+            return;
+        }
+        let block = items[return_item..].iter().enumerate().take_while(|(_, item)| {
+            !matches!(item, Item::Label(label) if provenance.block_boundaries.contains(label)
+                || provenance.source_boundaries.contains(label) || self.preserved_block_boundaries.contains(label))
+        });
+        let mut instructions =
+            block.filter_map(|(offset, item)| Some((return_item + offset, item.as_instruction()?)));
+        let prefix = instructions
+            .by_ref()
+            .take(10)
+            .map(|(_, record)| record)
+            .collect::<smallvec::SmallVec<[_; 16]>>();
+        let [authored, clear @ .., pop, outer, final_pop, load, guard] = prefix.as_slice() else {
+            return;
+        };
+        let [inner, none, store, delete] = clear else {
+            return;
+        };
+        let Some((marker_index, marker)) = instructions.next() else {
+            return;
+        };
+        if authored.opcode != NOP
+            || authored.fusion_policy.is_converted_pop_block()
+            || !clear.iter().map(|record| record.opcode).eq([
+                POP_EXCEPT,
+                LOAD_CONST,
+                STORE_FAST,
+                DELETE_FAST,
+            ])
+            || store.operand() != delete.operand()
+            || outer.opcode != POP_EXCEPT
+            || ![pop, final_pop].iter().all(|record| {
+                record.opcode == NOP
+                    && record.fusion_policy.is_converted_pop_block()
+                    && record.exception_policy() == ExceptionPolicy::EXCLUDE_ALWAYS
+            })
+            || load.opcode != LOAD_FAST
+            || !matches!(guard.opcode, POP_JUMP_IF_NONE | POP_JUMP_IF_NOT_NONE)
+            || ![authored, inner, none, store, delete, outer, load, guard]
+                .iter()
+                .all(|record| record.exception_policy() == ExceptionPolicy::NoneUnchanged)
+            || prefix[1..8]
+                .iter()
+                .any(|record| record.location != authored.location)
+            || marker.opcode != NOT_TAKEN
+            || marker.location != guard.location
+            || marker.exception_policy() != ExceptionPolicy::NonePresent
+            || prefix.iter().enumerate().any(|(index, record)| {
+                record.pre_fold_extra_instructions() != 0
+                    || record.local_policy.hidden_exception_owner_slots()
+                        != if index == 9 { 3 } else { 0 }
+            })
+            || marker.pre_fold_extra_instructions() != 0
+            || marker.local_policy.hidden_exception_owner_slots() != 0
+        {
+            return;
+        }
+        drop(prefix);
+        let Item::Instruction(marker) = &mut self.linear_items_mut()[marker_index] else {
+            unreachable!()
+        };
+        marker.set_exception_policy(ExceptionPolicy::AlwaysAbsent);
+    }
+
     /// Captures a bare return's two handler POPs and complete first local None test.
     pub(crate) fn record_copied_bare_handler_none_prefix(
         &mut self,

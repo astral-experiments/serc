@@ -12695,6 +12695,24 @@ impl<'source> Compiler<'source> {
                                         == self.source_location(statement.range).line)
                         })
                         .map(|(pop_item, _, _)| pop_item);
+                    let inner_named_handler_return = self.context.python_version
+                        == crate::PythonVersion::Py314
+                        && self.unit.flags & (CO_GENERATOR | CO_COROUTINE | CO_ASYNC_GENERATOR)
+                            == CO_COROUTINE
+                        && !preserve_tos
+                        && !return_is_overridden
+                        && return_finally_contexts.len() == 1
+                        && finally_context.handler_depth == 0
+                        && finally_context.exception_region_depth == 0
+                        && self.control.withs.active_with_exits.is_empty()
+                        && self.control.loops.contexts.is_empty()
+                        && self.control.finally.active_finally_end_blocks == 0
+                        && self.control.exceptions.active_exception_group_handlers == 0
+                        && matches!(self.control.exceptions.active_exception_handlers.as_slice(), [outer, inner]
+                            if outer.name.is_none() && inner.name.is_some()
+                                && outer.try_body_depth == inner.try_body_depth
+                                && outer.exception_region_depth == outer.try_body_depth + 1
+                                && inner.exception_region_depth == outer.exception_region_depth + 1);
                     let named_outer_handler = self
                         .control
                         .exceptions
@@ -13557,6 +13575,10 @@ impl<'source> Compiler<'source> {
                             handler,
                             iterator_try_pop_slot,
                         );
+                    }
+                    if result.is_ok() && inner_named_handler_return {
+                        self.assembler
+                            .exclude_inner_handler_finally_none_marker(copied_handler_return_item);
                     }
                     if result.is_ok() && copied_bare_handler_none {
                         self.assembler.record_copied_bare_handler_none_prefix(
