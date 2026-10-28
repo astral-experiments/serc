@@ -23980,6 +23980,21 @@ impl<'source> Compiler<'source> {
                         .set_location(self.source_location(statement.range()));
                 }
                 let backedge = self.emit_loop_tail_backedge(restart, try_body_normal_exit)?;
+                if self.context.python_version >= crate::PythonVersion::Py314
+                    && test.is_none()
+                    && matches!(body, [Stmt::Pass(_)])
+                    && final_chained_comparison_jump(final_test).is_some()
+                    && !try_body_normal_exit
+                    && self.control.in_loop_tail_without_nested_cleanup()
+                    && self.control.loops.contexts.last().is_some_and(|context| {
+                        context.iterator_cleanup == IteratorCleanup::None
+                            && context.continue_label == restart
+                    })
+                {
+                    // The comparison cleanup targets the Pass array. Its NOP still
+                    // separates the forward jump from the backedge during threading.
+                    self.assembler.prevent_jump_threading_target(backedge);
+                }
                 if shared_match_failure || copied_erased_branch_exit {
                     // Native copies the common backedge into this arm's forward exit:
                     // [unlocated NOP, unlocated JUMP]. Preserve that original array so
