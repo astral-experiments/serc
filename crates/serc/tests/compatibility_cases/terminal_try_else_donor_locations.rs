@@ -33,3 +33,13 @@ fn matches_cpython_terminal_try_else_break_donors() {
         }
     }
 }
+
+#[test]
+fn copies_while_backedges_from_a_nested_try_else_guard() {
+    for handler in ["break", "pass"] {
+        let source = format!(
+            "def f(active):\n    while active:\n        try:\n            try:\n                ready = read()\n            except Inner:\n                recover()\n            else:\n                if ready:\n                    work()\n        except Outer:\n            {handler}\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "nested_try_else_backedge.py");
+    }
+}
