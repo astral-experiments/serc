@@ -9010,6 +9010,54 @@ impl LayoutAssembler {
                     }
                     // These replay rules only resolve inserted markers.
                     if instruction.opcode == NOT_TAKEN {
+                        // A copied cleanup can discard a call immediately before SETUP.
+                        // The argument, call, and discard retain their original positions
+                        // relative to SETUP after LOAD_GLOBAL absorbs its PUSH_NULL.
+                        if instruction.exception_policy()
+                            == super::ExceptionPolicy::NoneDynamicCondition
+                            && owner_history_exact
+                            && pop_slot_epoch_known
+                            && tail.insertions == 0
+                            && tail.late_removals == 0
+                            && tail.post_compaction_fusions == 0
+                            && let Some((start, setup_tail, _)) = protected_suffix
+                            && tail.early_removals == setup_tail.early_removals
+                            && tail
+                                .early_removals
+                                .checked_sub(instruction_index - start)
+                                .is_some_and(|before| (2..=4).contains(&before))
+                            && let Some(global) = start.checked_sub(5)
+                            && original_array_start <= global
+                            && retained_setup_nops.contains(&(start - 1))
+                            && matches!(indexed_instructions[global].operand(), Operand::Value(arg) if arg & 1 != 0)
+                            && indexed_instructions[global].opcode == LOAD_GLOBAL
+                            && matches!(
+                                indexed_instructions[global + 1].opcode,
+                                crate::target::opcodes::LOAD_FAST
+                                    | crate::target::opcodes::LOAD_FAST_BORROW
+                            )
+                            && indexed_instructions[global + 2].opcode
+                                == crate::target::opcodes::CALL
+                            && indexed_instructions[global + 2].value_argument() == Some(1)
+                            && indexed_instructions[global + 3].opcode == POP_TOP
+                            && indexed_instructions[global..start - 1].iter().all(|op| {
+                                op.local_policy.hidden_exception_owner_slots() == 0
+                                    && op.pre_fold_extra_instructions() == 0
+                                    && op.exception_policy()
+                                        == super::ExceptionPolicy::NoneUnchanged
+                            })
+                            && owners
+                                .get(instruction_index)
+                                .is_none_or(|owner| !owner.is_definitive())
+                            && let Some(region) =
+                                self.uniform_exception_owner(global, start - 1, &label_positions)
+                            && self.exception_regions[region].is_scope_fallback
+                        {
+                            owners.insert(
+                                instruction_index,
+                                ExceptionOwnerDecision::override_with_region(Some(region)),
+                            );
+                        }
                         // Primitive match tests keep their unchanged marker policy. They
                         // still append a fresh NULL record once entry-prologue insertion
                         // consumes every exact early-compaction slot in the original array.
