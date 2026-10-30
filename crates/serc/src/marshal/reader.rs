@@ -1,6 +1,5 @@
 //! The wire graph has no compiler-side ownership or interning provenance. Indexing
 //! an arena preserves sharing without cloning subtrees or recursively dropping them.
-#![allow(dead_code)] // Consumed by the instruction and source reconstruction layers.
 
 use super::v6::{
     FLAG_REF, TYPE_ASCII, TYPE_ASCII_INTERNED, TYPE_BINARY_COMPLEX, TYPE_BINARY_FLOAT, TYPE_CODE,
@@ -22,7 +21,7 @@ pub(crate) enum Object<'a> {
     Float(u64),
     Complex(u64, u64),
     Bytes(&'a [u8]),
-    Text(&'a [u8]),
+    Text { bytes: &'a [u8], interned: bool },
     Tuple(Vec<Id>),
     FrozenSet(Vec<Id>),
     FrozenDict(Vec<(Id, Id)>),
@@ -73,7 +72,7 @@ impl<'a> Module<'a> {
 
     pub(crate) fn text(&self, id: Id) -> Result<&'a str, String> {
         match self.objects[id] {
-            Object::Text(bytes) => {
+            Object::Text { bytes, .. } => {
                 std::str::from_utf8(bytes).map_err(|_| "unsupported surrogate in string".into())
             }
             _ => Err("expected string".into()),
@@ -244,7 +243,13 @@ impl<'a> Reader<'a> {
                 if tag == TYPE_STRING {
                     Object::Bytes(bytes)
                 } else {
-                    Object::Text(bytes)
+                    Object::Text {
+                        bytes,
+                        interned: matches!(
+                            tag,
+                            TYPE_INTERNED | TYPE_ASCII_INTERNED | TYPE_SHORT_ASCII_INTERNED
+                        ),
+                    }
                 }
             }
             TYPE_SMALL_TUPLE | TYPE_TUPLE | TYPE_FROZENSET => {
