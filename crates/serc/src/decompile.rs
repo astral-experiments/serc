@@ -29,10 +29,14 @@ mod tests {
 
     #[test]
     fn verification_rejects_a_cache_for_another_target() {
-        let original = crate::compile("pass\n", "module.py").unwrap().to_timestamp_pyc(0, 0);
+        let original = crate::compile("pass\n", "module.py")
+            .unwrap()
+            .to_timestamp_pyc(0, 0);
         let mut candidate = original.clone();
         candidate[..4].copy_from_slice(&PythonVersion::Py315.target().magic_number);
         let result = serc_decompile::decompile_pyc(&original, |_, _, _, _| Some(candidate.clone()));
-        assert!(matches!(result, Err(DecompileError::Verify(PythonVersion::Py314, reason)) if reason.contains("3.15")));
+        assert!(
+            matches!(result, Err(DecompileError::Verify(PythonVersion::Py314, reason)) if reason.contains("3.15"))
+        );
     }
 }
