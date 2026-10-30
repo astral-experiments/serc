@@ -2,7 +2,7 @@
 //! stack; values that survive a join must be expressible as a Python expression.
 use std::fmt::Write as _;
 
-use super::{Body, Instruction, Value};
+use super::{Body, Instruction, Object, Value};
 
 pub(super) struct Fragment {
     lines: String,
@@ -117,6 +117,22 @@ impl Body<'_, '_, '_> {
         while i < end {
             let op = ops[i];
             let next = match op.name {
+                // CPython builds a constant set display by updating an empty
+                // set from a frozenset constant. Its elements belong directly
+                // in the display, including when that display is itself starred.
+                "BUILD_SET"
+                    if op.arg == 0
+                        && let [constant, update, ..] = &ops[i + 1..end]
+                        && constant.name == "LOAD_CONST"
+                        && (update.name, update.arg) == ("SET_UPDATE", 1)
+                        && matches!(
+                            self.m.objects[self.item(self.code.constants, constant.arg)?],
+                            Object::FrozenSet(_)
+                        ) =>
+                {
+                    self.constant(constant.arg)?;
+                    Ok(i + 3)
+                }
                 "CALL_INTRINSIC_1"
                     if op.arg
                         == serc_bytecode::target::operands::UnaryIntrinsic::IMPORT_STAR

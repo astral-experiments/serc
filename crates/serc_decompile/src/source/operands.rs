@@ -144,13 +144,13 @@ impl Body<'_, '_, '_> {
         self.emit_call(&args)
     }
 
-    pub(super) fn extend_literal(&mut self, op: Instruction) -> Result<(), String> {
+    pub(super) fn update_literal(&mut self, op: Instruction) -> Result<(), String> {
         if op.arg != 1 {
             return Err("unsupported collection update".into());
         }
         let items = self.expr()?;
         let collection = self.expr()?;
-        let (open, close) = if op.name == "LIST_EXTEND" {
+        let (open, close) = if matches!(op.name, "LIST_EXTEND" | "LIST_APPEND") {
             ('[', ']')
         } else {
             ('{', '}')
@@ -164,7 +164,13 @@ impl Body<'_, '_, '_> {
         } else {
             format!("{prefix}, ")
         };
-        let body = tuple_items(&items).map_or_else(|_| format!("*({items})"), |v| v.join(", "));
+        let body = if matches!(op.name, "LIST_APPEND" | "SET_ADD") {
+            items
+        } else {
+            // A tuple used by LIST_EXTEND or SET_UPDATE is still one iterable,
+            // even when its elements could be written as separate operands.
+            format!("*({items})")
+        };
         self.push(format!("{open}{prefix}{body}{close}"))
     }
 
