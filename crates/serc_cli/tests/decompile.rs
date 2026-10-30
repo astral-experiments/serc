@@ -275,3 +275,22 @@ fn extended_calls_and_assignment_expressions() {
         "result = f(3), f(7)",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn dotted_import_and_future_annotation_spellings() {
+    check_fixture(
+        "from __future__ import annotations\nimport xml.etree.ElementTree as tree\ndef f(x: int) -> (int, str):\n    return x\n",
+        "result = tree.Element('tag').tag, f(7), f.__annotations__",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn discarded_statements_keep_tracing_instructions() {
+    check_fixture("pass\npass\npass\n", "result = 1");
+    check_fixture(
+        "def f():\n    pass\n    pass\n    return 1\n",
+        "result = f()",
+    );
+}

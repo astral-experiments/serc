@@ -24,8 +24,18 @@ use crate::target::operands315::CommonConstant;
 const MAX_SOURCE: usize = 1 << 20;
 const MAX_WORK: usize = 16 << 20;
 
-pub(super) fn recover(m: &Module<'_>) -> Result<Vec<String>, String> {
-    let mut work = MAX_WORK;
+struct Recovery {
+    budget: usize,
+    preserve_nops: bool,
+    saw_nop: bool,
+}
+
+pub(super) fn recover(m: &Module<'_>, preserve_nops: bool) -> Result<(Vec<String>, bool), String> {
+    let mut work = Recovery {
+        budget: MAX_WORK,
+        preserve_nops,
+        saw_nop: false,
+    };
     let text = scope(m, m.root, 0, false, &mut work)?;
     let parsed = ruff_python_parser::parse_module(&text)
         .map_err(|e| format!("invalid reconstructed Python: {e}"))?;
@@ -60,7 +70,7 @@ pub(super) fn recover(m: &Module<'_>) -> Result<Vec<String>, String> {
             }
         }
     }
-    Ok(candidates)
+    Ok((candidates, work.saw_nop))
 }
 
 fn class_layout(
@@ -95,7 +105,7 @@ fn scope(
     id: Id,
     depth: usize,
     class: bool,
-    work: &mut usize,
+    work: &mut Recovery,
 ) -> Result<String, String> {
     if crate::stack_growth_required() {
         return crate::grow_stack(|| scope(m, id, depth, class, work));
@@ -184,13 +194,14 @@ struct Body<'m, 'data, 'work> {
     depth: usize,
     class: bool,
     annotations: Vec<(Option<u32>, String, String)>,
-    work: &'work mut usize,
+    work: &'work mut Recovery,
 }
 
 impl Body<'_, '_, '_> {
     fn charge(&mut self, cost: usize) -> Result<(), String> {
-        *self.work = self
+        self.work.budget = self
             .work
+            .budget
             .checked_sub(cost)
             .ok_or("reconstruction work limit exceeded")?;
         Ok(())
@@ -273,7 +284,7 @@ impl Body<'_, '_, '_> {
         } else if let Object::Slice(ids) = self.m.objects[id] {
             operands::constant_slice(self, ids)
         } else {
-            let text = literal(self.m, id, 0, self.work)?;
+            let text = literal(self.m, id, 0, &mut self.work.budget)?;
             self.push(text)
         }
     }
@@ -367,8 +378,13 @@ impl Body<'_, '_, '_> {
         self.charge(1)?;
         let a = op.arg;
         match op.name {
-            "RESUME" | "NOP" | "NOT_TAKEN" | "COPY_FREE_VARS" | "MAKE_CELL"
-            | "SETUP_ANNOTATIONS" => {}
+            "NOP" => {
+                self.work.saw_nop = true;
+                if self.work.preserve_nops {
+                    self.line("pass")?;
+                }
+            }
+            "RESUME" | "NOT_TAKEN" | "COPY_FREE_VARS" | "MAKE_CELL" | "SETUP_ANNOTATIONS" => {}
             "PUSH_NULL" => self.stack.push(Value::Null),
             "LOAD_CONST" => self.constant(a)?,
             "LOAD_SMALL_INT" => self.push(a.to_string())?,
@@ -600,6 +616,10 @@ impl Body<'_, '_, '_> {
                 if self.depth == 0 || self.class {
                     if expr != "None" {
                         return Err("module returns a value".into());
+                    }
+                    // CPython merges the last pass with an implicit return.
+                    if self.work.preserve_nops && self.lines.ends_with("pass\n") {
+                        self.line("pass")?;
                     }
                 } else if expr == "None" && self.suspended() {
                     self.line("return")?;

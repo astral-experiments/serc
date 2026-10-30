@@ -45,29 +45,41 @@ pub fn decompile_pyc(bytes: &[u8]) -> Result<String, DecompileError> {
     }
     let filename = module.text(code.filename).map_err(reconstruct)?;
     let mut mismatch = None;
-    for source in source::recover(&module).map_err(reconstruct)? {
-        // The header does not record the optimization level.
-        for level in [
-            OptimizationLevel::Zero,
-            OptimizationLevel::One,
-            OptimizationLevel::Two,
-        ] {
-            let options = CompileOptions {
-                python_version: version,
-                optimization_level: level,
-                ..CompileOptions::default()
-            };
-            if let Ok(compiled) = compile_with_options(&source, filename, &options) {
-                let check = compiled.to_timestamp_pyc(0, 0);
-                let candidate =
-                    read(&check).map_err(|message| DecompileError::Verify(version, message))?;
-                match verify::compare(&module, &candidate) {
-                    Ok(()) => return Ok(source),
-                    Err(reason) => {
-                        mismatch.get_or_insert(reason);
+    // A NOP can be a user statement or compiler-generated tracing machinery.
+    // Try explicit pass statements only after the simpler spelling fails.
+    for preserve_nops in [false, true] {
+        let (sources, saw_nop) = match source::recover(&module, preserve_nops) {
+            Ok(result) => result,
+            Err(_) if preserve_nops => break,
+            Err(message) => return Err(reconstruct(message)),
+        };
+        for source in sources {
+            // The header does not record the optimization level.
+            for level in [
+                OptimizationLevel::Zero,
+                OptimizationLevel::One,
+                OptimizationLevel::Two,
+            ] {
+                let options = CompileOptions {
+                    python_version: version,
+                    optimization_level: level,
+                    ..CompileOptions::default()
+                };
+                if let Ok(compiled) = compile_with_options(&source, filename, &options) {
+                    let check = compiled.to_timestamp_pyc(0, 0);
+                    let candidate =
+                        read(&check).map_err(|message| DecompileError::Verify(version, message))?;
+                    match verify::compare(&module, &candidate) {
+                        Ok(()) => return Ok(source),
+                        Err(reason) => {
+                            mismatch.get_or_insert(reason);
+                        }
                     }
                 }
             }
+        }
+        if !saw_nop {
+            break;
         }
     }
     Err(DecompileError::Verify(

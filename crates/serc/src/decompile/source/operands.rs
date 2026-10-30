@@ -194,7 +194,7 @@ pub(super) fn constant_slice(
 ) -> Result<(), String> {
     let mut items = Vec::new();
     for id in ids {
-        items.push(super::literal(body.m, id, 0, body.work)?);
+        items.push(super::literal(body.m, id, 0, &mut body.work.budget)?);
     }
     if items[2] == "None" {
         items.pop();

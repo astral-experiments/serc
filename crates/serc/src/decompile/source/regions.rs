@@ -137,6 +137,19 @@ impl Body<'_, '_, '_> {
                     self.annotation_site()?;
                     Ok(i + 2)
                 }
+                "SWAP"
+                    if op.arg == 2
+                        && i + 1 < end
+                        && ops[i + 1].name == "POP_TOP"
+                        && matches!(
+                            self.stack.as_slice(),
+                            [.., Value::Import(_), Value::Member(_)]
+                        ) =>
+                {
+                    // A dotted import walks the package before binding its final member.
+                    self.pop()?;
+                    Ok(i + 2)
+                }
                 "KW_NAMES" if i + 1 < end && ops[i + 1].name == "CALL" => {
                     self.constant(op.arg)?;
                     let keys = self.expr()?;

@@ -109,7 +109,7 @@ impl Body<'_, '_, '_> {
             for (&key, binding) in keys.iter().zip(bindings) {
                 pairs.push(format!(
                     "{}: {binding}",
-                    super::literal(self.m, key, 0, self.work)?
+                    super::literal(self.m, key, 0, &mut self.work.budget)?
                 ));
             }
             body_end = target(ops, find(ops, branch + 1, unpack, "POP_JUMP_IF_NONE")?, end)?;

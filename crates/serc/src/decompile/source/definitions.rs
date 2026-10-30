@@ -66,6 +66,11 @@ impl Import {
                 self.path,
                 members.join(", ")
             ))
+        } else if let Some((member, alias)) = self.members.last() {
+            if self.path.split('.').next_back() != Some(member) {
+                return Err("unsupported dotted import binding".into());
+            }
+            Ok(format!("{prefix}import {} as {alias}", self.path))
         } else if self.path.split('.').next() == Some(binding) {
             Ok(format!("{prefix}import {}", self.path))
         } else {
@@ -114,7 +119,7 @@ impl Body<'_, '_, '_> {
             && (self.m.version <= PythonVersion::Py313
                 || self.code.flags & code_flags::CO_HAS_DOCSTRING != 0)
         {
-            let doc = literal(self.m, id, 0, self.work)?;
+            let doc = literal(self.m, id, 0, &mut self.work.budget)?;
             self.line(&doc)?;
         }
         let kinds = self.m.bytes(self.code.local_kinds)?;
@@ -199,6 +204,7 @@ impl Body<'_, '_, '_> {
                 return Err("expected annotation function".into());
             };
             def.annotations = self.lazy_annotations(annotation.id)?;
+            self.annotation_spellings(def)?;
             return Ok(());
         }
         let text = self.expr()?;
@@ -217,6 +223,7 @@ impl Body<'_, '_, '_> {
                     def.annotations
                         .push((key.value.to_str().to_owned(), pair[1].clone()));
                 }
+                self.annotation_spellings(def)?;
             }
             8 => {
                 tuple_items(&text)?;
@@ -239,6 +246,15 @@ impl Body<'_, '_, '_> {
                 }
             }
             _ => return Err(format!("unsupported function attribute {flag}")),
+        }
+        Ok(())
+    }
+
+    fn annotation_spellings(&self, def: &mut Definition) -> Result<(), String> {
+        if self.code.flags & code_flags::CO_FUTURE_ANNOTATIONS != 0 {
+            for (_, annotation) in &mut def.annotations {
+                *annotation = string_value(annotation)?;
+            }
         }
         Ok(())
     }
@@ -348,7 +364,7 @@ impl Body<'_, '_, '_> {
             .annotations
             .iter()
             .find(|(k, _)| k == "return")
-            .map_or_else(String::new, |(_, v)| format!(" -> {v}"));
+            .map_or_else(String::new, |(_, v)| format!(" -> ({v})"));
         let prefix =
             if code.flags & (code_flags::CO_COROUTINE | code_flags::CO_ASYNC_GENERATOR) == 0 {
                 ""
