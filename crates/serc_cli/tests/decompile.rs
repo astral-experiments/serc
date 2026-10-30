@@ -368,3 +368,45 @@ fn unpacking_targets_preserve_binding_order_and_scope() {
         "import asyncio, contextlib\nlog=[]\nmanage(contextlib.nullcontext((1,2,3)), log.append)\nasync def rows(): yield (1, (2,3,4))\nasyncio.run(consume(rows(), log.append))\nasyncio.run(manage_async(contextlib.nullcontext((4,5)), log.append))\nresult=log",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn comprehension_clauses_preserve_iteration_and_filter_order() {
+    check_fixture(
+        "def f(rows, project, select):\n    return [(a, b if b else 0) for a, values in rows if select(a) for b in project(values) if b is None or select(b)]\n",
+        r"
+log = []
+def select(a):
+    log.append(('select', a))
+    return a
+def project(values):
+    log.append(('project', values))
+    return values
+result = f([(0, [9]), (1, [None, 0, 3]), (2, [])], project, select), log",
+    );
+    check_fixture(
+        "def mapping(rows):\n    return {key: item for row in rows if row for key, items in row for item in items if not item}\ndef unique(groups):\n    return {item for group in groups for item in group if item is None}\n",
+        "result = mapping([[], [('a', [1, 0]), ('b', [None])]]), unique([[1,None],[],[None]])",
+    );
+    check_fixture(
+        "def nested(rows):\n    x = 'outer'\n    result = [[x for x in row] for row in rows]\n    return result, x\n",
+        "result = nested([[1,2],[],[3]])",
+    );
+    check_fixture(
+        "def gen(rows, visit):\n    return (visit(b) for a in rows if a for b in a if b)\n",
+        r"
+log = []
+def rows():
+    for row in ([], [0, 4, 5], [6]):
+        log.append(('row', row))
+        yield row
+def visit(value):
+    log.append(('visit', value))
+    return value
+g = gen(rows(), visit)
+before = list(log)
+first = next(g)
+after_first = list(log)
+result = before, first, after_first, list(g), log",
+    );
+}

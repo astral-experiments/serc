@@ -20,6 +20,13 @@ impl Fragment {
             Err("region is not a single expression".into())
         }
     }
+    pub(super) fn key_value(mut self) -> Result<(String, String), String> {
+        let Some(Value::Expr(value)) = self.stack.pop() else {
+            return Err("missing comprehension value".into());
+        };
+        Ok((self.expression()?, value))
+    }
+
     pub(super) fn pending_return(mut self) -> Result<(String, bool), String> {
         match self.stack.pop() {
             None => Ok((self.lines, false)),

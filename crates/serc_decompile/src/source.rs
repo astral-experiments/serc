@@ -1,4 +1,5 @@
 mod annotations;
+mod comprehensions;
 mod definitions;
 mod exceptions;
 mod operands;
@@ -159,11 +160,20 @@ fn recover_scope(
             .iter()
             .any(|op| matches!(op.name, "LIST_APPEND" | "SET_ADD" | "MAP_ADD"))
     {
-        let stop = bc
+        // Nested comprehensions can place the inner unwind code before the
+        // outer handler. The normal path ends at the first cleanup after a return.
+        let mut handlers = bc
             .handlers
-            .first()
-            .and_then(|h| bc.ops.binary_search_by_key(&h.target, |op| op.offset).ok())
-            .unwrap_or(bc.ops.len());
+            .iter()
+            .filter_map(|h| bc.ops.binary_search_by_key(&h.target, |op| op.offset).ok());
+        let first = handlers.next().unwrap_or(bc.ops.len());
+        let stop = handlers
+            .filter(|&i| {
+                i > 0
+                    && matches!(bc.ops[i - 1].name, "RETURN_VALUE" | "RETURN_CONST")
+                    && (bc.ops[i].name, bc.ops[i].arg) == ("SWAP", 2)
+            })
+            .fold(first, usize::min);
         body.region(&bc.ops, 0, stop, 0)
     } else if bc.handlers.is_empty() {
         body.region(&bc.ops, 0, bc.ops.len(), 0)
