@@ -125,10 +125,10 @@ impl Body<'_, '_, '_> {
         let kinds = self.m.bytes(self.code.local_kinds)?;
         let mut declarations = std::collections::BTreeSet::new();
         for op in ops {
-            if op.name == "STORE_GLOBAL" {
+            if matches!(op.name, "STORE_GLOBAL" | "DELETE_GLOBAL") {
                 declarations.insert(format!("global {}", self.name(self.code.names, op.arg)?));
             }
-            if op.name == "STORE_DEREF"
+            if matches!(op.name, "STORE_DEREF" | "DELETE_DEREF")
                 && kinds
                     .get(op.arg as usize)
                     .is_some_and(|kind| kind & local_kinds::CO_FAST_FREE != 0)

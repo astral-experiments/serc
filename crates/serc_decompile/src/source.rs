@@ -447,6 +447,23 @@ impl Body<'_, '_, '_> {
                 let attr = self.name(self.code.names, a >> 1)?;
                 self.load_callable(format!("({obj}).{attr}"), a & 1 != 0)?;
             }
+            "DELETE_NAME" | "DELETE_GLOBAL" | "DELETE_FAST" | "DELETE_DEREF" => {
+                let table = if matches!(op.name, "DELETE_NAME" | "DELETE_GLOBAL") {
+                    self.code.names
+                } else {
+                    self.code.locals
+                };
+                self.line(&format!("del {}", self.name(table, a)?))?;
+            }
+            "DELETE_ATTR" => {
+                let obj = self.expr()?;
+                self.line(&format!("del ({obj}).{}", self.name(self.code.names, a)?))?;
+            }
+            "DELETE_SUBSCR" => {
+                let index = self.index()?;
+                let obj = self.expr()?;
+                self.line(&format!("del ({obj})[{index}]"))?;
+            }
             "STORE_NAME" | "STORE_FAST" | "STORE_DEREF" | "STORE_GLOBAL" => {
                 let tuple = if matches!(op.name, "STORE_NAME" | "STORE_GLOBAL") {
                     self.code.names
