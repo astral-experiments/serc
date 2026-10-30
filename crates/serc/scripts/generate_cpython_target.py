@@ -783,6 +783,20 @@ def parse_import_modes(source: str) -> tuple[int, list[tuple[str, int]]]:
     return shift, definitions
 
 
+def decoder_opcodes(opcodes: list[tuple[str, int]]) -> list[str]:
+    """Map on-disk IDs to semantic opcodes, excluding compiler-only aliases."""
+    return [
+        '#[cfg(feature = "decompile")]',
+        "pub(crate) fn decode_opcode(byte: u8) -> Option<(Opcode, &'static str)> {",
+        "    match byte {",
+        *(f'        {code} => Some((opcodes::{name}, "{name}")),' for name, code in opcodes),
+        "        _ => None,",
+        "    }",
+        "}",
+        "",
+    ]
+
+
 def opcode_match_expression(opcodes: list[tuple[str, int]], names: set[str]) -> str:
     variants = [f"opcodes::{name}" for name, _ in opcodes if name in names]
     if not variants:
@@ -1099,6 +1113,7 @@ def render(sources: dict[str, str]) -> str:
             "",
         ]
     )
+    lines.extend(decoder_opcodes(opcodes))
     if TARGET_MINOR == "3.14":
         lines.extend(["pub(crate) mod opcodes {", "    use super::Opcode;", ""])
         for name, code in opcodes:
