@@ -351,3 +351,20 @@ result = list(box), box.attr, log",
         "outer()\nresult = 'v' in globals()",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn unpacking_targets_preserve_binding_order_and_scope() {
+    check_fixture(
+        "def assign(rows):\n    (first, last), (*span, tail) = rows\n    return first, last, span, tail\ndef loop(rows, emit):\n    for head, (a, *middle, z) in rows:\n        emit((head, a, middle, z))\n",
+        "log = []\nloop([(0, [1, 2, 3, 4]), (5, [6, 7])], log.append)\nresult = assign(((1,2),(3,4,5))), log",
+    );
+    check_fixture(
+        "def comp(rows):\n    a = 'outer'\n    values = {a: b for a, *b in rows if a}\n    return values, a\ndef gen(rows):\n    return (a + b for a, b in rows)\n",
+        "result = comp([(0,1), (2,3,4), (5,)]), list(gen([(1,2), (4,5)]))",
+    );
+    check_fixture(
+        "def manage(cm, log):\n    with cm as (a, *rest):\n        log((a, rest))\nasync def consume(rows, log):\n    async for a, (b, *c) in rows:\n        log((a, b, c))\nasync def manage_async(cm, log):\n    async with cm as (a, b):\n        log((a, b))\n",
+        "import asyncio, contextlib\nlog=[]\nmanage(contextlib.nullcontext((1,2,3)), log.append)\nasync def rows(): yield (1, (2,3,4))\nasyncio.run(consume(rows(), log.append))\nasyncio.run(manage_async(contextlib.nullcontext((4,5)), log.append))\nresult=log",
+    );
+}
