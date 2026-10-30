@@ -131,3 +131,28 @@ fn branches_preserve_call_order() {
         "calls = []\nf(1, lambda x: len(calls) < 2, calls.append)\nresult = calls",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn definitions_preserve_bindings() {
+    check_fixture(
+        "def outer(x=3, *, k=4):\n    def inner(y):\n        return x + y\n    return inner\n",
+        "result = outer()(2)",
+    );
+    check_fixture(
+        "class C:\n    def f(self, name='x'):\n        return name\n",
+        "result = C().f()",
+    );
+    check_fixture(
+        "from sys import version as v\nimport sys as s\n",
+        "result = v == s.version",
+    );
+    check_fixture(
+        "def deco(f):\n    return f\n@deco\ndef f(x, /, *args, y=3, **kwargs):\n    return x\n",
+        "result = f(42,1,2)",
+    );
+    check_fixture(
+        "def f[T](x: T) -> T:\n    return x\n",
+        "result = f(42), repr(f.__annotations__)",
+    );
+}
