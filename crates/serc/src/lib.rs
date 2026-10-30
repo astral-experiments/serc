@@ -36,6 +36,8 @@ pub use config::{
     CompileOptions, NativeBuildProfile, OptimizationLevel, ParseOptimizationLevelError,
     ParsePythonVersionError, PythonVersion,
 };
+#[cfg(feature = "decompile")]
+pub use decompile::{DecompileError, decompile_pyc};
 pub use initial_intern_state::InitialInternState;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 use siphasher::sip::SipHasher13;

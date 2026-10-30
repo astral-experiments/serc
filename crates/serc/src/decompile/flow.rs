@@ -5,7 +5,6 @@ use crate::PythonVersion;
 use crate::target::{is_scope_exit_for, is_unconditional_jump, opcodes, stack_counts_for};
 
 impl Bytecode {
-    #[allow(dead_code)] // Used by the source reconstruction layer.
     pub(super) fn stack_heights(
         &self,
         version: PythonVersion,
