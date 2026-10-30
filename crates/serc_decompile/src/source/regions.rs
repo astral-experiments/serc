@@ -46,12 +46,6 @@ impl Fragment {
     }
 }
 
-fn destination(ops: &[Instruction], i: usize) -> Result<usize, String> {
-    let offset = ops[i].jump.ok_or("missing jump destination")?;
-    ops.binary_search_by_key(&offset, |op| op.offset)
-        .map_err(|_| "invalid jump destination".into())
-}
-
 impl Body<'_, '_, '_> {
     pub(super) fn fragment(
         &mut self,
@@ -73,11 +67,14 @@ impl Body<'_, '_, '_> {
     ) -> Result<Fragment, String> {
         let outer_stack = std::mem::replace(&mut self.stack, stack);
         let outer_lines = std::mem::take(&mut self.lines);
-        self.region(ops, start, end, level + 1)?;
-        Ok(Fragment {
+        let outer_loop = self.loop_edges;
+        let result = self.region(ops, start, end, level + 1);
+        self.loop_edges = outer_loop;
+        let fragment = Fragment {
             lines: std::mem::replace(&mut self.lines, outer_lines),
             stack: std::mem::replace(&mut self.stack, outer_stack),
-        })
+        };
+        result.map(|()| fragment)
     }
 
     pub(super) fn block(&mut self, header: &str, suite: &str) -> Result<(), String> {
@@ -221,6 +218,12 @@ impl Body<'_, '_, '_> {
                     self.line(self.loop_transfer(ops, i).unwrap())?;
                     Ok(i + 1)
                 }
+                "NOP" | "POP_TOP" | "POP_ITER"
+                    if self.stack.is_empty() && self.folded_break(ops, i, end) =>
+                {
+                    self.line("break")?;
+                    Ok(self.flow.block(i).ops.end)
+                }
                 "POP_TOP" | "POP_ITER"
                     if self.stack.is_empty()
                         && i + 1 < end
@@ -284,7 +287,7 @@ impl Body<'_, '_, '_> {
         };
         let discard =
             branch + 1 + usize::from(ops.get(branch + 1).is_some_and(|op| op.name == "NOT_TAKEN"));
-        let target = destination(ops, branch)?;
+        let target = self.flow.target(branch)?;
         if ops.get(discard).is_none_or(|op| op.name != "POP_TOP")
             || target > end
             || target <= discard + 1
@@ -296,209 +299,6 @@ impl Body<'_, '_, '_> {
             .fragment(ops, discard + 1, target, level)?
             .expression()?;
         self.push(format!("({lhs} {operator} {rhs})"))?;
-        Ok(target)
-    }
-
-    fn loop_transfer(&self, ops: &[Instruction], i: usize) -> Option<&'static str> {
-        let (header, after) = self.loop_edges?;
-        if !matches!(ops[i].name, "JUMP_BACKWARD" | "JUMP_FORWARD") {
-            return None;
-        }
-        let dest = destination(ops, i).ok()?;
-        if dest == header {
-            Some("continue")
-        } else if Some(dest) == after {
-            Some("break")
-        } else {
-            None
-        }
-    }
-
-    fn for_loop(
-        &mut self,
-        ops: &[Instruction],
-        header: usize,
-        end: usize,
-        level: usize,
-    ) -> Result<usize, String> {
-        let exit = destination(ops, header)?;
-        if exit > end
-            || exit <= header + 2
-            || ops[exit].name != "END_FOR"
-            || ops[exit - 1].jump != Some(ops[header].offset)
-        {
-            return Err("unsupported for-loop exit".into());
-        }
-        let binding = self.binding(ops, header + 1, exit - 1)?;
-        let iterable = self.expr()?;
-        let after_cleanup = exit
-            + 1
-            + usize::from(
-                ops.get(exit + 1)
-                    .is_some_and(|op| matches!(op.name, "POP_ITER" | "POP_TOP")),
-            );
-        let mut after_else = None;
-        for index in binding.next..exit - 1 {
-            if ops[index].name == "JUMP_FORWARD" {
-                let dest = destination(ops, index)?;
-                if dest >= after_cleanup && dest <= end {
-                    if after_else.is_some_and(|other| other != dest) {
-                        return Err("multiple for-loop exit targets".into());
-                    }
-                    after_else = Some(dest);
-                }
-            }
-        }
-        let outer = self.loop_edges.replace((header, after_else));
-        let suite = self
-            .seeded(ops, binding.next, exit - 1, level, binding.seed)?
-            .suite()?;
-        self.loop_edges = outer;
-        self.block(&format!("for {} in {iterable}:", binding.target), &suite)?;
-        if let Some(after) = after_else
-            && after > after_cleanup
-        {
-            let suite = self.fragment(ops, after_cleanup, after, level)?.suite()?;
-            self.block("else:", &suite)?;
-            Ok(after)
-        } else {
-            Ok(after_cleanup)
-        }
-    }
-
-    fn conditional(
-        &mut self,
-        ops: &[Instruction],
-        i: usize,
-        end: usize,
-        level: usize,
-    ) -> Result<usize, String> {
-        let target = destination(ops, i)?;
-        if target <= i || target > end {
-            return Err("unsupported conditional destination".into());
-        }
-        let value = self.expr()?;
-        let start = i + 1 + usize::from(ops.get(i + 1).is_some_and(|op| op.name == "NOT_TAKEN"));
-        let tail = target - 1;
-        if start < tail
-            && ops[tail].name == "RAISE_VARARGS"
-            && ops[tail].arg == 1
-            && (ops[start].name == "LOAD_ASSERTION_ERROR"
-                || (ops[start].name == "LOAD_COMMON_CONSTANT"
-                    && ops[start].arg
-                        == serc_bytecode::target::operands315::CommonConstant::ASSERTIONERROR
-                            .argument()))
-        {
-            let test = if ops[i].name == "POP_JUMP_IF_TRUE" {
-                value
-            } else if ops[i].name == "POP_JUMP_IF_FALSE" {
-                format!("not ({value})")
-            } else {
-                return Err("unsupported assertion condition".into());
-            };
-            let msg = if start + 1 == tail {
-                String::new()
-            } else if ops[tail - 1].name == "CALL" {
-                format!(
-                    ", {}",
-                    self.fragment(ops, start + 1, tail - 1, level)?
-                        .expression()?
-                )
-            } else {
-                return Err("unsupported assertion argument".into());
-            };
-            self.line(&format!("assert {test}{msg}"))?;
-            return Ok(target);
-        }
-        let test = match ops[i].name {
-            "POP_JUMP_IF_FALSE" => value,
-            "POP_JUMP_IF_TRUE" => format!("not ({value})"),
-            "POP_JUMP_IF_NONE" => format!("({value}) is not None"),
-            _ => format!("({value}) is None"),
-        };
-        if self.loop_transfer(ops, tail).is_some() {
-            let suite = self.fragment(ops, start, target, level)?.suite()?;
-            self.block(&format!("if {test}:"), &suite)?;
-            return Ok(target);
-        }
-        if ops[tail].name == "JUMP_BACKWARD" {
-            let back = destination(ops, tail)?;
-            let body_end = if back <= i {
-                tail
-            } else if back == start && tail > start && ops[tail - 1].jump == ops[i].jump {
-                // CPython 3.12 duplicates the condition at the bottom. Match
-                // its complete operand sequence before removing the copy.
-                let mut before = i;
-                let mut copy = tail - 1;
-                while copy > start
-                    && before > 0
-                    && ops[before - 1].opcode == ops[copy - 1].opcode
-                    && ops[before - 1].arg == ops[copy - 1].arg
-                {
-                    before -= 1;
-                    copy -= 1;
-                }
-                copy
-            } else {
-                return Err("unsupported loop condition".into());
-            };
-            let suite = self.fragment(ops, start, body_end, level)?.suite()?;
-            self.block(&format!("while {test}:"), &suite)?;
-            return Ok(target);
-        }
-        if ops[tail].name == "JUMP_FORWARD" {
-            let join = destination(ops, tail)?;
-            if join <= target || join > end {
-                return Err("unsupported conditional join".into());
-            }
-            let yes = self.fragment(ops, start, tail, level)?;
-            let no = self.fragment(ops, target, join, level)?;
-            if yes.stack.is_empty() && no.stack.is_empty() {
-                self.block(&format!("if {test}:"), &yes.suite()?)?;
-                self.block("else:", &no.suite()?)?;
-            } else {
-                self.push(format!(
-                    "({} if {test} else {})",
-                    yes.expression()?,
-                    no.expression()?
-                ))?;
-            }
-            return Ok(join);
-        }
-        let suite = self.fragment(ops, start, target, level)?.suite()?;
-        if matches!(ops[tail].name, "RETURN_CONST" | "RETURN_VALUE")
-            && end > target
-            && matches!(ops[end - 1].name, "RETURN_CONST" | "RETURN_VALUE")
-        {
-            let other = self.fragment(ops, target, end, level)?.suite()?;
-            let split_return = |s: &str| -> Option<(String, String)> {
-                let (before, last) = s
-                    .trim_end_matches('\n')
-                    .rsplit_once('\n')
-                    .unwrap_or(("", s.trim_end_matches('\n')));
-                Some((before.to_owned(), last.strip_prefix("return ")?.to_owned()))
-            };
-            if let (Some((left, a)), Some((right, b))) =
-                (split_return(&suite), split_return(&other))
-            {
-                if left.is_empty() && right.is_empty() {
-                    self.line(&format!("return {a} if {test} else {b}"))?;
-                    return Ok(end);
-                }
-                if a == b {
-                    self.block(&format!("if {test}:"), &left)?;
-                    if !right.is_empty() {
-                        self.block("else:", &right)?;
-                    }
-                    self.line(&format!("return {a}"))?;
-                    return Ok(end);
-                }
-            }
-            self.block(&format!("if {test}:"), &suite)?;
-            self.block("else:", &other)?;
-            return Ok(end);
-        }
-        self.block(&format!("if {test}:"), &suite)?;
         Ok(target)
     }
 }
