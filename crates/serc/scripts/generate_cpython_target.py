@@ -789,7 +789,10 @@ def decoder_opcodes(opcodes: list[tuple[str, int]]) -> list[str]:
         '#[cfg(feature = "decompile")]',
         "pub(crate) fn decode_opcode(byte: u8) -> Option<(Opcode, &'static str)> {",
         "    match byte {",
-        *(f'        {code} => Some((opcodes::{name}, "{name}")),' for name, code in opcodes),
+        *(
+            f'        {code} => Some((opcodes::{name}, "{name}")),'
+            for name, code in opcodes
+        ),
         "        _ => None,",
         "    }",
         "}",
