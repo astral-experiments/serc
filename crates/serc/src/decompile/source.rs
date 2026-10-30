@@ -1,4 +1,6 @@
+mod definitions;
 mod regions;
+use definitions::{Definition, Import};
 
 use ruff_python_ast::str::TripleQuotes;
 use ruff_python_literal::escape::{AsciiEscape, UnicodeEscape};
@@ -18,7 +20,7 @@ const MAX_WORK: usize = 16 << 20;
 
 pub(super) fn recover(m: &Module<'_>) -> Result<String, String> {
     let mut work = MAX_WORK;
-    let text = scope(m, m.root, 0, &mut work)?;
+    let text = scope(m, m.root, 0, false, &mut work)?;
     let parsed = ruff_python_parser::parse_module(&text)
         .map_err(|e| format!("invalid reconstructed Python: {e}"))?;
     let indent = Indentation::default();
@@ -30,7 +32,13 @@ pub(super) fn recover(m: &Module<'_>) -> Result<String, String> {
     Ok(result)
 }
 
-fn scope(m: &Module<'_>, id: Id, depth: usize, work: &mut usize) -> Result<String, String> {
+fn scope(
+    m: &Module<'_>,
+    id: Id,
+    depth: usize,
+    class: bool,
+    work: &mut usize,
+) -> Result<String, String> {
     if depth > 32 {
         return Err("nested code limit exceeded".into());
     }
@@ -63,9 +71,11 @@ fn scope(m: &Module<'_>, id: Id, depth: usize, work: &mut usize) -> Result<Strin
         stack: Vec::new(),
         lines: String::new(),
         loop_edges: None,
+        class,
         depth,
         work,
     };
+    body.declarations(&bc.ops)?;
     body.region(&bc.ops, 0, bc.ops.len(), 0)
         .map_err(|e| format!("{name}: {e}"))?;
     if !body.stack.is_empty() {
@@ -78,7 +88,11 @@ enum Value {
     Expr(String),
     Null,
     Code(Id),
-    Function(Id),
+    Function(Definition),
+    BuildClass,
+    Class(Id, Vec<String>),
+    Import(Import),
+    Member(String),
 }
 
 struct Body<'m, 'data, 'work> {
@@ -88,6 +102,7 @@ struct Body<'m, 'data, 'work> {
     lines: String,
     loop_edges: Option<(usize, Option<usize>)>,
     depth: usize,
+    class: bool,
     work: &'work mut usize,
 }
 
@@ -180,6 +195,10 @@ impl Body<'_, '_, '_> {
     }
 
     fn call(&mut self, argc: u32) -> Result<(), String> {
+        if let Some(result) = self.special_call(argc)? {
+            self.stack.push(result);
+            return Ok(());
+        }
         let args = self.args(argc)?;
         let callable = if self.m.version == PythonVersion::Py312 {
             let name = self.expr()?;
@@ -209,32 +228,33 @@ impl Body<'_, '_, '_> {
 
     fn store(&mut self, name: &str) -> Result<(), String> {
         match self.pop()? {
+            Value::Expr(_)
+                if self.class
+                    && matches!(
+                        name,
+                        "__module__"
+                            | "__qualname__"
+                            | "__firstlineno__"
+                            | "__static_attributes__"
+                            | "__classdict__"
+                            | "__classdictcell__"
+                            | "__classcell__"
+                    ) =>
+            {
+                Ok(())
+            }
+            Value::Expr(value) if name == "__doc__" && (self.depth == 0 || self.class) => {
+                self.line(&value)
+            }
             Value::Expr(value) => self.line(&format!("{name} = {value}")),
-            Value::Function(id) => {
-                let nested = self.m.code(id)?;
-                if self.m.text(nested.name)? != name
-                    || nested.pos_only > nested.args
-                    || nested.kw_only != 0
-                {
-                    return Err("unsupported function signature".into());
-                }
-                let locals = self.m.tuple(nested.locals)?;
-                let args = locals.get(..nested.args).ok_or("invalid argument count")?;
-                let mut names = Vec::new();
-                for (i, id) in args.iter().enumerate() {
-                    names.push(identifier(self.m.text(*id)?)?);
-                    if i + 1 == nested.pos_only {
-                        names.push("/");
-                    }
-                }
-                self.line(&format!("def {name}({}):", names.join(", ")))?;
-                let text = scope(self.m, id, self.depth + 1, self.work)?;
-                if text.is_empty() {
-                    self.line("    pass")?;
-                }
-                for line in text.lines() {
-                    self.line(&format!("    {line}"))?;
-                }
+            Value::Function(def) => self.definition(name, &def),
+            Value::Class(id, bases) => self.class_definition(name, id, &bases),
+            Value::Import(import) => self.line(&import.statement(name)?),
+            Value::Member(member) => {
+                let Some(Value::Import(import)) = self.stack.last_mut() else {
+                    return Err("missing import".into());
+                };
+                import.members.push((member, name.to_owned()));
                 Ok(())
             }
             _ => Err("unsupported store operand".into()),
@@ -245,7 +265,7 @@ impl Body<'_, '_, '_> {
         self.charge(1)?;
         let a = op.arg;
         match op.name {
-            "RESUME" | "NOP" | "NOT_TAKEN" => {}
+            "RESUME" | "NOP" | "NOT_TAKEN" | "COPY_FREE_VARS" | "MAKE_CELL" => {}
             "PUSH_NULL" => self.stack.push(Value::Null),
             "LOAD_CONST" => self.constant(a)?,
             "LOAD_SMALL_INT" => self.push(a.to_string())?,
@@ -264,7 +284,8 @@ impl Body<'_, '_, '_> {
                 self.push(value.to_owned())?;
             }
             "LOAD_NAME" => self.push(self.name(self.code.names, a)?.to_owned())?,
-            "LOAD_FAST" | "LOAD_FAST_BORROW" | "LOAD_FAST_CHECK" | "LOAD_DEREF" => {
+            "LOAD_FAST" | "LOAD_FAST_BORROW" | "LOAD_FAST_CHECK" | "LOAD_DEREF"
+            | "LOAD_CLOSURE" => {
                 self.push(self.name(self.code.locals, a)?.to_owned())?;
             }
             "LOAD_FAST_LOAD_FAST" | "LOAD_FAST_BORROW_LOAD_FAST_BORROW" => {
@@ -280,8 +301,8 @@ impl Body<'_, '_, '_> {
                 let attr = self.name(self.code.names, a >> 1)?;
                 self.load_callable(format!("({obj}).{attr}"), a & 1 != 0)?;
             }
-            "STORE_NAME" | "STORE_FAST" | "STORE_DEREF" => {
-                let tuple = if op.name == "STORE_NAME" {
+            "STORE_NAME" | "STORE_FAST" | "STORE_DEREF" | "STORE_GLOBAL" => {
+                let tuple = if matches!(op.name, "STORE_NAME" | "STORE_GLOBAL") {
                     self.code.names
                 } else {
                     self.code.locals
@@ -290,16 +311,26 @@ impl Body<'_, '_, '_> {
                 self.store(&name)?;
             }
             "POP_TOP" => {
-                let expr = self.expr()?;
-                self.line(&expr)?;
+                if let Some(Value::Import(_)) = self.stack.last() {
+                    let Value::Import(import) = self.pop()? else {
+                        unreachable!()
+                    };
+                    self.line(&import.statement("")?)?;
+                } else {
+                    let expr = self.expr()?;
+                    self.line(&expr)?;
+                }
             }
             "CALL" => self.call(a)?,
-            "MAKE_FUNCTION" if a == 0 => {
-                let Value::Code(id) = self.pop()? else {
-                    return Err("expected nested code".into());
-                };
-                self.stack.push(Value::Function(id));
-            }
+            "MAKE_FUNCTION" => self.make_function(a)?,
+            "SET_FUNCTION_ATTRIBUTE" => self.set_attribute(a)?,
+            "LOAD_BUILD_CLASS" => self.stack.push(Value::BuildClass),
+            "BUILD_MAP" | "BUILD_CONST_KEY_MAP" => self.build_map(op.name, a)?,
+            "IMPORT_NAME" => self.import(a)?,
+            "IMPORT_FROM" => self
+                .stack
+                .push(Value::Member(self.name(self.code.names, a)?.to_owned())),
+            "LOAD_LOCALS" if self.class => self.push("locals()".into())?,
             "BINARY_OP" | "BINARY_SUBSCR" | "COMPARE_OP" | "IS_OP" | "CONTAINS_OP" => {
                 let rhs = self.expr()?;
                 let lhs = self.expr()?;
@@ -373,7 +404,7 @@ impl Body<'_, '_, '_> {
                     self.constant(a)?;
                 }
                 let expr = self.expr()?;
-                if self.depth == 0 {
+                if self.depth == 0 || self.class {
                     if expr != "None" {
                         return Err("module returns a value".into());
                     }
