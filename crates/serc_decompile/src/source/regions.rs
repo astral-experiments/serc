@@ -166,7 +166,13 @@ impl Body<'_, '_, '_> {
                     self.keyword_call(ops[i + 1].arg, &keys)?;
                     Ok(i + 2)
                 }
-                "UNPACK_SEQUENCE" => self.unpack_names(ops, i, end),
+                "UNPACK_SEQUENCE" | "UNPACK_EX" => {
+                    let rhs = self.expr()?;
+                    let binding = self.binding(ops, i, end)?;
+                    self.line(&format!("{} = {rhs}", binding.target))?;
+                    self.stack.extend(binding.seed);
+                    Ok(binding.next)
+                }
                 "RETURN_GENERATOR" if i + 1 < end && ops[i + 1].name == "POP_TOP" => Ok(i + 2),
                 "GET_AWAITABLE" | "GET_YIELD_FROM_ITER" => self.delegated(ops, i, end),
                 "GET_ITER"
@@ -300,13 +306,7 @@ impl Body<'_, '_, '_> {
         {
             return Err("unsupported for-loop exit".into());
         }
-        let store = ops[header + 1];
-        let table = match store.name {
-            "STORE_NAME" => self.code.names,
-            "STORE_FAST" => self.code.locals,
-            _ => return Err("unsupported for-loop binding".into()),
-        };
-        let name = self.name(table, store.arg)?.to_owned();
+        let binding = self.binding(ops, header + 1, exit - 1)?;
         let iterable = self.expr()?;
         let after_cleanup = exit
             + 1
@@ -315,7 +315,7 @@ impl Body<'_, '_, '_> {
                     .is_some_and(|op| matches!(op.name, "POP_ITER" | "POP_TOP")),
             );
         let mut after_else = None;
-        for index in header + 2..exit - 1 {
+        for index in binding.next..exit - 1 {
             if ops[index].name == "JUMP_FORWARD" {
                 let dest = destination(ops, index)?;
                 if dest >= after_cleanup && dest <= end {
@@ -327,9 +327,11 @@ impl Body<'_, '_, '_> {
             }
         }
         let outer = self.loop_edges.replace((header, after_else));
-        let suite = self.fragment(ops, header + 2, exit - 1, level)?.suite()?;
+        let suite = self
+            .seeded(ops, binding.next, exit - 1, level, binding.seed)?
+            .suite()?;
         self.loop_edges = outer;
-        self.block(&format!("for {name} in {iterable}:"), &suite)?;
+        self.block(&format!("for {} in {iterable}:", binding.target), &suite)?;
         if let Some(after) = after_else
             && after > after_cleanup
         {

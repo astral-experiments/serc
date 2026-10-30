@@ -35,13 +35,9 @@ impl Body<'_, '_, '_> {
             };
             let start = idx(h.start)?;
             let end = idx(h.end)?;
-            let binding = match ops[start].name {
-                "STORE_FAST" => format!(" as {}", self.name(self.code.locals, ops[start].arg)?),
-                "POP_TOP" => String::new(),
-                _ => return Err("unsupported async with target".into()),
-            };
-            let suite = self.fragment(ops, start + 1, end, 0)?.suite()?;
-            self.block(&format!("async with {cm}{binding}:"), &suite)?;
+            let (item, body_start, seed) = self.manager_item(cm, ops, start, end)?;
+            let suite = self.seeded(ops, body_start, end, 0, seed)?.suite()?;
+            self.block(&format!("async with {item}:"), &suite)?;
             let close = find(ops, end, handler, "END_SEND")?;
             let ret = ops[close + 1..handler]
                 .iter()
@@ -85,13 +81,15 @@ impl Body<'_, '_, '_> {
         let last = find(ops, start + 1, end, "END_ASYNC_FOR")?;
         let bind = find(ops, start + 1, last, "END_SEND")? + 1;
         let bind = bind + usize::from(ops[bind].name == "NOT_TAKEN");
-        if ops[bind].name != "STORE_FAST" {
-            return Err("unsupported async for binding".into());
-        }
-        let name = self.name(self.code.locals, ops[bind].arg)?.to_owned();
-        let back = find(ops, bind + 1, last, "JUMP_BACKWARD")?;
-        let suite = self.fragment(ops, bind + 1, back, level)?.suite()?;
-        self.block(&format!("async for {name} in {iterable}:"), &suite)?;
+        let binding = self.binding(ops, bind, last)?;
+        let back = find(ops, binding.next, last, "JUMP_BACKWARD")?;
+        let suite = self
+            .seeded(ops, binding.next, back, level, binding.seed)?
+            .suite()?;
+        self.block(
+            &format!("async for {} in {iterable}:", binding.target),
+            &suite,
+        )?;
         // 3.15 has a separate END_ASYNC_FOR cleanup operand.
         Ok(last + 1)
     }
@@ -117,20 +115,10 @@ impl Body<'_, '_, '_> {
                 )
             })
             .ok_or("missing comprehension result")?;
-        let bind = ops[header + 1];
-        let mut seed = Vec::new();
-        let index = match bind.name {
-            "STORE_FAST" => bind.arg,
-            "STORE_FAST_LOAD_FAST" => {
-                seed.push(Value::Expr(
-                    self.name(self.code.locals, bind.arg & 15)?.to_owned(),
-                ));
-                bind.arg >> 4
-            }
-            _ => return Err("unsupported comprehension target".into()),
-        };
-        let name = self.name(self.code.locals, index)?.to_owned();
-        let mut element = header + 2;
+        let binding = self.binding(ops, header + 1, append)?;
+        let name = binding.target;
+        let mut seed = binding.seed;
+        let mut element = binding.next;
         let mut filters = String::new();
         while let Some(test) = ops[element..append]
             .iter()
@@ -183,7 +171,39 @@ impl Body<'_, '_, '_> {
         if ops[append].name == "YIELD_VALUE" {
             return Ok(end);
         }
-        let restore = find(ops, exit, end, "STORE_FAST")?;
-        Ok(restore + 1)
+        // Each saved local is restored in reverse order after the iterator cleanup.
+        let mut saved: Vec<_> = ops[start..header]
+            .iter()
+            .filter(|op| op.name == "LOAD_FAST_AND_CLEAR")
+            .map(|op| op.arg)
+            .collect();
+        let mut restore = exit + 1;
+        if restore < end
+            && matches!(ops[restore].name, "POP_ITER" | "POP_TOP")
+            && self.m.version >= serc_bytecode::PythonVersion::Py313
+        {
+            restore += 1;
+        }
+        if restore >= end || saved.is_empty() {
+            return Err("missing comprehension local restore".into());
+        }
+        match ops[restore].name {
+            "SWAP" if ops[restore].arg as usize == saved.len() + 1 => {}
+            // The optimizer can move the result store or discard before the
+            // restores. The entry SWAP then leaves the last saved local deepest.
+            "STORE_FAST" | "POP_TOP" => {
+                self.step(ops[restore])?;
+                saved.rotate_right(1);
+            }
+            _ => return Err("unsupported comprehension result cleanup".into()),
+        }
+        restore += 1;
+        for local in saved.into_iter().rev() {
+            if restore >= end || (ops[restore].name, ops[restore].arg) != ("STORE_FAST", local) {
+                return Err("unsupported comprehension local restore".into());
+            }
+            restore += 1;
+        }
+        Ok(restore)
     }
 }

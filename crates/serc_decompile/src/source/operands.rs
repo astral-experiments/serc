@@ -34,6 +34,12 @@ pub(super) fn augmented_load(ops: &[Instruction]) -> Option<usize> {
     }
 }
 
+pub(super) struct Binding {
+    pub(super) target: String,
+    pub(super) next: usize,
+    pub(super) seed: Vec<Value>,
+}
+
 impl Body<'_, '_, '_> {
     pub(super) fn augmented_store(
         &mut self,
@@ -162,41 +168,83 @@ impl Body<'_, '_, '_> {
         self.push(format!("{open}{prefix}{body}{close}"))
     }
 
-    pub(super) fn unpack_names(
+    /// Decode the stores for one Python target, keeping any load fused with the
+    /// final store as the first operand of the following expression or suite.
+    pub(super) fn binding(
         &mut self,
         ops: &[Instruction],
-        i: usize,
+        start: usize,
         end: usize,
-    ) -> Result<usize, String> {
-        let value = self.expr()?;
-        let mut next = i + 1;
-        let mut names = Vec::new();
-        let count = ops[i].arg as usize;
-        while names.len() < count && next < end {
-            let store = ops[next];
-            match store.name {
-                "STORE_FAST" | "STORE_NAME" | "STORE_DEREF" => {
-                    let table = if store.name == "STORE_NAME" {
-                        self.code.names
-                    } else {
-                        self.code.locals
-                    };
-                    names.push(self.name(table, store.arg)?.to_owned());
-                }
-                "STORE_FAST_STORE_FAST" => {
-                    for index in [store.arg >> 4, store.arg & 15] {
-                        names.push(self.name(self.code.locals, index)?.to_owned());
-                    }
-                }
-                _ => return Err("unsupported unpacking target".into()),
+    ) -> Result<Binding, String> {
+        let mut next = start;
+        let mut pending = None;
+        let mut target = String::new();
+        self.write_target(&ops[..end], &mut next, &mut pending, &mut target, 0)?;
+        let seed = match pending {
+            Some(("LOAD_FAST", index)) => {
+                vec![Value::Expr(self.name(self.code.locals, index)?.to_owned())]
             }
-            next += 1;
+            None => Vec::new(),
+            _ => return Err("unconsumed store after unpacking target".into()),
+        };
+        Ok(Binding { target, next, seed })
+    }
+
+    fn write_target(
+        &mut self,
+        ops: &[Instruction],
+        next: &mut usize,
+        pending: &mut Option<(&'static str, u32)>,
+        text: &mut String,
+        depth: usize,
+    ) -> Result<(), String> {
+        if depth > 32 || text.len() >= super::MAX_SOURCE {
+            return Err("unpacking target limit exceeded".into());
         }
-        if count == 0 || names.len() != count {
-            return Err("invalid unpacked target count".into());
+        self.charge(1)?;
+        let (name, arg) = if let Some(op) = pending.take() {
+            op
+        } else {
+            let op = ops.get(*next).ok_or("incomplete unpacking target")?;
+            *next += 1;
+            (op.name, op.arg)
+        };
+        if matches!(name, "UNPACK_SEQUENCE" | "UNPACK_EX") {
+            let star = (name == "UNPACK_EX").then_some(arg & 255);
+            let count = star.map_or(arg, |before| before + 1 + (arg >> 8));
+            text.push('(');
+            for i in 0..count {
+                if i > 0 {
+                    text.push_str(", ");
+                }
+                if star == Some(i) {
+                    text.push('*');
+                }
+                self.write_target(ops, next, pending, text, depth + 1)?;
+            }
+            if count == 1 {
+                text.push(',');
+            }
+            text.push(')');
+            return Ok(());
         }
-        self.line(&format!("({},) = {value}", names.join(", ")))?;
-        Ok(next)
+        let (table, index) = match name {
+            "STORE_NAME" | "STORE_GLOBAL" => (self.code.names, arg),
+            "STORE_FAST" | "STORE_DEREF" => (self.code.locals, arg),
+            "STORE_FAST_STORE_FAST" | "STORE_FAST_LOAD_FAST" => {
+                let second = if name == "STORE_FAST_LOAD_FAST" {
+                    "LOAD_FAST"
+                } else {
+                    "STORE_FAST"
+                };
+                *pending = Some((second, arg & 15));
+                (self.code.locals, arg >> 4)
+            }
+            _ => return Err("unsupported unpacking target".into()),
+        };
+        let name = self.name(table, index)?;
+        text.push_str(name);
+        self.charge(name.len())
     }
 
     pub(super) fn index(&mut self) -> Result<String, String> {

@@ -28,8 +28,10 @@ handlers.
 The source pass reconstructs Python from the decoded scopes. It handles common
 assignments and calls, branches, loops, function and class definitions,
 closures, annotations, selected generic functions, generators, comprehensions,
-and formatted and template strings. It recovers deletion and in-place updates to
-attributes, subscripts, and slices while preserving evaluation order. There are
+and formatted and template strings. It recovers nested and starred name targets
+in assignments, loops, comprehensions, and context managers. Deletion and
+in-place updates to attributes, subscripts, and slices preserve evaluation
+order. There are
 recognizers for individual exception handlers, multi-item synchronous context
 managers, and sequence, mapping, and class patterns. Combinations of these
 constructs can still fail.

@@ -148,12 +148,30 @@ impl Body<'_, '_, '_> {
         }
     }
 
+    pub(super) fn manager_item(
+        &mut self,
+        manager: String,
+        ops: &[Instruction],
+        start: usize,
+        end: usize,
+    ) -> Result<(String, usize, Vec<Value>), String> {
+        if ops.get(start).is_some_and(|op| op.name == "POP_TOP") {
+            return Ok((manager, start + 1, Vec::new()));
+        }
+        let binding = self.binding(ops, start, end)?;
+        Ok((
+            format!("{manager} as {}", binding.target),
+            binding.next,
+            binding.seed,
+        ))
+    }
+
     fn with_statement(&mut self, bc: &Bytecode) -> Result<(), String> {
         let ops = &bc.ops;
         let mut ranges = bc.handlers.iter();
         let mut entry = ranges.next().ok_or("missing with range")?;
         let mut managers = Vec::new();
-        let mut previous_binding = None;
+        let mut previous_body = None;
         let mut seed = Vec::new();
         let (start, end, handler) = loop {
             let start = boundary(ops, entry.start)?;
@@ -163,28 +181,16 @@ impl Body<'_, '_, '_> {
                 return Err("unsupported manager layout".into());
             }
             let enter = manager_entry(&ops[..start])?;
-            let manager = if let Some(previous) = previous_binding {
-                self.seeded(ops, previous + 1, enter, 0, std::mem::take(&mut seed))?
+            let manager = if let Some(previous) = previous_body {
+                self.seeded(ops, previous, enter, 0, std::mem::take(&mut seed))?
                     .expression()?
             } else {
                 self.region(ops, 0, enter, 0)?;
                 self.expr()?
             };
-            let bind = ops[start];
-            managers.push(match bind.name {
-                "STORE_FAST" => format!("{manager} as {}", self.name(self.code.locals, bind.arg)?),
-                "STORE_FAST_LOAD_FAST" => {
-                    let loaded = self.name(self.code.locals, bind.arg & 15)?;
-                    seed.push(Value::Expr(loaded.to_owned()));
-                    format!(
-                        "{manager} as {}",
-                        self.name(self.code.locals, bind.arg >> 4)?
-                    )
-                }
-                "STORE_NAME" => format!("{manager} as {}", self.name(self.code.names, bind.arg)?),
-                "POP_TOP" => manager,
-                _ => return Err("unsupported with target".into()),
-            });
+            let (item, body_start, loaded) = self.manager_item(manager, ops, start, end)?;
+            managers.push(item);
+            seed = loaded;
 
             // Each additional item starts where the enclosing protected range
             // ends. The enclosing handler resumes protection during inner cleanup.
@@ -198,15 +204,13 @@ impl Body<'_, '_, '_> {
                     .get(target + 1)
                     .is_some_and(|op| op.name == "WITH_EXCEPT_START")
             {
-                previous_binding = Some(start);
+                previous_body = Some(body_start);
                 entry = inner;
             } else {
-                break (start, end, handler);
+                break (body_start, end, handler);
             }
         };
-        let (body, returns) = self
-            .seeded(ops, start + 1, end, 0, seed)?
-            .pending_return()?;
+        let (body, returns) = self.seeded(ops, start, end, 0, seed)?.pending_return()?;
         self.block(&format!("with {}:", managers.join(", ")), &body)?;
 
         let mut next = end;
