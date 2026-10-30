@@ -29,8 +29,8 @@ The source pass reconstructs Python from the decoded scopes. It handles common
 assignments and calls, branches, loops, function and class definitions,
 closures, annotations, selected generic functions, generators, comprehensions,
 and formatted and template strings. There are recognizers for individual
-exception handlers, context managers, and sequence, mapping, and class patterns.
-Combinations of these constructs can still fail.
+exception handlers, multi-item synchronous context managers, and sequence,
+mapping, and class patterns. Combinations of these constructs can still fail.
 
 ## Verification
 
@@ -57,10 +57,10 @@ never executes corpus code.
 
 | CPython   | Compilable modules | Verified modules | Coverage | Verified code objects / total |
 | --------- | -----------------: | ---------------: | -------: | ----------------------------: |
-| 3.12.14   |              2,190 |            1,472 |    67.2% |                5,441 / 11,063 |
-| 3.13.15   |              2,209 |            1,432 |    64.8% |                4,803 / 11,562 |
-| 3.14.5    |              2,246 |            1,430 |    63.7% |                5,896 / 14,082 |
-| 3.15.0rc2 |              2,266 |            1,439 |    63.5% |                5,918 / 14,114 |
+| 3.12.14   |              2,190 |            1,475 |    67.4% |                5,449 / 11,063 |
+| 3.13.15   |              2,209 |            1,435 |    65.0% |                4,811 / 11,562 |
+| 3.14.5    |              2,246 |            1,432 |    63.8% |                5,898 / 14,082 |
+| 3.15.0rc2 |              2,266 |            1,441 |    63.6% |                5,920 / 14,114 |
 
 The code-object count includes each module and its nested code. Only objects
 from completely verified modules count as successes. All four runs had zero
