@@ -1,5 +1,5 @@
 //! Stack heights at instruction boundaries. Branch targets use the compiler's
-//! logical edges through END_FOR / END_SEND, including their cleanup effects.
+//! logical edges through `END_FOR` and `END_SEND`, including their cleanup effects.
 use super::instructions::Bytecode;
 use crate::PythonVersion;
 use crate::target::{is_scope_exit_for, is_unconditional_jump, opcodes, stack_counts_for};
