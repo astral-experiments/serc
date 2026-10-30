@@ -1,5 +1,7 @@
+mod annotations;
 mod definitions;
 mod exceptions;
+mod operands;
 mod patterns;
 mod regions;
 mod strings;
@@ -33,12 +35,59 @@ pub(super) fn recover(m: &Module<'_>) -> Result<Vec<String>, String> {
         result.push_str(&Generator::new(&indent, LineEnding::Lf).stmt(stmt));
         result.push('\n');
     }
-    if text != result {
+    let mut candidates = vec![result];
+    if candidates[0] != text {
         // Suite layout can change tracing NOPs even when the AST is identical.
-        Ok(vec![result, text])
-    } else {
-        Ok(vec![result])
+        candidates.push(text);
     }
+    if m.version >= PythonVersion::Py313 {
+        // Class bodies store __firstlineno__ as an executable constant.
+        // Restore blank lines before unambiguous class definitions when needed.
+        let mut class_lines = rustc_hash::FxHashMap::default();
+        for obj in &m.objects {
+            if let Object::Code(code) = obj
+                && code.flags & crate::target::code_flags::CO_NEWLOCALS == 0
+            {
+                class_lines
+                    .entry(m.text(code.name)?)
+                    .and_modify(|line| *line = None)
+                    .or_insert(Some(code.first_line));
+            }
+        }
+        for i in 0..candidates.len() {
+            if let Some(layout) = class_layout(&candidates[i], &class_lines) {
+                candidates.push(layout);
+            }
+        }
+    }
+    Ok(candidates)
+}
+
+fn class_layout(
+    source: &str,
+    lines: &rustc_hash::FxHashMap<&str, Option<usize>>,
+) -> Option<String> {
+    let mut result = String::new();
+    let mut lineno = 1;
+    for line in source.split_inclusive('\n') {
+        if let Some(name) = line
+            .trim_start()
+            .strip_prefix("class ")
+            .and_then(|s| s.split(['(', '[', ':']).next())
+            && let Some(&Some(target)) = lines.get(name)
+            && target > lineno
+        {
+            let gap = target - lineno;
+            if gap.checked_add(result.len())?.checked_add(source.len())? > MAX_SOURCE {
+                return None;
+            }
+            result.extend(std::iter::repeat_n('\n', gap));
+            lineno = target;
+        }
+        result.push_str(line);
+        lineno += 1;
+    }
+    (result.len() != source.len()).then_some(result)
 }
 
 fn scope(
@@ -48,6 +97,9 @@ fn scope(
     class: bool,
     work: &mut usize,
 ) -> Result<String, String> {
+    if crate::stack_growth_required() {
+        return crate::grow_stack(|| scope(m, id, depth, class, work));
+    }
     if depth > 32 {
         return Err("nested code limit exceeded".into());
     }
@@ -75,6 +127,7 @@ fn scope(
         lines: String::new(),
         loop_edges: None,
         class,
+        annotations: Vec::new(),
         depth,
         work,
     };
@@ -111,6 +164,8 @@ enum Value {
     Formatted(String),
     Interpolation(String),
     Interpolations(Vec<String>),
+    Slice(String),
+    InPlace(String, &'static str, String),
     Null,
     Code(Id),
     Function(Definition),
@@ -128,6 +183,7 @@ struct Body<'m, 'data, 'work> {
     loop_edges: Option<(usize, Option<usize>)>,
     depth: usize,
     class: bool,
+    annotations: Vec<(Option<u32>, String, String)>,
     work: &'work mut usize,
 }
 
@@ -192,6 +248,7 @@ impl Body<'_, '_, '_> {
         match self.pop()? {
             Value::Expr(value) => Ok(value),
             Value::Formatted(field) => Ok(format!("f\"{field}\"")),
+            Value::Function(def) => self.lambda(&def),
             _ => Err("expected expression".into()),
         }
     }
@@ -213,6 +270,8 @@ impl Body<'_, '_, '_> {
         if matches!(self.m.objects[id], Object::Code(_)) {
             self.stack.push(Value::Code(id));
             Ok(())
+        } else if let Object::Slice(ids) = self.m.objects[id] {
+            operands::constant_slice(self, ids)
         } else {
             let text = literal(self.m, id, 0, self.work)?;
             self.push(text)
@@ -225,6 +284,10 @@ impl Body<'_, '_, '_> {
             return Ok(());
         }
         let args = self.args(argc)?;
+        self.emit_call(&args)
+    }
+
+    fn emit_call(&mut self, args: &[String]) -> Result<(), String> {
         let callable = if self.m.version == PythonVersion::Py312 {
             let name = self.expr()?;
             if !matches!(self.pop()?, Value::Null) {
@@ -257,6 +320,13 @@ impl Body<'_, '_, '_> {
             self.push(text)?;
         }
         match self.pop()? {
+            Value::Expr(_) if name == "__conditional_annotations__" => Ok(()),
+            Value::Function(def)
+                if matches!(name, "__annotate__" | "__annotate_func__")
+                    && self.m.text(self.m.code(def.id)?.name)? == "__annotate__" =>
+            {
+                self.annotation_scope(def.id)
+            }
             Value::Expr(_)
                 if self.class
                     && matches!(
@@ -276,6 +346,9 @@ impl Body<'_, '_, '_> {
                 self.line(&value)
             }
             Value::Expr(value) => self.line(&format!("{name} = {value}")),
+            Value::InPlace(lhs, operator, rhs) if lhs == name => {
+                self.line(&format!("{name} {operator}= {rhs}"))
+            }
             Value::Function(def) => self.definition(name, &def),
             Value::Class(id, bases) => self.class_definition(name, id, &bases),
             Value::Import(import) => self.line(&import.statement(name)?),
@@ -294,12 +367,20 @@ impl Body<'_, '_, '_> {
         self.charge(1)?;
         let a = op.arg;
         match op.name {
-            "RESUME" | "NOP" | "NOT_TAKEN" | "COPY_FREE_VARS" | "MAKE_CELL" => {}
+            "RESUME" | "NOP" | "NOT_TAKEN" | "COPY_FREE_VARS" | "MAKE_CELL"
+            | "SETUP_ANNOTATIONS" => {}
             "PUSH_NULL" => self.stack.push(Value::Null),
             "LOAD_CONST" => self.constant(a)?,
             "LOAD_SMALL_INT" => self.push(a.to_string())?,
             "LOAD_COMMON_CONSTANT" => {
                 let value = [
+                    (CommonConstant::ASSERTIONERROR, "AssertionError"),
+                    (CommonConstant::NOTIMPLEMENTEDERROR, "NotImplementedError"),
+                    (CommonConstant::BUILTIN_ALL, "all"),
+                    (CommonConstant::BUILTIN_ANY, "any"),
+                    (CommonConstant::BUILTIN_TUPLE, "tuple"),
+                    (CommonConstant::BUILTIN_LIST, "list"),
+                    (CommonConstant::BUILTIN_SET, "set"),
                     (CommonConstant::NONE, "None"),
                     (CommonConstant::TRUE, "True"),
                     (CommonConstant::FALSE, "False"),
@@ -324,6 +405,17 @@ impl Body<'_, '_, '_> {
             }
             "LOAD_GLOBAL" => {
                 self.load_callable(self.name(self.code.names, a >> 1)?.to_owned(), a & 1 != 0)?;
+            }
+            "LOAD_FROM_DICT_OR_GLOBALS" | "LOAD_FROM_DICT_OR_DEREF" => {
+                if self.expr()? != "__classdict__" {
+                    return Err("unsupported annotation namespace".into());
+                }
+                let table = if op.name == "LOAD_FROM_DICT_OR_GLOBALS" {
+                    self.code.names
+                } else {
+                    self.code.locals
+                };
+                self.push(self.name(table, a)?.to_owned())?;
             }
             "LOAD_ATTR" => {
                 let obj = self.expr()?;
@@ -351,6 +443,36 @@ impl Body<'_, '_, '_> {
                 }
             }
             "CALL" => self.call(a)?,
+            "CALL_KW" => {
+                let keys = self.expr()?;
+                self.keyword_call(a, &keys)?;
+            }
+            "CALL_FUNCTION_EX" => self.expanded_call(a)?,
+            "DICT_UPDATE" | "DICT_MERGE" if a == 1 => self.merge_map()?,
+            "CALL_INTRINSIC_1"
+                if a == crate::target::operands::UnaryIntrinsic::LIST_TO_TUPLE.argument() =>
+            {
+                let list = self.expr()?;
+                let elements = list
+                    .strip_prefix('[')
+                    .and_then(|s| s.strip_suffix(']'))
+                    .ok_or("expected argument list")?;
+                self.push(format!("({elements},)"))?;
+            }
+            "LIST_EXTEND" | "SET_UPDATE" => self.extend_literal(op)?,
+            "STORE_ATTR" | "STORE_SUBSCR" | "STORE_SLICE" | "BINARY_SLICE" | "BUILD_SLICE" => {
+                self.subscript_or_attribute(op)?;
+            }
+            "STORE_FAST_STORE_FAST" | "STORE_FAST_LOAD_FAST" => {
+                let first = self.name(self.code.locals, a >> 4)?.to_owned();
+                self.store(&first)?;
+                let second = self.name(self.code.locals, a & 15)?.to_owned();
+                if op.name == "STORE_FAST_STORE_FAST" {
+                    self.store(&second)?;
+                } else {
+                    self.push(second)?;
+                }
+            }
             "MAKE_FUNCTION" => self.make_function(a)?,
             "SET_FUNCTION_ATTRIBUTE" => self.set_attribute(a)?,
             "LOAD_BUILD_CLASS" => self.stack.push(Value::BuildClass),
@@ -361,6 +483,13 @@ impl Body<'_, '_, '_> {
                 .push(Value::Member(self.name(self.code.names, a)?.to_owned())),
             "LOAD_LOCALS" if self.class => self.push("locals()".into())?,
             "BINARY_OP" | "BINARY_SUBSCR" | "COMPARE_OP" | "IS_OP" | "CONTAINS_OP" => {
+                if (op.name == "BINARY_SUBSCR" || (op.name == "BINARY_OP" && a == 26))
+                    && matches!(self.stack.last(), Some(Value::Slice(_)))
+                {
+                    let index = self.index()?;
+                    let obj = self.expr()?;
+                    return self.push(format!("({obj})[{index}]"));
+                }
                 let rhs = self.expr()?;
                 let lhs = self.expr()?;
                 let operator = match op.name {
@@ -393,11 +522,17 @@ impl Body<'_, '_, '_> {
                     _ => *[
                         "+", "&", "//", "<<", "@", "*", "%", "|", "**", ">>", "-", "/", "^",
                     ]
-                    .get(a as usize)
+                    .get(if (13..26).contains(&a) {
+                        (a - 13) as usize
+                    } else {
+                        a as usize
+                    })
                     .or_else(|| (a == 26).then_some(&"[]"))
                     .ok_or("unsupported binary operator")?,
                 };
-                if operator == "[]" {
+                if op.name == "BINARY_OP" && (13..26).contains(&a) {
+                    self.stack.push(Value::InPlace(lhs, operator, rhs));
+                } else if operator == "[]" {
                     self.push(format!("({lhs})[{rhs}]"))?;
                 } else {
                     self.push(format!("({lhs} {operator} {rhs})"))?;
@@ -437,7 +572,7 @@ impl Body<'_, '_, '_> {
                             format!("({args})")
                         }
                     }
-                    _ => return Err("unsupported empty set".into()),
+                    _ => "{*()}".into(),
                 };
                 self.push(expr)?;
             }
@@ -520,8 +655,9 @@ fn literal(m: &Module<'_>, id: Id, depth: usize, work: &mut usize) -> Result<Str
                 .to_string()
                 .ok_or("string representation overflow")?
         }
-        Object::Tuple(items) => {
-            let mut s = String::from("(");
+        Object::Tuple(items) | Object::FrozenSet(items) => {
+            let is_tuple = matches!(m.objects[id], Object::Tuple(_));
+            let mut s = String::from(if is_tuple { "(" } else { "{" });
             for item in items {
                 s.push_str(&literal(m, *item, depth + 1, work)?);
                 s.push_str(", ");
@@ -529,8 +665,40 @@ fn literal(m: &Module<'_>, id: Id, depth: usize, work: &mut usize) -> Result<Str
                     return Err("tuple literal limit exceeded".into());
                 }
             }
-            s.push(')');
+            s.push(if is_tuple { ')' } else { '}' });
             s
+        }
+        Object::Long { negative, digits } => {
+            if digits.len() > MAX_SOURCE / 4 {
+                return Err("integer literal limit exceeded".into());
+            }
+            // Marshal uses little-endian base-2^15 limbs. Hex source avoids a
+            // quadratic decimal conversion and CPython's decimal digit limit.
+            let mut hex = Vec::new();
+            let mut buffer = 0u32;
+            let mut bits = 0;
+            for pair in digits.chunks_exact(2) {
+                buffer |= u32::from(u16::from_le_bytes([pair[0], pair[1]])) << bits;
+                bits += 15;
+                while bits >= 4 {
+                    hex.push(char::from_digit(buffer & 15, 16).unwrap());
+                    buffer >>= 4;
+                    bits -= 4;
+                }
+            }
+            if bits != 0 {
+                hex.push(char::from_digit(buffer, 16).unwrap());
+            }
+            while hex.last() == Some(&'0') {
+                hex.pop();
+            }
+            if hex.is_empty() {
+                "0".into()
+            } else {
+                let mut s = String::from(if *negative { "-0x" } else { "0x" });
+                s.extend(hex.into_iter().rev());
+                s
+            }
         }
         _ => return Err("unsupported literal".into()),
     };

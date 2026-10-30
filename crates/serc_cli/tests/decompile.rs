@@ -245,3 +245,33 @@ fn template_interpolations_retain_expression_text() {
         &[serc::PythonVersion::Py314, serc::PythonVersion::Py315],
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn corpus_operand_layouts() {
+    check_fixture(
+        "import os\nimport sys as alias\nx: int = 3\ny: str\nclass C:\n    n: int = 42\n    def read(self, k: int) -> int:\n        return self.n + k\n",
+        "result = (x, C().read(2), C.__annotations__, (__annotate__(1) if \"__annotate__\" in globals() else __annotations__), alias is __import__('sys'))",
+    );
+    check_fixture(
+        "def f(obj, call, xs):\n    obj.attr = call(1, k=2)\n    xs[1:3] = [4, 5, 6]\n    a, b = xs[:2]\n    return a + b, obj.attr\n",
+        "from types import SimpleNamespace\nresult = f(SimpleNamespace(), lambda a, k: a + k, [0, 1, 2])",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn extended_calls_and_assignment_expressions() {
+    check_fixture(
+        "def f(call, args, kw):\n    return call(1, *args, k=2, **kw)\n",
+        "result = f(lambda *a, **kw: (a, kw), (3, 4), {'z': 5})",
+    );
+    check_fixture(
+        "from math import *\ndef f(n):\n    assert n, 'missing'\n    n += 1\n    return (lambda x: x + 2)(v := n), v\n",
+        "result = f(2), sqrt(9)",
+    );
+    check_fixture(
+        "def f(x):\n    return x in {1, 3, 5}, 0x123456789abcdef0001234\n",
+        "result = f(3), f(7)",
+    );
+}
