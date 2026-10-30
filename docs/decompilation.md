@@ -28,12 +28,14 @@ handlers.
 The source pass reconstructs Python from the decoded scopes. It handles common
 assignments and calls, branches, loops, function and class definitions,
 closures, annotations, selected generic functions, generators, comprehensions,
-and formatted and template strings. It recovers nested and starred name targets
-in assignments, loops, comprehensions, and context managers. Deletion and
-in-place updates to attributes, subscripts, and slices preserve evaluation
-order. There are recognizers for individual exception handlers, multi-item
-synchronous context managers, and sequence, mapping, and class patterns.
-Combinations of these constructs can still fail.
+and formatted and template strings. Synchronous comprehensions and generator
+expressions can contain multiple `for` clauses, filters, and conditional
+elements. It recovers nested and starred name targets in assignments, loops,
+comprehensions, and context managers. Deletion and in-place updates to
+attributes, subscripts, and slices preserve evaluation order. There are
+recognizers for individual exception handlers, multi-item synchronous context
+managers, and sequence, mapping, and class patterns. Combinations of these
+constructs can still fail.
 
 ## Verification
 
@@ -60,15 +62,15 @@ never executes corpus code.
 
 | CPython   | Compilable modules | Verified modules | Coverage | Verified code objects / total |
 | --------- | -----------------: | ---------------: | -------: | ----------------------------: |
-| 3.12.14   |              2,190 |            1,526 |    69.7% |                5,708 / 11,063 |
-| 3.13.15   |              2,209 |            1,488 |    67.4% |                5,057 / 11,562 |
-| 3.14.5    |              2,246 |            1,482 |    66.0% |                6,186 / 14,082 |
-| 3.15.0rc2 |              2,266 |            1,491 |    65.8% |                6,208 / 14,114 |
+| 3.12.14   |              2,190 |            1,537 |    70.2% |                5,785 / 11,063 |
+| 3.13.15   |              2,209 |            1,495 |    67.7% |                5,085 / 11,562 |
+| 3.14.5    |              2,246 |            1,490 |    66.3% |                6,244 / 14,082 |
+| 3.15.0rc2 |              2,266 |            1,496 |    66.0% |                6,217 / 14,114 |
 
 The code-object count includes each module and its nested code. Only objects
 from completely verified modules count as successes. All four runs had zero
 incorrect outputs, crashes, and timeouts. Current gaps include nested and
-overlapping control-flow constructs, complex exception cleanup, multi-clause
+overlapping control-flow constructs, complex exception cleanup, asynchronous
 comprehensions and some class and pattern layouts. A single unsupported scope
 prevents recovery of the containing module.
 
