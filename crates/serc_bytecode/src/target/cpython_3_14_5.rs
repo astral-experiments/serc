@@ -36,7 +36,7 @@ pub(crate) const TARGET_IMPLEMENTATION: &str = "cpython";
 pub(crate) const TARGET_VERSION: (u8, u8, u8) = (3, 14, 5);
 pub(crate) const TARGET_MAGIC_NUMBER: [u8; 4] = [0x2b, 0x0e, 0x0d, 0x0a];
 
-#[cfg(feature = "decompile")]
+#[cfg(feature = "read")]
 pub(crate) fn decode_opcode(byte: u8) -> Option<(Opcode, &'static str)> {
     match byte {
         0 => Some((opcodes::CACHE, "CACHE")),
@@ -180,133 +180,133 @@ pub(crate) fn decode_opcode(byte: u8) -> Option<(Opcode, &'static str)> {
 pub(crate) mod opcodes {
     use super::Opcode;
 
-    pub(crate) const CACHE: Opcode = Opcode::new(0);
-    pub(crate) const BINARY_SLICE: Opcode = Opcode::new(1);
-    pub(crate) const BUILD_TEMPLATE: Opcode = Opcode::new(2);
-    pub(crate) const BINARY_OP_INPLACE_ADD_UNICODE: Opcode = Opcode::new(3);
-    pub(crate) const CALL_FUNCTION_EX: Opcode = Opcode::new(4);
-    pub(crate) const CHECK_EG_MATCH: Opcode = Opcode::new(5);
-    pub(crate) const CHECK_EXC_MATCH: Opcode = Opcode::new(6);
-    pub(crate) const CLEANUP_THROW: Opcode = Opcode::new(7);
-    pub(crate) const DELETE_SUBSCR: Opcode = Opcode::new(8);
-    pub(crate) const END_FOR: Opcode = Opcode::new(9);
-    pub(crate) const END_SEND: Opcode = Opcode::new(10);
-    pub(crate) const EXIT_INIT_CHECK: Opcode = Opcode::new(11);
-    pub(crate) const FORMAT_SIMPLE: Opcode = Opcode::new(12);
-    pub(crate) const FORMAT_WITH_SPEC: Opcode = Opcode::new(13);
-    pub(crate) const GET_AITER: Opcode = Opcode::new(14);
-    pub(crate) const GET_ANEXT: Opcode = Opcode::new(15);
-    pub(crate) const GET_ITER: Opcode = Opcode::new(16);
-    pub(crate) const RESERVED: Opcode = Opcode::new(17);
-    pub(crate) const GET_LEN: Opcode = Opcode::new(18);
-    pub(crate) const GET_YIELD_FROM_ITER: Opcode = Opcode::new(19);
-    pub(crate) const INTERPRETER_EXIT: Opcode = Opcode::new(20);
-    pub(crate) const LOAD_BUILD_CLASS: Opcode = Opcode::new(21);
-    pub(crate) const LOAD_LOCALS: Opcode = Opcode::new(22);
-    pub(crate) const MAKE_FUNCTION: Opcode = Opcode::new(23);
-    pub(crate) const MATCH_KEYS: Opcode = Opcode::new(24);
-    pub(crate) const MATCH_MAPPING: Opcode = Opcode::new(25);
-    pub(crate) const MATCH_SEQUENCE: Opcode = Opcode::new(26);
-    pub(crate) const NOP: Opcode = Opcode::new(27);
-    pub(crate) const NOT_TAKEN: Opcode = Opcode::new(28);
-    pub(crate) const POP_EXCEPT: Opcode = Opcode::new(29);
-    pub(crate) const POP_ITER: Opcode = Opcode::new(30);
-    pub(crate) const POP_TOP: Opcode = Opcode::new(31);
-    pub(crate) const PUSH_EXC_INFO: Opcode = Opcode::new(32);
-    pub(crate) const PUSH_NULL: Opcode = Opcode::new(33);
-    pub(crate) const RETURN_GENERATOR: Opcode = Opcode::new(34);
-    pub(crate) const RETURN_VALUE: Opcode = Opcode::new(35);
-    pub(crate) const SETUP_ANNOTATIONS: Opcode = Opcode::new(36);
-    pub(crate) const STORE_SLICE: Opcode = Opcode::new(37);
-    pub(crate) const STORE_SUBSCR: Opcode = Opcode::new(38);
-    pub(crate) const TO_BOOL: Opcode = Opcode::new(39);
-    pub(crate) const UNARY_INVERT: Opcode = Opcode::new(40);
-    pub(crate) const UNARY_NEGATIVE: Opcode = Opcode::new(41);
-    pub(crate) const UNARY_NOT: Opcode = Opcode::new(42);
-    pub(crate) const WITH_EXCEPT_START: Opcode = Opcode::new(43);
-    pub(crate) const BINARY_OP: Opcode = Opcode::new(44);
-    pub(crate) const BUILD_INTERPOLATION: Opcode = Opcode::new(45);
-    pub(crate) const BUILD_LIST: Opcode = Opcode::new(46);
-    pub(crate) const BUILD_MAP: Opcode = Opcode::new(47);
-    pub(crate) const BUILD_SET: Opcode = Opcode::new(48);
-    pub(crate) const BUILD_SLICE: Opcode = Opcode::new(49);
-    pub(crate) const BUILD_STRING: Opcode = Opcode::new(50);
-    pub(crate) const BUILD_TUPLE: Opcode = Opcode::new(51);
-    pub(crate) const CALL: Opcode = Opcode::new(52);
-    pub(crate) const CALL_INTRINSIC_1: Opcode = Opcode::new(53);
-    pub(crate) const CALL_INTRINSIC_2: Opcode = Opcode::new(54);
-    pub(crate) const CALL_KW: Opcode = Opcode::new(55);
-    pub(crate) const COMPARE_OP: Opcode = Opcode::new(56);
-    pub(crate) const CONTAINS_OP: Opcode = Opcode::new(57);
-    pub(crate) const CONVERT_VALUE: Opcode = Opcode::new(58);
-    pub(crate) const COPY: Opcode = Opcode::new(59);
-    pub(crate) const COPY_FREE_VARS: Opcode = Opcode::new(60);
-    pub(crate) const DELETE_ATTR: Opcode = Opcode::new(61);
-    pub(crate) const DELETE_DEREF: Opcode = Opcode::new(62);
-    pub(crate) const DELETE_FAST: Opcode = Opcode::new(63);
-    pub(crate) const DELETE_GLOBAL: Opcode = Opcode::new(64);
-    pub(crate) const DELETE_NAME: Opcode = Opcode::new(65);
-    pub(crate) const DICT_MERGE: Opcode = Opcode::new(66);
-    pub(crate) const DICT_UPDATE: Opcode = Opcode::new(67);
-    pub(crate) const END_ASYNC_FOR: Opcode = Opcode::new(68);
-    pub(crate) const EXTENDED_ARG: Opcode = Opcode::new(69);
-    pub(crate) const FOR_ITER: Opcode = Opcode::new(70);
-    pub(crate) const GET_AWAITABLE: Opcode = Opcode::new(71);
-    pub(crate) const IMPORT_FROM: Opcode = Opcode::new(72);
-    pub(crate) const IMPORT_NAME: Opcode = Opcode::new(73);
-    pub(crate) const IS_OP: Opcode = Opcode::new(74);
-    pub(crate) const JUMP_BACKWARD: Opcode = Opcode::new(75);
-    pub(crate) const JUMP_BACKWARD_NO_INTERRUPT: Opcode = Opcode::new(76);
-    pub(crate) const JUMP_FORWARD: Opcode = Opcode::new(77);
-    pub(crate) const LIST_APPEND: Opcode = Opcode::new(78);
-    pub(crate) const LIST_EXTEND: Opcode = Opcode::new(79);
-    pub(crate) const LOAD_ATTR: Opcode = Opcode::new(80);
-    pub(crate) const LOAD_COMMON_CONSTANT: Opcode = Opcode::new(81);
-    pub(crate) const LOAD_CONST: Opcode = Opcode::new(82);
-    pub(crate) const LOAD_DEREF: Opcode = Opcode::new(83);
-    pub(crate) const LOAD_FAST: Opcode = Opcode::new(84);
-    pub(crate) const LOAD_FAST_AND_CLEAR: Opcode = Opcode::new(85);
-    pub(crate) const LOAD_FAST_BORROW: Opcode = Opcode::new(86);
-    pub(crate) const LOAD_FAST_BORROW_LOAD_FAST_BORROW: Opcode = Opcode::new(87);
-    pub(crate) const LOAD_FAST_CHECK: Opcode = Opcode::new(88);
-    pub(crate) const LOAD_FAST_LOAD_FAST: Opcode = Opcode::new(89);
-    pub(crate) const LOAD_FROM_DICT_OR_DEREF: Opcode = Opcode::new(90);
-    pub(crate) const LOAD_FROM_DICT_OR_GLOBALS: Opcode = Opcode::new(91);
-    pub(crate) const LOAD_GLOBAL: Opcode = Opcode::new(92);
-    pub(crate) const LOAD_NAME: Opcode = Opcode::new(93);
-    pub(crate) const LOAD_SMALL_INT: Opcode = Opcode::new(94);
-    pub(crate) const LOAD_SPECIAL: Opcode = Opcode::new(95);
-    pub(crate) const LOAD_SUPER_ATTR: Opcode = Opcode::new(96);
-    pub(crate) const MAKE_CELL: Opcode = Opcode::new(97);
-    pub(crate) const MAP_ADD: Opcode = Opcode::new(98);
-    pub(crate) const MATCH_CLASS: Opcode = Opcode::new(99);
-    pub(crate) const POP_JUMP_IF_FALSE: Opcode = Opcode::new(100);
-    pub(crate) const POP_JUMP_IF_NONE: Opcode = Opcode::new(101);
-    pub(crate) const POP_JUMP_IF_NOT_NONE: Opcode = Opcode::new(102);
-    pub(crate) const POP_JUMP_IF_TRUE: Opcode = Opcode::new(103);
-    pub(crate) const RAISE_VARARGS: Opcode = Opcode::new(104);
-    pub(crate) const RERAISE: Opcode = Opcode::new(105);
-    pub(crate) const SEND: Opcode = Opcode::new(106);
-    pub(crate) const SET_ADD: Opcode = Opcode::new(107);
-    pub(crate) const SET_FUNCTION_ATTRIBUTE: Opcode = Opcode::new(108);
-    pub(crate) const SET_UPDATE: Opcode = Opcode::new(109);
-    pub(crate) const STORE_ATTR: Opcode = Opcode::new(110);
-    pub(crate) const STORE_DEREF: Opcode = Opcode::new(111);
-    pub(crate) const STORE_FAST: Opcode = Opcode::new(112);
-    pub(crate) const STORE_FAST_LOAD_FAST: Opcode = Opcode::new(113);
-    pub(crate) const STORE_FAST_STORE_FAST: Opcode = Opcode::new(114);
-    pub(crate) const STORE_GLOBAL: Opcode = Opcode::new(115);
-    pub(crate) const STORE_NAME: Opcode = Opcode::new(116);
-    pub(crate) const SWAP: Opcode = Opcode::new(117);
-    pub(crate) const UNPACK_EX: Opcode = Opcode::new(118);
-    pub(crate) const UNPACK_SEQUENCE: Opcode = Opcode::new(119);
-    pub(crate) const YIELD_VALUE: Opcode = Opcode::new(120);
-    pub(crate) const RESUME: Opcode = Opcode::new(128);
+    pub const CACHE: Opcode = Opcode::new(0);
+    pub const BINARY_SLICE: Opcode = Opcode::new(1);
+    pub const BUILD_TEMPLATE: Opcode = Opcode::new(2);
+    pub const BINARY_OP_INPLACE_ADD_UNICODE: Opcode = Opcode::new(3);
+    pub const CALL_FUNCTION_EX: Opcode = Opcode::new(4);
+    pub const CHECK_EG_MATCH: Opcode = Opcode::new(5);
+    pub const CHECK_EXC_MATCH: Opcode = Opcode::new(6);
+    pub const CLEANUP_THROW: Opcode = Opcode::new(7);
+    pub const DELETE_SUBSCR: Opcode = Opcode::new(8);
+    pub const END_FOR: Opcode = Opcode::new(9);
+    pub const END_SEND: Opcode = Opcode::new(10);
+    pub const EXIT_INIT_CHECK: Opcode = Opcode::new(11);
+    pub const FORMAT_SIMPLE: Opcode = Opcode::new(12);
+    pub const FORMAT_WITH_SPEC: Opcode = Opcode::new(13);
+    pub const GET_AITER: Opcode = Opcode::new(14);
+    pub const GET_ANEXT: Opcode = Opcode::new(15);
+    pub const GET_ITER: Opcode = Opcode::new(16);
+    pub const RESERVED: Opcode = Opcode::new(17);
+    pub const GET_LEN: Opcode = Opcode::new(18);
+    pub const GET_YIELD_FROM_ITER: Opcode = Opcode::new(19);
+    pub const INTERPRETER_EXIT: Opcode = Opcode::new(20);
+    pub const LOAD_BUILD_CLASS: Opcode = Opcode::new(21);
+    pub const LOAD_LOCALS: Opcode = Opcode::new(22);
+    pub const MAKE_FUNCTION: Opcode = Opcode::new(23);
+    pub const MATCH_KEYS: Opcode = Opcode::new(24);
+    pub const MATCH_MAPPING: Opcode = Opcode::new(25);
+    pub const MATCH_SEQUENCE: Opcode = Opcode::new(26);
+    pub const NOP: Opcode = Opcode::new(27);
+    pub const NOT_TAKEN: Opcode = Opcode::new(28);
+    pub const POP_EXCEPT: Opcode = Opcode::new(29);
+    pub const POP_ITER: Opcode = Opcode::new(30);
+    pub const POP_TOP: Opcode = Opcode::new(31);
+    pub const PUSH_EXC_INFO: Opcode = Opcode::new(32);
+    pub const PUSH_NULL: Opcode = Opcode::new(33);
+    pub const RETURN_GENERATOR: Opcode = Opcode::new(34);
+    pub const RETURN_VALUE: Opcode = Opcode::new(35);
+    pub const SETUP_ANNOTATIONS: Opcode = Opcode::new(36);
+    pub const STORE_SLICE: Opcode = Opcode::new(37);
+    pub const STORE_SUBSCR: Opcode = Opcode::new(38);
+    pub const TO_BOOL: Opcode = Opcode::new(39);
+    pub const UNARY_INVERT: Opcode = Opcode::new(40);
+    pub const UNARY_NEGATIVE: Opcode = Opcode::new(41);
+    pub const UNARY_NOT: Opcode = Opcode::new(42);
+    pub const WITH_EXCEPT_START: Opcode = Opcode::new(43);
+    pub const BINARY_OP: Opcode = Opcode::new(44);
+    pub const BUILD_INTERPOLATION: Opcode = Opcode::new(45);
+    pub const BUILD_LIST: Opcode = Opcode::new(46);
+    pub const BUILD_MAP: Opcode = Opcode::new(47);
+    pub const BUILD_SET: Opcode = Opcode::new(48);
+    pub const BUILD_SLICE: Opcode = Opcode::new(49);
+    pub const BUILD_STRING: Opcode = Opcode::new(50);
+    pub const BUILD_TUPLE: Opcode = Opcode::new(51);
+    pub const CALL: Opcode = Opcode::new(52);
+    pub const CALL_INTRINSIC_1: Opcode = Opcode::new(53);
+    pub const CALL_INTRINSIC_2: Opcode = Opcode::new(54);
+    pub const CALL_KW: Opcode = Opcode::new(55);
+    pub const COMPARE_OP: Opcode = Opcode::new(56);
+    pub const CONTAINS_OP: Opcode = Opcode::new(57);
+    pub const CONVERT_VALUE: Opcode = Opcode::new(58);
+    pub const COPY: Opcode = Opcode::new(59);
+    pub const COPY_FREE_VARS: Opcode = Opcode::new(60);
+    pub const DELETE_ATTR: Opcode = Opcode::new(61);
+    pub const DELETE_DEREF: Opcode = Opcode::new(62);
+    pub const DELETE_FAST: Opcode = Opcode::new(63);
+    pub const DELETE_GLOBAL: Opcode = Opcode::new(64);
+    pub const DELETE_NAME: Opcode = Opcode::new(65);
+    pub const DICT_MERGE: Opcode = Opcode::new(66);
+    pub const DICT_UPDATE: Opcode = Opcode::new(67);
+    pub const END_ASYNC_FOR: Opcode = Opcode::new(68);
+    pub const EXTENDED_ARG: Opcode = Opcode::new(69);
+    pub const FOR_ITER: Opcode = Opcode::new(70);
+    pub const GET_AWAITABLE: Opcode = Opcode::new(71);
+    pub const IMPORT_FROM: Opcode = Opcode::new(72);
+    pub const IMPORT_NAME: Opcode = Opcode::new(73);
+    pub const IS_OP: Opcode = Opcode::new(74);
+    pub const JUMP_BACKWARD: Opcode = Opcode::new(75);
+    pub const JUMP_BACKWARD_NO_INTERRUPT: Opcode = Opcode::new(76);
+    pub const JUMP_FORWARD: Opcode = Opcode::new(77);
+    pub const LIST_APPEND: Opcode = Opcode::new(78);
+    pub const LIST_EXTEND: Opcode = Opcode::new(79);
+    pub const LOAD_ATTR: Opcode = Opcode::new(80);
+    pub const LOAD_COMMON_CONSTANT: Opcode = Opcode::new(81);
+    pub const LOAD_CONST: Opcode = Opcode::new(82);
+    pub const LOAD_DEREF: Opcode = Opcode::new(83);
+    pub const LOAD_FAST: Opcode = Opcode::new(84);
+    pub const LOAD_FAST_AND_CLEAR: Opcode = Opcode::new(85);
+    pub const LOAD_FAST_BORROW: Opcode = Opcode::new(86);
+    pub const LOAD_FAST_BORROW_LOAD_FAST_BORROW: Opcode = Opcode::new(87);
+    pub const LOAD_FAST_CHECK: Opcode = Opcode::new(88);
+    pub const LOAD_FAST_LOAD_FAST: Opcode = Opcode::new(89);
+    pub const LOAD_FROM_DICT_OR_DEREF: Opcode = Opcode::new(90);
+    pub const LOAD_FROM_DICT_OR_GLOBALS: Opcode = Opcode::new(91);
+    pub const LOAD_GLOBAL: Opcode = Opcode::new(92);
+    pub const LOAD_NAME: Opcode = Opcode::new(93);
+    pub const LOAD_SMALL_INT: Opcode = Opcode::new(94);
+    pub const LOAD_SPECIAL: Opcode = Opcode::new(95);
+    pub const LOAD_SUPER_ATTR: Opcode = Opcode::new(96);
+    pub const MAKE_CELL: Opcode = Opcode::new(97);
+    pub const MAP_ADD: Opcode = Opcode::new(98);
+    pub const MATCH_CLASS: Opcode = Opcode::new(99);
+    pub const POP_JUMP_IF_FALSE: Opcode = Opcode::new(100);
+    pub const POP_JUMP_IF_NONE: Opcode = Opcode::new(101);
+    pub const POP_JUMP_IF_NOT_NONE: Opcode = Opcode::new(102);
+    pub const POP_JUMP_IF_TRUE: Opcode = Opcode::new(103);
+    pub const RAISE_VARARGS: Opcode = Opcode::new(104);
+    pub const RERAISE: Opcode = Opcode::new(105);
+    pub const SEND: Opcode = Opcode::new(106);
+    pub const SET_ADD: Opcode = Opcode::new(107);
+    pub const SET_FUNCTION_ATTRIBUTE: Opcode = Opcode::new(108);
+    pub const SET_UPDATE: Opcode = Opcode::new(109);
+    pub const STORE_ATTR: Opcode = Opcode::new(110);
+    pub const STORE_DEREF: Opcode = Opcode::new(111);
+    pub const STORE_FAST: Opcode = Opcode::new(112);
+    pub const STORE_FAST_LOAD_FAST: Opcode = Opcode::new(113);
+    pub const STORE_FAST_STORE_FAST: Opcode = Opcode::new(114);
+    pub const STORE_GLOBAL: Opcode = Opcode::new(115);
+    pub const STORE_NAME: Opcode = Opcode::new(116);
+    pub const SWAP: Opcode = Opcode::new(117);
+    pub const UNPACK_EX: Opcode = Opcode::new(118);
+    pub const UNPACK_SEQUENCE: Opcode = Opcode::new(119);
+    pub const YIELD_VALUE: Opcode = Opcode::new(120);
+    pub const RESUME: Opcode = Opcode::new(128);
 }
 
 impl Opcode {
     /// Returns the inline-cache width generated from the pinned opcode metadata.
-    pub(crate) const fn caches(self) -> u8 {
+    pub const fn caches(self) -> u8 {
         match self {
             opcodes::STORE_SUBSCR => 1,
             opcodes::TO_BOOL => 3,
@@ -3799,7 +3799,7 @@ pub(crate) fn is_preinterned_string(value: &str) -> bool {
 }
 
 impl Opcode {
-    pub(crate) const fn has_jump(self) -> bool {
+    pub const fn has_jump(self) -> bool {
         matches!(
             self,
             opcodes::END_ASYNC_FOR
@@ -3841,117 +3841,118 @@ pub(crate) const fn is_conditional_jump(opcode: Opcode) -> bool {
 }
 
 #[allow(dead_code)]
-pub(crate) mod operands {
+pub mod operands {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct UnaryIntrinsic(u32);
+    pub struct UnaryIntrinsic(u32);
 
     #[allow(dead_code)]
     impl UnaryIntrinsic {
-        pub(crate) const PRINT: Self = Self(1);
-        pub(crate) const IMPORT_STAR: Self = Self(2);
-        pub(crate) const STOPITERATION_ERROR: Self = Self(3);
-        pub(crate) const ASYNC_GEN_WRAP: Self = Self(4);
-        pub(crate) const UNARY_POSITIVE: Self = Self(5);
-        pub(crate) const LIST_TO_TUPLE: Self = Self(6);
-        pub(crate) const TYPEVAR: Self = Self(7);
-        pub(crate) const PARAMSPEC: Self = Self(8);
-        pub(crate) const TYPEVARTUPLE: Self = Self(9);
-        pub(crate) const SUBSCRIPT_GENERIC: Self = Self(10);
-        pub(crate) const TYPEALIAS: Self = Self(11);
+        pub const PRINT: Self = Self(1);
+        pub const IMPORT_STAR: Self = Self(2);
+        pub const STOPITERATION_ERROR: Self = Self(3);
+        pub const ASYNC_GEN_WRAP: Self = Self(4);
+        pub const UNARY_POSITIVE: Self = Self(5);
+        pub const LIST_TO_TUPLE: Self = Self(6);
+        pub const TYPEVAR: Self = Self(7);
+        pub const PARAMSPEC: Self = Self(8);
+        pub const TYPEVARTUPLE: Self = Self(9);
+        pub const SUBSCRIPT_GENERIC: Self = Self(10);
+        pub const TYPEALIAS: Self = Self(11);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct BinaryIntrinsic(u32);
+    pub struct BinaryIntrinsic(u32);
 
     #[allow(dead_code)]
     impl BinaryIntrinsic {
-        pub(crate) const PREP_RERAISE_STAR: Self = Self(1);
-        pub(crate) const TYPEVAR_WITH_BOUND: Self = Self(2);
-        pub(crate) const TYPEVAR_WITH_CONSTRAINTS: Self = Self(3);
-        pub(crate) const SET_FUNCTION_TYPE_PARAMS: Self = Self(4);
-        pub(crate) const SET_TYPEPARAM_DEFAULT: Self = Self(5);
+        pub const PREP_RERAISE_STAR: Self = Self(1);
+        pub const TYPEVAR_WITH_BOUND: Self = Self(2);
+        pub const TYPEVAR_WITH_CONSTRAINTS: Self = Self(3);
+        pub const SET_FUNCTION_TYPE_PARAMS: Self = Self(4);
+        pub const SET_TYPEPARAM_DEFAULT: Self = Self(5);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct FunctionAttribute(u32);
+    pub struct FunctionAttribute(u32);
 
     #[allow(dead_code)]
     impl FunctionAttribute {
-        pub(crate) const DEFAULTS: Self = Self(1);
-        pub(crate) const KWDEFAULTS: Self = Self(2);
-        pub(crate) const ANNOTATIONS: Self = Self(4);
-        pub(crate) const CLOSURE: Self = Self(8);
-        pub(crate) const ANNOTATE: Self = Self(16);
+        pub const DEFAULTS: Self = Self(1);
+        pub const KWDEFAULTS: Self = Self(2);
+        pub const ANNOTATIONS: Self = Self(4);
+        pub const CLOSURE: Self = Self(8);
+        pub const ANNOTATE: Self = Self(16);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct CommonConstant(u32);
+    pub struct CommonConstant(u32);
 
     #[allow(dead_code)]
     impl CommonConstant {
-        pub(crate) const ASSERTIONERROR: Self = Self(0);
-        pub(crate) const NOTIMPLEMENTEDERROR: Self = Self(1);
-        pub(crate) const BUILTIN_TUPLE: Self = Self(2);
-        pub(crate) const BUILTIN_ALL: Self = Self(3);
-        pub(crate) const BUILTIN_ANY: Self = Self(4);
+        pub const ASSERTIONERROR: Self = Self(0);
+        pub const NOTIMPLEMENTEDERROR: Self = Self(1);
+        pub const BUILTIN_TUPLE: Self = Self(2);
+        pub const BUILTIN_ALL: Self = Self(3);
+        pub const BUILTIN_ANY: Self = Self(4);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct BinaryOperation(u32);
+    pub struct BinaryOperation(u32);
 
     #[allow(dead_code)]
     impl BinaryOperation {
-        pub(crate) const ADD: Self = Self(0);
-        pub(crate) const AND: Self = Self(1);
-        pub(crate) const FLOOR_DIVIDE: Self = Self(2);
-        pub(crate) const LSHIFT: Self = Self(3);
-        pub(crate) const MATRIX_MULTIPLY: Self = Self(4);
-        pub(crate) const MULTIPLY: Self = Self(5);
-        pub(crate) const REMAINDER: Self = Self(6);
-        pub(crate) const OR: Self = Self(7);
-        pub(crate) const POWER: Self = Self(8);
-        pub(crate) const RSHIFT: Self = Self(9);
-        pub(crate) const SUBTRACT: Self = Self(10);
-        pub(crate) const TRUE_DIVIDE: Self = Self(11);
-        pub(crate) const XOR: Self = Self(12);
-        pub(crate) const INPLACE_ADD: Self = Self(13);
-        pub(crate) const INPLACE_AND: Self = Self(14);
-        pub(crate) const INPLACE_FLOOR_DIVIDE: Self = Self(15);
-        pub(crate) const INPLACE_LSHIFT: Self = Self(16);
-        pub(crate) const INPLACE_MATRIX_MULTIPLY: Self = Self(17);
-        pub(crate) const INPLACE_MULTIPLY: Self = Self(18);
-        pub(crate) const INPLACE_REMAINDER: Self = Self(19);
-        pub(crate) const INPLACE_OR: Self = Self(20);
-        pub(crate) const INPLACE_POWER: Self = Self(21);
-        pub(crate) const INPLACE_RSHIFT: Self = Self(22);
-        pub(crate) const INPLACE_SUBTRACT: Self = Self(23);
-        pub(crate) const INPLACE_TRUE_DIVIDE: Self = Self(24);
-        pub(crate) const INPLACE_XOR: Self = Self(25);
-        pub(crate) const SUBSCR: Self = Self(26);
+        pub const ADD: Self = Self(0);
+        pub const AND: Self = Self(1);
+        pub const FLOOR_DIVIDE: Self = Self(2);
+        pub const LSHIFT: Self = Self(3);
+        pub const MATRIX_MULTIPLY: Self = Self(4);
+        pub const MULTIPLY: Self = Self(5);
+        pub const REMAINDER: Self = Self(6);
+        pub const OR: Self = Self(7);
+        pub const POWER: Self = Self(8);
+        pub const RSHIFT: Self = Self(9);
+        pub const SUBTRACT: Self = Self(10);
+        pub const TRUE_DIVIDE: Self = Self(11);
+        pub const XOR: Self = Self(12);
+        pub const INPLACE_ADD: Self = Self(13);
+        pub const INPLACE_AND: Self = Self(14);
+        pub const INPLACE_FLOOR_DIVIDE: Self = Self(15);
+        pub const INPLACE_LSHIFT: Self = Self(16);
+        pub const INPLACE_MATRIX_MULTIPLY: Self = Self(17);
+        pub const INPLACE_MULTIPLY: Self = Self(18);
+        pub const INPLACE_REMAINDER: Self = Self(19);
+        pub const INPLACE_OR: Self = Self(20);
+        pub const INPLACE_POWER: Self = Self(21);
+        pub const INPLACE_RSHIFT: Self = Self(22);
+        pub const INPLACE_SUBTRACT: Self = Self(23);
+        pub const INPLACE_TRUE_DIVIDE: Self = Self(24);
+        pub const INPLACE_XOR: Self = Self(25);
+        pub const SUBSCR: Self = Self(26);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
     impl BinaryOperation {
-        pub(crate) const fn inplace(self) -> Self {
+        #[must_use]
+        pub const fn inplace(self) -> Self {
             match self {
                 Self::ADD => Self::INPLACE_ADD,
                 Self::AND => Self::INPLACE_AND,
@@ -3973,117 +3974,117 @@ pub(crate) mod operands {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct ComparisonOperation(u32);
+    pub struct ComparisonOperation(u32);
 
     #[allow(dead_code)]
     impl ComparisonOperation {
-        pub(crate) const LT: Self = Self(2);
-        pub(crate) const LE: Self = Self(42);
-        pub(crate) const EQ: Self = Self(72);
-        pub(crate) const NE: Self = Self(103);
-        pub(crate) const GT: Self = Self(132);
-        pub(crate) const GE: Self = Self(172);
+        pub const LT: Self = Self(2);
+        pub const LE: Self = Self(42);
+        pub const EQ: Self = Self(72);
+        pub const NE: Self = Self(103);
+        pub const GT: Self = Self(132);
+        pub const GE: Self = Self(172);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
     impl ComparisonOperation {
-        pub(crate) const fn boolean_argument(self) -> u32 {
+        pub const fn boolean_argument(self) -> u32 {
             self.0 | 16
         }
 
-        pub(crate) const fn force_boolean(argument: u32) -> u32 {
+        pub const fn force_boolean(argument: u32) -> u32 {
             argument | 16
         }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct ResumeLocation(u32);
+    pub struct ResumeLocation(u32);
 
     #[allow(dead_code)]
     impl ResumeLocation {
-        pub(crate) const AT_FUNC_START: Self = Self(0);
-        pub(crate) const AFTER_YIELD: Self = Self(1);
-        pub(crate) const AFTER_YIELD_FROM: Self = Self(2);
-        pub(crate) const AFTER_AWAIT: Self = Self(3);
+        pub const AT_FUNC_START: Self = Self(0);
+        pub const AFTER_YIELD: Self = Self(1);
+        pub const AFTER_YIELD_FROM: Self = Self(2);
+        pub const AFTER_AWAIT: Self = Self(3);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
     impl ResumeLocation {
-        pub(crate) const fn at_depth(self, depth_one: bool) -> u32 {
+        pub const fn at_depth(self, depth_one: bool) -> u32 {
             let location = self.0 & 3;
             if depth_one { location | 4 } else { location }
         }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct Conversion(u32);
+    pub struct Conversion(u32);
 
     #[allow(dead_code)]
     impl Conversion {
-        pub(crate) const NONE: Self = Self(0);
-        pub(crate) const STR: Self = Self(1);
-        pub(crate) const REPR: Self = Self(2);
-        pub(crate) const ASCII: Self = Self(3);
+        pub const NONE: Self = Self(0);
+        pub const STR: Self = Self(1);
+        pub const REPR: Self = Self(2);
+        pub const ASCII: Self = Self(3);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct SpecialMethod(u32);
+    pub struct SpecialMethod(u32);
 
     #[allow(dead_code)]
     impl SpecialMethod {
-        pub(crate) const __ENTER__: Self = Self(0);
-        pub(crate) const __EXIT__: Self = Self(1);
-        pub(crate) const __AENTER__: Self = Self(2);
-        pub(crate) const __AEXIT__: Self = Self(3);
+        pub const __ENTER__: Self = Self(0);
+        pub const __EXIT__: Self = Self(1);
+        pub const __AENTER__: Self = Self(2);
+        pub const __AEXIT__: Self = Self(3);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 }
 
 #[allow(dead_code)]
-pub(crate) mod code_flags {
-    pub(crate) const CO_OPTIMIZED: u32 = 0x0000_0001;
-    pub(crate) const CO_NEWLOCALS: u32 = 0x0000_0002;
-    pub(crate) const CO_VARARGS: u32 = 0x0000_0004;
-    pub(crate) const CO_VARKEYWORDS: u32 = 0x0000_0008;
-    pub(crate) const CO_NESTED: u32 = 0x0000_0010;
-    pub(crate) const CO_GENERATOR: u32 = 0x0000_0020;
-    pub(crate) const CO_COROUTINE: u32 = 0x0000_0080;
-    pub(crate) const CO_ITERABLE_COROUTINE: u32 = 0x0000_0100;
-    pub(crate) const CO_ASYNC_GENERATOR: u32 = 0x0000_0200;
-    pub(crate) const CO_FUTURE_DIVISION: u32 = 0x0002_0000;
-    pub(crate) const CO_FUTURE_ABSOLUTE_IMPORT: u32 = 0x0004_0000;
-    pub(crate) const CO_FUTURE_WITH_STATEMENT: u32 = 0x0008_0000;
-    pub(crate) const CO_FUTURE_PRINT_FUNCTION: u32 = 0x0010_0000;
-    pub(crate) const CO_FUTURE_UNICODE_LITERALS: u32 = 0x0020_0000;
-    pub(crate) const CO_FUTURE_BARRY_AS_BDFL: u32 = 0x0040_0000;
-    pub(crate) const CO_FUTURE_GENERATOR_STOP: u32 = 0x0080_0000;
-    pub(crate) const CO_FUTURE_ANNOTATIONS: u32 = 0x0100_0000;
-    pub(crate) const CO_NO_MONITORING_EVENTS: u32 = 0x0200_0000;
-    pub(crate) const CO_HAS_DOCSTRING: u32 = 0x0400_0000;
-    pub(crate) const CO_METHOD: u32 = 0x0800_0000;
+pub mod code_flags {
+    pub const CO_OPTIMIZED: u32 = 0x0000_0001;
+    pub const CO_NEWLOCALS: u32 = 0x0000_0002;
+    pub const CO_VARARGS: u32 = 0x0000_0004;
+    pub const CO_VARKEYWORDS: u32 = 0x0000_0008;
+    pub const CO_NESTED: u32 = 0x0000_0010;
+    pub const CO_GENERATOR: u32 = 0x0000_0020;
+    pub const CO_COROUTINE: u32 = 0x0000_0080;
+    pub const CO_ITERABLE_COROUTINE: u32 = 0x0000_0100;
+    pub const CO_ASYNC_GENERATOR: u32 = 0x0000_0200;
+    pub const CO_FUTURE_DIVISION: u32 = 0x0002_0000;
+    pub const CO_FUTURE_ABSOLUTE_IMPORT: u32 = 0x0004_0000;
+    pub const CO_FUTURE_WITH_STATEMENT: u32 = 0x0008_0000;
+    pub const CO_FUTURE_PRINT_FUNCTION: u32 = 0x0010_0000;
+    pub const CO_FUTURE_UNICODE_LITERALS: u32 = 0x0020_0000;
+    pub const CO_FUTURE_BARRY_AS_BDFL: u32 = 0x0040_0000;
+    pub const CO_FUTURE_GENERATOR_STOP: u32 = 0x0080_0000;
+    pub const CO_FUTURE_ANNOTATIONS: u32 = 0x0100_0000;
+    pub const CO_NO_MONITORING_EVENTS: u32 = 0x0200_0000;
+    pub const CO_HAS_DOCSTRING: u32 = 0x0400_0000;
+    pub const CO_METHOD: u32 = 0x0800_0000;
 }
 
-pub(crate) mod local_kinds {
-    pub(crate) const CO_FAST_ARG_POS: u8 = 0x02;
-    pub(crate) const CO_FAST_ARG_KW: u8 = 0x04;
-    pub(crate) const CO_FAST_ARG_VAR: u8 = 0x08;
-    pub(crate) const CO_FAST_HIDDEN: u8 = 0x10;
-    pub(crate) const CO_FAST_LOCAL: u8 = 0x20;
-    pub(crate) const CO_FAST_CELL: u8 = 0x40;
-    pub(crate) const CO_FAST_FREE: u8 = 0x80;
+pub mod local_kinds {
+    pub const CO_FAST_ARG_POS: u8 = 0x02;
+    pub const CO_FAST_ARG_KW: u8 = 0x04;
+    pub const CO_FAST_ARG_VAR: u8 = 0x08;
+    pub const CO_FAST_HIDDEN: u8 = 0x10;
+    pub const CO_FAST_LOCAL: u8 = 0x20;
+    pub const CO_FAST_CELL: u8 = 0x40;
+    pub const CO_FAST_FREE: u8 = 0x80;
 }
 
 pub(crate) fn stack_counts(opcode: Opcode, argument: u32) -> (usize, usize) {

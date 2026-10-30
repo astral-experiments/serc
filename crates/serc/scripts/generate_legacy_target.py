@@ -59,7 +59,7 @@ def render_legacy_opcodes(metadata: dict) -> str:
         "",
     ]
     for code, name in enumerate(LEGACY_OPCODES, 129):
-        lines.append(f"pub(crate) const {name}: Opcode = Opcode::new({code});")
+        lines.append(f"pub const {name}: Opcode = Opcode::new({code});")
     return "\n".join(lines) + "\n"
 
 
@@ -194,7 +194,7 @@ def render_legacy_target(sources: dict[str, str], g) -> str:
     )
     lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
     lines.extend(lookup)
-    lines.extend(["", "#[allow(dead_code)]", "pub(crate) mod operands {"])
+    lines.extend(["", "#[allow(dead_code)]", "pub mod operands {"])
     render_operands(lines, sources, g)
     lines.extend(["}", "", "#[allow(dead_code)]", "pub(crate) mod code_flags {"])
     for name, value in g.parse_numeric_defines(
@@ -257,7 +257,8 @@ def render_operands(lines: list[str], sources: dict[str, str], g) -> None:
     lines.extend(
         [
             "    impl BinaryOperation {",
-            "        pub(crate) const fn inplace(self) -> Self {",
+            "        #[must_use]",
+            "        pub const fn inplace(self) -> Self {",
             "            match self {",
         ]
     )
@@ -302,7 +303,7 @@ def render_operands(lines: list[str], sources: dict[str, str], g) -> None:
         )
     ]
     g.render_operand_type(lines, "ComparisonOperation", operations, "")
-    lines.append(f"    pub(crate) const COMPARISON_SHIFT: u32 = {shift};")
+    lines.append(f"    pub const COMPARISON_SHIFT: u32 = {shift};")
     if g.TARGET_MINOR == "3.13":
         boolean_mask = int(
             g.require_match(
@@ -314,10 +315,10 @@ def render_operands(lines: list[str], sources: dict[str, str], g) -> None:
         lines.extend(
             [
                 "    impl ComparisonOperation {",
-                "        pub(crate) const fn boolean_argument(self) -> u32 {",
+                "        pub const fn boolean_argument(self) -> u32 {",
                 f"            self.0 | {boolean_mask}",
                 "        }",
-                "        pub(crate) const fn force_boolean(argument: u32) -> u32 {",
+                "        pub const fn force_boolean(argument: u32) -> u32 {",
                 f"            argument | {boolean_mask}",
                 "        }",
                 "    }",
@@ -335,7 +336,7 @@ def render_operands(lines: list[str], sources: dict[str, str], g) -> None:
         lines.extend(
             [
                 "    impl ResumeLocation {",
-                "        pub(crate) const fn at_depth(self, depth_one: bool) -> u32 {",
+                "        pub const fn at_depth(self, depth_one: bool) -> u32 {",
                 f"            (self.0 & {values['RESUME_OPARG_LOCATION_MASK']})",
                 f"                | if depth_one {{ {values['RESUME_OPARG_DEPTH1_MASK']} }} else {{ 0 }}",
                 "        }",

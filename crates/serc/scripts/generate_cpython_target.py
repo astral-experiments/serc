@@ -148,8 +148,9 @@ STARTUP_INTERNED_STRINGS = (
 UNIX_STARTUP_INTERNED_STRINGS = ("pause",)
 
 CRATE_ROOT = Path(__file__).resolve().parents[1]
-OUTPUT = CRATE_ROOT / "src" / "target" / "cpython_3_14_5.rs"
-MARSHAL_OUTPUT = CRATE_ROOT / "src" / "marshal" / "v5.rs"
+BYTECODE_ROOT = CRATE_ROOT.parent / "serc_bytecode"
+OUTPUT = BYTECODE_ROOT / "src" / "target" / "cpython_3_14_5.rs"
+MARSHAL_OUTPUT = BYTECODE_ROOT / "src" / "marshal" / "v5.rs"
 STARTUP_314_INPUT = "scripts/target_metadata/cpython_3_14_5_startup.json"
 STARTUP_314_SHA256 = "2f4c1896da530468f57bd870ae893498da6e84b93c93dabfe773a1c4bd828bc5"
 STARTUP_315_INPUT = "scripts/target_metadata/cpython_3_15_0rc2_startup.json"
@@ -344,8 +345,8 @@ def select_target_version(version: str) -> None:
     )
     MARSHAL_INPUTS = (marshal_header, "Python/marshal.c")
     module = TARGET_TAG.removeprefix("v").replace(".", "_")
-    OUTPUT = CRATE_ROOT / "src" / "target" / f"cpython_{module}.rs"
-    MARSHAL_OUTPUT = CRATE_ROOT / "src" / "marshal" / f"v{marshal_version}.rs"
+    OUTPUT = BYTECODE_ROOT / "src" / "target" / f"cpython_{module}.rs"
+    MARSHAL_OUTPUT = BYTECODE_ROOT / "src" / "marshal" / f"v{marshal_version}.rs"
 
 
 def parse_args() -> argparse.Namespace:
@@ -735,7 +736,7 @@ def render_operand_type(
     lines.extend(
         [
             "    #[derive(Clone, Copy, Debug, Eq, PartialEq)]",
-            f"    pub(crate) struct {type_name}(u32);",
+            f"    pub struct {type_name}(u32);",
             "",
             "    #[allow(dead_code)]",
             f"    impl {type_name} {{",
@@ -743,13 +744,11 @@ def render_operand_type(
     )
     for name, value in definitions:
         associated_name = name.removeprefix(prefix)
-        lines.append(
-            f"        pub(crate) const {associated_name}: Self = Self({value});"
-        )
+        lines.append(f"        pub const {associated_name}: Self = Self({value});")
     lines.extend(
         [
             "",
-            "        pub(crate) const fn argument(self) -> u32 {",
+            "        pub const fn argument(self) -> u32 {",
             "            self.0",
             "        }",
             "    }",
@@ -786,7 +785,7 @@ def parse_import_modes(source: str) -> tuple[int, list[tuple[str, int]]]:
 def decoder_opcodes(opcodes: list[tuple[str, int]]) -> list[str]:
     """Map on-disk IDs to semantic opcodes, excluding compiler-only aliases."""
     return [
-        '#[cfg(feature = "decompile")]',
+        '#[cfg(feature = "read")]',
         "pub(crate) fn decode_opcode(byte: u8) -> Option<(Opcode, &'static str)> {",
         "    match byte {",
         *(
@@ -1120,14 +1119,14 @@ def render(sources: dict[str, str]) -> str:
     if TARGET_MINOR == "3.14":
         lines.extend(["pub(crate) mod opcodes {", "    use super::Opcode;", ""])
         for name, code in opcodes:
-            lines.append(f"    pub(crate) const {name}: Opcode = Opcode::new({code});")
+            lines.append(f"    pub const {name}: Opcode = Opcode::new({code});")
         lines.extend(
             [
                 "}",
                 "",
                 "impl Opcode {",
                 "    /// Returns the inline-cache width generated from the pinned opcode metadata.",
-                "    pub(crate) const fn caches(self) -> u8 {",
+                "    pub const fn caches(self) -> u8 {",
                 "        match self {",
             ]
         )
@@ -1135,7 +1134,7 @@ def render(sources: dict[str, str]) -> str:
         # The IR keeps semantic identities from the original target. Only the
         # encoding boundary translates them to the selected target's IDs.
         semantic_names = parse_opcodes_from_generated_names(
-            CRATE_ROOT / "src" / "target" / "cpython_3_14_5.rs"
+            BYTECODE_ROOT / "src" / "target" / "cpython_3_14_5.rs"
         )
         missing = opcode_names - semantic_names
         if missing:
@@ -1289,7 +1288,7 @@ def render(sources: dict[str, str]) -> str:
             [
                 "",
                 "impl Opcode {",
-                "    pub(crate) const fn has_jump(self) -> bool {",
+                "    pub const fn has_jump(self) -> bool {",
                 f"        {expression}",
                 "    }",
                 "}",
@@ -1317,7 +1316,7 @@ def render(sources: dict[str, str]) -> str:
             ]
         )
 
-    lines.extend(["#[allow(dead_code)]", "pub(crate) mod operands {"])
+    lines.extend(["#[allow(dead_code)]", "pub mod operands {"])
     render_operand_type(lines, "UnaryIntrinsic", unary_intrinsics, "INTRINSIC_")
     render_operand_type(lines, "BinaryIntrinsic", binary_intrinsics, "INTRINSIC_")
     render_operand_type(
@@ -1328,7 +1327,8 @@ def render(sources: dict[str, str]) -> str:
     lines.extend(
         [
             "    impl BinaryOperation {",
-            "        pub(crate) const fn inplace(self) -> Self {",
+            "        #[must_use]",
+            "        pub const fn inplace(self) -> Self {",
             "            match self {",
         ]
     )
@@ -1354,11 +1354,11 @@ def render(sources: dict[str, str]) -> str:
     lines.extend(
         [
             "    impl ComparisonOperation {",
-            "        pub(crate) const fn boolean_argument(self) -> u32 {",
+            "        pub const fn boolean_argument(self) -> u32 {",
             f"            self.0 | {comparison_boolean_mask}",
             "        }",
             "",
-            "        pub(crate) const fn force_boolean(argument: u32) -> u32 {",
+            "        pub const fn force_boolean(argument: u32) -> u32 {",
             f"            argument | {comparison_boolean_mask}",
             "        }",
             "    }",
@@ -1369,7 +1369,7 @@ def render(sources: dict[str, str]) -> str:
     lines.extend(
         [
             "    impl ResumeLocation {",
-            "        pub(crate) const fn at_depth(self, depth_one: bool) -> u32 {",
+            "        pub const fn at_depth(self, depth_one: bool) -> u32 {",
             "            let location = self.0 & "
             f"{resume_values['RESUME_OPARG_LOCATION_MASK']};",
             "            if depth_one {",
@@ -1389,7 +1389,7 @@ def render(sources: dict[str, str]) -> str:
             [
                 "    impl ImportMode {",
                 "        /// Encode a name-table index with the selected import behavior.",
-                "        pub(crate) const fn encode_name(self, index: u32) -> u32 {",
+                "        pub const fn encode_name(self, index: u32) -> u32 {",
                 f"            (index << {import_shift}) | self.0",
                 "        }",
                 "    }",
@@ -1403,17 +1403,18 @@ def render(sources: dict[str, str]) -> str:
         render_operand_type(lines, "IteratorMode", iterator_modes, "GET_ITER_")
     render_operand_type(lines, "Conversion", conversions, "FVC_")
     render_operand_type(lines, "SpecialMethod", special_methods, "SPECIAL_")
-    lines.extend(["}", "", "#[allow(dead_code)]", "pub(crate) mod code_flags {"])
+    visibility = "pub" if TARGET_MINOR == "3.14" else "pub(crate)"
+    lines.extend(["}", "", "#[allow(dead_code)]", f"{visibility} mod code_flags {{"])
     for name, value in code_flags:
-        lines.append(f"    pub(crate) const {name}: u32 = {rust_hex(value, 8)};")
+        lines.append(f"    {visibility} const {name}: u32 = {rust_hex(value, 8)};")
     lines.extend(["}", ""])
     if TARGET_MINOR == "3.15":
         # Both targets currently share the local layout, but retain the selected
         # release's authoritative definitions for verification and future changes.
         lines.append("#[allow(dead_code)]")
-    lines.append("pub(crate) mod local_kinds {")
+    lines.append(f"{visibility} mod local_kinds {{")
     for name, value in local_kinds:
-        lines.append(f"    pub(crate) const {name}: u8 = {rust_hex(value, 2)};")
+        lines.append(f"    {visibility} const {name}: u8 = {rust_hex(value, 2)};")
     lines.extend(["}", ""])
 
     lines.extend(
@@ -1527,12 +1528,12 @@ def render_marshal(sources: dict[str, str]) -> str:
             "",
             "#![allow(dead_code)]",
             "",
-            f"pub(super) const MARSHAL_VERSION: u8 = {version};",
-            f"pub(super) const FLAG_REF: u8 = {rust_byte(flag_ref)};",
+            f"pub const MARSHAL_VERSION: u8 = {version};",
+            f"pub const FLAG_REF: u8 = {rust_byte(flag_ref)};",
         ]
     )
     for name, value in tags:
-        lines.append(f"pub(super) const {name}: u8 = {rust_byte(value)};")
+        lines.append(f"pub const {name}: u8 = {rust_byte(value)};")
     lines.append("")
     return "\n".join(lines)
 
@@ -1557,7 +1558,7 @@ def check_numeric_authority() -> None:
     )
     opcode_names = parse_opcodes_from_generated_names()
     for path in paths:
-        relative = path.relative_to(CRATE_ROOT)
+        relative = path.relative_to(CRATE_ROOT.parent)
         source = path.read_text()
         if re.search(r"Opcode::new\s*\(", source):
             raise ValueError(f"{relative} constructs Opcode outside the target module")
@@ -1574,10 +1575,13 @@ def check_numeric_authority() -> None:
             if re.search(pattern, source, re.MULTILINE):
                 raise ValueError(f"{relative} duplicates numeric opcode {name}")
 
-    for path in sorted((CRATE_ROOT / "src" / "marshal").rglob("*.rs")):
+    marshal_paths = (root / "src" / "marshal" for root in (CRATE_ROOT, BYTECODE_ROOT))
+    for path in sorted(
+        path for directory in marshal_paths for path in directory.rglob("*.rs")
+    ):
         if path.name in {"v4.rs", "v5.rs", "v6.rs"}:
             continue
-        relative = path.relative_to(CRATE_ROOT)
+        relative = path.relative_to(CRATE_ROOT.parent)
         if re.search(
             r"^\s*const\s+(?:FLAG_REF|MARSHAL_VERSION|TYPE_[A-Z0-9_]+)\s*:",
             path.read_text(),
@@ -1589,13 +1593,13 @@ def check_numeric_authority() -> None:
 
 
 def parse_opcodes_from_generated_names(
-    output: Path = CRATE_ROOT / "src" / "target" / "cpython_3_14_5.rs",
+    output: Path = BYTECODE_ROOT / "src" / "target" / "cpython_3_14_5.rs",
 ) -> set[str]:
     if not output.exists():
         return set()
     return set(
         re.findall(
-            r"^\s*pub\(crate\) const ([A-Z][A-Z0-9_]*): Opcode",
+            r"^\s*pub const ([A-Z][A-Z0-9_]*): Opcode",
             output.read_text(),
             re.MULTILINE,
         )
@@ -1620,7 +1624,7 @@ def main() -> int:
             )(sources)
             outputs.append(
                 (
-                    CRATE_ROOT / "src" / "target" / "legacy_opcodes.rs",
+                    BYTECODE_ROOT / "src" / "target" / "legacy_opcodes.rs",
                     format_rust(render_legacy_opcodes(metadata)),
                 )
             )

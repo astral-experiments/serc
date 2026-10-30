@@ -1,0 +1,21 @@
+[package]
+name = "serc_bytecode"
+version = "0.1.9"
+description = "Pinned CPython bytecode and marshal formats for serc."
+edition = { workspace = true }
+rust-version = { workspace = true }
+homepage = { workspace = true }
+repository = { workspace = true }
+authors = { workspace = true }
+license = { workspace = true }
+
+[lints]
+workspace = true
+
+[features]
+read = ["dep:stacker"]
+
+[dependencies]
+rustc-hash = { workspace = true }
+siphasher = { workspace = true }
+stacker = { workspace = true, optional = true }

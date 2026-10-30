@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parent.parent
 def release_version(root: Path) -> str:
     manifests = [
         ("crates/serc/Cargo.toml", "package"),
+        ("crates/serc_bytecode/Cargo.toml", "package"),
         ("crates/serc_cli/Cargo.toml", "package"),
         ("dist-workspace.toml", "workspace"),
     ]
@@ -20,8 +21,20 @@ def release_version(root: Path) -> str:
         filename: tomllib.loads((root / filename).read_text())[section]["version"]
         for filename, section in manifests
     }
-    cli = tomllib.loads((root / "crates/serc_cli/Cargo.toml").read_text())
-    versions["CLI serc dependency"] = cli["dependencies"]["serc"]["version"]
+    for filename, section in manifests:
+        if section != "package":
+            continue
+        manifest = tomllib.loads((root / filename).read_text())
+        for section_name in ("dependencies", "dev-dependencies"):
+            for name, dependency in manifest.get(section_name, {}).items():
+                if (
+                    isinstance(dependency, dict)
+                    and "path" in dependency
+                    and "version" in dependency
+                ):
+                    versions[f"{filename} {section_name}.{name}"] = dependency[
+                        "version"
+                    ]
     if len(set(versions.values())) != 1:
         raise ValueError(f"Release versions disagree: {versions}")
     version = next(iter(versions.values()))

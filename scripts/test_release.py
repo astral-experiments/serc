@@ -54,6 +54,7 @@ class ReleaseTests(unittest.TestCase):
                 for filename in (
                     "pyproject.toml",
                     "crates/serc/Cargo.toml",
+                    "crates/serc_bytecode/Cargo.toml",
                     "crates/serc_cli/Cargo.toml",
                     "dist-workspace.toml",
                 ):

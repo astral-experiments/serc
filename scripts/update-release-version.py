@@ -17,6 +17,7 @@ def update_versions(root: Path) -> str:
     for filename, section in [
         ("pyproject.toml", "project"),
         ("crates/serc/Cargo.toml", "package"),
+        ("crates/serc_bytecode/Cargo.toml", "package"),
         ("crates/serc_cli/Cargo.toml", "package"),
         ("dist-workspace.toml", "workspace"),
     ]:
@@ -35,17 +36,22 @@ def update_versions(root: Path) -> str:
         )
         if count != 1:
             raise ValueError(f"Could not update version in {filename}")
-        if filename == "crates/serc_cli/Cargo.toml":
-            old_pin = tomllib.loads(content)["dependencies"]["serc"]["version"]
-            content, count = re.subn(
-                rf'^(serc = \{{[^\n]*version = "){re.escape(old_pin)}(")',
-                rf"\g<1>{version}\2",
-                content,
-                count=1,
-                flags=re.M,
-            )
-            if count != 1:
-                raise ValueError("Could not update the CLI's serc dependency")
+        for section_name in ("dependencies", "dev-dependencies"):
+            dependencies = tomllib.loads(content).get(section_name, {})
+            for name, dependency in dependencies.items():
+                if (
+                    not isinstance(dependency, dict)
+                    or "path" not in dependency
+                    or "version" not in dependency
+                ):
+                    continue
+                old_pin = dependency["version"]
+                content = re.sub(
+                    rf'^({re.escape(name)} = \{{[^\n]*version = "){re.escape(old_pin)}(")',
+                    rf"\g<1>{version}\2",
+                    content,
+                    flags=re.M,
+                )
         path.write_text(content)
     return version
 

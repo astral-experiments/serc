@@ -34,67 +34,13 @@ use code_object::{CodeFilename, CodeObject};
 use compiler::Compiler;
 pub use config::{
     CompileOptions, NativeBuildProfile, OptimizationLevel, ParseOptimizationLevelError,
-    ParsePythonVersionError, PythonVersion,
 };
 #[cfg(feature = "decompile")]
 pub use decompile::{DecompileError, decompile_pyc};
 pub use initial_intern_state::InitialInternState;
 use ruff_text_size::{Ranged, TextRange, TextSize};
-use siphasher::sip::SipHasher13;
+pub use serc_bytecode::{CPYTHON_TARGET, CpythonTarget, ParsePythonVersionError, PythonVersion};
 pub use source::{SourceDecodeError, decode_source};
-
-/// The exact CPython implementation targeted by this compiler backend.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub struct CpythonTarget {
-    /// The value of `sys.implementation.name`.
-    pub implementation: &'static str,
-    /// The value of `sys.version_info[:3]`.
-    pub version: (u8, u8, u8),
-    /// The value of `importlib.util.MAGIC_NUMBER`.
-    pub magic_number: [u8; 4],
-    /// The upstream CPython release tag.
-    pub tag: &'static str,
-    /// The upstream CPython source commit.
-    pub commit: &'static str,
-}
-
-impl CpythonTarget {
-    /// Hash original source bytes for this target's hash-invalidated cache header.
-    pub fn source_hash(self, source: &[u8]) -> [u8; 8] {
-        // CPython's _imp.source_hash uses SipHash-1-3 keyed by the target magic.
-        let key = u64::from(u32::from_le_bytes(self.magic_number));
-        SipHasher13::new_with_keys(key, 0)
-            .hash(source)
-            .to_le_bytes()
-    }
-
-    /// Return the dotted form of [`Self::version`].
-    pub fn version_string(self) -> String {
-        let (major, minor, micro) = self.version;
-        format!("{major}.{minor}.{micro}")
-    }
-
-    /// Return the lowercase hexadecimal form of [`Self::magic_number`].
-    pub fn magic_hex(self) -> String {
-        const HEX: &[u8; 16] = b"0123456789abcdef";
-
-        let mut output = String::with_capacity(self.magic_number.len() * 2);
-        for byte in self.magic_number {
-            output.push(char::from(HEX[usize::from(byte >> 4)]));
-            output.push(char::from(HEX[usize::from(byte & 0x0f)]));
-        }
-        output
-    }
-}
-
-/// The default CPython target. See [`PythonVersion::target`] for other supported versions.
-pub const CPYTHON_TARGET: CpythonTarget = CpythonTarget {
-    implementation: target::TARGET_IMPLEMENTATION,
-    version: target::TARGET_VERSION,
-    magic_number: target::TARGET_MAGIC_NUMBER,
-    tag: target::TARGET_TAG,
-    commit: target::TARGET_COMMIT,
-};
 
 /// A compiled module code object and its selected CPython target.
 #[derive(Clone, Debug)]

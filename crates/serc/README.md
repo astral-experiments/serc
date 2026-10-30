@@ -123,8 +123,8 @@ python3 crates/serc/scripts/generate_cpython_target.py \
 
 Use the corresponding checkout and `--target-version` for other targets. Append
 `--check` to verify without writing. The generator rejects other commits, reads
-committed inputs, and records their hashes. Do not hand-edit generated files in
-`src/target` or `src/marshal`.
+committed inputs, and records their hashes. The generated tables live in
+[`serc_bytecode`](../serc_bytecode/src/).
 [Startup supplements](scripts/target_metadata/README.md) require a separately
 verified capture.
 
