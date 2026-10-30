@@ -180,3 +180,32 @@ fn cleanup_on_normal_and_exceptional_paths() {
         "log=[]\ndef work(): raise ExceptionGroup('group',[ValueError()])\nf(work,log.append)\nresult=log",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn suspension_and_iteration() {
+    check_fixture(
+        "def produce(xs):\n    yield 1\n    yield from xs\n",
+        "result = list(produce([2,3]))",
+    );
+    check_fixture(
+        "async def fetch(task):\n    return await task()\n",
+        "import asyncio\nasync def task(): return 42\nresult = asyncio.run(fetch(task))",
+    );
+    check_fixture(
+        "def comp(xs):\n    return [x+1 for x in xs if x]\n",
+        "result = comp([0,1,2])",
+    );
+    check_fixture(
+        "def total(xs):\n    return sum(x+1 for x in xs if x)\n",
+        "result = total([0,1,2])",
+    );
+    check_fixture(
+        "async def consume(xs, log):\n    async for x in xs:\n        log(x)\n",
+        "import asyncio\nasync def xs():\n    yield 1\n    yield 2\nresult=[]\nasyncio.run(consume(xs(), result.append))",
+    );
+    check_fixture(
+        "async def manage(cm, log):\n    async with cm as value:\n        log(value)\n",
+        "import asyncio, contextlib\n@contextlib.asynccontextmanager\nasync def manager(): yield 42\nresult=[]\nasyncio.run(manage(manager(),result.append))",
+    );
+}

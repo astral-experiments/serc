@@ -6,7 +6,7 @@ use super::{Body, Instruction, Value};
 
 pub(super) struct Fragment {
     lines: String,
-    stack: Vec<Value>,
+    pub(super) stack: Vec<Value>,
 }
 
 impl Fragment {
@@ -53,7 +53,18 @@ impl Body<'_, '_, '_> {
         end: usize,
         level: usize,
     ) -> Result<Fragment, String> {
-        let outer_stack = std::mem::take(&mut self.stack);
+        self.seeded(ops, start, end, level, Vec::new())
+    }
+
+    pub(super) fn seeded(
+        &mut self,
+        ops: &[Instruction],
+        start: usize,
+        end: usize,
+        level: usize,
+        stack: Vec<Value>,
+    ) -> Result<Fragment, String> {
+        let outer_stack = std::mem::replace(&mut self.stack, stack);
         let outer_lines = std::mem::take(&mut self.lines);
         self.region(ops, start, end, level + 1)?;
         Ok(Fragment {
@@ -87,6 +98,25 @@ impl Body<'_, '_, '_> {
         while i < end {
             let op = ops[i];
             let next = match op.name {
+                "RETURN_GENERATOR" if i + 1 < end && ops[i + 1].name == "POP_TOP" => Ok(i + 2),
+                "GET_AWAITABLE" | "GET_YIELD_FROM_ITER" => self.delegated(ops, i, end),
+                "GET_ITER"
+                    if ops
+                        .get(i + 1)
+                        .is_some_and(|next| next.name == "CALL" && next.arg == 0) =>
+                {
+                    Ok(i + 1)
+                }
+                "GET_ITER" if self.m.version == crate::PythonVersion::Py315 && op.arg == 3 => {
+                    self.delegated(ops, i, end)
+                }
+                "GET_AITER" if i + 1 < end && ops[i + 1].name == "GET_ANEXT" => {
+                    self.async_loop(ops, i, end, level)
+                }
+                "GET_ITER" if i + 1 < end && ops[i + 1].name == "LOAD_FAST_AND_CLEAR" => {
+                    self.comprehension(ops, i + 1, end, level)
+                }
+                "LOAD_FAST_AND_CLEAR" => self.comprehension(ops, i, end, level),
                 "JUMP_BACKWARD" | "JUMP_FORWARD" if self.loop_transfer(ops, i).is_some() => {
                     self.line(self.loop_transfer(ops, i).unwrap())?;
                     Ok(i + 1)

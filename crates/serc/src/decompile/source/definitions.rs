@@ -223,6 +223,17 @@ impl Body<'_, '_, '_> {
     pub(super) fn special_call(&mut self, argc: u32) -> Result<Option<Value>, String> {
         if argc == 0 && self.stack.len() >= 2 {
             let slot = self.stack.len() - 2;
+            if let [Value::Function(def), Value::Expr(_)] = &self.stack[slot..]
+                && self.m.text(self.m.code(def.id)?.name)? == "<genexpr>"
+            {
+                let id = def.id;
+                let iterable = self.expr()?;
+                self.pop()?;
+                let (mut body, bc) = self.wrapper(id)?;
+                body.stack.push(Value::Expr(iterable));
+                body.comprehension(&bc.ops, 0, bc.ops.len(), 0)?;
+                return Ok(Some(body.pop()?));
+            }
             let generic = match &self.stack[slot..] {
                 [Value::Function(def), Value::Null] | [Value::Null, Value::Function(def)] => {
                     Some(def.id)
@@ -311,7 +322,16 @@ impl Body<'_, '_, '_> {
             .iter()
             .find(|(k, _)| k == "return")
             .map_or_else(String::new, |(_, v)| format!(" -> {v}"));
-        self.block(&format!("def {name}{generics}({params}){result}:"), &body)
+        let prefix =
+            if code.flags & (code_flags::CO_COROUTINE | code_flags::CO_ASYNC_GENERATOR) == 0 {
+                ""
+            } else {
+                "async "
+            };
+        self.block(
+            &format!("{prefix}def {name}{generics}({params}){result}:"),
+            &body,
+        )
     }
 
     fn parameters(&self, code: &Code, def: &Definition) -> Result<String, String> {
@@ -383,7 +403,7 @@ impl Body<'_, '_, '_> {
             self.m.bytes(code.exceptions)?,
         )?;
         bc.stack_heights(self.m.version, code.stack_size)?;
-        if !bc.handlers.is_empty() {
+        if !bc.handlers.is_empty() && self.m.text(code.name)? != "<genexpr>" {
             return Err("unsupported wrapper exception region".into());
         }
         Ok((
