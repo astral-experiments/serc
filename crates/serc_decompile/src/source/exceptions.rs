@@ -1,15 +1,38 @@
 //! The exception table records protected intervals and unwind targets. CPython
 //! duplicates cleanup on normal paths and places the exceptional copy out of line.
-use super::{Body, Bytecode, Instruction};
+use super::{Body, Bytecode, Instruction, Value};
+use serc_bytecode::target::operands::SpecialMethod;
+
+fn boundary(ops: &[Instruction], offset: usize) -> Result<usize, String> {
+    ops.binary_search_by_key(&offset, |op| op.offset)
+        .map_err(|_| "invalid exception boundary".into())
+}
+
+/// Locate the implicit manager protocol immediately before a protected binding.
+fn manager_entry(ops: &[Instruction]) -> Result<usize, String> {
+    match ops {
+        [.., before] if before.name == "BEFORE_WITH" => Ok(ops.len() - 1),
+        [.., copy, exit, swap2, swap3, enter, call]
+            if (copy.name, copy.arg) == ("COPY", 1)
+                && (exit.name, exit.arg)
+                    == ("LOAD_SPECIAL", SpecialMethod::__EXIT__.argument())
+                && (swap2.name, swap2.arg) == ("SWAP", 2)
+                && (swap3.name, swap3.arg) == ("SWAP", 3)
+                && (enter.name, enter.arg)
+                    == ("LOAD_SPECIAL", SpecialMethod::__ENTER__.argument())
+                && (call.name, call.arg) == ("CALL", 0) =>
+        {
+            Ok(ops.len() - 6)
+        }
+        _ => Err("unsupported manager entry".into()),
+    }
+}
 
 impl Body<'_, '_, '_> {
     pub(super) fn protected(&mut self, bc: &Bytecode) -> Result<(), String> {
         let entry = bc.handlers[0];
         let ops = &bc.ops;
-        let index = |offset| {
-            ops.binary_search_by_key(&offset, |op| op.offset)
-                .map_err(|_| "invalid exception boundary")
-        };
+        let index = |offset| boundary(ops, offset);
         let start = index(entry.start)?;
         let end = index(entry.end)?;
         let handler = index(entry.target)?;
@@ -23,7 +46,7 @@ impl Body<'_, '_, '_> {
             .get(handler + 1)
             .is_some_and(|op| op.name == "WITH_EXCEPT_START")
         {
-            return self.with_statement(ops, start, end, handler);
+            return self.with_statement(bc);
         }
         if entry.depth != 0 || entry.lasti {
             return Err(format!("unsupported handler depth at byte {}", entry.start));
@@ -125,36 +148,79 @@ impl Body<'_, '_, '_> {
         }
     }
 
-    fn with_statement(
-        &mut self,
-        ops: &[Instruction],
-        start: usize,
-        end: usize,
-        handler: usize,
-    ) -> Result<(), String> {
-        let enter = ops[..start]
-            .iter()
-            .rposition(|op| op.name == "BEFORE_WITH" || op.name == "COPY")
-            .ok_or("unsupported manager entry")?;
-        self.region(ops, 0, enter, 0)?;
-        let manager = self.expr()?;
-        let binding = match ops[start].name {
-            "STORE_FAST" => format!(" as {}", self.name(self.code.locals, ops[start].arg)?),
-            "STORE_NAME" => format!(" as {}", self.name(self.code.names, ops[start].arg)?),
-            "POP_TOP" => String::new(),
-            _ => return Err("unsupported with target".into()),
+    fn with_statement(&mut self, bc: &Bytecode) -> Result<(), String> {
+        let ops = &bc.ops;
+        let mut ranges = bc.handlers.iter();
+        let mut entry = ranges.next().ok_or("missing with range")?;
+        let mut managers = Vec::new();
+        let mut previous_binding = None;
+        let mut seed = Vec::new();
+        let (start, end, handler) = loop {
+            let start = boundary(ops, entry.start)?;
+            let end = boundary(ops, entry.end)?;
+            let handler = boundary(ops, entry.target)?;
+            if start >= end || end > handler {
+                return Err("unsupported manager layout".into());
+            }
+            let enter = manager_entry(&ops[..start])?;
+            let manager = if let Some(previous) = previous_binding {
+                self.seeded(ops, previous + 1, enter, 0, std::mem::take(&mut seed))?
+                    .expression()?
+            } else {
+                self.region(ops, 0, enter, 0)?;
+                self.expr()?
+            };
+            let bind = ops[start];
+            managers.push(match bind.name {
+                "STORE_FAST" => format!("{manager} as {}", self.name(self.code.locals, bind.arg)?),
+                "STORE_FAST_LOAD_FAST" => {
+                    let loaded = self.name(self.code.locals, bind.arg & 15)?;
+                    seed.push(Value::Expr(loaded.to_owned()));
+                    format!(
+                        "{manager} as {}",
+                        self.name(self.code.locals, bind.arg >> 4)?
+                    )
+                }
+                "STORE_NAME" => format!("{manager} as {}", self.name(self.code.names, bind.arg)?),
+                "POP_TOP" => manager,
+                _ => return Err("unsupported with target".into()),
+            });
+
+            // Each additional item starts where the enclosing protected range
+            // ends. The enclosing handler resumes protection during inner cleanup.
+            if let Some(inner) = ranges.next()
+                && inner.start == entry.end
+                && inner.depth > entry.depth
+                && inner.lasti
+                && let target = boundary(ops, inner.target)?
+                && ops[target].name == "PUSH_EXC_INFO"
+                && ops
+                    .get(target + 1)
+                    .is_some_and(|op| op.name == "WITH_EXCEPT_START")
+            {
+                previous_binding = Some(start);
+                entry = inner;
+            } else {
+                break (start, end, handler);
+            }
         };
-        let (body, returns) = self.fragment(ops, start + 1, end, 0)?.pending_return()?;
-        self.block(&format!("with {manager}{binding}:"), &body)?;
-        let exit = ops[end..handler]
-            .iter()
-            .position(|op| op.name == "CALL")
-            .map(|n| end + n)
-            .ok_or("unsupported manager exit")?;
-        if ops.get(exit + 1).is_none_or(|op| op.name != "POP_TOP") {
-            return Err("unsupported manager result".into());
+        let (body, returns) = self
+            .seeded(ops, start + 1, end, 0, seed)?
+            .pending_return()?;
+        self.block(&format!("with {}:", managers.join(", ")), &body)?;
+
+        let mut next = end;
+        for _ in &managers {
+            let exit = ops[next..handler]
+                .iter()
+                .position(|op| op.name == "CALL")
+                .map(|n| next + n)
+                .ok_or("unsupported manager exit")?;
+            if exit + 1 >= handler || ops[exit + 1].name != "POP_TOP" {
+                return Err("unsupported manager result".into());
+            }
+            next = exit + 2;
         }
-        let next = exit + 2;
         if returns {
             if ops.get(next).is_none_or(|op| op.name != "RETURN_VALUE") {
                 return Err("unsupported return through with".into());
