@@ -26,7 +26,7 @@ version="$(python3 scripts/update-release-version.py)"
 python3 scripts/check-release.py
 
 echo "Updating lockfiles..."
-cargo update -p serc -p serc-cli
+cargo update -p serc -p serc-cli -p serc_bytecode
 uv lock --no-locked --default-index https://pypi.org/simple
 
 echo "Creating release branch..."

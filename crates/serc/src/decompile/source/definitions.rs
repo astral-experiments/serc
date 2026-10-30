@@ -471,7 +471,7 @@ impl Body<'_, '_, '_> {
             self.m.bytes(code.bytecode)?,
             self.m.bytes(code.exceptions)?,
         )?;
-        bc.stack_heights(self.m.version, code.stack_size)?;
+        crate::decompile::flow::stack_heights(&bc, self.m.version, code.stack_size)?;
         if !bc.handlers.is_empty() && self.m.text(code.name)? != "<genexpr>" {
             return Err("unsupported wrapper exception region".into());
         }

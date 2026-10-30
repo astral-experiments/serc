@@ -128,7 +128,7 @@ fn scope(
         m.bytes(code.exceptions)?,
     )
     .map_err(|e| format!("{name}: {e}"))?;
-    bc.stack_heights(m.version, code.stack_size)
+    crate::decompile::flow::stack_heights(&bc, m.version, code.stack_size)
         .map_err(|e| format!("{name}: {e}"))?;
     let mut body = Body {
         m,

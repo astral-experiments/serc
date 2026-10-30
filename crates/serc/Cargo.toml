@@ -17,7 +17,7 @@ doctest = false
 workspace = true
 
 [features]
-decompile = []
+decompile = ["serc_bytecode/read"]
 
 [dependencies]
 encoding_rs = { workspace = true }
@@ -30,12 +30,13 @@ ruff_python_parser = { workspace = true }
 ruff_source_file = { workspace = true }
 ruff_text_size = { workspace = true }
 rustc-hash = { workspace = true }
-siphasher = { workspace = true }
+serc_bytecode = { path = "../serc_bytecode", version = "0.1.9" }
 smallvec = { workspace = true }
 stacker = { workspace = true }
 unicode-normalization = { workspace = true }
 
 [dev-dependencies]
+serc_bytecode = { path = "../serc_bytecode", version = "0.1.9", features = ["read"] }
 datatest-stable = { workspace = true }
 insta = { workspace = true }
 clap = { workspace = true }

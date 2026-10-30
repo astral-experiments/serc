@@ -30,7 +30,7 @@ pub(crate) const TARGET_MAGIC_NUMBER: [u8; 4] = [0xcb, 0x0d, 0x0d, 0x0a];
 pub(crate) const SMALL_INT_MIN: i64 = -5;
 pub(crate) const SMALL_INT_MAX: i64 = 256;
 
-#[cfg(feature = "decompile")]
+#[cfg(feature = "read")]
 pub(crate) fn decode_opcode(byte: u8) -> Option<(Opcode, &'static str)> {
     match byte {
         0 => Some((opcodes::CACHE, "CACHE")),
@@ -4442,83 +4442,84 @@ fn is_preinterned_static_string(value: &str) -> bool {
 }
 
 #[allow(dead_code)]
-pub(crate) mod operands {
+pub mod operands {
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct UnaryIntrinsic(u32);
+    pub struct UnaryIntrinsic(u32);
 
     #[allow(dead_code)]
     impl UnaryIntrinsic {
-        pub(crate) const PRINT: Self = Self(1);
-        pub(crate) const IMPORT_STAR: Self = Self(2);
-        pub(crate) const STOPITERATION_ERROR: Self = Self(3);
-        pub(crate) const ASYNC_GEN_WRAP: Self = Self(4);
-        pub(crate) const UNARY_POSITIVE: Self = Self(5);
-        pub(crate) const LIST_TO_TUPLE: Self = Self(6);
-        pub(crate) const TYPEVAR: Self = Self(7);
-        pub(crate) const PARAMSPEC: Self = Self(8);
-        pub(crate) const TYPEVARTUPLE: Self = Self(9);
-        pub(crate) const SUBSCRIPT_GENERIC: Self = Self(10);
-        pub(crate) const TYPEALIAS: Self = Self(11);
+        pub const PRINT: Self = Self(1);
+        pub const IMPORT_STAR: Self = Self(2);
+        pub const STOPITERATION_ERROR: Self = Self(3);
+        pub const ASYNC_GEN_WRAP: Self = Self(4);
+        pub const UNARY_POSITIVE: Self = Self(5);
+        pub const LIST_TO_TUPLE: Self = Self(6);
+        pub const TYPEVAR: Self = Self(7);
+        pub const PARAMSPEC: Self = Self(8);
+        pub const TYPEVARTUPLE: Self = Self(9);
+        pub const SUBSCRIPT_GENERIC: Self = Self(10);
+        pub const TYPEALIAS: Self = Self(11);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct BinaryIntrinsic(u32);
+    pub struct BinaryIntrinsic(u32);
 
     #[allow(dead_code)]
     impl BinaryIntrinsic {
-        pub(crate) const PREP_RERAISE_STAR: Self = Self(1);
-        pub(crate) const TYPEVAR_WITH_BOUND: Self = Self(2);
-        pub(crate) const TYPEVAR_WITH_CONSTRAINTS: Self = Self(3);
-        pub(crate) const SET_FUNCTION_TYPE_PARAMS: Self = Self(4);
+        pub const PREP_RERAISE_STAR: Self = Self(1);
+        pub const TYPEVAR_WITH_BOUND: Self = Self(2);
+        pub const TYPEVAR_WITH_CONSTRAINTS: Self = Self(3);
+        pub const SET_FUNCTION_TYPE_PARAMS: Self = Self(4);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct BinaryOperation(u32);
+    pub struct BinaryOperation(u32);
 
     #[allow(dead_code)]
     impl BinaryOperation {
-        pub(crate) const ADD: Self = Self(0);
-        pub(crate) const AND: Self = Self(1);
-        pub(crate) const FLOOR_DIVIDE: Self = Self(2);
-        pub(crate) const LSHIFT: Self = Self(3);
-        pub(crate) const MATRIX_MULTIPLY: Self = Self(4);
-        pub(crate) const MULTIPLY: Self = Self(5);
-        pub(crate) const REMAINDER: Self = Self(6);
-        pub(crate) const OR: Self = Self(7);
-        pub(crate) const POWER: Self = Self(8);
-        pub(crate) const RSHIFT: Self = Self(9);
-        pub(crate) const SUBTRACT: Self = Self(10);
-        pub(crate) const TRUE_DIVIDE: Self = Self(11);
-        pub(crate) const XOR: Self = Self(12);
-        pub(crate) const INPLACE_ADD: Self = Self(13);
-        pub(crate) const INPLACE_AND: Self = Self(14);
-        pub(crate) const INPLACE_FLOOR_DIVIDE: Self = Self(15);
-        pub(crate) const INPLACE_LSHIFT: Self = Self(16);
-        pub(crate) const INPLACE_MATRIX_MULTIPLY: Self = Self(17);
-        pub(crate) const INPLACE_MULTIPLY: Self = Self(18);
-        pub(crate) const INPLACE_REMAINDER: Self = Self(19);
-        pub(crate) const INPLACE_OR: Self = Self(20);
-        pub(crate) const INPLACE_POWER: Self = Self(21);
-        pub(crate) const INPLACE_RSHIFT: Self = Self(22);
-        pub(crate) const INPLACE_SUBTRACT: Self = Self(23);
-        pub(crate) const INPLACE_TRUE_DIVIDE: Self = Self(24);
-        pub(crate) const INPLACE_XOR: Self = Self(25);
+        pub const ADD: Self = Self(0);
+        pub const AND: Self = Self(1);
+        pub const FLOOR_DIVIDE: Self = Self(2);
+        pub const LSHIFT: Self = Self(3);
+        pub const MATRIX_MULTIPLY: Self = Self(4);
+        pub const MULTIPLY: Self = Self(5);
+        pub const REMAINDER: Self = Self(6);
+        pub const OR: Self = Self(7);
+        pub const POWER: Self = Self(8);
+        pub const RSHIFT: Self = Self(9);
+        pub const SUBTRACT: Self = Self(10);
+        pub const TRUE_DIVIDE: Self = Self(11);
+        pub const XOR: Self = Self(12);
+        pub const INPLACE_ADD: Self = Self(13);
+        pub const INPLACE_AND: Self = Self(14);
+        pub const INPLACE_FLOOR_DIVIDE: Self = Self(15);
+        pub const INPLACE_LSHIFT: Self = Self(16);
+        pub const INPLACE_MATRIX_MULTIPLY: Self = Self(17);
+        pub const INPLACE_MULTIPLY: Self = Self(18);
+        pub const INPLACE_REMAINDER: Self = Self(19);
+        pub const INPLACE_OR: Self = Self(20);
+        pub const INPLACE_POWER: Self = Self(21);
+        pub const INPLACE_RSHIFT: Self = Self(22);
+        pub const INPLACE_SUBTRACT: Self = Self(23);
+        pub const INPLACE_TRUE_DIVIDE: Self = Self(24);
+        pub const INPLACE_XOR: Self = Self(25);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
     impl BinaryOperation {
-        pub(crate) const fn inplace(self) -> Self {
+        #[must_use]
+        pub const fn inplace(self) -> Self {
             match self {
                 Self::ADD => Self::INPLACE_ADD,
                 Self::AND => Self::INPLACE_AND,
@@ -4539,50 +4540,50 @@ pub(crate) mod operands {
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct ComparisonOperation(u32);
+    pub struct ComparisonOperation(u32);
 
     #[allow(dead_code)]
     impl ComparisonOperation {
-        pub(crate) const LT: Self = Self(2);
-        pub(crate) const LE: Self = Self(26);
-        pub(crate) const EQ: Self = Self(40);
-        pub(crate) const NE: Self = Self(55);
-        pub(crate) const GT: Self = Self(68);
-        pub(crate) const GE: Self = Self(92);
+        pub const LT: Self = Self(2);
+        pub const LE: Self = Self(26);
+        pub const EQ: Self = Self(40);
+        pub const NE: Self = Self(55);
+        pub const GT: Self = Self(68);
+        pub const GE: Self = Self(92);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
-    pub(crate) const COMPARISON_SHIFT: u32 = 4;
+    pub const COMPARISON_SHIFT: u32 = 4;
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct Conversion(u32);
+    pub struct Conversion(u32);
 
     #[allow(dead_code)]
     impl Conversion {
-        pub(crate) const NONE: Self = Self(0);
-        pub(crate) const STR: Self = Self(1);
-        pub(crate) const REPR: Self = Self(2);
-        pub(crate) const ASCII: Self = Self(3);
+        pub const NONE: Self = Self(0);
+        pub const STR: Self = Self(1);
+        pub const REPR: Self = Self(2);
+        pub const ASCII: Self = Self(3);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }
 
     #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-    pub(crate) struct FormatValue(u32);
+    pub struct FormatValue(u32);
 
     #[allow(dead_code)]
     impl FormatValue {
-        pub(crate) const NONE: Self = Self(0);
-        pub(crate) const STR: Self = Self(1);
-        pub(crate) const REPR: Self = Self(2);
-        pub(crate) const ASCII: Self = Self(3);
-        pub(crate) const HAVE_SPEC: Self = Self(4);
+        pub const NONE: Self = Self(0);
+        pub const STR: Self = Self(1);
+        pub const REPR: Self = Self(2);
+        pub const ASCII: Self = Self(3);
+        pub const HAVE_SPEC: Self = Self(4);
 
-        pub(crate) const fn argument(self) -> u32 {
+        pub const fn argument(self) -> u32 {
             self.0
         }
     }

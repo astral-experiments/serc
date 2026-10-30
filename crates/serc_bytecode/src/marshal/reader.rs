@@ -9,10 +9,10 @@ use super::v6::{
 };
 use crate::PythonVersion;
 
-pub(crate) type Id = usize;
+pub type Id = usize;
 
 #[derive(Debug)]
-pub(crate) enum Object<'a> {
+pub enum Object<'a> {
     None,
     Bool(bool),
     Ellipsis,
@@ -30,7 +30,7 @@ pub(crate) enum Object<'a> {
 }
 
 #[derive(Debug)]
-pub(crate) struct Code {
+pub struct Code {
     pub args: usize,
     pub pos_only: usize,
     pub kw_only: usize,
@@ -49,45 +49,45 @@ pub(crate) struct Code {
     pub exceptions: Id,
 }
 
-pub(crate) struct Module<'a> {
+pub struct Module<'a> {
     pub version: PythonVersion,
     pub objects: Vec<Object<'a>>,
     pub root: Id,
 }
 
 impl<'a> Module<'a> {
-    pub(crate) fn code(&self, id: Id) -> Result<&Code, String> {
-        match &self.objects[id] {
-            Object::Code(code) => Ok(code),
+    pub fn code(&self, id: Id) -> Result<&Code, String> {
+        match self.objects.get(id) {
+            Some(Object::Code(code)) => Ok(code),
             _ => Err("expected code object".into()),
         }
     }
 
-    pub(crate) fn bytes(&self, id: Id) -> Result<&'a [u8], String> {
-        match self.objects[id] {
-            Object::Bytes(bytes) => Ok(bytes),
+    pub fn bytes(&self, id: Id) -> Result<&'a [u8], String> {
+        match self.objects.get(id) {
+            Some(Object::Bytes(bytes)) => Ok(bytes),
             _ => Err("expected byte string".into()),
         }
     }
 
-    pub(crate) fn text(&self, id: Id) -> Result<&'a str, String> {
-        match self.objects[id] {
-            Object::Text { bytes, .. } => {
+    pub fn text(&self, id: Id) -> Result<&'a str, String> {
+        match self.objects.get(id) {
+            Some(Object::Text { bytes, .. }) => {
                 std::str::from_utf8(bytes).map_err(|_| "unsupported surrogate in string".into())
             }
             _ => Err("expected string".into()),
         }
     }
 
-    pub(crate) fn tuple(&self, id: Id) -> Result<&[Id], String> {
-        match &self.objects[id] {
-            Object::Tuple(items) => Ok(items),
+    pub fn tuple(&self, id: Id) -> Result<&[Id], String> {
+        match self.objects.get(id) {
+            Some(Object::Tuple(items)) => Ok(items),
             _ => Err("expected tuple".into()),
         }
     }
 }
 
-pub(crate) fn read(bytes: &[u8]) -> Result<Module<'_>, String> {
+pub fn read(bytes: &[u8]) -> Result<Module<'_>, String> {
     let header = bytes.get(..16).ok_or("truncated pyc header")?;
     let version = [
         PythonVersion::Py312,
@@ -182,9 +182,10 @@ impl<'a> Reader<'a> {
         if depth > 96 || self.budget == 0 {
             return Err("marshal nesting or node limit exceeded".into());
         }
-        if crate::stack_growth_required() {
-            return crate::grow_stack(|| self.object(depth));
-        }
+        stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || self.read_object(depth))
+    }
+
+    fn read_object(&mut self, depth: usize) -> Result<Id, String> {
         self.budget -= 1;
         let byte = self.byte()?;
         if byte == TYPE_REF {
@@ -310,42 +311,6 @@ impl<'a> Reader<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{CompileOptions, compile_with_options};
-
-    #[test]
-    fn all_targets_and_headers() {
-        for version in [
-            PythonVersion::Py312,
-            PythonVersion::Py313,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
-        ] {
-            let source = "def f():\n    return ('shared', 10**20)\nx = 'shared'\n";
-            let compiled = compile_with_options(
-                source,
-                "fixture.py",
-                &CompileOptions {
-                    python_version: version,
-                    ..CompileOptions::default()
-                },
-            )
-            .unwrap();
-            for bytes in [
-                compiled.to_timestamp_pyc(123, 42),
-                compiled.to_hash_pyc(source.as_bytes(), true),
-                compiled.to_hash_pyc(source.as_bytes(), false),
-            ] {
-                let module = read(&bytes).unwrap();
-                let root = module.code(module.root).unwrap();
-                assert_eq!(module.text(root.name).unwrap(), "<module>");
-                let constants = module.tuple(root.constants).unwrap();
-                assert!(constants.iter().any(|id| module.code(*id).is_ok()));
-                for end in 0..bytes.len() {
-                    assert!(read(&bytes[..end]).is_err());
-                }
-            }
-        }
-    }
 
     #[test]
     fn shared_items_keep_the_same_id() {
