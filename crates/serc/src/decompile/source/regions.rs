@@ -131,6 +131,15 @@ impl Body<'_, '_, '_> {
                 {
                     Ok(i + 1)
                 }
+                "MATCH_SEQUENCE" | "MATCH_MAPPING" | "MATCH_CLASS" => {
+                    self.match_cases(ops, i, end, level)
+                }
+                "COPY"
+                    if i + 1 < end
+                        && matches!(ops[i + 1].name, "MATCH_SEQUENCE" | "MATCH_MAPPING") =>
+                {
+                    self.match_cases(ops, i, end, level)
+                }
                 "COPY" if op.arg == 1 => self.boolean(ops, i, end, level),
                 "GET_ITER" if ops.get(i + 1).is_some_and(|next| next.name == "FOR_ITER") => {
                     self.for_loop(ops, i + 1, end, level)

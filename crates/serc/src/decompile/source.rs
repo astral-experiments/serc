@@ -1,6 +1,8 @@
 mod definitions;
 mod exceptions;
+mod patterns;
 mod regions;
+mod strings;
 mod suspension;
 use definitions::{Definition, Import};
 
@@ -20,7 +22,7 @@ use crate::target::operands315::CommonConstant;
 const MAX_SOURCE: usize = 1 << 20;
 const MAX_WORK: usize = 16 << 20;
 
-pub(super) fn recover(m: &Module<'_>) -> Result<String, String> {
+pub(super) fn recover(m: &Module<'_>) -> Result<Vec<String>, String> {
     let mut work = MAX_WORK;
     let text = scope(m, m.root, 0, false, &mut work)?;
     let parsed = ruff_python_parser::parse_module(&text)
@@ -31,7 +33,12 @@ pub(super) fn recover(m: &Module<'_>) -> Result<String, String> {
         result.push_str(&Generator::new(&indent, LineEnding::Lf).stmt(stmt));
         result.push('\n');
     }
-    Ok(result)
+    if text != result {
+        // Suite layout can change tracing NOPs even when the AST is identical.
+        Ok(vec![result, text])
+    } else {
+        Ok(vec![result])
+    }
 }
 
 fn scope(
@@ -100,6 +107,10 @@ fn scope(
 
 enum Value {
     Expr(String),
+    Converted(String, &'static str),
+    Formatted(String),
+    Interpolation(String),
+    Interpolations(Vec<String>),
     Null,
     Code(Id),
     Function(Definition),
@@ -178,10 +189,10 @@ impl Body<'_, '_, '_> {
     }
 
     fn expr(&mut self) -> Result<String, String> {
-        if let Value::Expr(value) = self.pop()? {
-            Ok(value)
-        } else {
-            Err("expected expression".into())
+        match self.pop()? {
+            Value::Expr(value) => Ok(value),
+            Value::Formatted(field) => Ok(format!("f\"{field}\"")),
+            _ => Err("expected expression".into()),
         }
     }
 
@@ -241,6 +252,10 @@ impl Body<'_, '_, '_> {
     }
 
     fn store(&mut self, name: &str) -> Result<(), String> {
+        if matches!(self.stack.last(), Some(Value::Formatted(_))) {
+            let text = self.expr()?;
+            self.push(text)?;
+        }
         match self.pop()? {
             Value::Expr(_)
                 if self.class
@@ -396,6 +411,19 @@ impl Body<'_, '_, '_> {
                     _ => "not ",
                 };
                 self.push(format!("({sign}{value})"))?;
+            }
+            "FORMAT_VALUE"
+            | "CONVERT_VALUE"
+            | "FORMAT_SIMPLE"
+            | "FORMAT_WITH_SPEC"
+            | "BUILD_STRING"
+            | "BUILD_INTERPOLATION"
+            | "BUILD_TEMPLATE" => self.string_op(op)?,
+            "BUILD_TUPLE"
+                if matches!(self.stack.last(), Some(Value::Interpolation(_))) && a > 0 =>
+            {
+                let fields = self.interpolations(a)?;
+                self.stack.push(Value::Interpolations(fields));
             }
             "BUILD_LIST" | "BUILD_TUPLE" | "BUILD_SET" => {
                 let args = self.args(a)?.join(", ");
