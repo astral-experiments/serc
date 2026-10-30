@@ -1,3 +1,5 @@
+mod regions;
+
 use ruff_python_ast::str::TripleQuotes;
 use ruff_python_literal::escape::{AsciiEscape, UnicodeEscape};
 
@@ -60,13 +62,12 @@ fn scope(m: &Module<'_>, id: Id, depth: usize, work: &mut usize) -> Result<Strin
         code,
         stack: Vec::new(),
         lines: String::new(),
+        loop_edges: None,
         depth,
         work,
     };
-    for op in bc.ops {
-        body.step(op)
-            .map_err(|e| format!("{name} at byte {} ({}): {e}", op.offset, op.name))?;
-    }
+    body.region(&bc.ops, 0, bc.ops.len(), 0)
+        .map_err(|e| format!("{name}: {e}"))?;
     if !body.stack.is_empty() {
         return Err(format!("{name}: unused stack values at end"));
     }
@@ -85,6 +86,7 @@ struct Body<'m, 'data, 'work> {
     code: &'m Code,
     stack: Vec<Value>,
     lines: String,
+    loop_edges: Option<(usize, Option<usize>)>,
     depth: usize,
     work: &'work mut usize,
 }
