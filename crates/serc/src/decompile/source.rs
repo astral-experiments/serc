@@ -1,6 +1,7 @@
 mod definitions;
 mod exceptions;
 mod regions;
+mod suspension;
 use definitions::{Definition, Import};
 
 use ruff_python_ast::str::TripleQuotes;
@@ -71,7 +72,21 @@ fn scope(
         work,
     };
     body.declarations(&bc.ops)?;
-    if bc.handlers.is_empty() {
+    if body.suspended() {
+        body.suspension_scope(&bc)
+    } else if bc.ops.iter().any(|op| op.name == "LOAD_FAST_AND_CLEAR")
+        && bc
+            .ops
+            .iter()
+            .any(|op| matches!(op.name, "LIST_APPEND" | "SET_ADD" | "MAP_ADD"))
+    {
+        let stop = bc
+            .handlers
+            .first()
+            .and_then(|h| bc.ops.binary_search_by_key(&h.target, |op| op.offset).ok())
+            .unwrap_or(bc.ops.len());
+        body.region(&bc.ops, 0, stop, 0)
+    } else if bc.handlers.is_empty() {
         body.region(&bc.ops, 0, bc.ops.len(), 0)
     } else {
         body.protected(&bc)
@@ -398,6 +413,12 @@ impl Body<'_, '_, '_> {
                 };
                 self.push(expr)?;
             }
+            "YIELD_VALUE" => {
+                let value = self.expr()?;
+                self.push(format!("(yield {value})"))?;
+            }
+            "CALL_INTRINSIC_1"
+                if a == crate::target::operands::UnaryIntrinsic::ASYNC_GEN_WRAP.argument() => {}
             "RAISE_VARARGS" => {
                 let args = self.args(a)?;
                 let line = match args.as_slice() {
@@ -417,6 +438,8 @@ impl Body<'_, '_, '_> {
                     if expr != "None" {
                         return Err("module returns a value".into());
                     }
+                } else if expr == "None" && self.suspended() {
+                    self.line("return")?;
                 } else {
                     self.line(&format!("return {expr}"))?;
                 }
