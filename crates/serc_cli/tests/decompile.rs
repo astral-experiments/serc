@@ -294,3 +294,32 @@ fn discarded_statements_keep_tracing_instructions() {
         "result = f()",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_context_managers_unwind_in_reverse_order() {
+    check_fixture(
+        "def f(outer, middle, inner, work):\n    with outer as a, middle as b, inner:\n        work(a, b)\n    return 42\n",
+        r"
+log = []
+class Manager:
+    def __init__(self, name, suppress=False):
+        self.name, self.suppress = name, suppress
+    def __enter__(self):
+        log.append(('enter', self.name))
+        return self.name
+    def __exit__(self, exc, value, tb):
+        log.append(('exit', self.name, exc.__name__ if exc else None))
+        return self.suppress
+def fail(a, b):
+    log.append((a, b))
+    raise ValueError()
+normal = f(Manager('a'), Manager('b'), Manager('c'), lambda a,b: log.append((a,b)))
+suppressed = f(Manager('a'), Manager('b', True), Manager('c'), fail)
+result = normal, suppressed, log",
+    );
+    check_fixture(
+        "def f(a, b, work):\n    with a, b:\n        return work()\n",
+        "from contextlib import nullcontext, suppress\nresult = f(nullcontext(), nullcontext(), lambda: 17), f(nullcontext(), suppress(ValueError), lambda: int('x'))",
+    );
+}
