@@ -16,7 +16,15 @@ pub(super) struct Definition {
     type_params: Vec<String>,
 }
 
-fn tuple_items(text: &str) -> Result<Vec<String>, String> {
+pub(super) fn string_value(text: &str) -> Result<String, String> {
+    let parsed = ruff_python_parser::parse_expression(text).map_err(|err| err.to_string())?;
+    let Expr::StringLiteral(value) = parsed.expr() else {
+        return Err("expected string literal".into());
+    };
+    Ok(value.value.to_str().to_owned())
+}
+
+pub(super) fn tuple_items(text: &str) -> Result<Vec<String>, String> {
     let expression = ruff_python_parser::parse_expression(text).map_err(|err| err.to_string())?;
     let Expr::Tuple(tuple) = expression.expr() else {
         return Err("expected tuple operand".into());

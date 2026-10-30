@@ -65,12 +65,17 @@ fn complete_modules_only() {
 
 #[cfg(feature = "decompile")]
 fn check_fixture(source: &str, exercise: &str) {
+    check_fixture_on(source, exercise, &common::PYTHON_VERSIONS);
+}
+
+#[cfg(feature = "decompile")]
+fn check_fixture_on(source: &str, exercise: &str, versions: &[serc::PythonVersion]) {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original.py");
     let recovered = temp.path().join("recovered.py");
     let cache = temp.path().join("file.pyc");
     fs_err::write(&original, source).unwrap();
-    for version in common::PYTHON_VERSIONS {
+    for &version in versions {
         let built = common::python_command(version).args(["-c", "import py_compile, sys; py_compile.compile(sys.argv[1], sys.argv[2], doraise=True)"]).arg(&original).arg(&cache).output().unwrap();
         assert!(built.status.success(), "{built:?}");
         let output = Command::new(env!("CARGO_BIN_EXE_serc"))
@@ -207,5 +212,36 @@ fn suspension_and_iteration() {
     check_fixture(
         "async def manage(cm, log):\n    async with cm as value:\n        log(value)\n",
         "import asyncio, contextlib\n@contextlib.asynccontextmanager\nasync def manager(): yield 42\nresult=[]\nasyncio.run(manage(manager(),result.append))",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn captures_guards_and_format_specs() {
+    check_fixture(
+        "def f(x):\n    match x:\n        case [a, b] if a: return b\n        case 4: return x\n        case _: return None\n",
+        "result = [f(x) for x in ([1,2], [0,2], 4, {}, None)]",
+    );
+    check_fixture(
+        "def f(x):\n    match x:\n        case {'hi': a}: return a\n        case _: return False\n",
+        "result = [f(x) for x in ({'hi': 42}, {}, [])]",
+    );
+    check_fixture(
+        "def f(x):\n    match x:\n        case A(a, v=b): return a+b\n        case _: return x\n",
+        "from collections import namedtuple\nA = namedtuple('A', 'u v')\nresult = f(A(1,2)), f(4)",
+    );
+    check_fixture(
+        "def f(x):\n    return f'{{hi}} {x!r:>8}! {x}'\n",
+        "result = f(42)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn template_interpolations_retain_expression_text() {
+    check_fixture_on(
+        "def f(n):\n    return t'{{hi}} {n!r:>8} {n}'\n",
+        "t = f(42)\nresult = t.strings, [(i.value, i.expression, i.conversion, i.format_spec) for i in t.interpolations]",
+        &[serc::PythonVersion::Py314, serc::PythonVersion::Py315],
     );
 }
