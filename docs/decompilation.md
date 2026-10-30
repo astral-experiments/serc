@@ -64,10 +64,10 @@ never executes corpus code.
 
 | CPython   | Compilable modules | Verified modules | Coverage | Verified code objects / total |
 | --------- | -----------------: | ---------------: | -------: | ----------------------------: |
-| 3.12.14   |              2,190 |            1,571 |    71.7% |                5,916 / 11,063 |
-| 3.13.15   |              2,209 |            1,527 |    69.1% |                5,199 / 11,562 |
-| 3.14.5    |              2,246 |            1,520 |    67.7% |                6,356 / 14,082 |
-| 3.15.0rc2 |              2,266 |            1,533 |    67.7% |                6,336 / 14,114 |
+| 3.12.14   |              2,190 |            1,585 |    72.4% |                5,932 / 11,063 |
+| 3.13.15   |              2,209 |            1,541 |    69.8% |                5,215 / 11,562 |
+| 3.14.5    |              2,246 |            1,537 |    68.4% |                6,382 / 14,082 |
+| 3.15.0rc2 |              2,266 |            1,550 |    68.4% |                6,360 / 14,114 |
 
 The code-object count includes each module and its nested code. Only objects
 from completely verified modules count as successes. All four runs had zero
