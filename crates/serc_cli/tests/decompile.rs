@@ -28,11 +28,14 @@ fn complete_modules_only() {
         for optimize in 0..=2 {
             for supported in [true, false] {
                 let text = if supported {
-                    "def add(x, y):\n    return x + y\nanswer = add(20, 22)\n"
+                    "def add(x, y):\n    return x + y\nanswer = add(20, 22)\n".to_owned()
                 } else {
-                    "def unsupported(x):\n    try:\n        x()\n    except* Exception:\n        raise\n"
+                    format!(
+                        "answer = 1\ndef unsupported():\n    return '{}'\n",
+                        "x".repeat(200_000)
+                    )
                 };
-                fs_err::write(&source, text).unwrap();
+                fs_err::write(&source, &text).unwrap();
                 let built = common::python_command(version).args(["-X", "no_debug_ranges", "-c", "import py_compile, sys; py_compile.compile(sys.argv[1], sys.argv[2], optimize=int(sys.argv[3]), doraise=True)"]).arg(&source).arg(&cache).arg(optimize.to_string()).output().unwrap();
                 assert!(built.status.success(), "{built:?}");
                 fs_err::remove_file(&source).unwrap();
@@ -154,5 +157,26 @@ fn definitions_preserve_bindings() {
     check_fixture(
         "def f[T](x: T) -> T:\n    return x\n",
         "result = f(42), repr(f.__annotations__)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn cleanup_on_normal_and_exceptional_paths() {
+    check_fixture(
+        "def f(work, emit):\n    try:\n        return work()\n    finally:\n        emit(1)\n",
+        "log = []\nf(lambda: 42, log.append)\ntry: f(lambda: 1/0, log.append)\nexcept ZeroDivisionError: log.append(2)\nresult = log",
+    );
+    check_fixture(
+        "def f(work, emit):\n    try:\n        work()\n    except ValueError:\n        emit(1)\n    emit(2)\n",
+        "log = []\nf(lambda: None,log.append)\nf(lambda: int('x'),log.append)\nresult = log",
+    );
+    check_fixture(
+        "def f(cm, work):\n    with cm as value:\n        work(value)\n    return 42\n",
+        "import contextlib\nresult = f(contextlib.suppress(ZeroDivisionError),lambda _: 1/0)",
+    );
+    check_fixture(
+        "def f(work, log):\n    try:\n        work()\n    except* ValueError:\n        log(1)\n    log(2)\n",
+        "log=[]\ndef work(): raise ExceptionGroup('group',[ValueError()])\nf(work,log.append)\nresult=log",
     );
 }

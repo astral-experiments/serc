@@ -2,13 +2,13 @@
 //! stack; values that survive a join must be expressible as a Python expression.
 use super::{Body, Instruction, Value};
 
-struct Fragment {
+pub(super) struct Fragment {
     lines: String,
     stack: Vec<Value>,
 }
 
 impl Fragment {
-    fn expression(mut self) -> Result<String, String> {
+    pub(super) fn expression(mut self) -> Result<String, String> {
         if self.lines.is_empty()
             && self.stack.len() == 1
             && let Some(Value::Expr(value)) = self.stack.pop()
@@ -18,7 +18,17 @@ impl Fragment {
             Err("region is not a single expression".into())
         }
     }
-    fn suite(self) -> Result<String, String> {
+    pub(super) fn pending_return(mut self) -> Result<(String, bool), String> {
+        match self.stack.pop() {
+            None => Ok((self.lines, false)),
+            Some(Value::Expr(value)) if self.stack.is_empty() => {
+                self.lines.push_str(&format!("return {value}\n"));
+                Ok((self.lines, true))
+            }
+            _ => Err("unsupported protected stack outcome".into()),
+        }
+    }
+    pub(super) fn suite(self) -> Result<String, String> {
         if self.stack.is_empty() {
             Ok(self.lines)
         } else {
@@ -34,7 +44,7 @@ fn destination(ops: &[Instruction], i: usize) -> Result<usize, String> {
 }
 
 impl Body<'_, '_, '_> {
-    fn fragment(
+    pub(super) fn fragment(
         &mut self,
         ops: &[Instruction],
         start: usize,
