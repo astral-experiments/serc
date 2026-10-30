@@ -190,11 +190,13 @@ for e in dis.Bytecode(f).exception_entries:
             ("SERC_TEST_PYTHON", PythonVersion::Py314),
             ("SERC_TEST_PYTHON_315", PythonVersion::Py315),
         ] {
-            let path = std::env::var(var).unwrap_or_else(|_| panic!("missing {var}"));
-            let output = Command::new(path)
+            let path = std::env::var(var).unwrap_or_else(|_| format!("python{version}"));
+            let output = Command::new(&path)
                 .args(["-I", "-S", "-c", script])
                 .output()
-                .unwrap();
+                .unwrap_or_else(|e| {
+                    panic!("failed to start {path}: {e} (set {var} to the pinned interpreter)")
+                });
             assert!(
                 output.status.success(),
                 "{}",
