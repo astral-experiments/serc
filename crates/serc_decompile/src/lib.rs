@@ -1,11 +1,10 @@
 //! Reconstruct Python source from the instruction stream stored in a CPython cache file.
 mod flow;
-use serc_bytecode::instructions;
 mod source;
 mod verify;
 
-use crate::marshal::reader::read;
-use crate::{CompileOptions, OptimizationLevel, PythonVersion, compile_with_options};
+use serc_bytecode::marshal::reader::read;
+use serc_bytecode::{OptimizationLevel, PythonVersion};
 use std::fmt;
 
 /// A cache file is invalid, unsupported, or could not be faithfully reconstructed.
@@ -34,8 +33,13 @@ impl std::error::Error for DecompileError {}
 
 /// Recover an entire module as Python source without executing the input.
 /// The cache magic selects one of serc's pinned targets. An error in any
-/// nested scope rejects the entire module.
-pub fn decompile_pyc(bytes: &[u8]) -> Result<String, DecompileError> {
+/// nested scope rejects the entire module. The compiler callback receives the
+/// source, original filename, target, and optimization level. It returns a cache
+/// for that candidate or `None` when the candidate cannot be compiled.
+pub fn decompile_pyc(
+    bytes: &[u8],
+    mut compile: impl FnMut(&str, &str, PythonVersion, OptimizationLevel) -> Option<Vec<u8>>,
+) -> Result<String, DecompileError> {
     let module = read(bytes).map_err(DecompileError::Read)?;
     let version = module.version;
     let reconstruct = |reason| DecompileError::Reconstruct(version, reason);
@@ -60,13 +64,7 @@ pub fn decompile_pyc(bytes: &[u8]) -> Result<String, DecompileError> {
                 OptimizationLevel::One,
                 OptimizationLevel::Two,
             ] {
-                let options = CompileOptions {
-                    python_version: version,
-                    optimization_level: level,
-                    ..CompileOptions::default()
-                };
-                if let Ok(compiled) = compile_with_options(&source, filename, &options) {
-                    let check = compiled.to_timestamp_pyc(0, 0);
+                if let Some(check) = compile(&source, filename, version, level) {
                     let candidate =
                         read(&check).map_err(|message| DecompileError::Verify(version, message))?;
                     match verify::compare(&module, &candidate) {

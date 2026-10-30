@@ -14,10 +14,10 @@ use ruff_python_literal::escape::{AsciiEscape, UnicodeEscape};
 use ruff_python_codegen::{Generator, Indentation};
 use ruff_source_file::LineEnding;
 
-use super::instructions::{Bytecode, Instruction};
-use crate::PythonVersion;
-use crate::marshal::reader::{Code, Id, Module, Object};
-use crate::target::operands315::CommonConstant;
+use serc_bytecode::PythonVersion;
+use serc_bytecode::instructions::{Bytecode, Instruction};
+use serc_bytecode::marshal::reader::{Code, Id, Module, Object};
+use serc_bytecode::target::operands315::CommonConstant;
 
 // Limit reconstructed text as well as the wire graph. A small shared constant
 // can occur at many use sites, and nested code can be shared by reference.
@@ -56,7 +56,7 @@ pub(super) fn recover(m: &Module<'_>, preserve_nops: bool) -> Result<(Vec<String
         let mut class_lines = rustc_hash::FxHashMap::default();
         for obj in &m.objects {
             if let Object::Code(code) = obj
-                && code.flags & crate::target::code_flags::CO_NEWLOCALS == 0
+                && code.flags & serc_bytecode::target::code_flags::CO_NEWLOCALS == 0
             {
                 class_lines
                     .entry(m.text(code.name)?)
@@ -107,9 +107,18 @@ fn scope(
     class: bool,
     work: &mut Recovery,
 ) -> Result<String, String> {
-    if crate::stack_growth_required() {
-        return crate::grow_stack(|| scope(m, id, depth, class, work));
-    }
+    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
+        recover_scope(m, id, depth, class, work)
+    })
+}
+
+fn recover_scope(
+    m: &Module<'_>,
+    id: Id,
+    depth: usize,
+    class: bool,
+    work: &mut Recovery,
+) -> Result<String, String> {
     if depth > 32 {
         return Err("nested code limit exceeded".into());
     }
@@ -128,7 +137,7 @@ fn scope(
         m.bytes(code.exceptions)?,
     )
     .map_err(|e| format!("{name}: {e}"))?;
-    crate::decompile::flow::stack_heights(&bc, m.version, code.stack_size)
+    crate::flow::stack_heights(&bc, m.version, code.stack_size)
         .map_err(|e| format!("{name}: {e}"))?;
     let mut body = Body {
         m,
@@ -466,7 +475,8 @@ impl Body<'_, '_, '_> {
             "CALL_FUNCTION_EX" => self.expanded_call(a)?,
             "DICT_UPDATE" | "DICT_MERGE" if a == 1 => self.merge_map()?,
             "CALL_INTRINSIC_1"
-                if a == crate::target::operands::UnaryIntrinsic::LIST_TO_TUPLE.argument() =>
+                if a == serc_bytecode::target::operands::UnaryIntrinsic::LIST_TO_TUPLE
+                    .argument() =>
             {
                 let list = self.expr()?;
                 let elements = list
@@ -597,7 +607,8 @@ impl Body<'_, '_, '_> {
                 self.push(format!("(yield {value})"))?;
             }
             "CALL_INTRINSIC_1"
-                if a == crate::target::operands::UnaryIntrinsic::ASYNC_GEN_WRAP.argument() => {}
+                if a == serc_bytecode::target::operands::UnaryIntrinsic::ASYNC_GEN_WRAP
+                    .argument() => {}
             "RAISE_VARARGS" => {
                 let args = self.args(a)?;
                 let line = match args.as_slice() {

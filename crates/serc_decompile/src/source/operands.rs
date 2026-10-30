@@ -26,7 +26,7 @@ impl Body<'_, '_, '_> {
     }
 
     pub(super) fn expanded_call(&mut self, flag: u32) -> Result<(), String> {
-        let keywords = if self.m.version >= crate::PythonVersion::Py314 {
+        let keywords = if self.m.version >= serc_bytecode::PythonVersion::Py314 {
             if matches!(self.stack.last(), Some(Value::Null)) {
                 self.pop()?;
                 None
@@ -176,12 +176,14 @@ impl Body<'_, '_, '_> {
         if obj == "__annotations__" {
             let binding = string_value(&index)?;
             let name = identifier(&binding)?;
-            let annotation =
-                if self.code.flags & crate::target::code_flags::CO_FUTURE_ANNOTATIONS != 0 {
-                    string_value(&value)?
-                } else {
-                    value
-                };
+            let annotation = if self.code.flags
+                & serc_bytecode::target::code_flags::CO_FUTURE_ANNOTATIONS
+                != 0
+            {
+                string_value(&value)?
+            } else {
+                value
+            };
             return self.annotate(name, &annotation);
         }
         self.line(&format!("({obj})[{index}] = {value}"))

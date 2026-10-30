@@ -91,9 +91,18 @@ impl Body<'_, '_, '_> {
         end: usize,
         level: usize,
     ) -> Result<(), String> {
-        if crate::stack_growth_required() {
-            return crate::grow_stack(|| self.region(ops, start, end, level));
-        }
+        stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
+            self.recover_region(ops, start, end, level)
+        })
+    }
+
+    fn recover_region(
+        &mut self,
+        ops: &[Instruction],
+        start: usize,
+        end: usize,
+        level: usize,
+    ) -> Result<(), String> {
         if level > 32 || end > ops.len() || start > end {
             return Err("unsupported region bounds or nesting".into());
         }
@@ -103,7 +112,8 @@ impl Body<'_, '_, '_> {
             let next = match op.name {
                 "CALL_INTRINSIC_1"
                     if op.arg
-                        == crate::target::operands::UnaryIntrinsic::IMPORT_STAR.argument()
+                        == serc_bytecode::target::operands::UnaryIntrinsic::IMPORT_STAR
+                            .argument()
                         && i + 1 < end
                         && ops[i + 1].name == "POP_TOP" =>
                 {
@@ -166,7 +176,9 @@ impl Body<'_, '_, '_> {
                 {
                     Ok(i + 1)
                 }
-                "GET_ITER" if self.m.version == crate::PythonVersion::Py315 && op.arg == 3 => {
+                "GET_ITER"
+                    if self.m.version == serc_bytecode::PythonVersion::Py315 && op.arg == 3 =>
+                {
                     self.delegated(ops, i, end)
                 }
                 "GET_AITER" if i + 1 < end && ops[i + 1].name == "GET_ANEXT" => {
@@ -346,7 +358,8 @@ impl Body<'_, '_, '_> {
             && (ops[start].name == "LOAD_ASSERTION_ERROR"
                 || (ops[start].name == "LOAD_COMMON_CONSTANT"
                     && ops[start].arg
-                        == crate::target::operands315::CommonConstant::ASSERTIONERROR.argument()))
+                        == serc_bytecode::target::operands315::CommonConstant::ASSERTIONERROR
+                            .argument()))
         {
             let test = if ops[i].name == "POP_JUMP_IF_TRUE" {
                 value

@@ -14,6 +14,7 @@ def release_version(root: Path) -> str:
     manifests = [
         ("crates/serc/Cargo.toml", "package"),
         ("crates/serc_bytecode/Cargo.toml", "package"),
+        ("crates/serc_decompile/Cargo.toml", "package"),
         ("crates/serc_cli/Cargo.toml", "package"),
         ("dist-workspace.toml", "workspace"),
     ]

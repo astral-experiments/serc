@@ -1,8 +1,6 @@
 mod graph;
 mod key;
 mod plan;
-#[cfg(feature = "decompile")]
-pub(crate) use serc_bytecode::marshal::reader;
 use serc_bytecode::marshal::{v4, v5, v6};
 mod writer;
 
