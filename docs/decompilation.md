@@ -21,8 +21,8 @@ Compiler-only builds omit the recovery crate and the reader.
 The reader recognizes timestamp, checked-hash and unchecked-hash headers for the
 four pinned targets. It uses a bounded marshal arena so nested code and shared
 constants can be inspected directly. The decoder resolves instruction prefixes,
-inline caches, jumps and exception table entries using target metadata. The recovery
-crate builds a basic-block graph for each scope, splitting at jumps,
+inline caches, jumps and exception table entries using target metadata. The
+recovery crate builds a basic-block graph for each scope, splitting at jumps,
 returns, and exception-table boundaries. It records normal predecessors and
 successors separately from exceptional edges, which restore the handler's stack
 depth. A worklist rejects inconsistent stack heights at joins.
@@ -30,8 +30,8 @@ depth. A worklist rejects inconsistent stack heights at joins.
 Source recovery uses forward postdominators to find where branches rejoin and
 shared successors to combine short-circuit tests. Loop recovery distinguishes
 exhaustion from explicit breaks, including when CPython copied the return after
-the loop into a break arm. It can also follow consecutive typed handlers with
-a shared return and recover a conditional break through duplicated finally
+the loop into a break arm. It can also follow consecutive typed handlers with a
+shared return and recover a conditional break through duplicated finally
 cleanup. Backedges end a forward region. More complex cyclic graphs and
 exception layouts can still be refused.
 
