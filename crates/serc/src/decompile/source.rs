@@ -1,4 +1,5 @@
 mod definitions;
+mod exceptions;
 mod regions;
 use definitions::{Definition, Import};
 
@@ -59,12 +60,6 @@ fn scope(
     .map_err(|e| format!("{name}: {e}"))?;
     bc.stack_heights(m.version, code.stack_size)
         .map_err(|e| format!("{name}: {e}"))?;
-    if let Some(h) = bc.handlers.first() {
-        return Err(format!(
-            "{name}: unsupported exception region at byte {}",
-            h.start
-        ));
-    }
     let mut body = Body {
         m,
         code,
@@ -76,8 +71,12 @@ fn scope(
         work,
     };
     body.declarations(&bc.ops)?;
-    body.region(&bc.ops, 0, bc.ops.len(), 0)
-        .map_err(|e| format!("{name}: {e}"))?;
+    if bc.handlers.is_empty() {
+        body.region(&bc.ops, 0, bc.ops.len(), 0)
+    } else {
+        body.protected(&bc)
+    }
+    .map_err(|e| format!("{name}: {e}"))?;
     if !body.stack.is_empty() {
         return Err(format!("{name}: unused stack values at end"));
     }
@@ -398,6 +397,16 @@ impl Body<'_, '_, '_> {
                     _ => return Err("unsupported empty set".into()),
                 };
                 self.push(expr)?;
+            }
+            "RAISE_VARARGS" => {
+                let args = self.args(a)?;
+                let line = match args.as_slice() {
+                    [] => "raise".into(),
+                    [err] => format!("raise {err}"),
+                    [err, cause] => format!("raise {err} from {cause}"),
+                    _ => return Err("invalid raise operand".into()),
+                };
+                self.line(&line)?;
             }
             "RETURN_CONST" | "RETURN_VALUE" => {
                 if op.name == "RETURN_CONST" {
