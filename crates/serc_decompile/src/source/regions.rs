@@ -211,6 +211,9 @@ impl Body<'_, '_, '_> {
                 {
                     self.match_cases(ops, i, end, level)
                 }
+                "COPY" if let Some(count) = super::operands::augmented_load(&ops[i..end]) => {
+                    self.augmented_store(ops, i + count, count, end, level)
+                }
                 "COPY" if op.arg == 1 => self.boolean(ops, i, end, level),
                 "GET_ITER" if ops.get(i + 1).is_some_and(|next| next.name == "FOR_ITER") => {
                     self.for_loop(ops, i + 1, end, level)

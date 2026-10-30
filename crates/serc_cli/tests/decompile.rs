@@ -323,3 +323,31 @@ result = normal, suppressed, log",
         "from contextlib import nullcontext, suppress\nresult = f(nullcontext(), nullcontext(), lambda: 17), f(nullcontext(), suppress(ValueError), lambda: int('x'))",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn assignment_targets_are_evaluated_once() {
+    check_fixture(
+        "def update(obj, key, value):\n    obj().attr += value()\n    obj()[key()] *= value()\n    obj()[key():key()] += [value()]\n    del obj().attr\n    del obj()[key()]\n",
+        r"
+log = []
+class Box(list):
+    attr = 10
+box = Box([2,3,4])
+def obj():
+    log.append('obj')
+    return box
+def key():
+    log.append('key')
+    return 1
+def value():
+    log.append('value')
+    return 3
+update(obj,key,value)
+result = list(box), box.attr, log",
+    );
+    check_fixture(
+        "v = 1\ndef outer():\n    x = 2\n    def inner():\n        global v\n        nonlocal x\n        del x, v\n        t = 3\n        del t\n    inner()\n",
+        "outer()\nresult = 'v' in globals()",
+    );
+}

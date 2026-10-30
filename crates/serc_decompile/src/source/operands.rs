@@ -4,6 +4,7 @@ use super::{
     definitions::{string_value, tuple_items},
     identifier,
 };
+use serc_bytecode::target::operands::BinaryOperation;
 
 fn slice_text(items: &[String]) -> String {
     items
@@ -13,7 +14,68 @@ fn slice_text(items: &[String]) -> String {
         .join(":")
 }
 
+/// CPython saves the receiver and indices once before loading an in-place target.
+pub(super) fn augmented_load(ops: &[Instruction]) -> Option<usize> {
+    let n = ops.first()?.arg as usize;
+    if !(1..=3).contains(&n)
+        || !ops
+            .get(..n)?
+            .iter()
+            .all(|op| op.name == "COPY" && op.arg as usize == n)
+    {
+        return None;
+    }
+    let load = ops.get(n)?;
+    match (n, load.name) {
+        (1, "LOAD_ATTR") if load.arg & 1 == 0 => Some(n),
+        (2, "BINARY_SUBSCR") | (3, "BINARY_SLICE") => Some(n),
+        (2, "BINARY_OP") if load.arg == BinaryOperation::SUBSCR.argument() => Some(n),
+        _ => None,
+    }
+}
+
 impl Body<'_, '_, '_> {
+    pub(super) fn augmented_store(
+        &mut self,
+        ops: &[Instruction],
+        load: usize,
+        count: usize,
+        end: usize,
+        level: usize,
+    ) -> Result<usize, String> {
+        self.step(ops[load])?;
+        let stores = ["STORE_ATTR", "STORE_SUBSCR", "STORE_SLICE"];
+        let inplace =
+            BinaryOperation::INPLACE_ADD.argument()..=BinaryOperation::INPLACE_XOR.argument();
+        for binary in load + 1..end {
+            self.charge(1)?;
+            let operation = ops[binary];
+            if operation.name != "BINARY_OP" || !inplace.contains(&operation.arg) {
+                continue;
+            }
+            let store = binary + 1 + count;
+            if store >= end
+                || ops[store].name != stores[count - 1]
+                || (count == 1 && ops[store].arg != ops[load].arg >> 1)
+                || !(0..count).all(|i| {
+                    ops[binary + 1 + i].name == "SWAP"
+                        && ops[binary + 1 + i].arg as usize == count + 1 - i
+                })
+            {
+                continue;
+            }
+            let rhs = self.fragment(ops, load + 1, binary, level)?.expression()?;
+            self.push(rhs)?;
+            self.step(operation)?;
+            let Value::InPlace(target, operator, value) = self.pop()? else {
+                return Err("expected in-place operation".into());
+            };
+            self.line(&format!("{target} {operator}= {value}"))?;
+            return Ok(store + 1);
+        }
+        Err("missing in-place target store".into())
+    }
+
     pub(super) fn merge_map(&mut self) -> Result<(), String> {
         let other = self.expr()?;
         let map = self.expr()?;
