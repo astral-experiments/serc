@@ -4,8 +4,8 @@ use ruff_python_literal::escape::UnicodeEscape;
 use ruff_source_file::LineEnding;
 
 use super::{Body, Code, Id, Instruction, Object, Value, identifier, literal, scope};
-use crate::PythonVersion;
-use crate::target::{code_flags, local_kinds};
+use serc_bytecode::PythonVersion;
+use serc_bytecode::target::{code_flags, local_kinds};
 
 pub(super) struct Definition {
     pub(super) id: Id,
@@ -89,7 +89,7 @@ impl Body<'_, '_, '_> {
         let (index, lazy) = if self.m.version == PythonVersion::Py315 {
             (
                 arg >> 2,
-                arg & 3 == crate::target::operands315::ImportMode::LAZY.argument(),
+                arg & 3 == serc_bytecode::target::operands315::ImportMode::LAZY.argument(),
             )
         } else {
             (arg, false)
@@ -471,7 +471,7 @@ impl Body<'_, '_, '_> {
             self.m.bytes(code.bytecode)?,
             self.m.bytes(code.exceptions)?,
         )?;
-        crate::decompile::flow::stack_heights(&bc, self.m.version, code.stack_size)?;
+        crate::flow::stack_heights(&bc, self.m.version, code.stack_size)?;
         if !bc.handlers.is_empty() && self.m.text(code.name)? != "<genexpr>" {
             return Err("unsupported wrapper exception region".into());
         }
@@ -525,7 +525,7 @@ impl Body<'_, '_, '_> {
     }
 
     fn generic(&mut self, id: Id) -> Result<Definition, String> {
-        use crate::target::operands::UnaryIntrinsic;
+        use serc_bytecode::target::operands::UnaryIntrinsic;
         let (mut body, bc) = self.wrapper(id)?;
         let tuple = bc
             .ops

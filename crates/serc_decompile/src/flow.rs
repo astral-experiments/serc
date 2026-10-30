@@ -1,8 +1,8 @@
 //! Stack heights at instruction boundaries. Branch targets use the compiler's
 //! logical edges through `END_FOR` and `END_SEND`, including their cleanup effects.
-use super::instructions::Bytecode;
-use crate::PythonVersion;
-use crate::target::{is_scope_exit_for, is_unconditional_jump, opcodes, stack_counts_for};
+use serc_bytecode::PythonVersion;
+use serc_bytecode::instructions::Bytecode;
+use serc_bytecode::target::{is_scope_exit_for, is_unconditional_jump, opcodes, stack_counts_for};
 
 pub(super) fn stack_heights(
     code: &Bytecode,
@@ -78,20 +78,32 @@ pub(super) fn stack_heights(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::marshal::reader::{Object, read};
-    use crate::{CompileOptions, compile_with_options};
+    use serc_bytecode::marshal::reader::{Object, read};
+    use std::process::Command;
 
     #[test]
     fn joins_backedges_and_handlers() {
-        for version in [
-            PythonVersion::Py312,
-            PythonVersion::Py313,
-            PythonVersion::Py314,
-            PythonVersion::Py315,
+        let source = "def f(xs):\n for x in xs:\n  try:\n   if x: use(x)\n  except ValueError: break\n return None\n";
+        for (var, version) in [
+            ("SERC_TEST_PYTHON_312", PythonVersion::Py312),
+            ("SERC_TEST_PYTHON_313", PythonVersion::Py313),
+            ("SERC_TEST_PYTHON", PythonVersion::Py314),
+            ("SERC_TEST_PYTHON_315", PythonVersion::Py315),
         ] {
-            let code = compile_with_options("def f(xs):\n for x in xs:\n  try:\n   if x: use(x)\n  except ValueError: break\n return None\n", "flow.py", &CompileOptions { python_version: version, ..CompileOptions::default() }).unwrap();
-            let bytes = code.to_timestamp_pyc(0, 0);
-            let m = read(&bytes).unwrap();
+            let python = std::env::var(var).unwrap_or_else(|_| format!("python{version}"));
+            let compiled = Command::new(python)
+                .args(["-I", "-S", "-c", "import importlib.util, marshal, platform, sys\nassert platform.python_version() == sys.argv[2]\nsys.stdout.buffer.write(importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(compile(sys.argv[1], 'flow.py', 'exec')))"])
+                .arg(source)
+                .arg(version.target().tag.trim_start_matches('v'))
+                .output()
+                .unwrap();
+            assert!(
+                compiled.status.success(),
+                "{}",
+                String::from_utf8_lossy(&compiled.stderr)
+            );
+            let m = read(&compiled.stdout).unwrap();
+            assert_eq!(m.version, version);
             for item in &m.objects {
                 if let Object::Code(code) = item {
                     let bc = Bytecode::decode(

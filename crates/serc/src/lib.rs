@@ -32,14 +32,15 @@ use std::path::Path;
 
 use code_object::{CodeFilename, CodeObject};
 use compiler::Compiler;
-pub use config::{
-    CompileOptions, NativeBuildProfile, OptimizationLevel, ParseOptimizationLevelError,
-};
+pub use config::{CompileOptions, NativeBuildProfile};
 #[cfg(feature = "decompile")]
 pub use decompile::{DecompileError, decompile_pyc};
 pub use initial_intern_state::InitialInternState;
 use ruff_text_size::{Ranged, TextRange, TextSize};
-pub use serc_bytecode::{CPYTHON_TARGET, CpythonTarget, ParsePythonVersionError, PythonVersion};
+pub use serc_bytecode::{
+    CPYTHON_TARGET, CpythonTarget, OptimizationLevel, ParseOptimizationLevelError,
+    ParsePythonVersionError, PythonVersion,
+};
 pub use source::{SourceDecodeError, decode_source};
 
 /// A compiled module code object and its selected CPython target.

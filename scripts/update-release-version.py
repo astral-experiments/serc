@@ -18,6 +18,7 @@ def update_versions(root: Path) -> str:
         ("pyproject.toml", "project"),
         ("crates/serc/Cargo.toml", "package"),
         ("crates/serc_bytecode/Cargo.toml", "package"),
+        ("crates/serc_decompile/Cargo.toml", "package"),
         ("crates/serc_cli/Cargo.toml", "package"),
         ("dist-workspace.toml", "workspace"),
     ]:

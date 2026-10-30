@@ -92,6 +92,57 @@ impl fmt::Display for ParsePythonVersionError {
 
 impl Error for ParsePythonVersionError {}
 
+/// Python's bytecode optimization level.
+#[derive(Clone, Copy, Debug, Default, Eq, Hash, Ord, PartialEq, PartialOrd)]
+pub enum OptimizationLevel {
+    /// Retain assertions and docstrings, and evaluate `__debug__` as true.
+    #[default]
+    Zero,
+    /// Remove assertions and evaluate `__debug__` as false, like Python's `-O`.
+    One,
+    /// Also remove docstrings, like Python's `-OO`.
+    Two,
+}
+
+impl fmt::Display for OptimizationLevel {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(match self {
+            Self::Zero => "0",
+            Self::One => "1",
+            Self::Two => "2",
+        })
+    }
+}
+
+impl FromStr for OptimizationLevel {
+    type Err = ParseOptimizationLevelError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "0" => Ok(Self::Zero),
+            "1" => Ok(Self::One),
+            "2" => Ok(Self::Two),
+            _ => Err(ParseOptimizationLevelError(value.to_owned())),
+        }
+    }
+}
+
+/// An unsupported optimization level supplied to [`OptimizationLevel::from_str`].
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ParseOptimizationLevelError(String);
+
+impl fmt::Display for ParseOptimizationLevelError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "unsupported optimization level {:?}; expected 0, 1, or 2",
+            self.0
+        )
+    }
+}
+
+impl Error for ParseOptimizationLevelError {}
+
 /// The exact CPython implementation targeted by this compiler backend.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CpythonTarget {

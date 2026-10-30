@@ -9,6 +9,15 @@ cargo build --locked -p serc-cli --features decompile
 target/debug/serc decompile __pycache__/example.cpython-314.pyc
 ```
 
+## Workspace crates
+
+`serc_bytecode` owns the generated target tables, marshal tags, and instruction
+decoder. Its `read` feature adds cache parsing. `serc_decompile` uses those
+decoded instructions for stack analysis, control-flow recovery, source
+reconstruction, and verification. The public `serc::decompile_pyc` entry point
+supplies serc's compiler for verification. The CLI calls that same entry point.
+Compiler-only builds omit the recovery crate and the reader.
+
 The reader recognizes timestamp, checked-hash and unchecked-hash headers for the
 four pinned targets. It uses a bounded marshal arena so nested code and shared
 constants can be inspected directly. The decoder resolves instruction prefixes,
