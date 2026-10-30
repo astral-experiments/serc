@@ -9,6 +9,8 @@ mod code_object;
 mod compiler;
 mod config;
 mod decimal_literals;
+#[cfg(feature = "decompile")]
+mod decompile;
 mod delimiter_nesting;
 mod indentation;
 mod initial_intern_state;
