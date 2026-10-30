@@ -35,9 +35,9 @@ starred iterables. On 3.15 the decompiler also recovers unpacking in
 comprehensions and generator expressions. It recovers nested and starred name
 targets in assignments, loops, comprehensions, and context managers. Deletion
 and in-place updates to attributes, subscripts, and slices preserve evaluation
-order. There are recognizers for individual exception handlers, multi-item
-synchronous context managers, and sequence, mapping, and class patterns.
-Combinations of these constructs can still fail.
+order. There are recognizers for individual exception handlers, multi-item and
+consecutive synchronous context managers, and sequence, mapping, and class
+patterns. Combinations of these constructs can still fail.
 
 ## Verification
 

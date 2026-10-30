@@ -443,3 +443,33 @@ fn unpacking_comprehensions_use_the_target_iteration_order() {
         &[serc::PythonVersion::Py315],
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn consecutive_managers_keep_separate_exception_paths() {
+    check_fixture(
+        "def run(manager, emit):\n    with manager(1) as a, manager(2) as b:\n        emit(a, b)\n    emit('between')\n    with manager(3) as c:\n        emit(c)\n    emit('done')\n    return 17\n",
+        r"
+def scenario(fail, suppress):
+    events = []
+    class Manager:
+        def __init__(self, n):
+            self.n = n
+        def __enter__(self):
+            events.append(('enter', self.n))
+            return self.n
+        def __exit__(self, typ, value, tb):
+            events.append(('exit', self.n, typ.__name__ if typ else None))
+            return self.n == suppress
+    def emit(*values):
+        events.append(values)
+        if values[0] == fail:
+            raise ValueError()
+    try:
+        value = run(Manager, emit)
+    except ValueError:
+        value = 'raised'
+    return value, events
+result = [scenario(*args) for args in [(0,0), (1,0), (1,1), (3,3), ('between',3)]]",
+    );
+}

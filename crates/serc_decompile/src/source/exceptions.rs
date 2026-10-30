@@ -1,11 +1,20 @@
 //! The exception table records protected intervals and unwind targets. CPython
 //! duplicates cleanup on normal paths and places the exceptional copy out of line.
 use super::{Body, Bytecode, Instruction, Value};
+use serc_bytecode::instructions::Handler;
 use serc_bytecode::target::operands::SpecialMethod;
 
 fn boundary(ops: &[Instruction], offset: usize) -> Result<usize, String> {
     ops.binary_search_by_key(&offset, |op| op.offset)
         .map_err(|_| "invalid exception boundary".into())
+}
+
+fn is_manager_handler(ops: &[Instruction], entry: &Handler) -> Result<bool, String> {
+    let target = boundary(ops, entry.target)?;
+    Ok(ops[target].name == "PUSH_EXC_INFO"
+        && ops
+            .get(target + 1)
+            .is_some_and(|op| op.name == "WITH_EXCEPT_START"))
 }
 
 /// Locate the implicit manager protocol immediately before a protected binding.
@@ -168,16 +177,53 @@ impl Body<'_, '_, '_> {
 
     fn with_statement(&mut self, bc: &Bytecode) -> Result<(), String> {
         let ops = &bc.ops;
-        let mut ranges = bc.handlers.iter();
-        let mut entry = ranges.next().ok_or("missing with range")?;
+        let mut ranges = bc.handlers.iter().peekable();
+        let mut cursor = 0;
+        let mut normal_end = ops.len();
+        let depth = bc.handlers[0].depth;
+        while cursor < normal_end {
+            // Skip ranges that resume outer protection during the previous
+            // group's cleanup. Only a subsequent independent manager at the
+            // same depth starts another statement.
+            let Some(entry) = ranges.find(|range| range.start >= ops[cursor].offset) else {
+                break;
+            };
+            if entry.depth != depth
+                || !entry.lasti
+                || boundary(ops, entry.start)? >= normal_end
+                || !is_manager_handler(ops, entry)?
+            {
+                break;
+            }
+            let Some(next) =
+                self.manager_group(ops, cursor, entry, &mut ranges, &mut normal_end)?
+            else {
+                return Ok(());
+            };
+            cursor = next;
+        }
+        self.region(ops, cursor, normal_end, 0)
+    }
+
+    /// Recover one with statement, including adjacent items in its header.
+    /// Return the normal continuation, or None for a return through the managers.
+    fn manager_group<'a>(
+        &mut self,
+        ops: &[Instruction],
+        cursor: usize,
+        mut entry: &'a Handler,
+        ranges: &mut std::iter::Peekable<std::slice::Iter<'a, Handler>>,
+        normal_end: &mut usize,
+    ) -> Result<Option<usize>, String> {
         let mut managers = Vec::new();
         let mut previous_body = None;
         let mut seed = Vec::new();
-        let (start, end, handler) = loop {
+        let (start, end) = loop {
             let start = boundary(ops, entry.start)?;
             let end = boundary(ops, entry.end)?;
             let handler = boundary(ops, entry.target)?;
-            if start >= end || end > handler {
+            *normal_end = (*normal_end).min(handler);
+            if start >= end || end > *normal_end {
                 return Err("unsupported manager layout".into());
             }
             let enter = manager_entry(&ops[..start])?;
@@ -185,7 +231,7 @@ impl Body<'_, '_, '_> {
                 self.seeded(ops, previous, enter, 0, std::mem::take(&mut seed))?
                     .expression()?
             } else {
-                self.region(ops, 0, enter, 0)?;
+                self.region(ops, cursor, enter, 0)?;
                 self.expr()?
             };
             let (item, body_start, loaded) = self.manager_item(manager, ops, start, end)?;
@@ -194,20 +240,17 @@ impl Body<'_, '_, '_> {
 
             // Each additional item starts where the enclosing protected range
             // ends. The enclosing handler resumes protection during inner cleanup.
-            if let Some(inner) = ranges.next()
+            if let Some(&inner) = ranges.peek()
                 && inner.start == entry.end
                 && inner.depth > entry.depth
                 && inner.lasti
-                && let target = boundary(ops, inner.target)?
-                && ops[target].name == "PUSH_EXC_INFO"
-                && ops
-                    .get(target + 1)
-                    .is_some_and(|op| op.name == "WITH_EXCEPT_START")
+                && is_manager_handler(ops, inner)?
             {
+                ranges.next();
                 previous_body = Some(body_start);
                 entry = inner;
             } else {
-                break (body_start, end, handler);
+                break (body_start, end);
             }
         };
         let (body, returns) = self.seeded(ops, start, end, 0, seed)?.pending_return()?;
@@ -215,12 +258,12 @@ impl Body<'_, '_, '_> {
 
         let mut next = end;
         for _ in &managers {
-            let exit = ops[next..handler]
+            let exit = ops[next..*normal_end]
                 .iter()
                 .position(|op| op.name == "CALL")
                 .map(|n| next + n)
                 .ok_or("unsupported manager exit")?;
-            if exit + 1 >= handler || ops[exit + 1].name != "POP_TOP" {
+            if exit + 1 >= *normal_end || ops[exit + 1].name != "POP_TOP" {
                 return Err("unsupported manager result".into());
             }
             next = exit + 2;
@@ -229,9 +272,9 @@ impl Body<'_, '_, '_> {
             if ops.get(next).is_none_or(|op| op.name != "RETURN_VALUE") {
                 return Err("unsupported return through with".into());
             }
-            Ok(())
+            Ok(None)
         } else {
-            self.region(ops, next, handler, 0)
+            Ok(Some(next))
         }
     }
 }
