@@ -151,7 +151,7 @@ impl Body<'_, '_, '_> {
             .position(|op| op.name == "CALL")
             .map(|n| end + n)
             .ok_or("unsupported manager exit")?;
-        if !ops.get(exit + 1).is_some_and(|op| op.name == "POP_TOP") {
+        if ops.get(exit + 1).is_none_or(|op| op.name != "POP_TOP") {
             return Err("unsupported manager result".into());
         }
         let next = exit + 2;

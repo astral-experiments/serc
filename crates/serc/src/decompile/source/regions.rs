@@ -1,5 +1,7 @@
 //! Structure a slice of the instruction graph. Each arm gets a fresh operand
 //! stack; values that survive a join must be expressible as a Python expression.
+use std::fmt::Write as _;
+
 use super::{Body, Instruction, Value};
 
 pub(super) struct Fragment {
@@ -22,7 +24,7 @@ impl Fragment {
         match self.stack.pop() {
             None => Ok((self.lines, false)),
             Some(Value::Expr(value)) if self.stack.is_empty() => {
-                self.lines.push_str(&format!("return {value}\n"));
+                writeln!(self.lines, "return {value}").unwrap();
                 Ok((self.lines, true))
             }
             _ => Err("unsupported protected stack outcome".into()),
