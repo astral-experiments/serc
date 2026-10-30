@@ -16,6 +16,9 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+decompile = []
+
 [dependencies]
 encoding_rs = { workspace = true }
 hashbrown = { workspace = true }
