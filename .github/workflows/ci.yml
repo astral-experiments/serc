@@ -306,6 +306,30 @@ jobs:
       - name: "Compare with CPython 3.13"
         run: ./scripts/check-cpython-compatibility "$SERC_TEST_PYTHON_313" 3.13
 
+  decompile-corpus:
+    name: "Decompiler corpus"
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env: *rust-env
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+          submodules: true
+      - uses: ./.github/actions/setup-python
+      - uses: Swatinem/rust-cache@c19371144df3bb44fab255c43d04cbc2ab54d1c4 # v2.9.1
+      - name: "Check the default CLI"
+        run: cargo test -p serc-cli --no-default-features --locked --test decompile
+      - name: "Build the decompiler"
+        run: cargo build -p serc-cli --features decompile --locked
+      - name: "Recompile recovered modules on each pinned interpreter"
+        run: |
+          for python in "$SERC_TEST_PYTHON_312" "$SERC_TEST_PYTHON_313" "$SERC_TEST_PYTHON" "$SERC_TEST_PYTHON_315"; do
+            "$python" -I -B scripts/check_decompile_corpus.py target/debug/serc
+          done
+
   benchmark:
     name: "CodSpeed benchmarks"
     # Fork pull requests are intentionally skipped so untrusted code cannot request an OIDC token.
