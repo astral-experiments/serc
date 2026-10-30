@@ -3,6 +3,14 @@ use std::fmt::Write as _;
 
 use super::{Body, Instruction, Value};
 
+pub(super) fn is_collection_insert(op: &Instruction) -> bool {
+    op.arg > 1
+        && matches!(
+            op.name,
+            "LIST_APPEND" | "SET_ADD" | "MAP_ADD" | "LIST_EXTEND" | "SET_UPDATE" | "DICT_UPDATE"
+        )
+}
+
 fn loop_exit(ops: &[Instruction], header: usize, end: usize) -> Result<usize, String> {
     let exit = ops[header]
         .jump
@@ -61,9 +69,7 @@ fn clause_boundary(
             {
                 back - 3
             }
-            [.., append] if matches!(append.name, "LIST_APPEND" | "SET_ADD" | "MAP_ADD") => {
-                back - 1
-            }
+            [.., append] if is_collection_insert(append) => back - 1,
             _ => return Err("missing comprehension result".into()),
         }
     })
@@ -124,8 +130,18 @@ impl Body<'_, '_, '_> {
             let body = self.seeded(ops, element, boundary, level, seed)?;
             if let Some(child) = child {
                 iterable = body.expression()?;
-                header = child;
                 exit = loop_exit(ops, child, back)?;
+                // 3.15 expands a starred generator element with an anonymous
+                // inner loop that yields each item directly, without binding it.
+                if self.m.version == serc_bytecode::PythonVersion::Py315
+                    && self.m.text(self.code.name)? == "<genexpr>"
+                    && let [item, resume, pop] = &ops[child + 1..exit - 1]
+                    && (item.name, resume.name, pop.name) == ("YIELD_VALUE", "RESUME", "POP_TOP")
+                {
+                    self.push(format!("(*({iterable}){clauses})"))?;
+                    return Ok(end);
+                }
+                header = child;
                 continue;
             }
             let op = ops[boundary].name;
@@ -136,6 +152,9 @@ impl Body<'_, '_, '_> {
                 }
                 "LIST_APPEND" => format!("[{}{clauses}]", body.expression()?),
                 "SET_ADD" => format!("{{{}{clauses}}}", body.expression()?),
+                "LIST_EXTEND" => format!("[*({}){clauses}]", body.expression()?),
+                "SET_UPDATE" => format!("{{*({}){clauses}}}", body.expression()?),
+                "DICT_UPDATE" => format!("{{**({}){clauses}}}", body.expression()?),
                 "YIELD_VALUE" => format!("({}{clauses})", body.expression()?),
                 _ => unreachable!(),
             };

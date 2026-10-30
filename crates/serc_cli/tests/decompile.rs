@@ -410,3 +410,36 @@ after_first = list(log)
 result = before, first, after_first, list(g), log",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn starred_collections_evaluate_elements_in_order() {
+    check_fixture(
+        "def build(f, spread, call):\n    a = [f(1), *spread(2), f(3)]\n    b = {f(4), *spread(5), f(6)}\n    c = (f(7), *spread(8), f(9))\n    d = call(f(10), *spread(11), f(12), token=f(13))\n    return a, b, c, d\n",
+        r"
+log = []
+def f(n):
+    log.append(n)
+    return n
+def spread(n):
+    log.append(n)
+    yield n
+    log.append(-n)
+    yield -n
+result = build(f, spread, lambda *args, **kw: (args, kw)), log",
+    );
+    check_fixture(
+        "def f(x, y):\n    return [*(x(), y()), 1], {*(1, 2), x()}, (3, *y(), (4,5)), [1, 2, 3], {1, 2, 3}, {*{1, 2, 3}, x()}\n",
+        "result = f(lambda: 42, lambda: (0,))",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn unpacking_comprehensions_use_the_target_iteration_order() {
+    check_fixture_on(
+        "def f(rows, maps):\n    return [*row for row in rows if row], {*row for row in rows}, {**m for group in maps for m in group}\ndef gen(rows):\n    return (*row for row in rows if row)\n",
+        "result = f([[1,2], [], [3,2]], [[{'a':1}, {'b':2}], [{'a':3}]]), list(gen([[], [4,5], [6]]))",
+        &[serc::PythonVersion::Py315],
+    );
+}

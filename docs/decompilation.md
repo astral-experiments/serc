@@ -30,12 +30,14 @@ assignments and calls, branches, loops, function and class definitions,
 closures, annotations, selected generic functions, generators, comprehensions,
 and formatted and template strings. Synchronous comprehensions and generator
 expressions can contain multiple `for` clauses, filters, and conditional
-elements. It recovers nested and starred name targets in assignments, loops,
-comprehensions, and context managers. Deletion and in-place updates to
-attributes, subscripts, and slices preserve evaluation order. There are
-recognizers for individual exception handlers, multi-item synchronous context
-managers, and sequence, mapping, and class patterns. Combinations of these
-constructs can still fail.
+elements. List, set, and tuple displays and calls can mix ordinary elements with
+starred iterables. On 3.15 the decompiler also recovers unpacking in
+comprehensions and generator expressions. It recovers nested and starred name
+targets in assignments, loops, comprehensions, and context managers. Deletion
+and in-place updates to attributes, subscripts, and slices preserve evaluation
+order. There are recognizers for individual exception handlers, multi-item
+synchronous context managers, and sequence, mapping, and class patterns.
+Combinations of these constructs can still fail.
 
 ## Verification
 

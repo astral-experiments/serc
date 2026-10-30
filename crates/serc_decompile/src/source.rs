@@ -155,10 +155,7 @@ fn recover_scope(
     if body.suspended() {
         body.suspension_scope(&bc)
     } else if bc.ops.iter().any(|op| op.name == "LOAD_FAST_AND_CLEAR")
-        && bc
-            .ops
-            .iter()
-            .any(|op| matches!(op.name, "LIST_APPEND" | "SET_ADD" | "MAP_ADD"))
+        && bc.ops.iter().any(comprehensions::is_collection_insert)
     {
         // Nested comprehensions can place the inner unwind code before the
         // outer handler. The normal path ends at the first cleanup after a return.
@@ -512,7 +509,7 @@ impl Body<'_, '_, '_> {
                     .ok_or("expected argument list")?;
                 self.push(format!("({elements},)"))?;
             }
-            "LIST_EXTEND" | "SET_UPDATE" => self.extend_literal(op)?,
+            "LIST_EXTEND" | "SET_UPDATE" | "LIST_APPEND" | "SET_ADD" => self.update_literal(op)?,
             "STORE_ATTR" | "STORE_SUBSCR" | "STORE_SLICE" | "BINARY_SLICE" | "BUILD_SLICE" => {
                 self.subscript_or_attribute(op)?;
             }
