@@ -40,9 +40,12 @@ thread_local! {
 
 /// Pool keys never match different constant variants, including numerically equal types.
 #[inline]
-fn find_pool_constant(values: &[Constant], constant: &Constant) -> Option<usize> {
+fn find_pool_constant<'a>(
+    values: impl IntoIterator<Item = &'a Constant>,
+    constant: &Constant,
+) -> Option<usize> {
     let kind = std::mem::discriminant(constant);
-    values.iter().position(|existing| {
+    values.into_iter().position(|existing| {
         std::mem::discriminant(existing) == kind
             && ConstantEquality::PoolKey.equal(existing, constant)
     })
@@ -81,9 +84,20 @@ impl ConstantIndices {
         constant: &Constant,
         fingerprint: Option<u64>,
     ) -> Option<u32> {
+        self.find_by(values, |value| value, constant, fingerprint)
+    }
+
+    /// Look up the earliest matching entry, including tables that keep metadata beside the value.
+    fn find_by<T>(
+        &self,
+        values: &[T],
+        value: impl Fn(&T) -> &Constant,
+        constant: &Constant,
+        fingerprint: Option<u64>,
+    ) -> Option<u32> {
         let matches = |index: &u32| {
             let index = usize::try_from(*index).expect("constant index fits in usize");
-            ConstantEquality::PoolKey.equal(&values[index], constant)
+            ConstantEquality::PoolKey.equal(value(&values[index]), constant)
         };
         if let Some(fingerprint) = fingerprint {
             if self.fallback.is_empty() {
@@ -109,7 +123,7 @@ impl ConstantIndices {
                 .copied()
                 .min();
         }
-        find_pool_constant(values, constant)
+        find_pool_constant(values.iter().map(value), constant)
             .map(|index| u32::try_from(index).expect("constant index fits in u32"))
     }
 }
@@ -276,6 +290,8 @@ pub(super) struct OutputState {
     pub(super) has_deferred_break_none: bool,
     pub(super) deferred_constants_before_return: Vec<(OperandPatchId, Constant)>,
     pub(super) deferred_constants: Vec<(Option<DeferredConstantTarget>, Constant)>,
+    /// Number of deferred occurrences indexed so far and their first-match lookup table.
+    deferred_indices: Option<Box<(usize, ConstantIndices)>>,
     pub(super) fresh_empty_bytes_deferred: FxHashSet<usize>,
     pub(super) folded_constant_dependencies: Vec<(Constant, Vec<Constant>)>,
     pub(super) has_untracked_discarded_collection: bool,
@@ -845,12 +861,10 @@ impl Compiler<'_> {
             Expr::Subscript(subscript) => [Some(&*subscript.value), Some(&*subscript.slice)],
             _ => return Ok(()),
         };
-        let mut operands = operand_expressions
-            .into_iter()
-            .flatten()
-            .filter_map(|value| self.source_aware_fold_constant(value));
+        let mut expressions = operand_expressions.into_iter().flatten();
         // Preserve the empty-operand gate before folding the result.
-        let Some(first) = operands.next() else {
+        let Some(first) = expressions.find_map(|value| self.source_aware_fold_constant(value))
+        else {
             return Ok(());
         };
         let Some(result) = self.source_aware_fold_constant(expression) else {
@@ -859,7 +873,9 @@ impl Compiler<'_> {
         if self.output.reserved_constant_index(&result).is_some() {
             return Ok(());
         }
-        let operands = std::iter::once(first).chain(operands).collect();
+        let operands = std::iter::once(first)
+            .chain(expressions.filter_map(|value| self.source_aware_fold_constant(value)))
+            .collect();
         self.output
             .record_unreserved_folded_constant_dependencies(&result, operands);
         Ok(())
@@ -967,17 +983,42 @@ impl OutputState {
         constant
     }
 
+    /// Begin admitting deferred constants to the pool in emission order.
+    pub(super) fn take_deferred_constants(
+        &mut self,
+    ) -> Vec<(Option<DeferredConstantTarget>, Constant)> {
+        self.deferred_indices = None;
+        std::mem::take(&mut self.deferred_constants)
+    }
+
     /// Finds the first reserved pool key without changing its admission order.
-    fn reserved_constant_index(&self, constant: &Constant) -> Option<usize> {
+    fn reserved_constant_index(&mut self, constant: &Constant) -> Option<usize> {
         self.constants.find(constant).or_else(|| {
-            let kind = std::mem::discriminant(constant);
-            self.deferred_constants
-                .iter()
-                .position(|(_, existing)| {
-                    std::mem::discriminant(existing) == kind
-                        && ConstantEquality::PoolKey.equal(existing, constant)
-                })
-                .map(|index| self.constants.len() + index)
+            let deferred = &self.deferred_constants;
+            let index = if deferred.len() < CONSTANT_INDEX_THRESHOLD
+                || u32::try_from(deferred.len()).is_err()
+            {
+                find_pool_constant(deferred.iter().map(|(_, value)| value), constant)?
+            } else {
+                let (indexed_len, indices) = self
+                    .deferred_indices
+                    .get_or_insert_with(Default::default)
+                    .as_mut();
+                for (index, (_, value)) in deferred.iter().enumerate().skip(*indexed_len) {
+                    indices.insert(
+                        constant_pool_fingerprint(value),
+                        u32::try_from(index).unwrap(),
+                    );
+                }
+                *indexed_len = deferred.len();
+                indices.find_by(
+                    deferred,
+                    |(_, value)| value,
+                    constant,
+                    constant_pool_fingerprint(constant),
+                )? as usize
+            };
+            Some(self.constants.len() + index)
         })
     }
 
@@ -5357,6 +5398,11 @@ def outer(argument):
                     .unwrap();
             }
             reverse.constants.intern(compatible.clone()).unwrap();
+            for value in 0..prefix_len {
+                reverse
+                    .deferred_constants
+                    .push((None, Constant::Int(u64::try_from(value).unwrap())));
+            }
             reverse.deferred_constants.push((None, compatible));
             let duplicate = Constant::FrozenSet(vec![Constant::Int(1), Constant::Int(1)]);
             assert_eq!(reverse.reserved_constant_index(&duplicate), None);
@@ -5368,7 +5414,7 @@ def outer(argument):
                     Constant::Int(1),
                     Constant::Int(3)
                 ])),
-                Some(reverse.constants.len() + 1)
+                Some(reverse.constants.len() + prefix_len + 1)
             );
         }
     }

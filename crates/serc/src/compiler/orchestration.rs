@@ -1332,10 +1332,11 @@ impl<'source> Compiler<'source> {
         }
 
         self.output.first_flowgraph_constant = self.output.constants.len();
-        for (deferred_index, (target, constant)) in
-            std::mem::take(&mut self.output.deferred_constants)
-                .into_iter()
-                .enumerate()
+        for (deferred_index, (target, constant)) in self
+            .output
+            .take_deferred_constants()
+            .into_iter()
+            .enumerate()
         {
             if self
                 .output
