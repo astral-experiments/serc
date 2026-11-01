@@ -6,8 +6,8 @@ use std::hash::{Hash, Hasher};
 use hashbrown::HashTable;
 use ruff_python_ast::visitor::{Visitor, walk_expr, walk_pattern, walk_stmt};
 use ruff_python_ast::{
-    BoolOp, Expr, ExprBinOp, ExprContext, ExprUnaryOp, FStringPartRef, InterpolatedStringElement,
-    Number, Operator, Pattern, Singleton, Stmt, UnaryOp,
+    BoolOp, BytesLiteralValue, Expr, ExprBinOp, ExprContext, ExprUnaryOp, FStringPartRef,
+    InterpolatedStringElement, Number, Operator, Pattern, Singleton, Stmt, UnaryOp,
 };
 use ruff_text_size::Ranged;
 use rustc_hash::{FxHashMap, FxHashSet, FxHasher};
@@ -1968,6 +1968,15 @@ pub(super) fn number_constant(number: &Number) -> Constant {
     }
 }
 
+/// Copy the decoded parts of a bytes literal into one constant, including implicit concatenations.
+pub(super) fn bytes_constant(value: &BytesLiteralValue) -> Constant {
+    let mut bytes = Vec::with_capacity(value.len());
+    for part in value {
+        bytes.extend_from_slice(part);
+    }
+    Constant::Bytes(bytes)
+}
+
 pub(super) fn literal_constant(expression: &Expr) -> Option<Constant> {
     match expression {
         Expr::NoneLiteral(_) => Some(Constant::None),
@@ -1975,7 +1984,7 @@ pub(super) fn literal_constant(expression: &Expr) -> Option<Constant> {
         Expr::EllipsisLiteral(_) => Some(Constant::Ellipsis),
         Expr::NumberLiteral(number) => Some(number_constant(&number.value)),
         Expr::StringLiteral(string) => Some(Constant::String(string.value.to_str().to_string())),
-        Expr::BytesLiteral(bytes) => Some(Constant::Bytes(bytes.value.bytes().collect())),
+        Expr::BytesLiteral(bytes) => Some(bytes_constant(&bytes.value)),
         _ => None,
     }
 }

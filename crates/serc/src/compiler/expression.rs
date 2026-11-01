@@ -41,10 +41,10 @@ use crate::target::{Opcode, is_scope_exit};
 use crate::{CompileError, PythonVersion};
 
 use super::constant::{
-    PercentFormatPart, double_negated_ellipsis, explicit_surrogate_string, first_literal_constant,
-    fold_constant, fold_constant_for_version, folded_bool_operand, folded_constant_owner_slots,
-    is_small_literal_tuple_element, number_constant, optimized_percent_format,
-    two_element_slice_optimization, unique_frozenset_constants,
+    PercentFormatPart, bytes_constant, double_negated_ellipsis, explicit_surrogate_string,
+    first_literal_constant, fold_constant, fold_constant_for_version, folded_bool_operand,
+    folded_constant_owner_slots, is_small_literal_tuple_element, number_constant,
+    optimized_percent_format, two_element_slice_optimization, unique_frozenset_constants,
 };
 use super::scope::{
     LoweringFunctionPlan, NameId, NameSet, analyze_lambda_scope, analyze_lambda_scope_with_mangler,
@@ -2757,7 +2757,7 @@ impl Compiler<'_> {
                 self.emit(LOAD_CONST, index, 1)
             }
             Expr::BytesLiteral(bytes) => {
-                let index = self.add_constant(Constant::Bytes(bytes.value.bytes().collect()))?;
+                let index = self.add_constant(bytes_constant(&bytes.value))?;
                 self.emit(LOAD_CONST, index, 1)
             }
             _ => unreachable!("scalar literal path requires a scalar AST literal"),
