@@ -21,9 +21,19 @@ Compiler-only builds omit the recovery crate and the reader.
 The reader recognizes timestamp, checked-hash and unchecked-hash headers for the
 four pinned targets. It uses a bounded marshal arena so nested code and shared
 constants can be inspected directly. The decoder resolves instruction prefixes,
-inline caches, jumps and exception table entries using target metadata. A
-worklist checks operand stack heights at control-flow joins and exception
-handlers.
+inline caches, jumps and exception table entries using target metadata. The
+recovery crate builds a basic-block graph for each scope, splitting at jumps,
+returns, and exception-table boundaries. It records normal predecessors and
+successors separately from exceptional edges, which restore the handler's stack
+depth. A worklist rejects inconsistent stack heights at joins.
+
+Source recovery uses forward postdominators to find where branches rejoin and
+shared successors to combine short-circuit tests. Loop recovery distinguishes
+exhaustion from explicit breaks, including when CPython copied the return after
+the loop into a break arm. It can also follow consecutive typed handlers with a
+shared return and recover a conditional break through duplicated finally
+cleanup. Backedges end a forward region. More complex cyclic graphs and
+exception layouts can still be refused.
 
 The source pass reconstructs Python from the decoded scopes. It handles common
 assignments and calls, branches, loops, function and class definitions,
@@ -64,10 +74,10 @@ never executes corpus code.
 
 | CPython   | Compilable modules | Verified modules | Coverage | Verified code objects / total |
 | --------- | -----------------: | ---------------: | -------: | ----------------------------: |
-| 3.12.14   |              2,190 |            1,585 |    72.4% |                5,932 / 11,063 |
-| 3.13.15   |              2,209 |            1,541 |    69.8% |                5,215 / 11,562 |
-| 3.14.5    |              2,246 |            1,537 |    68.4% |                6,382 / 14,082 |
-| 3.15.0rc2 |              2,266 |            1,550 |    68.4% |                6,360 / 14,114 |
+| 3.12.14   |              2,190 |            1,593 |    72.7% |                5,951 / 11,063 |
+| 3.13.15   |              2,209 |            1,549 |    70.1% |                5,234 / 11,562 |
+| 3.14.5    |              2,246 |            1,550 |    69.0% |                6,434 / 14,082 |
+| 3.15.0rc2 |              2,266 |            1,564 |    69.0% |                6,417 / 14,114 |
 
 The code-object count includes each module and its nested code. Only objects
 from completely verified modules count as successes. All four runs had zero

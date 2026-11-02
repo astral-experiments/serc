@@ -1,7 +1,9 @@
 mod annotations;
 mod comprehensions;
+mod conditionals;
 mod definitions;
 mod exceptions;
+mod loops;
 mod operands;
 mod patterns;
 mod regions;
@@ -138,13 +140,14 @@ fn recover_scope(
         m.bytes(code.exceptions)?,
     )
     .map_err(|e| format!("{name}: {e}"))?;
-    crate::flow::stack_heights(&bc, m.version, code.stack_size)
+    let flow = crate::flow::Graph::build(&bc, m.version, code.stack_size)
         .map_err(|e| format!("{name}: {e}"))?;
     let mut body = Body {
         m,
         code,
         stack: Vec::new(),
         lines: String::new(),
+        flow,
         loop_edges: None,
         class,
         annotations: Vec::new(),
@@ -206,7 +209,8 @@ struct Body<'m, 'data, 'work> {
     code: &'m Code,
     stack: Vec<Value>,
     lines: String,
-    loop_edges: Option<(usize, Option<usize>)>,
+    flow: crate::flow::Graph,
+    loop_edges: Option<loops::Loop>,
     depth: usize,
     class: bool,
     annotations: Vec<(Option<u32>, String, String)>,

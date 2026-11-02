@@ -473,3 +473,37 @@ def scenario(fail, suppress):
 result = [scenario(*args) for args in [(0,0), (1,0), (1,1), (3,3), ('between',3)]]",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn forward_joins_and_loop_exits() {
+    check_fixture(
+        "def first(xs, emit):\n    for x in xs:\n        emit(x)\n        break\n    else:\n        emit(0)\n    emit(9)\n",
+        "result = []\nfirst([], result.append)\nfirst([1, 2], result.append)",
+    );
+    check_fixture(
+        "def f(a, b, c, log):\n    if (a() and b()) or c():\n        log(1)\n    return 2\n",
+        "from itertools import product\nresult = []\nfor a, b, c in product([False, True], repeat=3):\n    def probe(n, v): result.append(n); return v\n    result.append(f(lambda: probe('a', a), lambda: probe('b', b), lambda: probe('c', c), result.append))",
+    );
+    check_fixture(
+        "def f(xs, emit):\n    for x in xs:\n        if x < 0:\n            continue\n        if x == 2:\n            break\n        emit(x)\n    else:\n        emit(0)\n    return 1\n",
+        "result = []\nfor xs in [[], [-1, 1], [1, 2, 3]]: result.append(f(xs, result.append))",
+    );
+    check_fixture(
+        "def f(pred, stop, emit):\n    while pred():\n        if stop():\n            break\n        emit(1)\n    else:\n        emit(2)\n    return 3\n",
+        "result = []\nfor stop in [True, False]:\n    pred = iter([True, True, False])\n    result.append(f(lambda: next(pred), lambda: stop, result.append))",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn exception_edges_and_loop_cleanup() {
+    check_fixture(
+        "def f(xs, emit):\n    for x in xs:\n        try:\n            if x:\n                break\n        finally:\n            emit(x)\n    return 2\n",
+        "result = []\nresult.append(f([0, 1, 2], result.append))\nclass Bad:\n    def __bool__(self): raise ValueError\ntry: f([Bad()], lambda x: result.append('cleanup'))\nexcept ValueError: result.append('caught')",
+    );
+    check_fixture(
+        "def f(work, emit):\n    try:\n        return work()\n    except ValueError:\n        emit(1)\n    except TypeError:\n        emit(2)\n    return 3\n",
+        "result = []\ndef fail(e): raise e\nfor work in [lambda: 0, lambda: fail(ValueError()), lambda: fail(TypeError()), lambda: fail(KeyError())]:\n    try: result.append(f(work, result.append))\n    except KeyError: result.append('unmatched')",
+    );
+}

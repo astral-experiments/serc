@@ -1,5 +1,6 @@
 //! The exception table records protected intervals and unwind targets. CPython
 //! duplicates cleanup on normal paths and places the exceptional copy out of line.
+use super::conditionals::Predicate;
 use super::{Body, Bytecode, Instruction, Value};
 use serc_bytecode::instructions::Handler;
 use serc_bytecode::target::operands::SpecialMethod;
@@ -57,6 +58,11 @@ impl Body<'_, '_, '_> {
         {
             return self.with_statement(bc);
         }
+        if entry.depth > 0 && !entry.lasti {
+            // A protected condition inside a loop keeps the iterator on the
+            // stack. Its exceptional cleanup is out of line.
+            return self.region(ops, 0, handler, 0);
+        }
         if entry.depth != 0 || entry.lasti {
             return Err(format!("unsupported handler depth at byte {}", entry.start));
         }
@@ -66,6 +72,20 @@ impl Body<'_, '_, '_> {
         let star = ops
             .get(handler + 1)
             .is_some_and(|op| op.name == "BUILD_LIST");
+        if !star
+            && returns
+            && end + 1 == handler
+            && ops[end].name == "RETURN_VALUE"
+            && ops.get(handler + 1).is_some_and(|_| {
+                self.flow
+                    .block(handler + 1)
+                    .ops
+                    .clone()
+                    .any(|i| ops[i].name == "CHECK_EXC_MATCH")
+            })
+        {
+            return self.returning_handlers(ops, handler);
+        }
         let match_kind = if star {
             "CHECK_EG_MATCH"
         } else {
@@ -155,6 +175,105 @@ impl Body<'_, '_, '_> {
         } else {
             self.region(ops, next, handler, 0)
         }
+    }
+
+    /// Follow the failed-match edge to each subsequent handler. When the try
+    /// returns, CPython can duplicate the continuation's return after `POP_EXCEPT`
+    /// in every successful handler, leaving no jump to the original return.
+    fn returning_handlers(&mut self, ops: &[Instruction], handler: usize) -> Result<(), String> {
+        let mut cursor = handler + 1;
+        let mut continuation = None;
+        while ops.get(cursor).is_some_and(|op| op.name != "RERAISE") {
+            let check = self
+                .flow
+                .block(cursor)
+                .ops
+                .clone()
+                .find(|&i| ops[i].name == "CHECK_EXC_MATCH")
+                .ok_or("unsupported exception type")?;
+            let jump = check + 1;
+            let next = self
+                .flow
+                .jump(jump)
+                .filter(|&next| next > jump && ops[jump].name == "POP_JUMP_IF_FALSE")
+                .ok_or("unsupported exception dispatch")?;
+            let kind = self.fragment(ops, cursor, check, 0)?.expression()?;
+            let binding = jump + 1 + usize::from(ops[jump + 1].name == "NOT_TAKEN");
+            if binding >= next || ops[binding].name != "POP_TOP" {
+                return Err("unsupported returning exception binding".into());
+            }
+            let pop = (binding + 1..next)
+                .find(|&i| ops[i].name == "POP_EXCEPT")
+                .ok_or("missing exception cleanup")?;
+            let suite = self.fragment(ops, binding + 1, pop, 0)?.suite()?;
+            self.block(&format!("except {kind}:"), &suite)?;
+            if !matches!(ops[next - 1].name, "RETURN_CONST" | "RETURN_VALUE") {
+                return Err("unsupported exception continuation".into());
+            }
+            let tail = self.fragment(ops, pop + 1, next, 0)?.suite()?;
+            if continuation
+                .as_ref()
+                .is_some_and(|previous| previous != &tail)
+            {
+                return Err("distinct handler continuations".into());
+            }
+            continuation = Some(tail);
+            cursor = next;
+        }
+        for line in continuation.ok_or("missing exception handler")?.lines() {
+            self.line(line)?;
+        }
+        Ok(())
+    }
+
+    /// A conditional transfer through finally has two normal copies of the
+    /// cleanup and an exceptional copy. Match all three before lifting the
+    /// break out of the normal copy.
+    pub(super) fn finally_break(
+        &mut self,
+        ops: &[Instruction],
+        predicate: &Predicate,
+        handler: Handler,
+        level: usize,
+        end: usize,
+    ) -> Result<usize, String> {
+        let (taken, fallthrough) = (predicate.target, predicate.suite);
+        let exceptional = boundary(ops, handler.target)?;
+        let unwind = self
+            .flow
+            .handler(exceptional)
+            .filter(|h| h.lasti)
+            .ok_or("missing finally unwind handler")?;
+        let stop = boundary(ops, unwind.end)?;
+        if ops[exceptional].name != "PUSH_EXC_INFO"
+            || stop <= exceptional + 1
+            || ops[stop - 1].name != "RERAISE"
+        {
+            return Err("unsupported finally cleanup".into());
+        }
+        let length = stop - exceptional - 2;
+        let cleanup = self
+            .fragment(ops, exceptional + 1, stop - 1, level)?
+            .suite()?;
+        let mut normal_copy = |start: usize, limit: usize| -> Result<usize, String> {
+            let start = start + usize::from(ops[start].name == "NOP");
+            let after = start + length;
+            if after > limit || self.fragment(ops, start, after, level)?.suite()? != cleanup {
+                return Err("distinct finally cleanup paths".into());
+            }
+            Ok(after)
+        };
+        let transfer = normal_copy(fallthrough, taken)?;
+        let next = normal_copy(taken, end)?;
+        if self.fragment(ops, transfer, taken, level)?.suite()?.trim() != "break" {
+            return Err("unsupported transfer through finally".into());
+        }
+        self.block(
+            "try:",
+            &format!("if {}:\n    break\n", predicate.test(true)),
+        )?;
+        self.block("finally:", &cleanup)?;
+        Ok(next)
     }
 
     pub(super) fn manager_item(
