@@ -1,5 +1,5 @@
 use super::{Body, Bytecode, Instruction};
-use serc_bytecode::target::code_flags;
+use serc_bytecode::target::{code_flags, operands::UnaryIntrinsic};
 
 fn find(ops: &[Instruction], start: usize, end: usize, name: &str) -> Result<usize, String> {
     ops.get(start..end)
@@ -43,6 +43,23 @@ impl Body<'_, '_, '_> {
                 .map(|n| close + 1 + n)
                 .ok_or("unsupported async manager continuation")?;
             return self.region(ops, close + 2, ret + 1, 0);
+        }
+        // A suspended body can end with a raise, even when another path
+        // returns. The StopIteration handler marks the end of the normal CFG.
+        if let [body @ .., handler, reraise] = ops.as_slice()
+            && (handler.name, handler.arg)
+                == (
+                    "CALL_INTRINSIC_1",
+                    UnaryIntrinsic::STOPITERATION_ERROR.argument(),
+                )
+            && (reraise.name, reraise.arg) == ("RERAISE", 1)
+            && !bc.handlers.is_empty()
+            && bc
+                .handlers
+                .iter()
+                .all(|h| h.target == handler.offset && h.depth == 0 && h.lasti)
+        {
+            return self.region(ops, 0, body.len(), 0);
         }
         let stop = ops
             .iter()

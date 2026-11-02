@@ -3,7 +3,7 @@
 use std::collections::BTreeMap;
 
 use rustc_hash::{FxHashMap, FxHashSet};
-use serc_bytecode::target::local_kinds;
+use serc_bytecode::target::{code_flags, local_kinds};
 
 use super::{Body, Code, Id, Instruction, Module, Object, identifier};
 
@@ -12,6 +12,7 @@ pub(super) struct Stub<'a> {
     names: Vec<&'a str>,
     locals: Vec<&'a str>,
     guard: Option<String>,
+    generator: bool,
 }
 
 // A tracing NOP can stand in for a dead suite. At the end of a scope the
@@ -23,7 +24,9 @@ pub(crate) type Hints = FxHashMap<Id, Hint>;
 pub(crate) struct Hint {
     names: Vec<usize>,
     locals: Vec<usize>,
+    captures: Vec<usize>,
     guard: Option<String>,
+    generator: bool,
 }
 
 // Compare the first compiled candidate with the input before constructing
@@ -67,9 +70,25 @@ pub(crate) fn differences(m: &Module<'_>, candidate: &Module<'_>) -> Result<Hint
             Ok(absent)
         };
         let names = missing(code.names, recovered.names)?;
-        let mut locals = missing(code.locals, recovered.locals)?;
         let kinds = m.bytes(code.local_kinds)?;
-        locals.retain(|&i| kinds.get(i) == Some(&local_kinds::CO_FAST_LOCAL));
+        let mut locals = Vec::new();
+        let mut captures = Vec::new();
+        for i in missing(code.locals, recovered.locals)? {
+            match kinds.get(i) {
+                Some(&local_kinds::CO_FAST_FREE) => captures.push(i),
+                Some(kind)
+                    if kind & (local_kinds::CO_FAST_LOCAL | local_kinds::CO_FAST_CELL) != 0
+                        && kind & local_kinds::CO_FAST_HIDDEN == 0 =>
+                {
+                    locals.push(i);
+                }
+                _ => {}
+            }
+        }
+        let generator_flags = code_flags::CO_GENERATOR | code_flags::CO_ASYNC_GENERATOR;
+        let generator = code.flags & generator_flags != 0 && recovered.flags & generator_flags == 0;
+        let needs_suite =
+            !names.is_empty() || !locals.is_empty() || !captures.is_empty() || generator;
         let a = m.tuple(code.constants)?;
         let b = candidate.tuple(recovered.constants)?;
         budget = budget
@@ -82,19 +101,21 @@ pub(crate) fn differences(m: &Module<'_>, candidate: &Module<'_>) -> Result<Hint
             None
         };
         if guard.is_none()
-            && (!names.is_empty() || !locals.is_empty())
+            && needs_suite
             && a.first()
                 .is_some_and(|&i| matches!(m.objects[i], Object::None))
         {
             guard = Some("None".into());
         }
-        if !names.is_empty() || !locals.is_empty() || guard.is_some() {
+        if needs_suite || guard.is_some() {
             hints.insert(
                 id,
                 Hint {
                     names,
                     locals,
+                    captures,
                     guard,
+                    generator,
                 },
             );
         }
@@ -197,8 +218,13 @@ impl Hint {
         place_names(m, locals, &self.locals, &bindings, &nops, |site, name| {
             stubs.entry(site).or_default().locals.push(name);
         })?;
-        if let Some(guard) = &self.guard {
-            stubs.entry(nops.first().copied()).or_default().guard = Some(guard.clone());
+        if self.guard.is_some() || self.generator || !self.captures.is_empty() {
+            let stub = stubs.entry(nops.first().copied()).or_default();
+            stub.guard.clone_from(&self.guard);
+            stub.generator = self.generator;
+            for &i in &self.captures {
+                stub.names.push(identifier(m.text(locals[i])?)?);
+            }
         }
         Ok(stubs)
     }
@@ -242,21 +268,38 @@ impl Body<'_, '_, '_> {
         if stub.locals.len() + stub.names.len() > 128 {
             return Err("synthetic statement operand limit exceeded".into());
         }
-        let rhs = if stub.locals.is_empty() {
-            "pass"
-        } else {
-            "None"
-        };
+        let mut value = stub.names.join(", ");
+        if stub.generator {
+            value = if value.is_empty() {
+                "(yield)".into()
+            } else {
+                format!("(yield {value})")
+            };
+        } else if value.is_empty() {
+            value = if stub.locals.is_empty() {
+                "pass"
+            } else {
+                "None"
+            }
+            .into();
+        }
+        // An implicit None return can carry the last dead suite's line.
+        // Let that suite end the function instead of adding another NOP.
+        if site.is_none()
+            && let Some(prefix) = self
+                .lines
+                .strip_suffix("return\n")
+                .or_else(|| self.lines.strip_suffix("return None\n"))
+            && (prefix.is_empty() || prefix.ends_with('\n'))
+        {
+            self.lines.truncate(prefix.len());
+        }
         let mut out = format!("if {}: ", stub.guard.as_deref().unwrap_or("False"));
         for local in stub.locals {
             out.push_str(local);
             out.push_str(" = ");
         }
-        if stub.names.is_empty() {
-            out.push_str(rhs);
-        } else {
-            out.push_str(&stub.names.join(", "));
-        }
+        out.push_str(&value);
         out.push_str("  # serc: synthetic dead code");
         self.line(&out)?;
         self.work.emitted_stub = true;

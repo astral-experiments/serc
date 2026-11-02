@@ -82,8 +82,10 @@ answer = 1
 ```
 
 The marker identifies the entire synthetic suite. It is included by default in
-CLI and library output. The guard is always false, and the marked source must
-pass the same whole-module verification as any other output.
+CLI and library output. A synthetic suite can contain a `yield` to preserve a
+generator function or reference a name captured by a closure. Its guard is
+always false. The marked source must pass the same whole-module verification as
+any other output.
 
 ## Ruff corpus
 

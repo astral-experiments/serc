@@ -109,7 +109,7 @@ def load(path):
     return compile(open(path, encoding='utf-8').read(), '<fixture>', 'exec')
 def fields(c):
     return (c.co_code, c.co_flags, c.co_names, c.co_varnames, c.co_cellvars, c.co_freevars,
-            c.co_argcount, c.co_posonlyargcount, c.co_kwonlyargcount, c.co_exceptiontable,
+            c.co_argcount, c.co_posonlyargcount, c.co_kwonlyargcount, c.co_stacksize, c.co_exceptiontable,
             tuple(fields(k) if isinstance(k, types.CodeType) else k for k in c.co_consts))
 def exercise(c):
     scope = {}
@@ -786,4 +786,28 @@ Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12)
         assert!(!output.status.success(), "{version}");
         assert!(output.stdout.is_empty());
     }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn synthetic_yields_and_captures_preserve_function_kinds() {
+    check_output(
+        "def outer(x):\n    async def stream():\n        if False: yield x\n    return stream\n",
+        "import asyncio, inspect\nstream = outer(42)\nasync def collect(): return [n async for n in stream()]\nresult = inspect.isasyncgenfunction(stream), stream.__closure__[0].cell_contents, asyncio.run(collect())",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert_eq!(source.matches("# serc: synthetic dead code").count(), 1);
+            assert!(source.contains("(yield x)  # serc: synthetic dead code"));
+        },
+    );
+    check_output(
+        "def stream():\n    if False: yield ghost()\n    raise LookupError\n",
+        "import inspect\niterator = stream()\ntry: next(iterator)\nexcept LookupError: result = inspect.isgenerator(iterator)",
+        &common::PYTHON_VERSIONS,
+        |source| assert!(source.contains("(yield ghost)  # serc: synthetic dead code")),
+    );
+    check_fixture(
+        "def stream(stop):\n    yield 1\n    if stop: return\n    raise LookupError\n",
+        "a, b = stream(True), stream(False)\nresult = [next(a), next(b), next(a, 2)]\ntry: next(b)\nexcept LookupError: result.append(3)",
+    );
 }
