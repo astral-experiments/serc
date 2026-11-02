@@ -12,11 +12,12 @@ target/debug/serc decompile __pycache__/example.cpython-314.pyc
 ## Workspace crates
 
 `serc_bytecode` owns the generated target tables, marshal tags, and instruction
-decoder. Its `read` feature adds cache parsing. `serc_decompile` uses those
-decoded instructions for stack analysis, control-flow recovery, source
-reconstruction, and verification. The public `serc::decompile_pyc` entry point
-supplies serc's compiler for verification. The CLI calls that same entry point.
-Compiler-only builds omit the recovery crate and the reader.
+decoder. Its `read` feature adds cache parsing and instruction line numbers.
+`serc_decompile` uses those decoded instructions for stack analysis,
+control-flow recovery, source reconstruction, and verification. The public
+`serc::decompile_pyc` entry point supplies serc's compiler for verification. The
+CLI calls that same entry point. Compiler-only builds omit the recovery crate
+and the reader.
 
 The reader recognizes timestamp, checked-hash and unchecked-hash headers for the
 four pinned targets. It uses a bounded marshal arena so nested code and shared
@@ -35,19 +36,25 @@ shared return and recover a conditional break through duplicated finally
 cleanup. Backedges end a forward region. More complex cyclic graphs and
 exception layouts can still be refused.
 
-The source pass reconstructs Python from the decoded scopes. It handles common
-assignments and calls, branches, loops, function and class definitions,
-closures, annotations, selected generic functions, generators, comprehensions,
-and formatted and template strings. Synchronous comprehensions and generator
-expressions can contain multiple `for` clauses, filters, and conditional
-elements. List, set, and tuple displays and calls can mix ordinary elements with
-starred iterables. On 3.15 the decompiler also recovers unpacking in
-comprehensions and generator expressions. It recovers nested and starred name
-targets in assignments, loops, comprehensions, and context managers. Deletion
-and in-place updates to attributes, subscripts, and slices preserve evaluation
-order. There are recognizers for individual exception handlers, multi-item and
-consecutive synchronous context managers, and sequence, mapping, and class
-patterns. Combinations of these constructs can still fail.
+The source pass reconstructs ordinary and simultaneous assignments, calls,
+branches, loops, imports, functions, closures, and classes. It preserves the
+evaluation order of chained comparisons and parallel assignments. Class headers
+can include decorators, type parameters, and metaclass keywords. Lazy type
+aliases, bounds, constraints, and defaults retain their separate evaluation
+scopes.
+
+Comprehensions and generator expressions can mix synchronous and asynchronous
+`for` clauses and filters. Async clauses use the exception table to find the
+exhaustion block for each iterator. On 3.15 the decompiler also handles starred
+elements in comprehensions. Other supported expressions include complex
+literals, multidimensional slice indices, starred displays and calls, and
+formatted and template strings.
+
+Exception recovery handles selected typed and bare handlers, multi-item and
+consecutive synchronous context managers, and handlers whose `try: pass` body
+CPython optimized away. Match recovery handles value and singleton patterns,
+alternatives, guards, captures, and selected sequence, mapping, and class
+patterns. Nested or overlapping cases can still exceed these recognizers.
 
 ## Verification
 
@@ -74,20 +81,26 @@ never executes corpus code.
 
 | CPython   | Compilable modules | Verified modules | Coverage | Verified code objects / total |
 | --------- | -----------------: | ---------------: | -------: | ----------------------------: |
-| 3.12.14   |              2,190 |            1,593 |    72.7% |                5,951 / 11,063 |
-| 3.13.15   |              2,209 |            1,549 |    70.1% |                5,234 / 11,562 |
-| 3.14.5    |              2,246 |            1,550 |    69.0% |                6,434 / 14,082 |
-| 3.15.0rc2 |              2,266 |            1,564 |    69.0% |                6,417 / 14,114 |
+| 3.12.14   |              2,190 |            1,754 |    80.1% |                7,366 / 11,063 |
+| 3.13.15   |              2,209 |            1,748 |    79.1% |                7,535 / 11,562 |
+| 3.14.5    |              2,246 |            1,752 |    78.0% |                9,170 / 14,082 |
+| 3.15.0rc2 |              2,266 |            1,766 |    77.9% |                9,153 / 14,114 |
 
 The code-object count includes each module and its nested code. Only objects
 from completely verified modules count as successes. All four runs had zero
-incorrect outputs, crashes, and timeouts. Current gaps include nested and
-overlapping control-flow constructs, complex exception cleanup, asynchronous
-comprehensions and some class and pattern layouts. A single unsupported scope
-prevents recovery of the containing module.
+incorrect outputs, crashes, and timeouts. On 3.14, among the 494 refusals, 227
+produced a source candidate that failed verification. The most frequent
+differences were instructions, constants, and exception tables. Remaining source
+recovery gaps include nested exception cleanup, overlapping branches and loops,
+and patterns that combine different kinds of captures. These counts record only
+the first refusal in each module.
 
-Run the check with each pinned CPython. It prints JSON counts, grouped refusal
-reasons and the filenames of any verification failures.
+Run the check with each pinned CPython. It prints JSON counts, first refusal
+reasons and the filenames of any verification failures. To compare two builds,
+pass the older executable to `--compare-with`. When the new build refuses a
+file, the checker recompiles the older build's output with the same CPython. A
+previously verified module in the `regressions` map fails the run even if total
+coverage increased.
 
 ```console
 /path/to/python3.14 -I -B scripts/check_decompile_corpus.py target/debug/serc
