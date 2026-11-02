@@ -165,10 +165,10 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
             let output = serc::decompile_pyc_with_mode(&bytes, mode)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
             if output.verification_error.is_some() {
-                eprintln!(
-                    "serc: {}: best-effort decompilation; see diagnostics in source",
+                write_error(&format!(
+                    "{}: best-effort decompilation (see diagnostics in source)",
                     path.display()
-                );
+                ));
             }
             io::stdout()
                 .lock()
