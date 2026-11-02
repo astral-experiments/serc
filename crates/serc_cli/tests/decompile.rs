@@ -272,6 +272,15 @@ fn template_interpolations_retain_expression_text() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn formatted_displays_remain_interpolations() {
+    check_fixture(
+        "def show(x):\n    return f\"{ {'a': x}!r}\", f\"nested { {f'{ {x} }'} } end\"\n",
+        "result = show(42)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn corpus_operand_layouts() {
     check_fixture(
         "import os\nimport sys as alias\nx: int = 3\ny: str\nclass C:\n    n: int = 42\n    def read(self, k: int) -> int:\n        return self.n + k\n",

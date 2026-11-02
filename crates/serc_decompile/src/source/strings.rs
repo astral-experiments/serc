@@ -84,7 +84,15 @@ impl Body<'_, '_, '_> {
                         conversion(if op.name == "FORMAT_VALUE" { a & 3 } else { 0 })?,
                     )
                 };
-                let field = format!("{{{value}{conv}{spec}}}");
+                // A display immediately following the opening brace would be
+                // read as a literal "{{". Template fields already carry the
+                // exact expression spelling, including any leading whitespace.
+                let padding = if !template && value.starts_with('{') {
+                    " "
+                } else {
+                    ""
+                };
+                let field = format!("{{{padding}{value}{conv}{spec}}}");
                 self.charge(field.len())?;
                 self.stack.push(if template {
                     Value::Interpolation(field)
