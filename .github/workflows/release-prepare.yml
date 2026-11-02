@@ -20,7 +20,7 @@ env:
 
 jobs:
   prepare-release:
-    if: github.repository == 'astral-sh/serc'
+    if: github.repository == 'astral-experiments/serc'
     runs-on: ubuntu-24.04
     environment: automations
     permissions:
@@ -49,7 +49,7 @@ jobs:
         with:
           exchange-url: ${{ secrets.STS_API_URL }}/exchange
           audience: ${{ secrets.STS_API_URL }}
-          repository: astral-sh/serc
+          repository: astral-experiments/serc
           permissions: |
             contents: write
             pull_requests: write

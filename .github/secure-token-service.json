@@ -2,10 +2,10 @@
   "version": 2,
   "repositories": {
     "serc": {
-      "name": "astral-sh/serc",
+      "name": "astral-experiments/serc",
       "id": 1385584662,
       "oidc_subject": "immutable",
-      "owner_id": 115962839
+      "owner_id": 330068706
     }
   },
   "rules": [
