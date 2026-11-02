@@ -815,6 +815,11 @@ fn synthetic_yields_and_captures_preserve_function_kinds() {
 #[cfg(feature = "decompile")]
 #[test]
 fn chained_assignments_evaluate_the_rhs_once_and_targets_in_order() {
+    check_fixture_on(
+        "a: (x := 1)\n",
+        "result = x, __annotations__['a']",
+        &[serc::PythonVersion::Py312, serc::PythonVersion::Py313],
+    );
     check_output(
         "def assign(obj, key, value):\n    first = obj()[key()] = second = obj().attr = value()\n    return first is second\n",
         r"class Obj:

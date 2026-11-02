@@ -393,7 +393,17 @@ impl Body<'_, '_, '_> {
                     (
                         "STORE_SUBSCR",
                         [Value::Expr(obj), Value::Expr(index) | Value::Slice(index)],
-                    ) => format!("({obj})[{index}]"),
+                    ) => {
+                        // An eager annotation stores its expression here. Leave a
+                        // preceding walrus on the stack for annotation recovery.
+                        if self.m.version <= serc_bytecode::PythonVersion::Py313
+                            && obj == "__annotations__"
+                            && string_value(index).is_ok()
+                        {
+                            break;
+                        }
+                        format!("({obj})[{index}]")
+                    }
                     ("STORE_SLICE", [Value::Expr(obj), Value::Expr(lower), Value::Expr(upper)]) => {
                         let lower = if lower == "None" { "" } else { lower };
                         let upper = if upper == "None" { "" } else { upper };
