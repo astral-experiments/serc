@@ -1,4 +1,5 @@
 mod annotations;
+mod classes;
 mod comprehensions;
 mod conditionals;
 mod definitions;
@@ -475,7 +476,8 @@ impl Body<'_, '_, '_> {
                 self.load_callable(self.name(self.code.names, a >> 1)?.to_owned(), a & 1 != 0)?;
             }
             "LOAD_FROM_DICT_OR_GLOBALS" | "LOAD_FROM_DICT_OR_DEREF" => {
-                if self.expr()? != "__classdict__" {
+                let namespace = self.expr()?;
+                if namespace != "__classdict__" && !(self.class && namespace == "locals()") {
                     return Err("unsupported annotation namespace".into());
                 }
                 let table = if op.name == "LOAD_FROM_DICT_OR_GLOBALS" {
@@ -485,6 +487,7 @@ impl Body<'_, '_, '_> {
                 };
                 self.push(self.name(table, a)?.to_owned())?;
             }
+            "LOAD_SUPER_ATTR" => self.super_attribute(a)?,
             "LOAD_ATTR" => {
                 let obj = self.expr()?;
                 let attr = self.name(self.code.names, a >> 1)?;

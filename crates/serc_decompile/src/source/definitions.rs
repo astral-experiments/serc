@@ -16,6 +16,27 @@ pub(super) struct Definition {
     pub(super) type_params: Vec<String>,
 }
 
+impl Definition {
+    pub(super) fn new(id: Id) -> Self {
+        Self {
+            id,
+            defaults: Vec::new(),
+            keywords: Vec::new(),
+            decorators: Vec::new(),
+            annotations: Vec::new(),
+            type_params: Vec::new(),
+        }
+    }
+
+    pub(super) fn generic_suffix(&self) -> String {
+        if self.type_params.is_empty() {
+            String::new()
+        } else {
+            format!("[{}]", self.type_params.join(", "))
+        }
+    }
+}
+
 pub(super) fn string_value(text: &str) -> Result<String, String> {
     let parsed = ruff_python_parser::parse_expression(text).map_err(|err| err.to_string())?;
     let Expr::StringLiteral(value) = parsed.expr() else {
@@ -169,14 +190,7 @@ impl Body<'_, '_, '_> {
         let Value::Code(id) = self.pop()? else {
             return Err("expected function code".into());
         };
-        let mut def = Definition {
-            id,
-            defaults: Vec::new(),
-            keywords: Vec::new(),
-            decorators: Vec::new(),
-            annotations: Vec::new(),
-            type_params: Vec::new(),
-        };
+        let mut def = Definition::new(id);
         if flags & !15 != 0 {
             return Err("unknown function flags".into());
         }
@@ -350,7 +364,14 @@ impl Body<'_, '_, '_> {
         for decorator in def.decorators.iter().rev() {
             self.line(&format!("@{decorator}"))?;
         }
-        self.block(&format!("class {name}({}):", bases.join(", ")), &body)
+        self.block(
+            &format!(
+                "class {name}{}({}):",
+                def.generic_suffix(),
+                bases.join(", ")
+            ),
+            &body,
+        )
     }
 
     pub(super) fn definition(&mut self, name: &str, def: &Definition) -> Result<(), String> {
@@ -367,11 +388,7 @@ impl Body<'_, '_, '_> {
         for decorator in def.decorators.iter().rev() {
             self.line(&format!("@{decorator}"))?;
         }
-        let generics = if def.type_params.is_empty() {
-            String::new()
-        } else {
-            format!("[{}]", def.type_params.join(", "))
-        };
+        let generics = def.generic_suffix();
         let result = def
             .annotations
             .iter()

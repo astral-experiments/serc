@@ -565,3 +565,22 @@ class Later:
         &common::PYTHON_VERSIONS[1..],
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn generic_classes_and_super() {
+    check_fixture(
+        r#"class Base[T]:
+    def method(self):
+        return "base"
+def record(cls):
+    return cls
+@record
+class Child[T: int](Base[T], metaclass=type):
+    value: T
+    def method(self):
+        return super().method() + super(Child, self).method()
+"#,
+        "result = Child().method(), repr(Child.__orig_bases__), repr(Child.__annotations__)",
+    );
+}

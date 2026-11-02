@@ -33,11 +33,7 @@ impl Body<'_, '_, '_> {
             return Err("type alias binding differs from code name".into());
         }
         let rhs = self.lazy_value(def.id, false)?;
-        let params = if def.type_params.is_empty() {
-            String::new()
-        } else {
-            format!("[{}]", def.type_params.join(", "))
-        };
+        let params = def.generic_suffix();
         self.line(&format!("type {name}{params} = {rhs}"))
     }
 
@@ -191,6 +187,9 @@ impl Body<'_, '_, '_> {
             body.stack.push(Value::TypeParams(params));
             body.region(ops, pos + 1, ops.len() - 1, 0)?;
             return body.pop();
+        }
+        if ops.get(pos + 1).is_some_and(|op| op.name == "STORE_DEREF") {
+            return body.generic_class(ops, pos + 1, params);
         }
         let swap = ops
             .iter()
