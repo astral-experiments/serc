@@ -373,6 +373,51 @@ fn conditional_none_value_is_distinct_from_a_guard_return() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_nested_guard_can_return_before_a_shared_continuation() {
+    check_fixture(
+        r"def finish(future):
+    if not future.cancelled():
+        exc = future.exception()
+        if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+            return
+    future.stop()
+",
+        r"result = []
+class Future:
+    def __init__(self, cancelled, exc):
+        self.cancel = cancelled
+        self.exc = exc
+    def cancelled(self): return self.cancel
+    def exception(self):
+        assert not self.cancel
+        result.append('checked')
+        return self.exc
+    def stop(self): result.append('stopped')
+for cancelled, exc in [(True, None), (False, None), (False, SystemExit())]:
+    finish(Future(cancelled, exc))
+assert result == ['stopped', 'checked', 'stopped', 'checked']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_guards_can_each_own_a_copy_of_the_function_exit() {
+    check_fixture(
+        r"def wake(waiter, events):
+    if waiter is not None:
+        events.append('waiting')
+        if not waiter():
+            events.append('woke')
+",
+        r"result = []
+for waiter in [None, lambda: True, lambda: False]:
+    wake(waiter, result)
+assert result == ['waiting', 'waiting', 'woke']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn conditional_guards_keep_distinct_function_exits() {
     check_fixture(
         r"def emit(ready, allowed, events):

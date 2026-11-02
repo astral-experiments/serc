@@ -275,10 +275,14 @@ impl Body<'_, '_, '_> {
             }
             return Ok(join);
         }
-        if self.loop_edges.is_none() && end == self.terminal_returns.end {
+        // An enclosing guard can trim later copies of the very same exit.
+        // Its nested suite still reaches the end of the function on fallthrough.
+        if self.loop_edges.is_none()
+            && (self.terminal_returns.start..=self.terminal_returns.end).contains(&end)
+        {
             // A guard can return immediately, leaving the rest of the function
             // on its other edge. Keep it separate from any branches in the tail.
-            if self.none_return(&ops[start..fallthrough_end])
+            if end == self.terminal_returns.end && self.none_return(&ops[start..fallthrough_end])
                 && !self.terminal_returns.contains(&target)
                 // A conditional expression can return an owned alternate
                 // local where a separate return statement borrows it.
@@ -311,6 +315,9 @@ impl Body<'_, '_, '_> {
         if matches!(ops[tail].name, "RETURN_CONST" | "RETURN_VALUE")
             && end > target
             && matches!(ops[end - 1].name, "RETURN_CONST" | "RETURN_VALUE")
+            // A physical return at the end of the suite can belong to a
+            // nested guard. Its other edge still enters the shared tail.
+            && !self.flow.incoming(target).any(|from| (start..fallthrough_end).contains(&from))
         {
             let other = self.fragment(ops, target, end, level)?.suite()?;
             let split_return = |s: &str| -> Option<(String, String)> {
