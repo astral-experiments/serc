@@ -70,6 +70,16 @@ fn check_fixture(source: &str, exercise: &str) {
 
 #[cfg(feature = "decompile")]
 fn check_fixture_on(source: &str, exercise: &str, versions: &[serc::PythonVersion]) {
+    check_output(source, exercise, versions, |_| {});
+}
+
+#[cfg(feature = "decompile")]
+fn check_output(
+    source: &str,
+    exercise: &str,
+    versions: &[serc::PythonVersion],
+    inspect: impl Fn(&str),
+) {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original.py");
     let recovered = temp.path().join("recovered.py");
@@ -88,6 +98,7 @@ fn check_fixture_on(source: &str, exercise: &str, versions: &[serc::PythonVersio
             "{version}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        inspect(std::str::from_utf8(&output.stdout).unwrap());
         fs_err::write(&recovered, output.stdout).unwrap();
         let oracle = common::python_command(version)
             .args([
@@ -712,4 +723,67 @@ async def consume():
 ",
         "import asyncio; result = asyncio.run(consume())",
     );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn synthetic_dead_code_is_marked_at_each_site() {
+    check_output(
+        "if False: hidden()\nanswer = 1\nif False: later()\n",
+        "result = answer",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert_eq!(
+                source,
+                "if False: hidden  # serc: synthetic dead code\nanswer = 1\nif False: later  # serc: synthetic dead code\n"
+            );
+        },
+    );
+    check_output(
+        "def unchanged(arg):\n    return arg\ndef f():\n    if False: lost = hidden()\n    return lost\n",
+        "try: f()\nexcept UnboundLocalError: result = unchanged(42)",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert_eq!(source.matches("# serc: synthetic dead code").count(), 1);
+            assert!(source.contains("lost = hidden  # serc: synthetic dead code"));
+        },
+    );
+    check_output(
+        "if 0: pass\nanswer = 1\n",
+        "result = answer",
+        &common::PYTHON_VERSIONS,
+        |source| assert!(source.contains("if 0: pass  # serc: synthetic dead code")),
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn synthetic_dead_code_still_requires_whole_module_verification() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("altered.pyc");
+    for version in common::PYTHON_VERSIONS {
+        let built = common::python_command(version)
+            .args([
+                "-c",
+                r"
+import importlib.util, marshal, sys
+from pathlib import Path
+module = compile('if False: hidden()\ndef f(): return 1\n', 'lost.py', 'exec')
+constants = tuple(c.replace(co_stacksize=c.co_stacksize + 1) if hasattr(c, 'co_stacksize')
+                  else c for c in module.co_consts)
+Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12)
+                              + marshal.dumps(module.replace(co_consts=constants)))",
+            ])
+            .arg(&cache)
+            .output()
+            .unwrap();
+        assert!(built.status.success(), "{built:?}");
+        let output = Command::new(env!("CARGO_BIN_EXE_serc"))
+            .arg("decompile")
+            .arg(&cache)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{version}");
+        assert!(output.stdout.is_empty());
+    }
 }

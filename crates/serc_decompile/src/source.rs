@@ -13,6 +13,7 @@ mod patterns;
 mod regions;
 mod strings;
 mod suspension;
+pub(super) mod synthetic;
 mod type_params;
 mod value_patterns;
 use definitions::{Definition, Import};
@@ -33,56 +34,71 @@ use serc_bytecode::target::operands315::CommonConstant;
 const MAX_SOURCE: usize = 1 << 20;
 const MAX_WORK: usize = 16 << 20;
 
-struct Recovery {
+struct Recovery<'m> {
     budget: usize,
     preserve_nops: bool,
     saw_nop: bool,
+    synthetic: Option<&'m synthetic::Hints>,
+    emitted_stub: bool,
 }
 
-pub(super) fn recover(m: &Module<'_>, preserve_nops: bool) -> Result<(Vec<String>, bool), String> {
+pub(super) fn recover(
+    m: &Module<'_>,
+    preserve_nops: bool,
+    synthetic: Option<&synthetic::Hints>,
+) -> Result<(Vec<String>, bool), String> {
     let mut work = Recovery {
         budget: MAX_WORK,
         preserve_nops,
         saw_nop: false,
+        synthetic,
+        emitted_stub: false,
     };
     let text = scope(m, m.root, 0, false, &mut work)?;
+    if synthetic.is_some() && !work.emitted_stub {
+        return Ok((Vec::new(), work.saw_nop));
+    }
     let parsed = ruff_python_parser::parse_module(&text)
         .map_err(|e| format!("invalid reconstructed Python: {e}"))?;
-    let indent = Indentation::default();
-    let mut result = String::new();
-    for stmt in parsed.suite() {
-        result.push_str(&Generator::new(&indent, LineEnding::Lf).stmt(stmt));
-        result.push('\n');
+    let mut candidates = Vec::new();
+    // The AST generator discards comments. Keep each synthetic marker on the
+    // source line that will be recompiled and returned to the caller.
+    if !work.emitted_stub {
+        let indent = Indentation::default();
+        let mut result = String::new();
+        for stmt in parsed.suite() {
+            result.push_str(&Generator::new(&indent, LineEnding::Lf).stmt(stmt));
+            result.push('\n');
+        }
+        if result != text {
+            candidates.push(result);
+        }
     }
-    let mut candidates = vec![result];
-    if candidates[0] != text {
-        // Suite layout can change tracing NOPs even when the AST is identical.
-        candidates.push(text);
-    }
+    candidates.push(text);
     if m.version >= PythonVersion::Py313 {
         layout::class_candidates(m, &mut candidates)?;
     }
     Ok((candidates, work.saw_nop))
 }
 
-fn scope(
-    m: &Module<'_>,
+fn scope<'m>(
+    m: &'m Module<'_>,
     id: Id,
     depth: usize,
     class: bool,
-    work: &mut Recovery,
+    work: &mut Recovery<'m>,
 ) -> Result<String, String> {
     stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
         recover_scope(m, id, depth, class, work)
     })
 }
 
-fn recover_scope(
-    m: &Module<'_>,
+fn recover_scope<'m>(
+    m: &'m Module<'_>,
     id: Id,
     depth: usize,
     class: bool,
-    work: &mut Recovery,
+    work: &mut Recovery<'m>,
 ) -> Result<String, String> {
     if depth > 32 {
         return Err("nested code limit exceeded".into());
@@ -104,7 +120,13 @@ fn recover_scope(
     .map_err(|e| format!("{name}: {e}"))?;
     let flow = crate::flow::Graph::build(&bc, m.version, code.stack_size)
         .map_err(|e| format!("{name}: {e}"))?;
+    let stubs = if let Some(hint) = work.synthetic.and_then(|hints| hints.get(&id)) {
+        hint.place(m, code, &bc.ops)?
+    } else {
+        synthetic::Stubs::new()
+    };
     let mut body = Body {
+        stubs,
         m,
         code,
         stack: Vec::new(),
@@ -146,6 +168,7 @@ fn recover_scope(
     if !body.stack.is_empty() {
         return Err(format!("{name}: unused stack values at end"));
     }
+    body.emit_stub(None)?;
     Ok(body.lines)
 }
 
@@ -173,12 +196,13 @@ struct Body<'m, 'data, 'work> {
     code: &'m Code,
     stack: Vec<Value>,
     lines: String,
+    stubs: synthetic::Stubs<'m>,
     flow: crate::flow::Graph,
     loop_edges: Option<loops::Loop>,
     depth: usize,
     class: bool,
     annotations: Vec<(Option<u32>, String, String)>,
-    work: &'work mut Recovery,
+    work: &'work mut Recovery<'m>,
 }
 
 impl Body<'_, '_, '_> {
@@ -383,7 +407,7 @@ impl Body<'_, '_, '_> {
         match op.name {
             "NOP" => {
                 self.work.saw_nop = true;
-                if self.work.preserve_nops {
+                if !self.emit_stub(Some(op.offset))? && self.work.preserve_nops {
                     self.line("pass")?;
                 }
             }

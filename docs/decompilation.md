@@ -70,6 +70,21 @@ optimization generally cannot be recovered. Traceback line numbers can change.
 The decompiler preserves class line numbers when they appear as executable
 constants and can refuse a module if it cannot reproduce them.
 
+CPython sometimes keeps a name, local binding, or constant after removing the
+statement that introduced it. If ordinary recovery cannot reproduce those
+fields, serc can emit a dead suite with an inline marker. For example,
+`if False: hidden()` and `if False: hidden` can produce the same cache. With a
+subsequent assignment to `answer`, serc emits the following source.
+
+```python
+if False: hidden  # serc: synthetic dead code
+answer = 1
+```
+
+The marker identifies the entire synthetic suite. It is included by default in
+CLI and library output. The guard is always false, and the marked source must
+pass the same whole-module verification as any other output.
+
 ## Ruff corpus
 
 The corpus uses the compiler's five fixture directories at Ruff revision
