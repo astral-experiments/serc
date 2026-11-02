@@ -174,7 +174,11 @@ fn complete_prefix(source: &str) -> usize {
         let next = statements
             .get(i + 1)
             .map_or(source.len(), |s| s.start().to_usize());
-        if stmt.end() > error.location.start()
+        // The parser can recover multiple statements on one malformed line.
+        // A diagnostic appended at such a boundary would join its first token
+        // to the retained expression.
+        if !source[..next].ends_with('\n')
+            || stmt.end() > error.location.start()
             || ruff_python_parser::parse_module(&source[end..next]).is_err()
         {
             break;
@@ -182,4 +186,15 @@ fn complete_prefix(source: &str) -> usize {
         end = next;
     }
     end
+}
+
+#[cfg(test)]
+mod tests {
+    use super::complete_prefix;
+
+    #[test]
+    fn partial_prefix_discards_the_entire_malformed_line() {
+        let source = "before = 1\nf\"x\"broken\nafter = 2\n";
+        assert_eq!(&source[..complete_prefix(source)], "before = 1\n");
+    }
 }
