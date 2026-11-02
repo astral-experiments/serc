@@ -19,7 +19,8 @@ Serc produces byte-for-byte identical output on an extensive corpus of
 real-world Python code, including [Django](https://github.com/django/django),
 [Airflow](https://github.com/apache/airflow), and
 [Transformers](https://github.com/huggingface/transformers), while compiling
-[**2.9-4.1× faster**](BENCHMARKS.md#project-compilation) than CPython’s `compileall`.
+[**2.9-4.1× faster**](BENCHMARKS.md#project-compilation) than CPython’s
+`compileall`.
 
 <p align="center">
   <img src="docs/assets/benchmarks/project-compilation.svg" width="100%" alt="Median compile times for CPython and Serc. Airflow took 324 vs. 79 ms (4.1× faster with Serc), Django 358 vs. 94 ms (3.8×), NumPy 432 vs. 131 ms (3.3×), and Transformers 832 vs. 288 ms (2.9×).">

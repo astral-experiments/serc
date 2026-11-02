@@ -8,12 +8,12 @@ x86-64 releases of CPython 3.14.5 from
 and [Serc 0.1.9](https://github.com/astral-experiments/serc/releases/tag/0.1.9).
 All four plots use the same scale from zero to one second.
 
-| Package sources | Python files | CPython 3.14.5 (16 workers) | Serc 0.1.9 (32 workers) |
-| --- | ---: | ---: | ---: |
-| [Airflow](https://github.com/apache/airflow/tree/cad6220034e87c586eb87e14b5a75f4b82984fd0/airflow-core/src/airflow) | 700 | 324 ms | 79 ms |
-| [Django 5.2](https://github.com/django/django/tree/9e7cc2b628fe8fd3895986af9b7fc9525034c1b0/django) | 883 | 358 ms | 94 ms |
-| [NumPy 2.4.6](https://github.com/numpy/numpy/tree/b832a09cf2a169c833dd2371e7c07aa00b293242/numpy) | 505 | 432 ms | 131 ms |
-| [Transformers](https://github.com/huggingface/transformers/tree/ab1771c9e42891d893189978a8009426d70b4688/src/transformers) | 2,876 | 832 ms | 288 ms |
+| Package sources                                                                                                            | Python files | CPython 3.14.5 (16 workers) | Serc 0.1.9 (32 workers) |
+| -------------------------------------------------------------------------------------------------------------------------- | -----------: | --------------------------: | ----------------------: |
+| [Airflow](https://github.com/apache/airflow/tree/cad6220034e87c586eb87e14b5a75f4b82984fd0/airflow-core/src/airflow)        |          700 |                      324 ms |                   79 ms |
+| [Django 5.2](https://github.com/django/django/tree/9e7cc2b628fe8fd3895986af9b7fc9525034c1b0/django)                        |          883 |                      358 ms |                   94 ms |
+| [NumPy 2.4.6](https://github.com/numpy/numpy/tree/b832a09cf2a169c833dd2371e7c07aa00b293242/numpy)                          |          505 |                      432 ms |                  131 ms |
+| [Transformers](https://github.com/huggingface/transformers/tree/ab1771c9e42891d893189978a8009426d70b4688/src/transformers) |        2,876 |                      832 ms |                  288 ms |
 
 Both compilers had access to all 32 vCPUs on the same AMD EPYC Milan Linux VM.
 Each input tree contained the tracked `.py` files from the linked package
@@ -33,8 +33,8 @@ ratios, giving all four packages equal weight, and used that count throughout.
 We shuffled the project and worker-count pairs each pass. In each comparison,
 both compilers ran first equally often.
 
-At the selected settings, all 4,964 `.pyc` paths and contents matched. The
-chart uses ten fresh runs per compiler and package after two warmups. Cache-file
+At the selected settings, all 4,964 `.pyc` paths and contents matched. The chart
+uses ten fresh runs per compiler and package after two warmups. Cache-file
 cleanup was untimed and filesystem caches stayed warm throughout. The
 [raw timings](scripts/benchmarks/results/projects-2026-11-01.csv) distinguish
 the initial sweep, refinement, and confirmation runs for the four candidates.
