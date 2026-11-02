@@ -76,7 +76,9 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("serc", type=Path)
     parser.add_argument("pycdc", type=Path)
-    parser.add_argument("--corpus", choices=("stdlib", "ruff"), default="stdlib")
+    parser.add_argument(
+        "--corpus", choices=("stdlib", "stdlib-packages", "ruff"), default="stdlib"
+    )
     args = parser.parse_args()
     sys.path.insert(0, str(corpus.ROOT / "crates/serc/scripts"))
     import generate_cpython_target as target
@@ -89,9 +91,20 @@ def main():
         or target.TARGETS[minor][0] != f"v{version}"
     ):
         parser.error("run this script with a serc-pinned CPython")
-    if args.corpus == "stdlib":
+    if args.corpus in {"stdlib", "stdlib-packages"}:
         root = Path(sysconfig.get_path("stdlib"))
-        files = sorted(root.glob("*.py"))
+        if args.corpus == "stdlib":
+            files = sorted(root.glob("*.py"))
+        else:
+            # The stdlib directory may also contain installed distributions.
+            # Use this exact interpreter's package names without importing them.
+            files = sorted(
+                path
+                for name in sys.stdlib_module_names
+                if (root / name / "__init__.py").is_file()
+                for path in (root / name).rglob("*.py")
+                if not path.is_symlink()
+            )
     else:
         subprocess.run(
             [corpus.ROOT / "scripts/check-ruff-pin"], check=True, stdout=sys.stderr
@@ -112,6 +125,7 @@ def main():
         "serc": [args.serc.resolve(), "decompile"],
         "pycdc": [args.pycdc.resolve()],
     }
+    packages = defaultdict(lambda: defaultdict(Counter))
     with warnings.catch_warnings(), tempfile.TemporaryDirectory() as scratch:
         warnings.simplefilter("ignore", SyntaxWarning)
         cache = Path(scratch) / "input.pyc"
@@ -125,18 +139,25 @@ def main():
                 counts["cpython_rejected"] += 1
                 continue
             counts["modules"] += 1
-            counts["code_objects"] += corpus.object_count(code)
+            objects = corpus.object_count(code)
+            counts["code_objects"] += objects
+            package = None
+            if args.corpus == "stdlib-packages":
+                package = packages[path.relative_to(root).parts[0]]
+                package["inputs"].update(modules=1, code_objects=objects)
             cache.write_bytes(
                 importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(code)
             )
             for tool, command in commands.items():
-                measure(command, cache, filename, code, totals[tool])
-    print(
-        json.dumps(
-            {"python": version, "corpus": args.corpus, "inputs": counts, **totals},
-            indent=2,
-        )
-    )
+                result = Counter()
+                measure(command, cache, filename, code, result)
+                totals[tool].update(result)
+                if package is not None:
+                    package[tool].update(result)
+    report = {"python": version, "corpus": args.corpus, "inputs": counts, **totals}
+    if packages:
+        report["packages"] = packages
+    print(json.dumps(report, indent=2))
 
 
 if __name__ == "__main__":
