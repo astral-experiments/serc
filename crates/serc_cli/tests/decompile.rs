@@ -545,6 +545,30 @@ except TypeError:
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_handled_error_can_skip_the_rest_of_an_iteration() {
+    check_fixture(
+        r"def collect(obj, names, emit):
+    for name in names:
+        try:
+            value = getattr(obj, name)
+        except AttributeError:
+            continue
+        emit(value)
+    emit('done')
+",
+        r"class Item:
+    first = 1
+    last = 2
+result = []
+collect(Item(), ('first', 'missing', 'last'), result.append)
+collect(Item(), (), result.append)
+assert result == [1, 2, 'done', 'done']
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_guard_and_loop_exhaustion_can_return_the_same_constant() {
     check_fixture(
         r"def wake(waiters, emit):
@@ -577,6 +601,43 @@ fn conditional_none_value_is_distinct_from_a_guard_return() {
         "def pair(a, b):\n    return None if a is None else (a, b)\n",
         "result = [pair(None, 2), pair(1, 2)]",
         &[serc::PythonVersion::Py312, serc::PythonVersion::Py313],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn statement_and_expression_returns_keep_their_constant_opcodes() {
+    check_fixture_on(
+        r"def scheme(env):
+    if env.get('HTTPS') in ('yes', 'on', '1'):
+        return 'https'
+    else:
+        return 'http'
+
+def parse(value):
+    if value == b'00':
+        return False
+    if value == b'01':
+        return True
+    return int(value)
+
+def expression(flag):
+    return 'https' if flag else 'http'
+",
+        r"result = [scheme({}), scheme({'HTTPS': 'on'}), expression(False), expression(True),
+          parse(b'00'), parse(b'01'), parse(b'17')]",
+        &[serc::PythonVersion::Py312, serc::PythonVersion::Py313],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn consecutive_guard_returns_fit_before_the_next_class() {
+    check_output(
+        "def classify(c):\n    if c == 'a':\n        return 'letter'\n    if c == ' ':\n        return 'space'\n    return 'other'\nclass Edit:\n    pass\n",
+        "result = [classify(c) for c in ('a', ' ', '?')], Edit.__firstlineno__",
+        &[serc::PythonVersion::Py313],
+        |source| assert!(!source.contains("# serc: best-effort"), "{source}"),
     );
 }
 
@@ -985,6 +1046,69 @@ result = [scenario(*args) for args in [(0,0), (1,0), (1,1), (3,3), ('between',3)
 
 #[cfg(feature = "decompile")]
 #[test]
+fn suppressed_return_expressions_resume_after_the_manager() {
+    check_fixture(
+        r"def parse(first, second, probe):
+    with first:
+        return probe(1)
+    with second:
+        return probe(2)
+
+def fallback(first, second, probe):
+    with first, second:
+        return probe(1)
+    return probe(2)
+",
+        r"from contextlib import nullcontext, suppress
+def scenario(run, outer, inner, failures):
+    calls = []
+    def probe(n):
+        calls.append(n)
+        if n in failures:
+            raise ValueError(n)
+        return n
+    try:
+        value = run(outer, inner, probe)
+    except ValueError as exc:
+        value = exc.args
+    return value, calls
+result = [scenario(run, outer(), inner(), fail)
+          for run in (parse, fallback)
+          for outer in (nullcontext, lambda: suppress(ValueError))
+          for inner in (nullcontext, lambda: suppress(ValueError))
+          for fail in ((), (1,), (1, 2))]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn guarded_raise_stays_in_the_try_else_suite() {
+    check_fixture_on(
+        r"def resolve(read, expected, finish):
+    try:
+        found = read()
+    except LookupError:
+        raise ValueError('missing') from None
+    else:
+        if found is not expected:
+            raise ValueError('different')
+    return finish(found)
+",
+        r"def check(read, finish):
+    try:
+        return resolve(read, None, finish)
+    except Exception as error:
+        return type(error).__name__, error.args
+def missing(*args):
+    raise KeyError('key')
+result = [check(lambda: None, lambda value: 'ok'), check(missing, missing),
+          check(lambda: 1, missing), check(lambda: None, missing)]",
+        &[serc::PythonVersion::Py313],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn forward_joins_and_loop_exits() {
     check_fixture(
         "def first(xs, emit):\n    for x in xs:\n        emit(x)\n        break\n    else:\n        emit(0)\n    emit(9)\n",
@@ -1325,6 +1449,13 @@ def present(mapping, key):
         return False
     else:
         return bool(value)
+
+def shared(obj):
+    try:
+        obj.method()
+    except AttributeError:
+        pass
+    return sentinel
 ",
         r"import sys
 class WithMethod:
@@ -1334,7 +1465,9 @@ class WithoutMethod:
     def fallback(self):
         assert sys.exception() is None
         return 'fallback'
-result = [lookup(WithMethod()), lookup(WithoutMethod()), present({}, 1), present({1: 5}, 1)]
+sentinel = 7
+result = [lookup(WithMethod()), lookup(WithoutMethod()), present({}, 1), present({1: 5}, 1),
+          shared(WithMethod()), shared(WithoutMethod())]
 ",
     );
 }

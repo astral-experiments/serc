@@ -61,10 +61,14 @@ Exception recovery handles selected typed and bare handlers, multi-item and
 consecutive synchronous context managers, and handlers whose `try: pass` body
 CPython optimized away. A generator or coroutine can suspend inside a context
 manager. Recovery follows the manager's exception-table entries across an
-`await` and distinguishes `with` from `async with` at each entry and exit. Match
-recovery handles value and singleton patterns, alternatives, guards, captures,
-and selected sequence, mapping, and class patterns. Nested or overlapping cases
-can still exceed these recognizers.
+`await` and distinguishes `with` from `async with` at each entry and exit. When
+evaluating a return expression raises, a synchronous manager can suppress the
+exception and execution resumes after the `with`. This recovers the second parse
+attempt in 3.14.5's `_pyrepl._module_completer.ImportParser._parse`.
+
+Match recovery handles value and singleton patterns, alternatives, guards,
+captures, and selected sequence, mapping, and class patterns. Nested or
+overlapping cases can still exceed these recognizers.
 
 In `asyncio.__getattr__` on 3.14 and 3.15, two platform checks in literal cases
 can reach the same `raise AttributeError` after the match. A failed platform
@@ -109,18 +113,23 @@ errors from exceptions the callback must re-raise or pass to the future. The
 reconstructed `_sock_recv`, `_sock_recv_into`, and `_sock_accept` methods match
 on all four targets.
 
+An exception handler in a `for` loop can return from the function or advance to
+the next item. In IDLE's `ObjectTreeItem.GetSubList`, an `AttributeError` from
+reading one attribute skips that item. Recovery keeps the loop's `continue` in
+the handler so the remaining attributes are still inspected.
+
 CPython can build long dictionary displays one pair at a time. Recognizing those
 insertions lets recovery continue past the configuration dictionary in 3.14.5's
-`turtle.py`, where 204 of 250 code objects now match. In `codecs.py`, the module
+`turtle.py`, where 212 of 250 code objects now match. In `codecs.py`, the module
 begins with a handler that binds an exception and always raises. The exception
 table separates the handler body from CPython's cleanup of the bound name.
-Following its normal continuation recovers 84 of 100 code objects.
+Following its normal continuation recovers 93 of 100 code objects.
 
 In 3.14.5's `importlib._bootstrap_external`, the module starts with
 `assert all(len(sep) == 1 for sep in path_separators)`. CPython emits two paths,
 an inlined loop for the builtin and an ordinary call for a replacement bound to
 `all`. Recovering that call and the formatted set comprehension that follows it
-places the later definitions back in the module. CPython reproduces 95 of its
+places the later definitions back in the module. CPython reproduces 99 of its
 125 code objects.
 
 ## Verification
@@ -194,6 +203,10 @@ single insertion is limited to 1,024 lines, and the padded source must fit the 1
 MiB source budget. Blank lines do not count against the space for detached
 bodies or original block listings.
 
+In the 3.14.5 standard-library package sample, aligning best-effort output
+reproduced `__firstlineno__` for 1,844 of 1,886 original classes, up from 784.
+The change added 39,542 blank lines across 193 files.
+
 CPython sometimes keeps a name, local binding, or constant after removing the
 statement that introduced it. If ordinary recovery cannot reproduce those
 fields, serc can emit a dead suite with an inline marker. For example,
@@ -240,13 +253,13 @@ The checker never executes corpus code.
 
 | CPython   | Compilable modules | Strictly verified | Coverage | Verified code objects / total | Modules with dead suites / live guards |
 | --------- | -----------------: | ----------------: | -------: | ----------------------------: | -------------------------------------: |
-| 3.12.14   |              2,190 |             1,870 |    85.4% |                8,139 / 11,063 |                                 47 / 1 |
-| 3.13.15   |              2,209 |             1,874 |    84.8% |                8,311 / 11,562 |                                 47 / 1 |
-| 3.14.5    |              2,246 |             1,871 |    83.3% |               10,068 / 14,082 |                                 53 / 5 |
-| 3.15.0rc2 |              2,266 |             1,891 |    83.5% |               10,104 / 14,114 |                                 57 / 8 |
+| 3.12.14   |              2,190 |             1,880 |    85.8% |                8,206 / 11,063 |                                 48 / 1 |
+| 3.13.15   |              2,209 |             1,884 |    85.3% |                8,378 / 11,562 |                                 48 / 1 |
+| 3.14.5    |              2,246 |             1,876 |    83.5% |               10,094 / 14,082 |                                 53 / 5 |
+| 3.15.0rc2 |              2,266 |             1,896 |    83.7% |               10,130 / 14,114 |                                 57 / 8 |
 
 The code-object count includes each module and its nested code. Only objects
-from strictly verified modules count here. On 3.14, 172 of the 375 refusals
+from strictly verified modules count here. On 3.14, 168 of the 370 refusals
 produced a candidate that failed verification. The most frequent differences
 were instructions, exception tables, and constants. Remaining recovery gaps
 include nested exception cleanup, overlapping branches and loops, and patterns
@@ -273,10 +286,10 @@ packages in subdirectories are outside this sample.
 
 | CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
 | --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
-| 3.12.14   |     164 |                         164 / 51 |                          22 / 3 |                           6,158 / 97 / 8,040 |
-| 3.13.15   |     153 |                        153 / 153 |                          24 / 1 |                            5,407 / 1 / 7,720 |
-| 3.14.5    |     154 |                          154 / 0 |                          24 / 0 |                            5,691 / 0 / 8,064 |
-| 3.15.0rc2 |     152 |                          152 / 0 |                          21 / 0 |                            5,809 / 0 / 8,259 |
+| 3.12.14   |     164 |                         164 / 51 |                          24 / 3 |                           6,364 / 97 / 8,040 |
+| 3.13.15   |     153 |                        153 / 153 |                          25 / 1 |                            6,016 / 1 / 7,720 |
+| 3.14.5    |     154 |                          154 / 0 |                          24 / 0 |                            6,204 / 0 / 8,064 |
+| 3.15.0rc2 |     152 |                          152 / 0 |                          21 / 0 |                            6,333 / 0 / 8,259 |
 
 A compilable file can contain placeholders. The last column pairs code objects
 by qualified name and occurrence and compares executable fields, including
@@ -301,18 +314,26 @@ report breaks out executable matches and detached definitions by package.
 
 | CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
 | --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
-| 3.12.14   |     519 |                        519 / 257 |                        286 / 25 |                       9,807 / 1,076 / 11,772 |
-| 3.13.15   |     477 |                        477 / 404 |                        248 / 14 |                          9,096 / 14 / 11,740 |
-| 3.14.5    |     498 |                          498 / 0 |                         258 / 0 |                           9,972 / 0 / 12,586 |
-| 3.15.0rc2 |     539 |                          539 / 0 |                         273 / 0 |                          10,645 / 0 / 13,544 |
+| 3.12.14   |     519 |                        519 / 257 |                        305 / 25 |                      10,043 / 1,076 / 11,772 |
+| 3.13.15   |     477 |                        477 / 404 |                        260 / 14 |                          9,954 / 14 / 11,740 |
+| 3.14.5    |     498 |                          498 / 0 |                         263 / 0 |                          10,721 / 0 / 12,586 |
+| 3.15.0rc2 |     539 |                          539 / 0 |                         279 / 0 |                          11,430 / 0 / 13,544 |
 
 On 3.14.5, the largest gaps by number of unmatched code objects are in `idlelib`
-(328), `asyncio` (291), and `multiprocessing` (220). A mismatch counts once per
+(255), `asyncio` (241), and `multiprocessing` (163). A mismatch counts once per
 code object, so a single lost method can also cause its enclosing class and
 module to miss.
 
-On the same target, 23 of the 498 package modules produced a warning about the
-module's own code. Four had a changed exception table and 19 also had a changed
+An independent CFG check recompiled the 235 best-effort package modules on
+3.14.5 at all three optimization levels. It paired uniquely named functions
+whose recovered body had no marked gap. Of 2,845 such functions with a
+conditional branch and no exception table, 20 had different normal edges at
+every level. Of 921 functions with an exception table in the original or a
+candidate, 144 had different normal edges and 197 had a different exception
+table at every level. A matching graph does not check instruction operands.
+
+On the same target, 21 of the 498 package modules produced a warning about the
+module's own code. Four had a changed exception table and 17 also had a changed
 normal control-flow graph. In `ctypes._endian`, recovery keeps the
 unknown-byte-order exception on its original branch. The module's import-time
 graph matches even though code inside some classes still differs.
@@ -322,12 +343,31 @@ functions as well as modules. The report lists previously matching scopes by
 filename, qualified name, and occurrence, and the command exits nonzero if any
 were lost.
 
+For functions fully placed by both builds, `--compare-with` also checks normal
+edges and exception tables independently. Each field matches if native CPython
+reproduces it at any of the three optimization levels. Losing a previously
+matching field adds the function and field to `flow_regressions` and fails a
+standard-library comparison. Ruff reports these changes without failing.
+Repeated definitions are paired within their parent when the counts agree. If a
+previously placed function is missing, ambiguous, or now contains a marked gap,
+it appears in `newly_unplaced`. That list is informational.
+
+The table check caught a regression in 3.13's `pickle._Pickler.save_global`.
+Moving a guarded raise out of the `try` statement's `else` suite preserved the
+normal edges but dropped a tracing `NOP`, shifting the exception handler by two
+bytes. Restoring the `else` reproduced the function's executable fields.
+
+The `pycdc_only` map lists every scope that pycdc matched and serc missed. Any
+entry fails either standard-library comparison, even if serc matches more scopes
+overall. Both standard-library samples passed on all four targets.
+
 The Ruff sample (`--corpus ruff`) uses the same revision and fixture directories
-as the strict check.
+as the strict check. Its `pycdc_only` entries are informational. There were
+seven on 3.12 and one on 3.13.
 
 | CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
 | --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
-| 3.12.14   |   2,190 |                    2,190 / 1,569 |                     1,871 / 754 |                       9,976 / 3,194 / 11,063 |
-| 3.13.15   |   2,209 |                    2,209 / 2,040 |                     1,875 / 337 |                        10,148 / 337 / 11,562 |
-| 3.14.5    |   2,246 |                        2,246 / 0 |                       1,872 / 0 |                          12,379 / 0 / 14,082 |
-| 3.15.0rc2 |   2,266 |                        2,266 / 0 |                       1,892 / 0 |                          12,415 / 0 / 14,114 |
+| 3.12.14   |   2,190 |                    2,190 / 1,569 |                     1,881 / 754 |                      10,055 / 3,194 / 11,063 |
+| 3.13.15   |   2,209 |                    2,209 / 2,040 |                     1,885 / 337 |                        10,413 / 337 / 11,562 |
+| 3.14.5    |   2,246 |                        2,246 / 0 |                       1,877 / 0 |                          12,642 / 0 / 14,082 |
+| 3.15.0rc2 |   2,266 |                        2,266 / 0 |                       1,897 / 0 |                          12,681 / 0 / 14,114 |
