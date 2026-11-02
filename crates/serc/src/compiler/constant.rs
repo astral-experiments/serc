@@ -4604,15 +4604,24 @@ pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
     }
 
     let mut value = vec![0_u16];
-    for digit in token.chars().filter_map(|digit| digit.to_digit(10)) {
-        let mut carry = digit;
+    // A 15-bit limb times 10^14 plus a carry still fits in u64.
+    for chunk in token.as_bytes().chunks(14) {
+        let mut multiplier = 1_u64;
+        let mut carry = 0_u64;
+        for &byte in chunk {
+            if byte.is_ascii_digit() {
+                multiplier *= 10;
+                carry = carry * 10 + u64::from(byte - b'0');
+            }
+        }
         for limb in &mut value {
-            let next = u32::from(*limb) * 10 + carry;
+            let next = u64::from(*limb) * multiplier + carry;
             *limb = (next & 0x7fff) as u16;
             carry = next >> 15;
         }
-        if carry != 0 {
-            value.push(u16::try_from(carry).expect("decimal carry is at most nine"));
+        while carry != 0 {
+            value.push((carry & 0x7fff) as u16);
+            carry >>= 15;
         }
     }
     value
@@ -4667,6 +4676,19 @@ mod tests {
                 format!("0o00_{value:o}"),
                 format!("0X00_{value:X}"),
             ] {
+                assert_eq!(super::big_integer_digits(&token), expected, "{token}");
+            }
+        }
+    }
+
+    #[test]
+    fn decimal_chunks_preserve_carries_and_skip_separators() {
+        for length in [13, 14, 15, 27, 28, 29, 38] {
+            let value = 10_u128.pow(length) - 1;
+            let expected = super::big_integer_digits(&format!("0x{value:x}"));
+            let decimal = value.to_string();
+            let separated = decimal.replace("99", "9_9");
+            for token in [decimal, separated] {
                 assert_eq!(super::big_integer_digits(&token), expected, "{token}");
             }
         }
