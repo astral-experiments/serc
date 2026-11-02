@@ -342,10 +342,14 @@ impl Body<'_, '_, '_> {
                 (split_return(&suite), split_return(&other))
             {
                 if left.is_empty() && right.is_empty() {
-                    // The alternate of a conditional expression returns an owned
-                    // local on 3.14+. A borrowed load here belongs to a separate
-                    // return statement.
-                    if target + 2 == end && ops[target].name == "LOAD_FAST_BORROW" {
+                    // A conditional expression loads its constant arms before
+                    // RETURN_VALUE. RETURN_CONST on 3.12/3.13 instead belongs
+                    // to a separate return, as does a borrowed alternate local
+                    // on the newer targets.
+                    if ops[tail].name == "RETURN_CONST"
+                        || ops[end - 1].name == "RETURN_CONST"
+                        || (target + 2 == end && ops[target].name == "LOAD_FAST_BORROW")
+                    {
                         self.block(&format!("if {test}:"), &suite)?;
                         self.line(&format!("return {b}"))?;
                         return Ok(end);

@@ -606,6 +606,32 @@ fn conditional_none_value_is_distinct_from_a_guard_return() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn statement_and_expression_returns_keep_their_constant_opcodes() {
+    check_fixture_on(
+        r"def scheme(env):
+    if env.get('HTTPS') in ('yes', 'on', '1'):
+        return 'https'
+    else:
+        return 'http'
+
+def parse(value):
+    if value == b'00':
+        return False
+    if value == b'01':
+        return True
+    return int(value)
+
+def expression(flag):
+    return 'https' if flag else 'http'
+",
+        r"result = [scheme({}), scheme({'HTTPS': 'on'}), expression(False), expression(True),
+          parse(b'00'), parse(b'01'), parse(b'17')]",
+        &[serc::PythonVersion::Py312, serc::PythonVersion::Py313],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn nested_conditional_returns_test_the_outer_predicate_first() {
     check_fixture(
         r"def choose(test, value):
