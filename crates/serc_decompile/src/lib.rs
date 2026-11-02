@@ -88,7 +88,7 @@ pub fn decompile_pyc_with_mode(
 fn verified(
     module: &Module<'_>,
     compile: &mut impl FnMut(&str, &str, PythonVersion, OptimizationLevel) -> Option<Vec<u8>>,
-    mut fallback: Option<&mut Option<String>>,
+    mut fallback: Option<&mut Option<source::Candidate>>,
 ) -> Result<String, DecompileError> {
     let version = module.version;
     let reconstruct = |reason| DecompileError::Reconstruct(version, reason);
@@ -117,11 +117,12 @@ fn verified(
         } else {
             None
         };
-        let (sources, has_nop) = match source::recover(module, preserve_nops, stubs, mode) {
-            Ok(result) => result,
-            Err(_) if preserve_nops || mode != Ordinary => continue,
-            Err(message) => return Err(reconstruct(message)),
-        };
+        let (sources, has_nop, definitions) =
+            match source::recover(module, preserve_nops, stubs, mode) {
+                Ok(result) => result,
+                Err(_) if preserve_nops || mode != Ordinary => continue,
+                Err(message) => return Err(reconstruct(message)),
+            };
         saw_nop = has_nop;
         for source in sources {
             // The header does not record the optimization level.
@@ -146,7 +147,10 @@ fn verified(
                                 && let Some(slot) = fallback.as_deref_mut()
                                 && slot.is_none()
                             {
-                                *slot = Some(source.clone());
+                                *slot = Some(source::Candidate {
+                                    source: source.clone(),
+                                    definitions: definitions.clone(),
+                                });
                             }
                             mismatch.get_or_insert(reason);
                         }

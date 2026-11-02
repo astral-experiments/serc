@@ -4,6 +4,7 @@ mod comparisons;
 mod comprehensions;
 mod conditionals;
 mod definitions;
+mod detached;
 mod elided_tries;
 mod exceptions;
 mod layout;
@@ -44,6 +45,12 @@ struct Recovery<'m> {
     mode: synthetic::Mode,
     emitted: bool,
     partial: bool,
+    definitions: Vec<Id>,
+}
+
+pub(super) struct Candidate {
+    pub source: String,
+    pub definitions: Vec<Id>,
 }
 
 pub(super) fn recover(
@@ -51,7 +58,7 @@ pub(super) fn recover(
     preserve_nops: bool,
     synthetic: Option<&synthetic::Hints>,
     mode: synthetic::Mode,
-) -> Result<(Vec<String>, bool), String> {
+) -> Result<(Vec<String>, bool, Vec<Id>), String> {
     let mut work = Recovery {
         budget: MAX_WORK,
         preserve_nops,
@@ -60,10 +67,11 @@ pub(super) fn recover(
         mode,
         emitted: false,
         partial: false,
+        definitions: Vec::new(),
     };
     let text = scope(m, m.root, 0, false, &mut work)?;
     if mode != synthetic::Mode::Ordinary && !work.emitted {
-        return Ok((Vec::new(), work.saw_nop));
+        return Ok((Vec::new(), work.saw_nop, Vec::new()));
     }
     let parsed = ruff_python_parser::parse_module(&text)
         .map_err(|e| format!("invalid reconstructed Python: {e}"))?;
@@ -85,7 +93,7 @@ pub(super) fn recover(
     if m.version >= PythonVersion::Py313 {
         layout::class_candidates(m, &mut candidates)?;
     }
-    Ok((candidates, work.saw_nop))
+    Ok((candidates, work.saw_nop, work.definitions))
 }
 
 fn scope<'m>(

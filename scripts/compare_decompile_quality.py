@@ -5,12 +5,14 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import io
 import json
 import marshal
 import subprocess
 import sys
 import sysconfig
 import tempfile
+import tokenize
 import types
 import warnings
 from collections import Counter, defaultdict, deque
@@ -48,6 +50,16 @@ def measure(command, cache, filename, original, counts):
         counts["invalid_source"] += 1
         return
     counts["compilable_modules"] += 1
+    if b"# serc: detached function " in run.stdout:
+        sections = sum(
+            token.type == tokenize.COMMENT
+            and token.string.startswith("# serc: detached function ")
+            and " (original line " in token.string
+            for token in tokenize.tokenize(io.BytesIO(run.stdout).readline)
+        )
+        if sections:
+            counts["detached_sections"] += sections
+            counts["modules_with_detached_sections"] += 1
     # Pair repeated definitions of the same qualified name in constant-table
     # order. Each comparison includes nested code and the types of constants.
     candidates = defaultdict(deque)

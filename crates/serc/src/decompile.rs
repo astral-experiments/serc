@@ -37,6 +37,24 @@ mod tests {
     use crate::PythonVersion;
 
     #[test]
+    fn repeated_names_keep_their_own_bodies_when_a_handler_is_unplaced() {
+        let cache = crate::compile(
+            "try:\n    risky()\nexcept ValueError:\n    def same(): return 1\nexcept KeyError:\n    def same(): return 2\nafter = 42\n",
+            "handlers.py",
+        )
+        .unwrap()
+        .to_timestamp_pyc(0, 0);
+        let source = decompile_pyc(&cache).unwrap();
+        assert_eq!(source.matches("def same():").count(), 2);
+        assert_eq!(source.matches("return 1").count(), 1);
+        assert_eq!(source.matches("return 2").count(), 1);
+        if let Some((_, detached)) = source.split_once("# serc: detached function ") {
+            assert!(detached.starts_with("same (original line 6)\n"));
+            assert!(detached.contains("#     return 2"));
+        }
+    }
+
+    #[test]
     fn verification_rejects_a_cache_for_another_target() {
         let original = crate::compile("pass\n", "module.py")
             .unwrap()

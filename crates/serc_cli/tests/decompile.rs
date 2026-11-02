@@ -864,6 +864,20 @@ def large():
     return '{big}'
 def after(x):
     return x + before
+if before:
+    lost = '{big}'
+    def repeated(x, /):
+        def inner():
+            return x + 1
+        return inner
+else:
+    async def repeated(*, y):
+        return y + 2
+fake_marker = '# __serc_definition_id__ 7'
+def annotated(x: int): return x
+if before:
+    lost = '{big}'
+    def __annotate__(user_format): return user_format
 def protected(flag, action, events):
     if flag: prefix = '{big}'
     else: wrongly_hoisted()
@@ -917,6 +931,28 @@ def unfinished():
         assert!(!text.contains("wrongly_hoisted()"));
         assert!(text.contains("if False: x = None  # serc: synthetic dead code"));
         assert!(text.contains("def kept():"));
+        assert_eq!(
+            text.matches("# serc: detached function repeated (original line ")
+                .count(),
+            2
+        );
+        assert!(text.contains("# def repeated(x, /):\n#     def inner():"));
+        assert!(text.contains("# async def repeated(*, y):"));
+        assert!(!text.contains("# serc: detached function repeated.<locals>.inner"));
+        assert!(!text.contains("# serc: detached function after"));
+        assert_eq!(
+            text.matches("# serc: detached function __annotate__ ")
+                .count(),
+            1
+        );
+        assert!(text.contains("# def __annotate__(user_format):"));
+        let appendix = text.split_once("\n# serc: detached function ").unwrap().1;
+        assert!(
+            appendix
+                .lines()
+                .skip(1)
+                .all(|line| line.is_empty() || line.starts_with('#'))
+        );
         fs_err::write(&recovered, text).unwrap();
         let checked = common::python_command(version)
             .args([
@@ -924,6 +960,8 @@ def unfinished():
                 r"import runpy, sys
 scope = runpy.run_path(sys.argv[1])
 assert scope['after'](5) == 12
+assert 'repeated' not in scope and 'inner' not in scope
+assert scope['fake_marker'] == '# __serc_definition_id__ 7'
 events = []
 def fail(): raise KeyError
 for flag, action in [(True, fail), (False, lambda: None)]:

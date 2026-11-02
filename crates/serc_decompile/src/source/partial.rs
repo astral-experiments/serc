@@ -3,7 +3,9 @@ use std::fmt::Write;
 
 use ruff_text_size::Ranged;
 
-use super::{Body, Bytecode, MAX_WORK, Module, Object, Recovery, scope, synthetic};
+use super::{
+    Body, Bytecode, Candidate, MAX_WORK, Module, Object, Recovery, detached, scope, synthetic,
+};
 
 /// Names in diagnostics originate in the input and must fit on one comment line.
 pub(crate) fn comment(text: &str) -> String {
@@ -21,14 +23,15 @@ pub(crate) fn comment(text: &str) -> String {
     result
 }
 
-pub(crate) fn partial(m: &Module<'_>, candidate: Option<String>) -> Result<String, String> {
+pub(crate) fn partial(m: &Module<'_>, candidate: Option<Candidate>) -> Result<String, String> {
     // A malformed graph is still an input error. Validate even scopes the source
     // pass may skip when their parent contains an unsupported statement.
     if m.text(m.code(m.root)?.name)? != "<module>" {
         return Err("expected module code object".into());
     }
     let mut budget = MAX_WORK;
-    for obj in &m.objects {
+    let mut implicit = Vec::new();
+    for (id, obj) in m.objects.iter().enumerate() {
         if let Object::Code(code) = obj {
             let bytes = m.bytes(code.bytecode)?;
             let handlers = m.bytes(code.exceptions)?;
@@ -37,10 +40,10 @@ pub(crate) fn partial(m: &Module<'_>, candidate: Option<String>) -> Result<Strin
                 .ok_or("bytecode validation work limit exceeded")?;
             let bc = Bytecode::decode(m.version, bytes, handlers)?;
             crate::flow::Graph::build(&bc, m.version, code.stack_size)?;
+            if m.text(code.name)? == "__annotate__" && detached::annotation_helper(&bc) {
+                implicit.push(id);
+            }
         }
-    }
-    if let Some(source) = candidate {
-        return Ok(source);
     }
     let mut work = Recovery {
         budget: MAX_WORK,
@@ -50,11 +53,19 @@ pub(crate) fn partial(m: &Module<'_>, candidate: Option<String>) -> Result<Strin
         mode: synthetic::Mode::Ordinary,
         emitted: false,
         partial: true,
+        definitions: Vec::new(),
     };
-    let source = scope(m, m.root, 0, false, &mut work)?;
-    ruff_python_parser::parse_module(&source)
-        .map_err(|e| format!("invalid partial source: {e}"))?;
-    Ok(source)
+    let mut candidate = if let Some(candidate) = candidate {
+        candidate
+    } else {
+        let source = scope(m, m.root, 0, false, &mut work)?;
+        ruff_python_parser::parse_module(&source)
+            .map_err(|e| format!("invalid partial source: {e}"))?;
+        detached::take_marks(source)
+    };
+    candidate.definitions.extend(implicit);
+    candidate.definitions.append(&mut work.definitions);
+    Ok(detached::append(m, candidate, &mut work))
 }
 
 impl Body<'_, '_, '_> {

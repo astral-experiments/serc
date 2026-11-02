@@ -383,7 +383,7 @@ impl Body<'_, '_, '_> {
         if self.m.text(code.name)? != name {
             return Err("function binding differs from code name".into());
         }
-        let params = self.parameters(code, def)?;
+        let params = def.parameters(self.m, code)?;
         let body = scope(self.m, def.id, self.depth + 1, false, self.work)?;
         for decorator in def.decorators.iter().rev() {
             self.line(&format!("@{decorator}"))?;
@@ -394,16 +394,16 @@ impl Body<'_, '_, '_> {
             .iter()
             .find(|(k, _)| k == "return")
             .map_or_else(String::new, |(_, v)| format!(" -> ({v})"));
-        let prefix =
-            if code.flags & (code_flags::CO_COROUTINE | code_flags::CO_ASYNC_GENERATOR) == 0 {
-                ""
-            } else {
-                "async "
-            };
-        self.block(
-            &format!("{prefix}def {name}{generics}({params}){result}:"),
-            &body,
-        )
+        let prefix = function_prefix(code);
+        let mut header = format!("{prefix}def {name}{generics}({params}){result}:");
+        if self.work.partial {
+            super::detached::mark(&mut header, def.id);
+        }
+        self.block(&header, &body)?;
+        if !self.work.partial {
+            self.work.definitions.push(def.id);
+        }
+        Ok(())
     }
 
     pub(super) fn lambda(&mut self, def: &Definition) -> Result<String, String> {
@@ -411,7 +411,7 @@ impl Body<'_, '_, '_> {
         if self.m.text(code.name)? != "<lambda>" {
             return Err("expected expression".into());
         }
-        let params = self.parameters(code, def)?;
+        let params = def.parameters(self.m, code)?;
         let body = scope(self.m, def.id, self.depth + 1, false, self.work)?;
         let expr = body
             .trim_end()
@@ -428,24 +428,31 @@ impl Body<'_, '_, '_> {
         import.members.push(("*".into(), "*".into()));
         self.line(&import.statement("")?)
     }
+}
 
-    fn parameters(&self, code: &Code, def: &Definition) -> Result<String, String> {
-        let locals = self.m.tuple(code.locals)?;
+pub(super) fn function_prefix(code: &Code) -> &'static str {
+    if code.flags & (code_flags::CO_COROUTINE | code_flags::CO_ASYNC_GENERATOR) == 0 {
+        ""
+    } else {
+        "async "
+    }
+}
+
+impl Definition {
+    pub(super) fn parameters(&self, m: &super::Module<'_>, code: &Code) -> Result<String, String> {
+        let locals = m.tuple(code.locals)?;
         let param = |i| -> Result<&str, String> {
-            identifier(
-                self.m
-                    .text(*locals.get(i).ok_or("invalid parameter index")?)?,
-            )
+            identifier(m.text(*locals.get(i).ok_or("invalid parameter index")?)?)
         };
         let start_defaults = code
             .args
-            .checked_sub(def.defaults.len())
+            .checked_sub(self.defaults.len())
             .ok_or("too many defaults")?;
         if code.pos_only > code.args || code.args + code.kw_only > locals.len() {
             return Err("invalid signature".into());
         }
         let annotate = |name: &str| {
-            def.annotations
+            self.annotations
                 .iter()
                 .find(|(key, _)| key == name)
                 .map_or_else(|| name.to_owned(), |(_, v)| format!("{name}: {v}"))
@@ -456,7 +463,7 @@ impl Body<'_, '_, '_> {
             parts.push(if i < start_defaults {
                 name
             } else {
-                format!("{name}={}", def.defaults[i - start_defaults])
+                format!("{name}={}", self.defaults[i - start_defaults])
             });
             if i + 1 == code.pos_only {
                 parts.push("/".into());
@@ -472,7 +479,7 @@ impl Body<'_, '_, '_> {
         for i in code.args..code.args + code.kw_only {
             let name = param(i)?;
             parts.push(
-                if let Some((_, default)) = def.keywords.iter().find(|(k, _)| k == name) {
+                if let Some((_, default)) = self.keywords.iter().find(|(k, _)| k == name) {
                     format!("{}={default}", annotate(name))
                 } else {
                     annotate(name)
@@ -504,6 +511,9 @@ impl<'m, 'data> Body<'m, 'data, '_> {
         if !bc.handlers.is_empty() && self.m.text(code.name)? != "<genexpr>" {
             return Err("unsupported wrapper exception region".into());
         }
+        // This code object implements a source construct such as a type
+        // alias or annotation. Its body already has a place in the output.
+        self.work.definitions.push(id);
         Ok((
             Body {
                 stubs: super::synthetic::Stubs::new(),

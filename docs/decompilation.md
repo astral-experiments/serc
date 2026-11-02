@@ -82,6 +82,15 @@ best-effort result can differ in behavior from the input. Invalid cache
 headers, marshal data, and undecodable instruction streams still produce an
 error.
 
+If the definition site is lost but a named function's code object survives,
+serc appends its body as comments. Each entry starts with
+`# serc: detached function`, the original qualified name, and the original
+line number. Parameters and coroutine flags come from the code object. The
+enclosing code supplies decorators, annotations, and default values, so
+detached signatures omit those details. A nested definition recovered inside
+a detached body appears with its parent. These comments never bind a name or
+run a decorator.
+
 Use `serc decompile --strict FILE.pyc` to require whole-module verification. In
 strict mode a refusal writes the reason to stderr and leaves stdout empty.
 Library callers can use `serc::decompile_pyc_with_mode` to inspect
