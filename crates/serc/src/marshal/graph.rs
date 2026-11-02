@@ -436,7 +436,12 @@ impl<'a> ObjectGraph<'a> {
         let (preprocessing, aliases) =
             GraphPreprocessing::for_code(code, python_version, initial_intern_state);
         let graph = Self::build_for_code(code, python_version, &preprocessing, aliases, None);
-        if graph.needs_reference_sorting {
+        if graph.needs_reference_sorting
+            && !graph
+                .frozen_set_orders
+                .iter()
+                .all(|(_, members)| graph.string_member_order_is_final(members))
+        {
             // Tuple members sort by complete marshal streams: their descendants' reference flags
             // depend on sharing across the entire code graph. Resolve that sharing before recording
             // occurrences; explicitly interned scalar strings also sort by their interned tag.
@@ -532,6 +537,21 @@ impl<'a> ObjectGraph<'a> {
             },
         );
         graph
+    }
+
+    // The first traversal gives every string a reference flag. Clearing that flag on
+    // every member preserves their bytewise order when their string tags stay the same.
+    fn string_member_order_is_final(&self, members: &FrozenSetMembers<'a>) -> bool {
+        let mut reference_flag = None;
+        members.iter().all(|&member| {
+            let Constant::String(string) = member else {
+                return false;
+            };
+            let (shared, interned) = self.sort_key_properties(member);
+            let referenced = self.python_version != PythonVersion::Py312 || shared || interned;
+            interned == should_intern(string)
+                && *reference_flag.get_or_insert(referenced) == referenced
+        })
     }
 
     fn sort_frozen_set_members(&self, values: &'a [Constant]) -> FrozenSetMembers<'a> {
@@ -3203,11 +3223,9 @@ impl<'code> MarshalVisitor<'code> for GraphVisitor<'_, 'code> {
         };
         // Graph traversal and writer traversal visit precisely the same frozen sets. Preserve the
         // final graph's member order so the writer need not rebuild independent marshal sort keys.
-        if self.sort_graph.is_some() || !self.graph.needs_reference_sorting {
-            self.graph
-                .frozen_set_orders
-                .push((values.as_ptr().addr(), members.clone()));
-        }
+        self.graph
+            .frozen_set_orders
+            .push((values.as_ptr().addr(), members.clone()));
         members
     }
 

@@ -7608,25 +7608,9 @@ impl Compiler<'_> {
                 }
                 return Ok(());
             }
-            if elements.len() > 30
-                && !(self.context.python_version <= PythonVersion::Py313
-                    && matches!(kind, CollectionKind::List | CollectionKind::Set)
-                    && elements
-                        .iter()
-                        .all(|element| self.source_aware_fold_constant(element).is_some()))
-            {
-                self.emit(kind.build_opcode_for_unpacking(), 0, 1)?;
-                for element in elements {
-                    self.compile_expression(element)?;
-                    self.emit(kind.append_opcode(), 1, -1)?;
-                }
-                if kind == CollectionKind::Tuple {
-                    self.emit_unary_intrinsic(UnaryIntrinsic::LIST_TO_TUPLE)?;
-                }
-                return Ok(());
-            }
             if matches!(kind, CollectionKind::List | CollectionKind::Set)
                 && elements.len() >= 3
+                && (elements.len() <= 30 || self.context.python_version <= PythonVersion::Py313)
                 && let Some(constants) = elements
                     .iter()
                     .map(|element| self.source_aware_fold_constant(element))
@@ -7683,6 +7667,17 @@ impl Compiler<'_> {
                 }) {
                     self.assembler
                         .record_last_uniform_fold_owner_slots(hidden_owner_slots);
+                }
+                return Ok(());
+            }
+            if elements.len() > 30 {
+                self.emit(kind.build_opcode_for_unpacking(), 0, 1)?;
+                for element in elements {
+                    self.compile_expression(element)?;
+                    self.emit(kind.append_opcode(), 1, -1)?;
+                }
+                if kind == CollectionKind::Tuple {
+                    self.emit_unary_intrinsic(UnaryIntrinsic::LIST_TO_TUPLE)?;
                 }
                 return Ok(());
             }

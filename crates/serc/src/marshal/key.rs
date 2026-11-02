@@ -341,11 +341,18 @@ impl Eq for FrozenSetKey<'_> {}
 
 impl Hash for FrozenSetKey<'_> {
     fn hash<H: Hasher>(&self, state: &mut H) {
-        if self.has_nested_sets() {
-            self.canonical_members().hash(state);
-        } else {
-            self.sorted_members().as_slice().hash(state);
+        // Equal sets may store their members in a different order. Hash each leaf or
+        // container independently and combine the results without sorting the members.
+        let mut sum = 0_u64;
+        let mut xor = 0_u64;
+        for value in self.0 {
+            let hash = HashedObjectKey::new(constant_key(value)).hash();
+            sum = sum.wrapping_add(hash);
+            xor ^= hash.rotate_left((hash >> 58) as u32);
         }
+        self.0.len().hash(state);
+        sum.hash(state);
+        xor.hash(state);
     }
 }
 
@@ -370,7 +377,6 @@ impl Ord for FrozenSetKey<'_> {
 /// Prepares descendants once before comparing nested set members. Retaining this tree for the
 /// operation prevents each parent comparison from recursively sorting the same descendants.
 struct CanonicalKey<'a> {
-    value: &'a Constant,
     key: ObjectKey<'a>,
     children: CanonicalChildren<'a>,
 }
@@ -401,35 +407,7 @@ impl<'a> CanonicalKey<'a> {
             ])),
             _ => CanonicalChildren::None,
         };
-        Self {
-            value,
-            key,
-            children,
-        }
-    }
-
-    // ConstantTupleKey has a distinct hash stream from ObjectKey's derived enum hash.
-    fn hash_constant<H: Hasher>(&self, state: &mut H) {
-        match &self.children {
-            CanonicalChildren::None => hash_constant(self.value, state),
-            CanonicalChildren::Tuple(members) => {
-                11_u8.hash(state);
-                members.len().hash(state);
-                for member in members {
-                    member.hash_constant(state);
-                }
-            }
-            CanonicalChildren::FrozenSet(_) => {
-                12_u8.hash(state);
-                self.hash(state);
-            }
-            CanonicalChildren::Slice(members) => {
-                13_u8.hash(state);
-                for member in members.iter() {
-                    member.hash_constant(state);
-                }
-            }
-        }
+        Self { key, children }
     }
 }
 
@@ -440,31 +418,6 @@ impl PartialEq for CanonicalKey<'_> {
 }
 
 impl Eq for CanonicalKey<'_> {}
-
-impl Hash for CanonicalKey<'_> {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        if matches!(self.children, CanonicalChildren::None) {
-            self.key.hash(state);
-            return;
-        }
-        std::mem::discriminant(&self.key).hash(state);
-        match &self.children {
-            CanonicalChildren::None => unreachable!(),
-            CanonicalChildren::Tuple(members) => {
-                members.len().hash(state);
-                for member in members {
-                    member.hash_constant(state);
-                }
-            }
-            CanonicalChildren::FrozenSet(members) => members.hash(state),
-            CanonicalChildren::Slice(members) => {
-                for member in members.iter() {
-                    member.hash(state);
-                }
-            }
-        }
-    }
-}
 
 impl PartialOrd for CanonicalKey<'_> {
     fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
@@ -1129,7 +1082,44 @@ fn constant_sort_key_with_properties<'a>(
     output
 }
 
+// The short ASCII tag for interned strings sorts before the tag for ordinary strings.
+// Sort the text once, then stably group it by tag and one-byte length.
+fn short_ascii_set_members(values: &[Constant]) -> Option<FrozenSetMembers<'_>> {
+    let mut offsets = [0_usize; 512];
+    let mut rows = Vec::new();
+    for value in values {
+        let Constant::String(text) = value else {
+            return None;
+        };
+        let length = u8::try_from(text.len()).ok()?;
+        if !text.is_ascii() {
+            return None;
+        }
+        let bucket = usize::from(!should_intern(text)) * 256 + usize::from(length);
+        offsets[bucket] += 1;
+        rows.push((text.as_str(), value, bucket));
+    }
+    rows.sort_by_key(|&(text, _, _)| text);
+    let mut next = 0;
+    for count in &mut offsets {
+        let size = *count;
+        *count = next;
+        next += size;
+    }
+    let mut members = FrozenSetMembers::from_elem(&values[0], values.len());
+    for (_, value, bucket) in rows {
+        members[offsets[bucket]] = value;
+        offsets[bucket] += 1;
+    }
+    Some(members)
+}
+
 pub(super) fn frozen_set_members_in_wire_order(values: &[Constant]) -> FrozenSetMembers<'_> {
+    if values.len() >= 64
+        && let Some(members) = short_ascii_set_members(values)
+    {
+        return members;
+    }
     let mut members = SmallVec::<[(ConstantSortKey, &Constant); 4]>::new();
     for value in values {
         members.push((constant_sort_key(value), value));
