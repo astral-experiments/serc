@@ -40,12 +40,13 @@ impl Body<'_, '_, '_> {
                 (fall(i), jump)
             }
         };
-        let value = match ops[first].name {
+        // For either identity branch, use the test that is true on fallthrough.
+        let condition = |i: usize, value: String| match ops[i].name {
             "POP_JUMP_IF_NONE" => format!("({value}) is not None"),
             "POP_JUMP_IF_NOT_NONE" => format!("({value}) is None"),
             _ => value,
         };
-        let mut value = value;
+        let mut value = condition(first, value);
         let mut branch = first;
         let (mut yes, mut no) = arms(branch, self.flow.target(branch)?);
         for _ in 0..32 {
@@ -56,7 +57,13 @@ impl Body<'_, '_, '_> {
             let next = self.flow.block(start).ops.end - 1;
             if next >= end
                 || next == start
-                || !matches!(ops[next].name, "POP_JUMP_IF_FALSE" | "POP_JUMP_IF_TRUE")
+                || !matches!(
+                    ops[next].name,
+                    "POP_JUMP_IF_FALSE"
+                        | "POP_JUMP_IF_TRUE"
+                        | "POP_JUMP_IF_NONE"
+                        | "POP_JUMP_IF_NOT_NONE"
+                )
             {
                 break;
             }
@@ -81,6 +88,7 @@ impl Body<'_, '_, '_> {
             else {
                 break;
             };
+            let rhs = condition(next, rhs);
             let rhs = if invert { format!("not ({rhs})") } else { rhs };
             self.charge(value.len() + rhs.len() + 8)?;
             value = format!("({value} {operator} {rhs})");

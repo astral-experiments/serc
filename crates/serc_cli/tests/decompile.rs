@@ -931,3 +931,23 @@ for fail, suppress in [(0, False), (2, True), (2, False), (1, True)]:
 result = answers, log",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn short_circuit_none_tests_preserve_identity_and_lookup_order() {
+    check_fixture(
+        "def f(x, read, emit):\n    if x or read() is None: emit(1)\n    if x is None or read() is not None: emit(2)\n    return 3\n",
+        r"log = []
+class Flag:
+    def __bool__(self):
+        log.append('tested')
+        return True
+for x in [False, None, Flag()]:
+    for value in [None, Flag()]:
+        def read():
+            log.append('read')
+            return value
+        f(x, read, log.append)
+result = log",
+    );
+}
