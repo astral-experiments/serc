@@ -721,6 +721,24 @@ def rotate(x, y, z):
 ",
         "result = a, rotate(4, 5, 6), events",
     );
+    check_fixture(
+        "def fill(box, target, key, value):\n    box.a, box.b, box.c = value(1), value(2), value(3)\n    target()[key()], target().a = value(4), value(5)\n",
+        r"class Box(dict): pass
+box = Box()
+events = []
+def target():
+    events.append('target')
+    return box
+def key():
+    events.append('key')
+    return 6
+def value(x):
+    events.append(x)
+    return x
+fill(box, target, key, value)
+result = box.a, box.b, box.c, box[6], events
+assert result == (5, 2, 3, 4, [1, 2, 3, 4, 5, 'target', 'key', 'target'])",
+    );
 }
 
 #[cfg(feature = "decompile")]
