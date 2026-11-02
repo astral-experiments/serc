@@ -320,7 +320,12 @@ impl Body<'_, '_, '_> {
         let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
         if matches!(ops[tail].name, "RETURN_CONST" | "RETURN_VALUE")
             && end > target
-            && matches!(ops[end - 1].name, "RETURN_CONST" | "RETURN_VALUE")
+            && (matches!(ops[end - 1].name, "RETURN_CONST" | "RETURN_VALUE")
+                // A module or class return has no source statement. Its
+                // other arm must remain under an else or the raise runs on
+                // import even when the first arm completed successfully.
+                || ((self.depth == 0 || self.class)
+                    && matches!(ops[end - 1].name, "RAISE_VARARGS" | "RERAISE")))
             // A physical return at the end of the suite can belong to a
             // nested guard. Its other edge still enters the shared tail.
             && !self.flow.incoming(target).any(|from| (start..fallthrough_end).contains(&from))
@@ -349,6 +354,24 @@ impl Body<'_, '_, '_> {
                     return Ok(end);
                 }
                 if a == b {
+                    // An early constant return can guard a loop with a
+                    // different return inside it, followed by the same
+                    // constant at exhaustion. Keep the guard's own exit.
+                    if left.is_empty()
+                        && super::regions::constant_return(ops, fallthrough_end)
+                            .is_some_and(|(at, _)| at == start)
+                        && self.flow.blocks_in(target..end).any(|block| {
+                            block.ops.end < end
+                                && matches!(
+                                    ops[block.ops.end - 1].name,
+                                    "RETURN_CONST" | "RETURN_VALUE"
+                                )
+                        })
+                    {
+                        self.block(&format!("if {test}:"), &suite)?;
+                        self.line(other.trim_end_matches('\n'))?;
+                        return Ok(end);
+                    }
                     self.block(&format!("if {test}:"), &left)?;
                     if !right.is_empty() {
                         self.block("else:", &right)?;

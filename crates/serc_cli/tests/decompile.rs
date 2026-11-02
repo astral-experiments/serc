@@ -487,6 +487,41 @@ assert result == [0, 1, 'convert', 'closed', 0, 'closed']",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_terminal_module_guard_keeps_the_raise_in_the_else() {
+    for side in ["little", "big"] {
+        let source = format!(
+            "side = '{side}'\nif side == 'little':\n    value = 1\nelif side == 'big':\n    value = 2\nelse:\n    raise RuntimeError(side)\n"
+        );
+        check_fixture(
+            &source,
+            "result = value\nassert value == (1 if side == 'little' else 2)",
+        );
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_guard_and_loop_exhaustion_can_return_the_same_constant() {
+    check_fixture(
+        r"def wake(waiters, emit):
+    if not waiters:
+        return False
+    for waiter in waiters:
+        if not waiter:
+            emit(waiter)
+            return True
+    return False
+",
+        r"result = []
+assert not wake([], result.append)
+assert not wake([1], result.append)
+assert wake([1, 0, 0], result.append)
+assert result == [0]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn conditional_none_value_is_distinct_from_a_guard_return() {
     check_fixture(
         r"def keep(reset, value):
