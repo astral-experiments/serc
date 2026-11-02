@@ -19,6 +19,12 @@ control-flow recovery, source reconstruction, and verification. The public
 serc's compiler for verification. The CLI selects the mode through the same API.
 Compiler-only builds omit the recovery crate and the reader.
 
+A return in a nested guard can leave the enclosing guard's other path open. In
+`asyncio.base_events._run_until_complete_cb`, the test of the future's exception
+and the test for cancellation both have an edge to the call that stops the loop.
+The decompiler puts that call after the guard. All four targets reproduce the
+original callback.
+
 The reader recognizes timestamp, checked-hash and unchecked-hash headers for the
 four pinned targets. It uses a bounded marshal arena so nested code and shared
 constants can be inspected directly. The decoder resolves instruction prefixes,
@@ -30,13 +36,12 @@ depth. A worklist rejects inconsistent stack heights at joins.
 
 Source recovery uses forward postdominators to find where branches rejoin and
 shared successors to combine short-circuit tests. When CPython gives several
-edges separate copies of a function's implicit `None` return, recovery can
-place a guard at function exit without introducing a shared return block.
-Loop recovery distinguishes exhaustion from explicit breaks, including when
-CPython copied the return after the loop into a break arm. It can also follow consecutive typed handlers with a
-shared return and recover a conditional break through duplicated finally
-cleanup. Backedges end a forward region. More complex cyclic graphs and
-exception layouts can still be refused.
+edges separate copies of a function's implicit `None` return, recovery can place
+a guard at function exit without introducing a shared return block. Loop
+recovery distinguishes exhaustion from explicit breaks, including when CPython
+copied the return after the loop into a break arm. A branch can also leave a
+loop by falling through after its last backward jump. More complex cyclic graphs
+and exception layouts can still be refused.
 
 The source pass reconstructs ordinary and simultaneous assignments, calls,
 branches, loops, imports, functions, closures, and classes. It preserves the
@@ -63,19 +68,22 @@ can still exceed these recognizers.
 
 In `asyncio.Queue._wakeup_next`, a backedge follows the test of the current
 waiter but returns to the test of the queue. On 3.12 and 3.13, CPython emits a
-second copy of the queue test at the bottom of the loop. On 3.14 and 3.15,
-the jump targets the top of the loop directly. Recovery checks that destination
-so a completed waiter advances the loop to the next item.
+second copy of the queue test at the bottom of the loop. On 3.14 and 3.15, the
+jump targets the top of the loop directly. Recovery checks that destination so a
+completed waiter advances the loop to the next item. In 3.14's
+`asyncio.graph._build_graph_for_future`, two arms jump back to the header. The
+third falls past both jumps, so recovery emits a `break`. The same layout occurs
+in the interactive interpreter's dotted-name parser and backspace handler.
 
-For a protected `await`, CPython temporarily sends throws from `YIELD_VALUE`
-to `CLEANUP_THROW`. Both the resumed path and the cleanup can reach the
-user's handler. Following those edges places the cancellation handlers inside
-the loops in `asyncio.Queue.get` and `Queue.put`, including the nested
-`except ValueError` around removal of the waiter. Both methods recompile to
-matching executable fields on all four targets. For `finally`, recovery
-compares the cleanup on the normal path with the exceptional copy, including
-the destinations of jumps within each copy. This recovers the cleanup in
-`asyncio.sleep` and `asyncio.Event.wait` across all four targets.
+For a protected `await`, CPython temporarily sends throws from `YIELD_VALUE` to
+`CLEANUP_THROW`. Both the resumed path and the cleanup can reach the user's
+handler. Following those edges places the cancellation handlers inside the loops
+in `asyncio.Queue.get` and `Queue.put`, including the nested `except ValueError`
+around removal of the waiter. Both methods recompile to matching executable
+fields on all four targets. For `finally`, recovery compares the cleanup on the
+normal path with the exceptional copy, including the destinations of jumps
+within each copy. This recovers the cleanup in `asyncio.sleep` and
+`asyncio.Event.wait` across all four targets.
 
 In ordinary functions, a conditional can skip an entire protected suite. The
 decompiler places each recognized handler at its protected entry and follows
@@ -85,24 +93,24 @@ also keeps the polling loop and computed return inside the `try` that restores
 the reader.
 
 For a chain of `except` clauses, the false edge of each type check identifies
-the next clause. Successful handlers can return, raise, or jump back to a
-shared continuation. In `asyncio.selector_events`, this separates transient
-socket errors from exceptions the callback must re-raise or pass to the future.
-The reconstructed `_sock_recv`, `_sock_recv_into`, and `_sock_accept` methods
-match on all four targets.
+the next clause. Successful handlers can return, raise, or jump back to a shared
+continuation. In `asyncio.selector_events`, this separates transient socket
+errors from exceptions the callback must re-raise or pass to the future. The
+reconstructed `_sock_recv`, `_sock_recv_into`, and `_sock_accept` methods match
+on all four targets.
 
 CPython can build long dictionary displays one pair at a time. Recognizing those
 insertions lets recovery continue past the configuration dictionary in 3.14.5's
-`turtle.py`, where 182 of 250 code objects then match. In `codecs.py`, the
-module begins with a handler that binds an exception and always raises. The
-exception table separates the handler body from CPython's cleanup of the bound
-name. Following its normal continuation recovers 82 of 100 code objects.
+`turtle.py`, where 204 of 250 code objects now match. In `codecs.py`, the module
+begins with a handler that binds an exception and always raises. The exception
+table separates the handler body from CPython's cleanup of the bound name.
+Following its normal continuation recovers 84 of 100 code objects.
 
 In 3.14.5's `importlib._bootstrap_external`, the module starts with
 `assert all(len(sep) == 1 for sep in path_separators)`. CPython emits two paths,
 an inlined loop for the builtin and an ordinary call for a replacement bound to
 `all`. Recovering that call and the formatted set comprehension that follows it
-places the later definitions back in the module. CPython reproduces 92 of its
+places the later definitions back in the module. CPython reproduces 94 of its
 125 code objects.
 
 ## Verification
@@ -143,14 +151,14 @@ by the skipped instructions can have its own listing. The appendix has a
 separate 16 MiB output budget. Reaching it leaves a truncation comment in the
 output.
 
-A function can have a complete-looking body that omits a branch or an
-exception path. When its normal control flow or exception table differs after
-recompilation at all three optimization levels, serc warns on the definition
-and lists the original blocks. The body remains executable. The normal-flow
-check compares the jump and fallthrough destinations of each block in
-instruction order and distinguishes returns from raises. Changes to offsets,
-operands, or inline caches alone do not trigger it. Functions with an explicit
-gap already have a listing.
+A function can have a complete-looking body that omits a branch or an exception
+path. When its normal control flow or exception table differs after
+recompilation at all three optimization levels, serc warns on the definition and
+lists the original blocks. The body remains executable. The normal-flow check
+compares the jump and fallthrough destinations of each block in instruction
+order and distinguishes returns from raises. If those edges and the exception
+table match, differences in instructions or their operands do not produce a
+function warning. Functions with an explicit gap already have a listing.
 
 Use `serc decompile --strict FILE.pyc` to require whole-module verification. In
 strict mode a refusal writes the reason to stderr and leaves stdout empty.
@@ -209,13 +217,13 @@ The checker never executes corpus code.
 
 | CPython   | Compilable modules | Strictly verified | Coverage | Verified code objects / total | Modules with dead suites / live guards |
 | --------- | -----------------: | ----------------: | -------: | ----------------------------: | -------------------------------------: |
-| 3.12.14   |              2,190 |             1,828 |    83.5% |                7,800 / 11,063 |                                 44 / 1 |
-| 3.13.15   |              2,209 |             1,831 |    82.9% |                7,982 / 11,562 |                                 44 / 1 |
-| 3.14.5    |              2,246 |             1,845 |    82.1% |                9,825 / 14,082 |                                 51 / 5 |
-| 3.15.0rc2 |              2,266 |             1,864 |    82.3% |                9,843 / 14,114 |                                 54 / 8 |
+| 3.12.14   |              2,190 |             1,869 |    85.3% |                8,136 / 11,063 |                                 47 / 1 |
+| 3.13.15   |              2,209 |             1,873 |    84.8% |                8,308 / 11,562 |                                 47 / 1 |
+| 3.14.5    |              2,246 |             1,870 |    83.3% |               10,064 / 14,082 |                                 53 / 5 |
+| 3.15.0rc2 |              2,266 |             1,890 |    83.4% |               10,100 / 14,114 |                                 57 / 8 |
 
 The code-object count includes each module and its nested code. Only objects
-from strictly verified modules count here. On 3.14, 197 of the 401 refusals
+from strictly verified modules count here. On 3.14, 171 of the 376 refusals
 produced a candidate that failed verification. The most frequent differences
 were instructions, exception tables, and constants. Remaining recovery gaps
 include nested exception cleanup, overlapping branches and loops, and patterns
@@ -242,10 +250,10 @@ packages in subdirectories are outside this sample.
 
 | CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
 | --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
-| 3.12.14   |     164 |                         164 / 51 |                          21 / 3 |                           5,643 / 97 / 8,040 |
-| 3.13.15   |     153 |                        153 / 153 |                          23 / 1 |                            4,949 / 1 / 7,720 |
-| 3.14.5    |     154 |                          154 / 0 |                          23 / 0 |                            5,245 / 0 / 8,064 |
-| 3.15.0rc2 |     152 |                          152 / 0 |                          20 / 0 |                            5,346 / 0 / 8,259 |
+| 3.12.14   |     164 |                         164 / 51 |                          22 / 3 |                           6,116 / 97 / 8,040 |
+| 3.13.15   |     153 |                        153 / 153 |                          24 / 1 |                            5,376 / 1 / 7,720 |
+| 3.14.5    |     154 |                          154 / 0 |                          24 / 0 |                            5,647 / 0 / 8,064 |
+| 3.15.0rc2 |     152 |                          152 / 0 |                          21 / 0 |                            5,763 / 0 / 8,259 |
 
 A compilable file can contain placeholders. The last column pairs code objects
 by qualified name and occurrence and compares executable fields, including
@@ -254,8 +262,8 @@ independent CPython comparisons omit source locations and marshal reference
 identity. The serc verifier additionally checks reference sharing. This pycdc
 revision rejected the 3.14 and 3.15 cache magic values.
 
-Across the four runs, 96 of the 623 outputs also include detached definitions.
-Their 733 commented entries are available for inspection and contribute no
+Across the four runs, 77 of the 623 outputs also include detached definitions.
+Their 604 commented entries are available for inspection and contribute no
 executable code objects to the comparison.
 
 ```console
@@ -270,15 +278,15 @@ report breaks out executable matches and detached definitions by package.
 
 | CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
 | --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
-| 3.12.14   |     519 |                        519 / 257 |                        255 / 25 |                       8,842 / 1,076 / 11,772 |
-| 3.13.15   |     477 |                        477 / 404 |                        217 / 14 |                          8,206 / 14 / 11,740 |
-| 3.14.5    |     498 |                          498 / 0 |                         231 / 0 |                           9,101 / 0 / 12,586 |
-| 3.15.0rc2 |     539 |                          539 / 0 |                         242 / 0 |                           9,692 / 0 / 13,544 |
+| 3.12.14   |     519 |                        519 / 257 |                        279 / 25 |                       9,716 / 1,076 / 11,772 |
+| 3.13.15   |     477 |                        477 / 404 |                        243 / 14 |                          9,014 / 14 / 11,740 |
+| 3.14.5    |     498 |                          498 / 0 |                         251 / 0 |                           9,877 / 0 / 12,586 |
+| 3.15.0rc2 |     539 |                          539 / 0 |                         266 / 0 |                          10,543 / 0 / 13,544 |
 
 On 3.14.5, the largest gaps by number of unmatched code objects are in `idlelib`
-(488), `asyncio` (453), and `_pyrepl` (289). A mismatch counts once per code
-object, so a single lost method can also cause its enclosing class and module to
-miss.
+(332), `asyncio` (294), and `multiprocessing` (222). A mismatch counts once per
+code object, so a single lost method can also cause its enclosing class and
+module to miss.
 
 Add `--compare-with /path/to/older/serc` to check for regressions in individual
 functions as well as modules. The report lists previously matching scopes by
@@ -290,7 +298,7 @@ as the strict check.
 
 | CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
 | --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
-| 3.12.14   |   2,190 |                    2,190 / 1,569 |                     1,829 / 754 |                       9,728 / 3,194 / 11,063 |
-| 3.13.15   |   2,209 |                    2,209 / 2,040 |                     1,832 / 337 |                         9,844 / 337 / 11,562 |
-| 3.14.5    |   2,246 |                        2,246 / 0 |                       1,846 / 0 |                          12,210 / 0 / 14,082 |
-| 3.15.0rc2 |   2,266 |                        2,266 / 0 |                       1,865 / 0 |                          12,229 / 0 / 14,114 |
+| 3.12.14   |   2,190 |                    2,190 / 1,569 |                     1,870 / 754 |                       9,911 / 3,194 / 11,063 |
+| 3.13.15   |   2,209 |                    2,209 / 2,040 |                     1,874 / 337 |                        10,039 / 337 / 11,562 |
+| 3.14.5    |   2,246 |                        2,246 / 0 |                       1,871 / 0 |                          12,269 / 0 / 14,082 |
+| 3.15.0rc2 |   2,266 |                        2,266 / 0 |                       1,891 / 0 |                          12,303 / 0 / 14,114 |
