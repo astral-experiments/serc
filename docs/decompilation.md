@@ -59,6 +59,23 @@ recovery handles value and singleton patterns, alternatives, guards, captures,
 and selected sequence, mapping, and class patterns. Nested or overlapping cases
 can still exceed these recognizers.
 
+For a protected `await`, CPython temporarily sends throws from `YIELD_VALUE`
+to `CLEANUP_THROW`. Both the resumed path and the cleanup can reach the
+user's handler. Following those edges places the cancellation handlers inside
+the loops in `asyncio.Queue.get` and `Queue.put`, including the nested
+`except ValueError` around removal of the waiter. Both methods recompile to
+matching executable fields on all four targets. For `finally`, recovery
+compares the cleanup on the normal path with the exceptional copy, including
+the destinations of jumps within each copy. This recovers the cleanup in
+`asyncio.sleep` and `asyncio.Event.wait` across all four targets.
+
+For a chain of `except` clauses, the false edge of each type check identifies
+the next clause. Successful handlers can return, raise, or jump back to a
+shared continuation. In `asyncio.selector_events`, this separates transient
+socket errors from exceptions the callback must re-raise or pass to the future.
+The reconstructed `_sock_recv`, `_sock_recv_into`, and `_sock_accept` methods
+match on all four targets.
+
 CPython can build long dictionary displays one pair at a time. Recognizing those
 insertions lets recovery continue past the configuration dictionary in 3.14.5's
 `turtle.py`, where 182 of 250 code objects then match. In `codecs.py`, the
@@ -114,9 +131,7 @@ output.
 A function can have a complete-looking body that omits an exception path. If its
 candidate recompiles with a different exception table at all three optimization
 levels, serc warns on its definition and lists the original blocks. The body
-remains executable. On CPython 3.14.5, this labels both `asyncio.Queue.get` and
-`Queue.put`. Their listings contain all 101 and 96 original instructions,
-respectively. Functions with an explicit gap already have a listing.
+remains executable. Functions with an explicit gap already have a listing.
 
 Use `serc decompile --strict FILE.pyc` to require whole-module verification. In
 strict mode a refusal writes the reason to stderr and leaves stdout empty.

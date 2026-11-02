@@ -930,6 +930,157 @@ fn comprehensions_inside_returning_exception_handlers() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn suspended_handlers_resume_and_reraise_in_loops() {
+    check_fixture(
+        r"async def consume(pending, wait, events):
+    while pending:
+        waiter = pending.pop()
+        try:
+            await wait(waiter)
+        except:
+            events.append('cancel')
+            try:
+                pending.remove(waiter)
+            except ValueError:
+                pass
+            if pending and not waiter:
+                events.append('wake')
+            raise
+    return 7
+",
+        r"import asyncio
+result = []
+async def ok(waiter): pass
+async def cancel(waiter): raise asyncio.CancelledError
+result.append(asyncio.run(consume([1], ok, result)))
+for pending in ([1, 0], [0, 0]):
+    try: asyncio.run(consume(pending, cancel, result))
+    except asyncio.CancelledError: result.append(list(pending))
+assert result == [7, 'cancel', 'wake', [1], 'cancel', []]",
+    );
+    check_fixture(
+        r"async def read(work, events):
+    try: await work()
+    except KeyError:
+        events.append('caught')
+        raise
+    return 7
+",
+        r"import asyncio
+result = []
+async def run(value):
+    async def task():
+        if value: raise value
+    try: result.append(await read(task, result))
+    except (KeyError, ValueError) as exc: result.append(type(exc).__name__)
+for value in (None, KeyError(), ValueError()): asyncio.run(run(value))
+assert result == [7, 'caught', 'KeyError', 'ValueError']",
+    );
+    check_fixture(
+        r"async def read(work):
+    try:
+        await work(1)
+        return await work(2)
+    except KeyError:
+        raise
+",
+        r"import asyncio
+result = []
+async def work(n):
+    result.append(n)
+    return n + 40
+result.append(asyncio.run(read(work)))
+assert result == [1, 2, 42]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn finally_runs_on_suspension_return_and_cancellation() {
+    check_fixture(
+        r"async def value(work, events):
+    try:
+        return await work()
+    finally:
+        events.append('cleanup')
+
+async def constant(work, events):
+    try:
+        await work()
+        return True
+    finally:
+        events.append('cleanup')
+
+async def resume(work, events):
+    try:
+        await work()
+    finally:
+        events.append('cleanup')
+    events.append('resumed')
+",
+        r"import asyncio
+result = []
+async def ok(): return 42
+async def cancel(): raise asyncio.CancelledError
+for run in (value, constant, resume):
+    result.append(asyncio.run(run(ok, result)))
+    try: asyncio.run(run(cancel, result))
+    except asyncio.CancelledError: result.append('cancelled')
+assert result == ['cleanup', 42, 'cleanup', 'cancelled',
+                  'cleanup', True, 'cleanup', 'cancelled',
+                  'cleanup', 'resumed', None, 'cleanup', 'cancelled']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn ordered_exception_clauses_keep_the_success_path() {
+    check_fixture(
+        r"def receive(read, events):
+    try:
+        data = read()
+    except (BlockingIOError, InterruptedError):
+        return
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException as exc:
+        events.append(type(exc).__name__)
+    else:
+        events.append(data)
+",
+        r"result = []
+def fail(exc):
+    def read(): raise exc
+    return read
+receive(lambda: 42, result)
+for exc in (BlockingIOError(), InterruptedError(), SystemExit(), KeyboardInterrupt(), ValueError()):
+    try: receive(fail(exc), result)
+    except (SystemExit, KeyboardInterrupt): result.append('raised')
+assert result == [42, 'raised', 'raised', 'ValueError']",
+    );
+    check_fixture(
+        r"def run(work, events):
+    try:
+        value = work()
+    except KeyError as exc:
+        events.append(str(exc))
+    except:
+        return 7
+    else:
+        events.append(value)
+    events.append('continued')
+    return 9
+",
+        r"result = []
+def missing(): raise KeyError(1)
+def other(): raise ValueError
+for task in (lambda: 42, missing, other): result.append(run(task, result))
+assert result == [42, 'continued', 9, '1', 'continued', 9, 7]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn mismatched_exception_tables_mark_only_the_affected_function() {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original.py");
@@ -952,7 +1103,32 @@ def reader(x): return x + 1
     .unwrap();
     for version in common::PYTHON_VERSIONS {
         let built = common::python_command(version)
-            .args(["-c", "import py_compile, sys; py_compile.compile(sys.argv[1], sys.argv[2], doraise=True)"])
+            .args(["-c", r"import dis, importlib.util, marshal, sys, types
+from pathlib import Path
+code = compile(Path(sys.argv[1]).read_bytes(), '<fixture>', 'exec')
+constants = list(code.co_consts)
+i = next(i for i, c in enumerate(constants) if isinstance(c, types.CodeType) and c.co_name == 'reader')
+reader = constants[i]
+# Split the final unwind range at a real instruction. The two entries still
+# protect exactly the same operations, but the compiler emits a single range.
+entries = list(dis.Bytecode(reader).exception_entries)
+last = entries.pop()
+split = next(op.offset for op in dis.get_instructions(reader) if last.start < op.offset < last.end)
+entries.extend([last._replace(end=split), last._replace(start=split)])
+def varint(n):
+    data = [n & 63]
+    while n >= 64:
+        n >>= 6
+        data.append(64 | (n & 63))
+    return bytes(reversed(data))
+table = bytearray()
+for start, end, target, depth, lasti in entries:
+    at = len(table)
+    table += varint(start // 2) + varint((end-start) // 2) + varint(target // 2) + varint(depth*2 + lasti)
+    table[at] |= 128
+constants[i] = reader.replace(co_exceptiontable=bytes(table))
+Path(sys.argv[2]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(code.replace(co_consts=tuple(constants))))
+"])
             .arg(&original).arg(&cache).output().unwrap();
         assert!(built.status.success(), "{built:?}");
         let output = Command::new(env!("CARGO_BIN_EXE_serc"))

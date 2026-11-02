@@ -37,6 +37,7 @@ impl Body<'_, '_, '_> {
         {
             return self.region(ops, 0, body.len(), 0);
         }
+        self.handlers = super::suspended_handlers::regions(bc, &self.flow);
         let stop = ops
             .iter()
             .rposition(|op| matches!(op.name, "RETURN_VALUE" | "RETURN_CONST"))

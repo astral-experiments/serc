@@ -50,6 +50,21 @@ pub(super) fn manager_entry(ops: &[Instruction], asynchronous: bool) -> Result<u
 }
 
 impl Body<'_, '_, '_> {
+    pub(super) fn try_block(&mut self, suite: &str, inline: bool) -> Result<(), String> {
+        // A one-line try suite can omit the tracing NOP before its first
+        // protected instruction. The formatted candidate also tries a block.
+        if inline && suite.lines().count() == 1
+            && ruff_python_parser::parse_module(suite).is_ok_and(|parsed| {
+                matches!(parsed.suite().as_slice(), [stmt] if !ruff_python_ast::helpers::is_compound_statement(stmt))
+            })
+        {
+            self.line(&format!("try: {}", suite.trim_end()))?;
+        } else {
+            self.block("try:", suite)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn protected(
         &mut self,
         bc: &Bytecode,
@@ -88,17 +103,7 @@ impl Body<'_, '_, '_> {
         }
         self.region(ops, 0, start, 0)?;
         let (suite, returns) = self.fragment(ops, start, end, 0)?.pending_return()?;
-        // A one-line try suite can omit the tracing NOP before its first
-        // protected instruction. The formatted candidate also tries a block.
-        if start > 0 && ops[start - 1].name != "NOP" && suite.lines().count() == 1
-            && ruff_python_parser::parse_module(&suite).is_ok_and(|parsed| {
-                matches!(parsed.suite().as_slice(), [stmt] if !ruff_python_ast::helpers::is_compound_statement(stmt))
-            })
-        {
-            self.line(&format!("try: {}", suite.trim_end()))?;
-        } else {
-            self.block("try:", &suite)?;
-        }
+        self.try_block(&suite, start > 0 && ops[start - 1].name != "NOP")?;
         let star = ops
             .get(handler + 1)
             .is_some_and(|op| op.name == "BUILD_LIST");
@@ -115,6 +120,12 @@ impl Body<'_, '_, '_> {
             })
         {
             return self.returning_handlers(ops, handler);
+        }
+        if !star
+            && !returns
+            && let Some(dispatch) = self.exception_dispatch(ops, handler, end, limit)
+        {
+            return self.emit_dispatch(ops, dispatch);
         }
         let match_kind = if star {
             "CHECK_EG_MATCH"
@@ -229,29 +240,7 @@ impl Body<'_, '_, '_> {
         let end = if ops[binding].name == "POP_TOP" {
             failed
         } else {
-            let cleanup = failed.checked_sub(4)?;
-            let [none, store, delete, reraise] = &ops[cleanup..failed] else {
-                return None;
-            };
-            let unwind = self.flow.handler(binding + 1)?;
-            let loads_none = match none.name {
-                "LOAD_CONST" => matches!(
-                    self.m.objects[self.item(self.code.constants, none.arg).ok()?],
-                    super::Object::None
-                ),
-                "LOAD_COMMON_CONSTANT" => none.arg == super::CommonConstant::NONE.argument(),
-                _ => false,
-            };
-            if (unwind.target, unwind.depth, unwind.lasti) != (none.offset, 1, true)
-                || !loads_none
-                || (store.name, store.arg) != (ops[binding].name, ops[binding].arg)
-                || delete.name.strip_prefix("DELETE_") != store.name.strip_prefix("STORE_")
-                || delete.arg != store.arg
-                || (reraise.name, reraise.arg) != ("RERAISE", 1)
-            {
-                return None;
-            }
-            cleanup
+            self.exception_name_cleanup(ops, binding, failed)?
         };
         (end > binding + 1 && ops[end - 1].name == "RAISE_VARARGS").then_some(end)
     }
@@ -263,21 +252,9 @@ impl Body<'_, '_, '_> {
         let mut cursor = handler + 1;
         let mut continuation = None;
         while ops.get(cursor).is_some_and(|op| op.name != "RERAISE") {
-            let check = self
-                .flow
-                .block(cursor)
-                .ops
-                .clone()
-                .find(|&i| ops[i].name == "CHECK_EXC_MATCH")
-                .ok_or("unsupported exception type")?;
-            let jump = check + 1;
-            let next = self
-                .flow
-                .jump(jump)
-                .filter(|&next| next > jump && ops[jump].name == "POP_JUMP_IF_FALSE")
+            let (check, binding, next) = super::dispatch::typed_handler(&self.flow, ops, cursor)
                 .ok_or("unsupported exception dispatch")?;
             let kind = self.fragment(ops, cursor, check, 0)?.expression()?;
-            let binding = jump + 1 + usize::from(ops[jump + 1].name == "NOT_TAKEN");
             if binding >= next || ops[binding].name != "POP_TOP" {
                 return Err("unsupported returning exception binding".into());
             }

@@ -7,6 +7,7 @@ mod comprehensions;
 mod conditionals;
 mod definitions;
 mod detached;
+mod dispatch;
 mod elided_tries;
 mod exceptions;
 mod layout;
@@ -17,6 +18,7 @@ pub(super) use partial::{comment, partial};
 mod patterns;
 mod regions;
 mod strings;
+mod suspended_handlers;
 mod suspension;
 pub(super) mod synthetic;
 mod type_params;
@@ -178,6 +180,7 @@ fn recover_scope<'m>(
         partial_start: 0,
         flow,
         loop_edges: None,
+        handlers: suspended_handlers::Handlers::default(),
         class,
         annotations: Vec::new(),
         depth,
@@ -265,6 +268,7 @@ struct Body<'m, 'data, 'work> {
     omitted_cell_stores: rustc_hash::FxHashSet<usize>,
     flow: crate::flow::Graph,
     loop_edges: Option<loops::Loop>,
+    handlers: suspended_handlers::Handlers,
     depth: usize,
     class: bool,
     annotations: Vec<(Option<u32>, String, String)>,
