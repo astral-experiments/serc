@@ -538,6 +538,27 @@ fn conditional_none_value_is_distinct_from_a_guard_return() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn nested_conditional_returns_test_the_outer_predicate_first() {
+    check_fixture(
+        r"def choose(test, value):
+    return (value(1) if test(2) else value(2)) if test(1) else (value(3) if test(3) else value(4))
+",
+        r"result = []
+for mask in range(8):
+    log = []
+    def test(n):
+        log.append(('test', n))
+        return mask & (1 << (n - 1))
+    def value(n):
+        log.append(('value', n))
+        return n
+    result.append((choose(test, value), log))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_nested_guard_can_return_before_a_shared_continuation() {
     check_fixture(
         r"def finish(future):

@@ -350,7 +350,9 @@ impl Body<'_, '_, '_> {
                         self.line(&format!("return {b}"))?;
                         return Ok(end);
                     }
-                    self.line(&format!("return {a} if {test} else {b}"))?;
+                    // An enclosing return can reuse this expression as its true
+                    // arm. Python otherwise associates the outer test to the right.
+                    self.line(&format!("return ({a} if {test} else {b})"))?;
                     return Ok(end);
                 }
                 if a == b {
