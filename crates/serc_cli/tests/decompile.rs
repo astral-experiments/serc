@@ -1325,6 +1325,13 @@ def present(mapping, key):
         return False
     else:
         return bool(value)
+
+def shared(obj):
+    try:
+        obj.method()
+    except AttributeError:
+        pass
+    return sentinel
 ",
         r"import sys
 class WithMethod:
@@ -1334,7 +1341,9 @@ class WithoutMethod:
     def fallback(self):
         assert sys.exception() is None
         return 'fallback'
-result = [lookup(WithMethod()), lookup(WithoutMethod()), present({}, 1), present({1: 5}, 1)]
+sentinel = 7
+result = [lookup(WithMethod()), lookup(WithoutMethod()), present({}, 1), present({1: 5}, 1),
+          shared(WithMethod()), shared(WithoutMethod())]
 ",
     );
 }
