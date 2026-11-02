@@ -61,10 +61,14 @@ Exception recovery handles selected typed and bare handlers, multi-item and
 consecutive synchronous context managers, and handlers whose `try: pass` body
 CPython optimized away. A generator or coroutine can suspend inside a context
 manager. Recovery follows the manager's exception-table entries across an
-`await` and distinguishes `with` from `async with` at each entry and exit. Match
-recovery handles value and singleton patterns, alternatives, guards, captures,
-and selected sequence, mapping, and class patterns. Nested or overlapping cases
-can still exceed these recognizers.
+`await` and distinguishes `with` from `async with` at each entry and exit. When
+evaluating a return expression raises, a synchronous manager can suppress the
+exception and execution resumes after the `with`. This recovers the second parse
+attempt in 3.14.5's `_pyrepl._module_completer.ImportParser._parse`.
+
+Match recovery handles value and singleton patterns, alternatives, guards,
+captures, and selected sequence, mapping, and class patterns. Nested or
+overlapping cases can still exceed these recognizers.
 
 In `asyncio.__getattr__` on 3.14 and 3.15, two platform checks in literal cases
 can reach the same `raise AttributeError` after the match. A failed platform
@@ -310,15 +314,23 @@ report breaks out executable matches and detached definitions by package.
 
 | CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
 | --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
-| 3.12.14   |     519 |                        519 / 257 |                        305 / 25 |                      10,036 / 1,076 / 11,772 |
-| 3.13.15   |     477 |                        477 / 404 |                        260 / 14 |                          9,948 / 14 / 11,740 |
-| 3.14.5    |     498 |                          498 / 0 |                         263 / 0 |                          10,714 / 0 / 12,586 |
-| 3.15.0rc2 |     539 |                          539 / 0 |                         279 / 0 |                          11,427 / 0 / 13,544 |
+| 3.12.14   |     519 |                        519 / 257 |                        305 / 25 |                      10,043 / 1,076 / 11,772 |
+| 3.13.15   |     477 |                        477 / 404 |                        260 / 14 |                          9,954 / 14 / 11,740 |
+| 3.14.5    |     498 |                          498 / 0 |                         263 / 0 |                          10,721 / 0 / 12,586 |
+| 3.15.0rc2 |     539 |                          539 / 0 |                         279 / 0 |                          11,430 / 0 / 13,544 |
 
 On 3.14.5, the largest gaps by number of unmatched code objects are in `idlelib`
 (255), `asyncio` (241), and `multiprocessing` (163). A mismatch counts once per
 code object, so a single lost method can also cause its enclosing class and
 module to miss.
+
+An independent CFG check recompiled the 235 best-effort package modules on
+3.14.5 at all three optimization levels. It paired uniquely named functions
+whose recovered body had no marked gap. Of 2,845 such functions with a
+conditional branch and no exception table, 20 had different normal edges at
+every level. Of 921 functions with an exception table in the original or a
+candidate, 144 had different normal edges and 197 had a different exception
+table at every level. A matching graph does not check instruction operands.
 
 On the same target, 21 of the 498 package modules produced a warning about the
 module's own code. Four had a changed exception table and 17 also had a changed
