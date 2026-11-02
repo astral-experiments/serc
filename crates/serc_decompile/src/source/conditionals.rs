@@ -385,6 +385,14 @@ impl Body<'_, '_, '_> {
                     self.line(&format!("return {a}"))?;
                     return Ok(end);
                 }
+                // A bare constant return exits the function. The remaining
+                // statements can stay at their original indentation, including
+                // another guard followed by its own return.
+                if start == tail && ops[tail].name == "RETURN_CONST" {
+                    self.block(&format!("if {test}:"), &suite)?;
+                    self.line(other.trim_end_matches('\n'))?;
+                    return Ok(end);
+                }
             }
             self.block(&format!("if {test}:"), &suite)?;
             self.block("else:", &other)?;

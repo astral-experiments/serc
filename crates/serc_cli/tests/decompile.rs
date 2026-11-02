@@ -632,6 +632,17 @@ def expression(flag):
 
 #[cfg(feature = "decompile")]
 #[test]
+fn consecutive_guard_returns_fit_before_the_next_class() {
+    check_output(
+        "def classify(c):\n    if c == 'a':\n        return 'letter'\n    if c == ' ':\n        return 'space'\n    return 'other'\nclass Edit:\n    pass\n",
+        "result = [classify(c) for c in ('a', ' ', '?')], Edit.__firstlineno__",
+        &[serc::PythonVersion::Py313],
+        |source| assert!(!source.contains("# serc: best-effort"), "{source}"),
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn nested_conditional_returns_test_the_outer_predicate_first() {
     check_fixture(
         r"def choose(test, value):
