@@ -4603,9 +4603,9 @@ pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
         _ => {}
     }
 
-    let mut value = vec![0_u16];
-    // A 15-bit limb times 10^14 plus a carry still fits in u64.
-    for chunk in token.as_bytes().chunks(14) {
+    let mut words = SmallVec::<[u64; 2]>::new();
+    // Both a 19-digit chunk and its multiplier fit in u64.
+    for chunk in token.as_bytes().chunks(19) {
         let mut multiplier = 1_u64;
         let mut carry = 0_u64;
         for &byte in chunk {
@@ -4614,30 +4614,37 @@ pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
                 carry = carry * 10 + u64::from(byte - b'0');
             }
         }
-        for limb in &mut value {
-            let next = u64::from(*limb) * multiplier + carry;
-            *limb = (next & 0x7fff) as u16;
-            carry = next >> 15;
+        for word in &mut words {
+            (*word, carry) = word.carrying_mul(multiplier, carry);
         }
-        while carry != 0 {
-            value.push((carry & 0x7fff) as u16);
-            carry >>= 15;
+        if carry != 0 {
+            words.push(carry);
         }
     }
+
+    let bytes = words.into_iter().flat_map(u64::to_le_bytes);
+    let mut value = pack_integer_digits(bytes.map(u32::from), 8);
+    // The high word may contribute whole zero marshal limbs.
+    value.truncate(significant_digits(&value).len().max(1));
     value
 }
 
 /// Pack binary, octal, or hexadecimal digits into little-endian 15-bit marshal limbs.
 fn power_of_two_digits(digits: &str, bits_per_digit: u32) -> Vec<u16> {
     let digits = digits.trim_start_matches(['0', '_']);
+    let digits = digits
+        .chars()
+        .rev()
+        .filter_map(|digit| digit.to_digit(1 << bits_per_digit));
+    pack_integer_digits(digits, bits_per_digit)
+}
+
+/// Pack little-endian digits of up to eight bits into 15-bit marshal limbs.
+fn pack_integer_digits(digits: impl Iterator<Item = u32>, bits_per_digit: u32) -> Vec<u16> {
     let mut value = Vec::new();
     let mut buffer = 0;
     let mut bits = 0;
-    for digit in digits
-        .chars()
-        .rev()
-        .filter_map(|digit| digit.to_digit(1 << bits_per_digit))
-    {
+    for digit in digits {
         buffer |= digit << bits;
         bits += bits_per_digit;
         if bits >= 15 {
@@ -4692,6 +4699,16 @@ mod tests {
                 assert_eq!(super::big_integer_digits(&token), expected, "{token}");
             }
         }
+    }
+
+    #[test]
+    fn decimal_words_cross_marshal_limb_boundaries() {
+        // 2^192 + 2^128 + 2^64 + 1 puts one bit in each of four 64-bit words.
+        let value = "6277101735386680764176071790128604879584176795969512275969";
+        assert_eq!(
+            super::big_integer_digits(value),
+            [1, 0, 0, 0, 16, 0, 0, 0, 256, 0, 0, 0, 4096]
+        );
     }
 
     #[test]
