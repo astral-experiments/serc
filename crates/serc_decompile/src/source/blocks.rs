@@ -12,7 +12,7 @@ pub(super) const MARK: &str = "# __serc_unplaced__ ";
 const TRUNCATED: &str = "# serc: unplaced block listing truncated at the output limit\n";
 
 pub(super) struct Gap {
-    scope: Id,
+    pub(super) scope: Id,
     ops: Range<usize>,
 }
 
@@ -56,12 +56,17 @@ pub(super) fn append(
     source: &mut String,
     gaps: Vec<Gap>,
     placed: &FxHashSet<Id>,
+    warned: Vec<Id>,
 ) -> Result<(), String> {
     let mut pending = BTreeMap::<Id, Vec<Range<usize>>>::new();
     for gap in gaps {
         if !gap.ops.is_empty() {
             pending.entry(gap.scope).or_default().push(gap.ops);
         }
+    }
+    let warned: FxHashSet<_> = warned.into_iter().collect();
+    for &id in &warned {
+        pending.entry(id).or_default().push(0..usize::MAX);
     }
     let mut seen = FxHashSet::default();
     let end = source.len() + MAX_WORK;
@@ -78,8 +83,14 @@ pub(super) fn append(
         )?;
         let flow = Graph::build(&bc, m.version, code.stack_size)?;
         let constants = m.tuple(code.constants)?;
+        let warning = warned.contains(&id);
+        let label = if warning {
+            "original blocks (exception table differs)"
+        } else {
+            "unplaced blocks"
+        };
         if !listing.line(format_args!(
-            "\n# serc: unplaced blocks in {} (original line {}, code {})",
+            "\n# serc: {label} in {} (original line {}, code {})",
             comment(m.text(code.qualname)?),
             code.first_line,
             id
@@ -98,7 +109,8 @@ pub(super) fn append(
             // A lost class, lambda, or compiler-generated scope may have no
             // Python definition in either the source or the detached appendix.
             for op in &bc.ops[range.clone()] {
-                if op.name == "LOAD_CONST"
+                if !warning
+                    && op.name == "LOAD_CONST"
                     && let Some(&child) = constants.get(op.arg as usize)
                     && matches!(m.objects[child], Object::Code(_))
                     && !placed.contains(&child)

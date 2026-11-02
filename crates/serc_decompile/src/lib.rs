@@ -73,8 +73,12 @@ pub fn decompile_pyc_with_mode(
             verification_error: None,
         }),
         Err(error) if mode == DecompileMode::BestEffort => {
-            let result = source::partial(&module, fallback)
-                .map_err(|reason| DecompileError::Reconstruct(module.version, reason))?;
+            let code = module.code(module.root).map_err(DecompileError::Read)?;
+            let filename = module.text(code.filename).map_err(DecompileError::Read)?;
+            let result = source::partial(&module, fallback, |source, level| {
+                compile(source, filename, module.version, level)
+            })
+            .map_err(|reason| DecompileError::Reconstruct(module.version, reason))?;
             let note = source::comment(&error.to_string());
             Ok(DecompileOutput {
                 source: format!("# serc: best-effort decompilation\n\n# {note}\n{result}"),

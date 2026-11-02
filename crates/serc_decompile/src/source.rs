@@ -21,6 +21,7 @@ mod suspension;
 pub(super) mod synthetic;
 mod type_params;
 mod value_patterns;
+mod warnings;
 use definitions::{Definition, Import};
 
 use ruff_python_ast::str::TripleQuotes;

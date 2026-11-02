@@ -926,6 +926,70 @@ fn comprehensions_inside_returning_exception_handlers() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn mismatched_exception_tables_mark_only_the_affected_function() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("original.py");
+    let cache = temp.path().join("module.pyc");
+    let recovered = temp.path().join("recovered.py");
+    fs_err::write(
+        &original,
+        r"def keep(fn): return fn
+@keep
+async def reader(work, events):
+    try: await work()
+    except KeyError:
+        events.append('lost')
+        raise
+    return 7
+first = reader
+def reader(x): return x + 1
+",
+    )
+    .unwrap();
+    for version in common::PYTHON_VERSIONS {
+        let built = common::python_command(version)
+            .args(["-c", "import py_compile, sys; py_compile.compile(sys.argv[1], sys.argv[2], doraise=True)"])
+            .arg(&original).arg(&cache).output().unwrap();
+        assert!(built.status.success(), "{built:?}");
+        let output = Command::new(env!("CARGO_BIN_EXE_serc"))
+            .arg("decompile")
+            .arg(&cache)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let source = String::from_utf8(output.stdout).unwrap();
+        let header =
+            "async def reader(work, events):  # serc: exception table differs after recompilation";
+        assert!(source.contains(header), "{source}");
+        assert_eq!(
+            source
+                .matches("# serc: exception table differs after recompilation")
+                .count(),
+            1
+        );
+        assert_eq!(
+            source
+                .matches("# serc: original blocks (exception table differs) in reader ")
+                .count(),
+            1
+        );
+        fs_err::write(&recovered, source).unwrap();
+        let checked = common::python_command(version).args(["-c", r"import asyncio, dis, marshal, re, runpy, sys, types
+with open(sys.argv[1], 'rb') as f:
+    f.read(16)
+    original = next(c for c in marshal.load(f).co_consts if isinstance(c, types.CodeType) and c.co_name == 'reader')
+text = open(sys.argv[2], encoding='utf8').read().split('# serc: original blocks (exception table differs) in reader ')[1]
+assert [(int(m[1]),m[2]) for m in re.finditer(r'^# +(\d+)  (\w+) ', text, re.M)] == [(op.offset,op.opname) for op in dis.get_instructions(original)]
+scope = runpy.run_path(sys.argv[2])
+async def ok(): return None
+assert asyncio.run(scope['first'](ok, [])) == 7 and scope['reader'](3) == 4
+"]).arg(&cache).arg(&recovered).output().unwrap();
+        assert!(checked.status.success(), "{checked:?}");
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original.py");

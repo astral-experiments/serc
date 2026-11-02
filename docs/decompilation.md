@@ -109,6 +109,15 @@ lost class or anonymous function referenced by the skipped instructions can have
 its own listing. The appendix has a separate 16 MiB output budget. Reaching it
 leaves a truncation comment in the output.
 
+A function can have a complete-looking body even when the candidate omits an
+exception path. For each named function without an explicit gap, serc compares
+the original exception table to the candidate recompiled at levels 0, 1, and
+2. If all three tables differ, a comment on the function header identifies
+the mismatch and the appendix shows the original blocks for that function.
+The candidate remains executable. For example, the 3.14.5 reconstruction of
+`asyncio.Queue.get` carries this warning on its `async def` line. An unchanged
+exception table alone does not establish that a function was verified.
+
 Use `serc decompile --strict FILE.pyc` to require whole-module verification. In
 strict mode a refusal writes the reason to stderr and leaves stdout empty.
 Library callers can use `serc::decompile_pyc_with_mode` to inspect

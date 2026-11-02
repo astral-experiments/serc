@@ -23,7 +23,11 @@ pub(crate) fn comment(text: &str) -> String {
     result
 }
 
-pub(crate) fn partial(m: &Module<'_>, candidate: Option<Candidate>) -> Result<String, String> {
+pub(crate) fn partial(
+    m: &Module<'_>,
+    candidate: Option<Candidate>,
+    compile: impl FnMut(&str, serc_bytecode::OptimizationLevel) -> Option<Vec<u8>>,
+) -> Result<String, String> {
     // A malformed graph is still an input error. Validate even scopes the source
     // pass may skip when their parent contains an unsupported statement.
     if m.text(m.code(m.root)?.name)? != "<module>" {
@@ -56,7 +60,7 @@ pub(crate) fn partial(m: &Module<'_>, candidate: Option<Candidate>) -> Result<St
         definitions: Vec::new(),
         private_class: None,
     };
-    let candidate = if let Some(candidate) = candidate {
+    let mut candidate = if let Some(candidate) = candidate {
         candidate
     } else {
         let source = scope(m, m.root, 0, false, &mut work)?;
@@ -65,7 +69,8 @@ pub(crate) fn partial(m: &Module<'_>, candidate: Option<Candidate>) -> Result<St
         detached::take_marks(source)
     };
     work.definitions.extend(implicit);
-    detached::append(m, candidate, &mut work)
+    let warned = super::warnings::annotate(m, &mut candidate, compile);
+    detached::append(m, candidate, &mut work, warned)
 }
 
 impl Body<'_, '_, '_> {

@@ -79,12 +79,15 @@ pub(super) fn append<'m>(
     m: &'m Module<'_>,
     candidate: Candidate,
     work: &mut Recovery<'m>,
+    warned: Vec<Id>,
 ) -> Result<String, String> {
     let Candidate {
         mut source,
         definitions,
         mut unplaced,
     } = candidate;
+    // Inserting diagnostics on def lines must not displace detached bodies.
+    let limit = MAX_SOURCE + warned.len() * super::warnings::WARNING.len();
     let mut placed: FxHashSet<_> = definitions.into_iter().collect();
     // Compiler helpers need no detached function, but their instructions still
     // belong in the listing if the expression using them was discarded.
@@ -102,7 +105,7 @@ pub(super) fn append<'m>(
             continue;
         };
         let Some(budget) = work.budget.checked_sub(constants.len() + 1) else {
-            if source.len() + LIMIT.len() <= MAX_SOURCE {
+            if source.len() + LIMIT.len() <= limit {
                 source.push_str(LIMIT);
             }
             break;
@@ -146,8 +149,8 @@ pub(super) fn append<'m>(
         // Prefix every physical line, even when the input contains one.
         let lines = body.source.split_terminator(['\r', '\n']);
         let size = title.len() + body.source.len() + lines.clone().count() * 7;
-        if source.len().saturating_add(size) + LIMIT.len() > MAX_SOURCE {
-            if source.len() + LIMIT.len() <= MAX_SOURCE {
+        if source.len().saturating_add(size) + LIMIT.len() > limit {
+            if source.len() + LIMIT.len() <= limit {
                 source.push_str(LIMIT);
             }
             break;
@@ -161,6 +164,6 @@ pub(super) fn append<'m>(
         placed.extend(body.definitions);
         helpers.extend(work.definitions.drain(..));
     }
-    blocks::append(m, &mut source, unplaced, &placed)?;
+    blocks::append(m, &mut source, unplaced, &placed, warned)?;
     Ok(source)
 }
