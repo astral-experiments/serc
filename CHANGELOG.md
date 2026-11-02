@@ -1,5 +1,49 @@
 # Changelog
 
+## 0.1.10
+
+Released on 2026-11-02.
+
+### Performance
+
+- Compile very large decimal integer literals using divide-and-conquer
+  conversion and process smaller decimals in chunks
+  (astral-experiments/serc#2294,
+  https://github.com/astral-experiments/serc/pull/2294,
+  astral-experiments/serc#2296,
+  https://github.com/astral-experiments/serc/pull/2296,
+  astral-experiments/serc#2298,
+  https://github.com/astral-experiments/serc/pull/2298)
+- Compile large constant set displays more efficiently on Python 3.12 and 3.13,
+  including sets of integers and short ASCII strings
+  (astral-experiments/serc#2291,
+  https://github.com/astral-experiments/serc/pull/2291,
+  astral-experiments/serc#2300,
+  https://github.com/astral-experiments/serc/pull/2300)
+- Reduce the cost of decoding UTF-8 source and looking up source positions
+  (astral-experiments/serc#2299,
+  https://github.com/astral-experiments/serc/pull/2299)
+- Compile modules containing many folded constants, such as negative numbers in
+  lookup tables, more efficiently (astral-experiments/serc#2289,
+  https://github.com/astral-experiments/serc/pull/2289)
+- Reduce the cost of compiling large bytes literals and binary, octal, or
+  hexadecimal integer literals (astral-experiments/serc#2290,
+  https://github.com/astral-experiments/serc/pull/2290,
+  astral-experiments/serc#2292,
+  https://github.com/astral-experiments/serc/pull/2292)
+- Avoid repeatedly scanning conditional jumps when computing exception
+  boundaries (astral-experiments/serc#2295,
+  https://github.com/astral-experiments/serc/pull/2295)
+- Reduce the cost of cleaning docstrings that contain tabs
+  (astral-experiments/serc#2297,
+  https://github.com/astral-experiments/serc/pull/2297)
+
+### Documentation
+
+- Add project compilation benchmarks for Airflow, Django, NumPy, and
+  Transformers (astral-experiments/serc#2293,
+  https://github.com/astral-experiments/serc/pull/2293)
+
 ## 0.1.9
 
 Released on 2026-10-28.
