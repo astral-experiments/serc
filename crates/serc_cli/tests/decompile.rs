@@ -811,3 +811,31 @@ fn synthetic_yields_and_captures_preserve_function_kinds() {
         "a, b = stream(True), stream(False)\nresult = [next(a), next(b), next(a, 2)]\ntry: next(b)\nexcept LookupError: result.append(3)",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn chained_assignments_evaluate_the_rhs_once_and_targets_in_order() {
+    check_output(
+        "def assign(obj, key, value):\n    first = obj()[key()] = second = obj().attr = value()\n    return first is second\n",
+        r"class Obj:
+    def __setitem__(self, key, value): log.append(('item', key, value is token))
+    def __setattr__(self, key, value): log.append(('attr', key, value is token))
+log, token, target = [], object(), Obj()
+def obj():
+    log.append('obj')
+    return target
+def key():
+    log.append('key')
+    return 7
+def value():
+    log.append('value')
+    return token
+result = assign(obj, key, value), log",
+        &common::PYTHON_VERSIONS,
+        |source| assert!(source.contains("first = obj()[key()] = second = obj().attr = value()")),
+    );
+    check_fixture(
+        "def assign(obj, values):\n    a, obj.attr = obj[1], b = values()\n    return a, b\n",
+        "class Obj(dict): pass\nobj = Obj()\nresult = assign(obj, lambda: (2, 3)), obj.attr, obj[1]",
+    );
+}

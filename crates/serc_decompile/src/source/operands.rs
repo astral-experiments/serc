@@ -225,6 +225,34 @@ impl Body<'_, '_, '_> {
         Ok(binding.next)
     }
 
+    /// Each COPY belongs to one more target of a single assignment. Read a
+    /// final target before consuming the RHS: an isolated copy and store can
+    /// instead be a walrus inside an expression.
+    pub(super) fn chained_targets(
+        &mut self,
+        ops: &[Instruction],
+        mut next: usize,
+    ) -> Result<Binding, String> {
+        let mut pending = None;
+        let mut target = String::new();
+        loop {
+            self.write_target(ops, &mut next, &mut pending, &mut target, 0)?;
+            self.charge(3)?;
+            target.push_str(" = ");
+            if pending.is_some()
+                || ops
+                    .get(next)
+                    .is_none_or(|op| (op.name, op.arg) != ("COPY", 1))
+            {
+                break;
+            }
+            next += 1;
+        }
+        self.write_target(ops, &mut next, &mut pending, &mut target, 0)?;
+        let seed = self.binding_seed(pending)?;
+        Ok(Binding { target, next, seed })
+    }
+
     fn bindings(
         &mut self,
         ops: &[Instruction],
@@ -245,14 +273,18 @@ impl Body<'_, '_, '_> {
             targets.reverse();
         }
         let target = targets.join(", ");
-        let seed = match pending {
-            Some(("LOAD_FAST", index)) => {
-                vec![Value::Expr(self.name(self.code.locals, index)?.to_owned())]
-            }
-            None => Vec::new(),
-            _ => return Err("unconsumed store after unpacking target".into()),
-        };
+        let seed = self.binding_seed(pending)?;
         Ok(Binding { target, next, seed })
+    }
+
+    fn binding_seed(&self, pending: Option<(&str, u32)>) -> Result<Vec<Value>, String> {
+        match pending {
+            Some(("LOAD_FAST", index)) => Ok(vec![Value::Expr(
+                self.name(self.code.locals, index)?.to_owned(),
+            )]),
+            None => Ok(Vec::new()),
+            _ => Err("unconsumed store after unpacking target".into()),
+        }
     }
 
     fn write_target(
@@ -267,6 +299,14 @@ impl Body<'_, '_, '_> {
             return Err("unpacking target limit exceeded".into());
         }
         self.charge(1)?;
+        if let Some(("LOAD_FAST", index)) = *pending {
+            *pending = None;
+            let receiver = Value::Expr(self.name(self.code.locals, index)?.to_owned());
+            let (target, after) = self.computed_target(ops, *next, vec![receiver])?;
+            text.push_str(&target);
+            *next = after;
+            return Ok(());
+        }
         let (name, arg) = if let Some(op) = pending.take() {
             op
         } else {
@@ -305,11 +345,73 @@ impl Body<'_, '_, '_> {
                 *pending = Some((second, arg & 15));
                 (self.code.locals, arg >> 4)
             }
+            _ if name.starts_with("LOAD_")
+                || matches!(name, "PUSH_NULL" | "BUILD_LIST" | "BUILD_MAP") =>
+            {
+                let start = *next - 1;
+                let (target, after) = self.computed_target(ops, start, Vec::new())?;
+                text.push_str(&target);
+                *next = after;
+                return Ok(());
+            }
             _ => return Err("unsupported unpacking target".into()),
         };
         let name = self.name(table, index)?;
         text.push_str(name);
         self.charge(name.len())
+    }
+
+    // The receiver and indices are evaluated after the RHS. The store is the
+    // first instruction that consumes the value beneath these operands.
+    fn computed_target(
+        &mut self,
+        ops: &[Instruction],
+        start: usize,
+        seed: Vec<Value>,
+    ) -> Result<(String, usize), String> {
+        if start >= ops.len() {
+            return Err("incomplete assignment target".into());
+        }
+        let end = ops.len().min(self.flow.block(start).ops.end);
+        let mut height = seed.len();
+        for i in start..end {
+            let op = ops[i];
+            self.charge(1)?;
+            let (pops, pushes) =
+                serc_bytecode::target::stack_counts_for(self.m.version, op.opcode, op.arg);
+            if pops > height {
+                if pops != height + 1
+                    || !matches!(op.name, "STORE_ATTR" | "STORE_SUBSCR" | "STORE_SLICE")
+                {
+                    break;
+                }
+                let values = self.seeded(ops, start, i, 0, seed)?.operands()?;
+                let target = match (op.name, values.as_slice()) {
+                    ("STORE_ATTR", [Value::Expr(obj)]) => {
+                        format!("({obj}).{}", self.name(self.code.names, op.arg)?)
+                    }
+                    (
+                        "STORE_SUBSCR",
+                        [Value::Expr(obj), Value::Expr(index) | Value::Slice(index)],
+                    ) => format!("({obj})[{index}]"),
+                    ("STORE_SLICE", [Value::Expr(obj), Value::Expr(lower), Value::Expr(upper)]) => {
+                        let lower = if lower == "None" { "" } else { lower };
+                        let upper = if upper == "None" { "" } else { upper };
+                        format!("({obj})[{lower}:{upper}]")
+                    }
+                    _ => break,
+                };
+                return Ok((target, i + 1));
+            }
+            if op.jump.is_some()
+                || op.name.starts_with("STORE_")
+                || matches!(op.name, "COPY" | "NOP")
+            {
+                break;
+            }
+            height = height - pops + pushes;
+        }
+        Err("unsupported unpacking target".into())
     }
 
     pub(super) fn push_slice_tuple(&mut self, items: &[String]) -> Result<(), String> {

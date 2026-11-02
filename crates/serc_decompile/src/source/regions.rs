@@ -10,6 +10,13 @@ pub(super) struct Fragment {
 }
 
 impl Fragment {
+    pub(super) fn operands(self) -> Result<Vec<Value>, String> {
+        if !self.lines.is_empty() {
+            return Err("statement in assignment target".into());
+        }
+        Ok(self.stack)
+    }
+
     pub(super) fn expression(mut self) -> Result<String, String> {
         if self.lines.is_empty()
             && self.stack.len() == 1
@@ -157,6 +164,14 @@ impl Body<'_, '_, '_> {
                     && matches!(self.stack.last(), Some(Value::Expr(value)) if value == "__class__") => {
                     self.pop()?;
                     Ok(i + 3)
+                }
+                "COPY" if op.arg == 1
+                    && matches!(self.stack.last(), Some(Value::Expr(_)))
+                    && let Ok(targets) = self.chained_targets(&ops[..end], i + 1) => {
+                    let rhs = self.expr()?;
+                    self.line(&format!("{} = {rhs}", targets.target))?;
+                    self.stack.extend(targets.seed);
+                    Ok(targets.next)
                 }
                 "COPY"
                     if op.arg == 1
