@@ -522,6 +522,7 @@ impl<'m, 'data> Body<'m, 'data, '_> {
                 code,
                 stack: Vec::new(),
                 lines: String::new(),
+                partial_prefix: 0,
                 flow,
                 loop_edges: None,
                 class: false,

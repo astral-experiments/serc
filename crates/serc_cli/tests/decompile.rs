@@ -883,6 +883,10 @@ else:
     async def repeated(*, y):
         return y + 2
 fake_marker = '# __serc_definition_id__ 7'
+label: str = 'αβγ'
+class Labels:
+    label: str = 'αβγ'
+    size: int = 3
 def annotated(x: int): return x
 if before:
     lost = '{big}'
@@ -971,6 +975,10 @@ scope = runpy.run_path(sys.argv[1])
 assert scope['after'](5) == 12
 assert 'repeated' not in scope and 'inner' not in scope
 assert scope['fake_marker'] == '# __serc_definition_id__ 7'
+annotations = scope['__annotate__'](1) if '__annotate__' in scope else scope['__annotations__']
+assert annotations['label'] is str and scope['label'] == 'αβγ'
+assert scope['Labels'].__annotations__ == dict(label=str, size=int)
+assert scope['Labels'].label == 'αβγ' and scope['Labels'].size == 3
 events = []
 def fail(): raise KeyError
 for flag, action in [(True, fail), (False, lambda: None)]:

@@ -151,6 +151,7 @@ fn recover_scope<'m>(
         code,
         stack: Vec::new(),
         lines: String::new(),
+        partial_prefix: 0,
         flow,
         loop_edges: None,
         class,
@@ -236,6 +237,8 @@ struct Body<'m, 'data, 'work> {
     code: &'m Code,
     stack: Vec<Value>,
     lines: String,
+    // End of the last complete statement while recovering a partial region.
+    partial_prefix: usize,
     stubs: synthetic::Stubs<'m>,
     omitted_cell_stores: rustc_hash::FxHashSet<usize>,
     flow: crate::flow::Graph,

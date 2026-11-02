@@ -95,8 +95,13 @@ impl Body<'_, '_, '_> {
             if self.lines.len() + annotation.len() + 2 >= super::MAX_SOURCE {
                 return Err("source size limit exceeded".into());
             }
-            self.lines
-                .insert_str(index + name.len(), &format!(": {annotation}"));
+            let insert = index + name.len();
+            self.lines.insert_str(insert, &format!(": {annotation}"));
+            // A delayed annotation can modify an already completed line.
+            // Keep the next statement boundary on the same physical line.
+            if insert < self.partial_prefix {
+                self.partial_prefix += annotation.len() + 2;
+            }
             Ok(())
         } else {
             self.line(&format!("{name}: {annotation}"))

@@ -74,9 +74,11 @@ impl Body<'_, '_, '_> {
     ) -> Result<Fragment, String> {
         let outer_stack = std::mem::replace(&mut self.stack, stack);
         let outer_lines = std::mem::take(&mut self.lines);
+        let outer_prefix = std::mem::take(&mut self.partial_prefix);
         let outer_loop = self.loop_edges;
         let result = self.region(ops, start, end, level + 1);
         self.loop_edges = outer_loop;
+        self.partial_prefix = outer_prefix;
         let fragment = Fragment {
             lines: std::mem::replace(&mut self.lines, outer_lines),
             stack: std::mem::replace(&mut self.stack, outer_stack),
@@ -122,17 +124,16 @@ impl Body<'_, '_, '_> {
             && start < end
             && self.stack.is_empty()
             && self.flow.unprotected_suite(start..end);
-        let mut prefix = self.lines.len();
         let mut i = start;
         while i < end {
             if partial && self.stack.is_empty() {
-                prefix = self.lines.len();
+                self.partial_prefix = self.lines.len();
             }
             let op = ops[i];
             let next = match self.region_step(ops, i, end, level) {
                 Ok(next) => next,
                 Err(reason) if partial => {
-                    self.lines.truncate(prefix);
+                    self.lines.truncate(self.partial_prefix);
                     self.stack.clear();
                     let next = self
                         .resume_after(ops, i)?
@@ -146,10 +147,12 @@ impl Body<'_, '_, '_> {
             if next <= i || next > end {
                 return Err(format!("branch escapes region at byte {}", op.offset));
             }
-            if partial && self.stack.is_empty() && self.lines.len() > prefix {
-                self.charge(self.lines.len() - prefix)?;
-                if let Err(error) = ruff_python_parser::parse_module(&self.lines[prefix..]) {
-                    self.lines.truncate(prefix);
+            if partial && self.stack.is_empty() && self.lines.len() > self.partial_prefix {
+                self.charge(self.lines.len() - self.partial_prefix)?;
+                if let Err(error) =
+                    ruff_python_parser::parse_module(&self.lines[self.partial_prefix..])
+                {
+                    self.lines.truncate(self.partial_prefix);
                     self.gap(
                         &format!("invalid reconstructed statement: {error}"),
                         &ops[i..next],
