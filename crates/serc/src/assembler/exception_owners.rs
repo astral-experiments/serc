@@ -2402,6 +2402,7 @@ struct UncompactedPrefixIndexes {
     positions: FxHashMap<Label, usize>,
     repeated_labels: FxHashSet<Label>,
     forward_jumps: FxHashMap<Label, smallvec::SmallVec<[usize; 1]>>,
+    original_conditions_by_target: OnceCell<FxHashMap<Label, SmallVec<[usize; 1]>>>,
     targets: FxHashSet<Label>,
     authored_break_targets: FxHashSet<Label>,
     pass_positions: OnceCell<(OwnerSignaturePositions, OwnerSignaturePositions)>,
@@ -2439,6 +2440,7 @@ impl UncompactedPrefixIndexes {
             positions,
             repeated_labels,
             forward_jumps,
+            original_conditions_by_target: OnceCell::new(),
             targets,
             authored_break_targets,
             pass_positions: OnceCell::new(),
@@ -2529,6 +2531,29 @@ impl UncompactedPrefixIndexes {
                 .iter()
                 .filter(|&&position| all[position] == Item::Instruction(instruction));
             matches.next().is_some() && matches.next().is_none()
+        })
+    }
+
+    /// Checks the original forward conditions targeting this label against their live instructions.
+    fn has_original_condition_target(
+        &self,
+        all: &[Item],
+        original: &[Instruction],
+        target: Label,
+    ) -> bool {
+        let by_target = self.original_conditions_by_target.get_or_init(|| {
+            let mut by_target = FxHashMap::<_, SmallVec<[usize; 1]>>::default();
+            for (index, condition) in original.iter().enumerate() {
+                if let Some(target) = condition.forward_target() {
+                    by_target.entry(target).or_default().push(index);
+                }
+            }
+            by_target
+        });
+        by_target.get(&target).is_some_and(|matches| {
+            matches
+                .iter()
+                .any(|&index| self.has_unique_forward_jump(all, original[index]))
         })
     }
 
@@ -3540,13 +3565,15 @@ impl ExceptionOwnerProvenance {
         // A raw emitted return or copied backedge is not necessarily a CP
         // record. The compiler's original branch target establishes the left
         // edge independently; the preceding terminator only bounds this scan.
+        let has_original_condition_target = |&target: &Label| {
+            indexes().has_original_condition_target(
+                all,
+                &self.original_primitive_condition_boundaries,
+                target,
+            )
+        };
         let has_original_target = || {
-            self.original_primitive_condition_boundaries
-                .iter()
-                .any(|condition| {
-                    matches!(condition.operand(), Operand::Forward(label) if leading_labels.contains(&label))
-                        && indexes().has_unique_forward_jump(all, *condition)
-                })
+            leading_labels.iter().any(has_original_condition_target)
                 || leading_labels
                     .iter()
                     .any(|label| indexes().authored_break_targets.contains(label))
@@ -3576,12 +3603,7 @@ impl ExceptionOwnerProvenance {
                     .any(|label| {
                         !self.source_boundaries.contains(label)
                             || !indexes().has_unique_label(*label)
-                            || !self.original_primitive_condition_boundaries.iter().any(
-                                |condition| {
-                                    condition.operand() == Operand::Forward(*label)
-                                        && indexes().has_unique_forward_jump(all, *condition)
-                                },
-                            )
+                            || !has_original_condition_target(label)
                     })
                 {
                     return false;
@@ -7113,7 +7135,11 @@ impl LayoutAssembler {
             PUSH_EXC_INFO, TO_BOOL,
         };
 
-        if tail.insertions != 0 || tail.post_compaction_fusions != 0 {
+        // Every recoverable truth marker fills a slot vacated by a removal.
+        if tail.insertions != 0
+            || tail.post_compaction_fusions != 0
+            || (tail.early_removals == 0 && tail.late_removals == 0)
+        {
             return None;
         }
         let start = condition_index.checked_sub(2)?;
@@ -18755,6 +18781,11 @@ mod tests {
         assert!(index.has_unique_forward_jump(&items, unique));
         assert!(!index.has_unique_forward_jump(&items, duplicate));
         assert!(!index.has_unique_forward_jump(&items, condition(POP_JUMP_IF_FALSE, absent)));
+
+        // A copied original does not qualify, but another original with the same target can.
+        assert!(!index.has_original_condition_target(&items, &[duplicate], target));
+        let shared = UncompactedPrefixIndexes::new(&items);
+        assert!(shared.has_original_condition_target(&items, &[duplicate, unique], target));
     }
 
     #[test]
