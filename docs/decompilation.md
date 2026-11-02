@@ -343,6 +343,15 @@ functions as well as modules. The report lists previously matching scopes by
 filename, qualified name, and occurrence, and the command exits nonzero if any
 were lost.
 
+For functions fully placed by both builds, `--compare-with` also checks normal
+edges and exception tables independently. Each field matches if native CPython
+reproduces it at any of the three optimization levels. Losing a previously
+matching field adds the function and field to `flow_regressions` and fails a
+standard-library comparison. Ruff reports these changes without failing.
+Repeated definitions are paired within their parent when the counts agree. If a
+previously placed function is missing, ambiguous, or now contains a marked gap,
+it appears in `newly_unplaced`. That list is informational.
+
 The `pycdc_only` map lists every scope that pycdc matched and serc missed. Any
 entry fails either standard-library comparison, even if serc matches more scopes
 overall. Both standard-library samples passed on all four targets.

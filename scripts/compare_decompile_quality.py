@@ -13,7 +13,6 @@ import sys
 import sysconfig
 import tempfile
 import tokenize
-import types
 import warnings
 from collections import Counter, defaultdict, deque
 from pathlib import Path
@@ -21,34 +20,28 @@ from pathlib import Path
 # Isolated mode excludes the script directory from sys.path.
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_decompile_corpus as corpus
+from decompile_flow import function_matches, scopes
 
 
-def scopes(code):
-    yield code
-    for value in code.co_consts:
-        if isinstance(value, types.CodeType):
-            yield from scopes(value)
-
-
-def measure(command, cache, filename, original, counts):
+def measure(command, cache, filename, original, counts, *, check_flow=False):
     try:
         run = subprocess.run(
             [*command, cache], capture_output=True, check=False, timeout=30
         )
     except subprocess.TimeoutExpired:
         counts["timeouts"] += 1
-        return set()
+        return set(), {}
     if run.returncode:
         counts["nonzero_exits"] += 1
     if not run.stdout.strip():
         counts["empty_outputs"] += 1
         if run.returncode:
-            return set()
+            return set(), {}
     try:
         recovered = compile(run.stdout, filename, "exec", dont_inherit=True, optimize=0)
     except (ValueError, SyntaxError, RecursionError):
         counts["invalid_source"] += 1
-        return set()
+        return set(), {}
     counts["compilable_modules"] += 1
     if b"# serc: detached function " in run.stdout:
         sections = sum(
@@ -75,7 +68,12 @@ def measure(command, cache, filename, original, counts):
             matches.add((name, occurrences[name]))
             counts["matching_code_objects"] += 1
             counts["matching_modules"] += scope is original
-    return matches
+    flow = (
+        function_matches(original, recovered, run.stdout, filename)
+        if check_flow
+        else {}
+    )
+    return matches, flow
 
 
 def main():
@@ -89,7 +87,7 @@ def main():
         "--compare-with",
         type=Path,
         metavar="OLDER_SERC",
-        help="report previously matching scopes that no longer match and exit nonzero",
+        help="check for lost code-object matches and changes to fully placed functions",
     )
     args = parser.parse_args()
     sys.path.insert(0, str(corpus.ROOT / "crates/serc/scripts"))
@@ -139,6 +137,8 @@ def main():
     }
     previous = [args.compare_with.resolve(), "decompile"] if args.compare_with else None
     regressions = {}
+    flow_regressions = {}
+    newly_unplaced = {}
     pycdc_only = {}
     gained = 0
     baseline = Counter()
@@ -168,13 +168,25 @@ def main():
             matched = {}
             for tool, command in commands.items():
                 result = Counter()
-                matches = measure(command, cache, filename, code, result)
+                compare = previous is not None and tool == "serc"
+                matches, flow = measure(
+                    command, cache, filename, code, result, check_flow=compare
+                )
                 matched[tool] = matches
-                if previous and tool == "serc":
-                    old = measure(previous, cache, filename, code, baseline)
+                if compare:
+                    old, old_flow = measure(
+                        previous, cache, filename, code, baseline, check_flow=True
+                    )
                     gained += len(matches - old)
                     if lost := old - matches:
                         regressions[filename] = sorted(lost)
+                    for key in sorted(flow.keys() & old_flow.keys()):
+                        if lost_fields := old_flow[key] - flow[key]:
+                            flow_regressions.setdefault(filename, []).append(
+                                (*key, sorted(lost_fields))
+                            )
+                    if unplaced := old_flow.keys() - flow.keys():
+                        newly_unplaced[filename] = sorted(unplaced)
                 totals[tool].update(result)
                 if package is not None:
                     package[tool].update(result)
@@ -190,9 +202,17 @@ def main():
     if packages:
         report["packages"] = packages
     if previous:
-        report.update(baseline=baseline, gained_scopes=gained, regressions=regressions)
+        report.update(
+            baseline=baseline,
+            gained_scopes=gained,
+            regressions=regressions,
+            flow_regressions=flow_regressions,
+            newly_unplaced=newly_unplaced,
+        )
     print(json.dumps(report, indent=2))
-    return bool(regressions or (args.corpus != "ruff" and pycdc_only))
+    return bool(
+        regressions or (args.corpus != "ruff" and (pycdc_only or flow_regressions))
+    )
 
 
 if __name__ == "__main__":
