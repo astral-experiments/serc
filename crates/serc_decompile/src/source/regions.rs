@@ -130,6 +130,15 @@ impl Body<'_, '_, '_> {
                     self.constant(constant.arg)?;
                     Ok(i + 3)
                 }
+                "BUILD_TUPLE"
+                    if op.arg == 3
+                        && ops[i + 1..end]
+                            .first()
+                            .is_some_and(super::type_params::is_alias_intrinsic) =>
+                {
+                    self.make_alias()?;
+                    Ok(i + 2)
+                }
                 "CALL_INTRINSIC_1"
                     if op.arg
                         == serc_bytecode::target::operands::UnaryIntrinsic::IMPORT_STAR
@@ -139,6 +148,15 @@ impl Body<'_, '_, '_> {
                 {
                     self.import_star()?;
                     Ok(i + 2)
+                }
+                "LOAD_LOCALS" if self.class && self.class_parameters(&ops[i..end])? => Ok(i + 3),
+                "COPY" if self.class && op.arg == 1
+                    && let [store, ret, ..] = &ops[i + 1..end]
+                    && store.name == "STORE_NAME" && ret.name == "RETURN_VALUE"
+                    && self.name(self.code.names, store.arg)? == "__classcell__"
+                    && matches!(self.stack.last(), Some(Value::Expr(value)) if value == "__class__") => {
+                    self.pop()?;
+                    Ok(i + 3)
                 }
                 "COPY"
                     if op.arg == 1

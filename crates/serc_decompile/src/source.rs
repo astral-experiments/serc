@@ -1,4 +1,5 @@
 mod annotations;
+mod classes;
 mod comprehensions;
 mod conditionals;
 mod definitions;
@@ -9,6 +10,7 @@ mod patterns;
 mod regions;
 mod strings;
 mod suspension;
+mod type_params;
 use definitions::{Definition, Import};
 
 use ruff_python_ast::str::TripleQuotes;
@@ -82,20 +84,30 @@ fn class_layout(
 ) -> Option<String> {
     let mut result = String::new();
     let mut lineno = 1;
+    let mut decorators = None;
     for line in source.split_inclusive('\n') {
+        if line.trim_start().starts_with('@') {
+            decorators.get_or_insert((result.len(), lineno));
+            result.push_str(line);
+            lineno += 1;
+            continue;
+        }
+        let (start, first_line) = decorators.take().unwrap_or((result.len(), lineno));
         if let Some(name) = line
             .trim_start()
             .strip_prefix("class ")
             .and_then(|s| s.split(['(', '[', ':']).next())
             && let Some(&Some(target)) = lines.get(name)
-            && target > lineno
+            && target > first_line
         {
-            let gap = target - lineno;
+            let gap = target - first_line;
             if gap.checked_add(result.len())?.checked_add(source.len())? > MAX_SOURCE {
                 return None;
             }
+            let preceding = result.split_off(start);
             result.extend(std::iter::repeat_n('\n', gap));
-            lineno = target;
+            result.push_str(&preceding);
+            lineno += gap;
         }
         result.push_str(line);
         lineno += 1;
@@ -199,7 +211,9 @@ enum Value {
     Code(Id),
     Function(Definition),
     BuildClass,
-    Class(Id, Vec<String>),
+    Class(Definition, Vec<String>),
+    TypeAlias(Definition),
+    TypeParams(Vec<String>),
     Import(Import),
     Member(String),
 }
@@ -298,23 +312,41 @@ impl Body<'_, '_, '_> {
 
     fn constant(&mut self, arg: u32) -> Result<(), String> {
         let id = self.item(self.code.constants, arg)?;
-        if matches!(self.m.objects[id], Object::Code(_)) {
-            self.stack.push(Value::Code(id));
-            Ok(())
-        } else if let Object::Slice(ids) = self.m.objects[id] {
-            operands::constant_slice(self, ids)
-        } else {
-            let text = literal(self.m, id, 0, &mut self.work.budget)?;
-            self.push(text)
+        match &self.m.objects[id] {
+            Object::Code(_) => self.stack.push(Value::Code(id)),
+            Object::Slice(ids) => {
+                let text = operands::constant_slice(self, *ids)?;
+                self.stack.push(Value::Slice(text));
+            }
+            Object::Tuple(items)
+                if items
+                    .iter()
+                    .any(|&i| matches!(self.m.objects[i], Object::Slice(_))) =>
+            {
+                let mut parts = Vec::new();
+                for &item in items {
+                    parts.push(if let Object::Slice(ids) = self.m.objects[item] {
+                        operands::constant_slice(self, ids)?
+                    } else {
+                        literal(self.m, item, 0, &mut self.work.budget)?
+                    });
+                }
+                self.push_slice_tuple(&parts)?;
+            }
+            _ => {
+                let text = literal(self.m, id, 0, &mut self.work.budget)?;
+                self.push(text)?;
+            }
         }
+        Ok(())
     }
 
-    fn call(&mut self, argc: u32) -> Result<(), String> {
-        if let Some(result) = self.special_call(argc)? {
+    fn call(&mut self, argc: u32, keys: &[String]) -> Result<(), String> {
+        if let Some(result) = self.special_call(argc, keys)? {
             self.stack.push(result);
             return Ok(());
         }
-        let args = self.args(argc)?;
+        let args = self.call_args(argc, keys)?;
         self.emit_call(&args)
     }
 
@@ -381,7 +413,8 @@ impl Body<'_, '_, '_> {
                 self.line(&format!("{name} {operator}= {rhs}"))
             }
             Value::Function(def) => self.definition(name, &def),
-            Value::Class(id, bases) => self.class_definition(name, id, &bases),
+            Value::TypeAlias(def) => self.alias_definition(name, &def),
+            Value::Class(def, bases) => self.class_definition(name, &def, &bases),
             Value::Import(import) => self.line(&import.statement(name)?),
             Value::Member(member) => {
                 let Some(Value::Import(import)) = self.stack.last_mut() else {
@@ -443,7 +476,8 @@ impl Body<'_, '_, '_> {
                 self.load_callable(self.name(self.code.names, a >> 1)?.to_owned(), a & 1 != 0)?;
             }
             "LOAD_FROM_DICT_OR_GLOBALS" | "LOAD_FROM_DICT_OR_DEREF" => {
-                if self.expr()? != "__classdict__" {
+                let namespace = self.expr()?;
+                if namespace != "__classdict__" && !(self.class && namespace == "locals()") {
                     return Err("unsupported annotation namespace".into());
                 }
                 let table = if op.name == "LOAD_FROM_DICT_OR_GLOBALS" {
@@ -453,6 +487,7 @@ impl Body<'_, '_, '_> {
                 };
                 self.push(self.name(table, a)?.to_owned())?;
             }
+            "LOAD_SUPER_ATTR" => self.super_attribute(a)?,
             "LOAD_ATTR" => {
                 let obj = self.expr()?;
                 let attr = self.name(self.code.names, a >> 1)?;
@@ -495,7 +530,7 @@ impl Body<'_, '_, '_> {
                     self.line(&expr)?;
                 }
             }
-            "CALL" => self.call(a)?,
+            "CALL" => self.call(a, &[])?,
             "CALL_KW" => {
                 let keys = self.expr()?;
                 self.keyword_call(a, &keys)?;
@@ -614,6 +649,24 @@ impl Body<'_, '_, '_> {
                 let fields = self.interpolations(a)?;
                 self.stack.push(Value::Interpolations(fields));
             }
+            "BUILD_TUPLE"
+                if self
+                    .stack
+                    .get(self.stack.len().saturating_sub(a as usize)..)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| matches!(item, Value::Slice(_)))
+                    }) =>
+            {
+                if a as usize > self.stack.len() {
+                    return Err("too few tuple operands".into());
+                }
+                let mut items = Vec::new();
+                for _ in 0..a {
+                    items.push(self.index()?);
+                }
+                items.reverse();
+                self.push_slice_tuple(&items)?;
+            }
             "BUILD_LIST" | "BUILD_TUPLE" | "BUILD_SET" => {
                 let args = self.args(a)?.join(", ");
                 let expr = match op.name {
@@ -682,6 +735,37 @@ fn identifier(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
+fn float_literal(value: f64) -> Result<String, String> {
+    if value.is_nan() {
+        return Err("unsupported NaN literal".into());
+    }
+    Ok(if value == f64::INFINITY {
+        "1e309".into()
+    } else if value == f64::NEG_INFINITY {
+        "-1e309".into()
+    } else {
+        format!("{value:?}")
+    })
+}
+
+fn complex_literal(real: f64, imag: f64) -> Result<String, String> {
+    let magnitude = float_literal(imag.abs())?;
+    if real.to_bits() == 0 && imag.is_sign_positive() {
+        return Ok(format!("{magnitude}j"));
+    }
+    // A negated imaginary literal has a negative real zero. Preserve both
+    // signs even when the imaginary component is itself zero.
+    if real.to_bits() == (-0.0_f64).to_bits() {
+        return Ok(if imag.is_sign_negative() {
+            format!("(-{magnitude}j)")
+        } else {
+            format!("(-(0.0 - {magnitude}j))")
+        });
+    }
+    let sign = if imag.is_sign_negative() { "-" } else { "+" };
+    Ok(format!("({} {sign} {magnitude}j)", float_literal(real)?))
+}
+
 fn literal(m: &Module<'_>, id: Id, depth: usize, work: &mut usize) -> Result<String, String> {
     if depth > 32 || *work == 0 {
         return Err("constant expansion limit exceeded".into());
@@ -692,8 +776,9 @@ fn literal(m: &Module<'_>, id: Id, depth: usize, work: &mut usize) -> Result<Str
         Object::Bool(v) => if *v { "True" } else { "False" }.into(),
         Object::Ellipsis => "...".into(),
         Object::Int(i) => i.to_string(),
-        Object::Float(bits) if f64::from_bits(*bits).is_finite() => {
-            format!("{:?}", f64::from_bits(*bits))
+        Object::Float(bits) => float_literal(f64::from_bits(*bits))?,
+        Object::Complex(real, imag) => {
+            complex_literal(f64::from_bits(*real), f64::from_bits(*imag))?
         }
         Object::Bytes(bytes) => {
             if bytes.len() > MAX_SOURCE / 4 {

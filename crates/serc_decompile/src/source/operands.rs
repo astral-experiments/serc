@@ -131,17 +131,20 @@ impl Body<'_, '_, '_> {
     }
 
     pub(super) fn keyword_call(&mut self, argc: u32, keys: &str) -> Result<(), String> {
-        let keys = tuple_items(keys)?;
+        self.call(argc, &tuple_items(keys)?)
+    }
+
+    pub(super) fn call_args(&mut self, argc: u32, keys: &[String]) -> Result<Vec<String>, String> {
         let mut args = self.args(argc)?;
         let first = args
             .len()
             .checked_sub(keys.len())
             .ok_or("invalid keyword argument count")?;
         for (arg, key) in args[first..].iter_mut().zip(keys) {
-            let key = string_value(&key)?;
+            let key = string_value(key)?;
             *arg = format!("{}={arg}", identifier(&key)?);
         }
-        self.emit_call(&args)
+        Ok(args)
     }
 
     pub(super) fn update_literal(&mut self, op: Instruction) -> Result<(), String> {
@@ -253,6 +256,19 @@ impl Body<'_, '_, '_> {
         self.charge(name.len())
     }
 
+    pub(super) fn push_slice_tuple(&mut self, items: &[String]) -> Result<(), String> {
+        let mut text = items.join(", ");
+        if items.len() == 1 {
+            text.push(',');
+        }
+        self.charge(text.len() + 1)?;
+        if text.len() > super::MAX_SOURCE {
+            return Err("slice index size limit exceeded".into());
+        }
+        self.stack.push(Value::Slice(text));
+        Ok(())
+    }
+
     pub(super) fn index(&mut self) -> Result<String, String> {
         if matches!(self.stack.last(), Some(Value::Slice(_))) {
             let Value::Slice(text) = self.pop()? else {
@@ -309,7 +325,7 @@ impl Body<'_, '_, '_> {
 pub(super) fn constant_slice(
     body: &mut Body<'_, '_, '_>,
     ids: [super::Id; 3],
-) -> Result<(), String> {
+) -> Result<String, String> {
     let mut items = Vec::new();
     for id in ids {
         items.push(super::literal(body.m, id, 0, &mut body.work.budget)?);
@@ -317,6 +333,5 @@ pub(super) fn constant_slice(
     if items[2] == "None" {
         items.pop();
     }
-    body.stack.push(Value::Slice(slice_text(&items)));
-    Ok(())
+    Ok(slice_text(&items))
 }

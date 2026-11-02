@@ -13,7 +13,28 @@ pub(super) struct Definition {
     keywords: Vec<(String, String)>,
     decorators: Vec<String>,
     annotations: Vec<(String, String)>,
-    type_params: Vec<String>,
+    pub(super) type_params: Vec<String>,
+}
+
+impl Definition {
+    pub(super) fn new(id: Id) -> Self {
+        Self {
+            id,
+            defaults: Vec::new(),
+            keywords: Vec::new(),
+            decorators: Vec::new(),
+            annotations: Vec::new(),
+            type_params: Vec::new(),
+        }
+    }
+
+    pub(super) fn generic_suffix(&self) -> String {
+        if self.type_params.is_empty() {
+            String::new()
+        } else {
+            format!("[{}]", self.type_params.join(", "))
+        }
+    }
 }
 
 pub(super) fn string_value(text: &str) -> Result<String, String> {
@@ -169,14 +190,7 @@ impl Body<'_, '_, '_> {
         let Value::Code(id) = self.pop()? else {
             return Err("expected function code".into());
         };
-        let mut def = Definition {
-            id,
-            defaults: Vec::new(),
-            keywords: Vec::new(),
-            decorators: Vec::new(),
-            annotations: Vec::new(),
-            type_params: Vec::new(),
-        };
+        let mut def = Definition::new(id);
         if flags & !15 != 0 {
             return Err("unknown function flags".into());
         }
@@ -259,8 +273,12 @@ impl Body<'_, '_, '_> {
         Ok(())
     }
 
-    pub(super) fn special_call(&mut self, argc: u32) -> Result<Option<Value>, String> {
-        if argc == 0 && self.stack.len() >= 2 {
+    pub(super) fn special_call(
+        &mut self,
+        argc: u32,
+        keys: &[String],
+    ) -> Result<Option<Value>, String> {
+        if argc == 0 && keys.is_empty() && self.stack.len() >= 2 {
             let slot = self.stack.len() - 2;
             if let [Value::Function(def), Value::Expr(_)] = &self.stack[slot..]
                 && self.m.text(self.m.code(def.id)?.name)? == "<genexpr>"
@@ -285,17 +303,22 @@ impl Body<'_, '_, '_> {
                     .text(self.m.code(id)?.name)?
                     .starts_with("<generic parameters of ")
             {
-                let def = self.generic(id)?;
+                let definition = self.generic(id)?;
                 self.stack.truncate(slot);
-                return Ok(Some(Value::Function(def)));
+                return Ok(Some(definition));
             }
-        }
-        if argc == 0 && matches!(self.stack.last(), Some(Value::Function(_))) {
-            let Value::Function(mut def) = self.pop()? else {
-                unreachable!()
-            };
-            def.decorators.push(self.expr()?);
-            return Ok(Some(Value::Function(def)));
+            if matches!(
+                &self.stack[slot..],
+                [Value::Expr(_), Value::Function(_) | Value::Class(..)]
+            ) {
+                let mut decorated = self.pop()?;
+                let decorator = self.expr()?;
+                match &mut decorated {
+                    Value::Function(def) | Value::Class(def, _) => def.decorators.push(decorator),
+                    _ => unreachable!(),
+                }
+                return Ok(Some(decorated));
+            }
         }
         let Some(start) = self.stack.len().checked_sub(argc as usize + 2) else {
             return Ok(None);
@@ -314,7 +337,7 @@ impl Body<'_, '_, '_> {
         if !is_class {
             return Ok(None);
         }
-        let bases = self.args(argc.checked_sub(2).ok_or("missing class arguments")?)?;
+        let bases = self.call_args(argc.checked_sub(2).ok_or("missing class arguments")?, keys)?;
         let name = self.expr()?;
         let Value::Function(def) = self.pop()? else {
             return Err("expected class body".into());
@@ -328,17 +351,27 @@ impl Body<'_, '_, '_> {
             return Err("unsupported dynamic class name".into());
         }
         self.stack.truncate(start);
-        Ok(Some(Value::Class(def.id, bases)))
+        Ok(Some(Value::Class(def, bases)))
     }
 
     pub(super) fn class_definition(
         &mut self,
         name: &str,
-        id: Id,
+        def: &Definition,
         bases: &[String],
     ) -> Result<(), String> {
-        let body = scope(self.m, id, self.depth + 1, true, self.work)?;
-        self.block(&format!("class {name}({}):", bases.join(", ")), &body)
+        let body = scope(self.m, def.id, self.depth + 1, true, self.work)?;
+        for decorator in def.decorators.iter().rev() {
+            self.line(&format!("@{decorator}"))?;
+        }
+        self.block(
+            &format!(
+                "class {name}{}({}):",
+                def.generic_suffix(),
+                bases.join(", ")
+            ),
+            &body,
+        )
     }
 
     pub(super) fn definition(&mut self, name: &str, def: &Definition) -> Result<(), String> {
@@ -355,11 +388,7 @@ impl Body<'_, '_, '_> {
         for decorator in def.decorators.iter().rev() {
             self.line(&format!("@{decorator}"))?;
         }
-        let generics = if def.type_params.is_empty() {
-            String::new()
-        } else {
-            format!("[{}]", def.type_params.join(", "))
-        };
+        let generics = def.generic_suffix();
         let result = def
             .annotations
             .iter()
@@ -493,23 +522,7 @@ impl Body<'_, '_, '_> {
     }
 
     fn lazy_annotations(&mut self, id: Id) -> Result<Vec<(String, String)>, String> {
-        let (mut body, bc) = self.wrapper(id)?;
-        let branch = bc
-            .ops
-            .iter()
-            .find(|op| op.name == "POP_JUMP_IF_FALSE")
-            .and_then(|op| op.jump)
-            .ok_or("unsupported annotation guard")?;
-        let start = bc
-            .ops
-            .binary_search_by_key(&branch, |op| op.offset)
-            .map_err(|_| "invalid annotation target")?;
-        let end = bc.ops.len() - 1;
-        if bc.ops[end].name != "RETURN_VALUE" {
-            return Err("unsupported annotation result".into());
-        }
-        body.region(&bc.ops, start, end, 0)?;
-        let result = body.expr()?;
+        let result = self.lazy_value(id, false)?;
         let parsed = ruff_python_parser::parse_expression(&result).map_err(|e| e.to_string())?;
         let Expr::Dict(map) = parsed.expr() else {
             return Err("expected annotation map".into());
@@ -523,45 +536,5 @@ impl Body<'_, '_, '_> {
                 Ok((key.value.to_str().to_owned(), render(&item.value)))
             })
             .collect()
-    }
-
-    fn generic(&mut self, id: Id) -> Result<Definition, String> {
-        use serc_bytecode::target::operands::UnaryIntrinsic;
-        let (mut body, bc) = self.wrapper(id)?;
-        let tuple = bc
-            .ops
-            .iter()
-            .position(|op| op.name == "BUILD_TUPLE")
-            .ok_or("unsupported type parameter tuple")?;
-        let mut params = Vec::new();
-        for pair in bc.ops[..tuple].windows(2) {
-            if pair[0].name == "LOAD_CONST" && pair[1].name == "CALL_INTRINSIC_1" {
-                let name = identifier(body.m.text(body.item(body.code.constants, pair[0].arg)?)?)?;
-                let prefix = if pair[1].arg == UnaryIntrinsic::TYPEVAR.argument() {
-                    ""
-                } else if pair[1].arg == UnaryIntrinsic::PARAMSPEC.argument() {
-                    "**"
-                } else if pair[1].arg == UnaryIntrinsic::TYPEVARTUPLE.argument() {
-                    "*"
-                } else {
-                    return Err("unsupported type parameter bound".into());
-                };
-                params.push(format!("{prefix}{name}"));
-            }
-        }
-        if params.len() != bc.ops[tuple].arg as usize {
-            return Err("unsupported generic parameter layout".into());
-        }
-        let swap = bc
-            .ops
-            .iter()
-            .rposition(|op| op.name == "SWAP")
-            .ok_or("unsupported generic result")?;
-        body.region(&bc.ops, tuple + 1, swap, 0)?;
-        let Value::Function(mut def) = body.pop()? else {
-            return Err("expected generic function".into());
-        };
-        def.type_params = params;
-        Ok(def)
     }
 }

@@ -507,3 +507,80 @@ fn exception_edges_and_loop_cleanup() {
         "result = []\ndef fail(e): raise e\nfor work in [lambda: 0, lambda: fail(ValueError()), lambda: fail(TypeError()), lambda: fail(KeyError())]:\n    try: result.append(f(work, result.append))\n    except KeyError: result.append('unmatched')",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn decorated_classes_and_metaclasses() {
+    check_fixture(
+        r#"events = []
+def mark(which):
+    events.append(which)
+    def decorate(cls):
+        events.append(cls.__name__ + which)
+        return cls
+    return decorate
+
+class Base:
+    pass
+
+@mark("outer")
+@mark("inner")
+class Derived(Base, metaclass=type):
+    pass
+"#,
+        "result = events, Derived.__base__.__name__",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn complex_constants_and_multidimensional_slices() {
+    check_fixture(
+        r"values = (12.25j, -3j, 2+3j, -0j, 2-0j, 1e999, -1e999, 1e999j)
+class Echo:
+    def __getitem__(self, key):
+        return key
+def keys(x, n):
+    return x[3, 1:4], x[n:, :n:2], x[n:,], x[:,]
+",
+        "result = repr(values), keys(Echo(), 2)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn lazy_type_aliases_and_bounds() {
+    check_fixture(
+        r"type Empty = None
+type Forward = Later
+type Pair[T: (str, bytes), U: T] = tuple[T, U]
+class Later:
+    type Element = int
+",
+        "result = Forward.__value__.__name__, Pair.__value__.__args__, Later.Element.__value__; result = repr(result)",
+    );
+    check_fixture_on(
+        "type Params[T: int = int, *Ts = *tuple[str, ...]] = T\n",
+        "result = repr(Params.__type_params__[0].__default__)",
+        &common::PYTHON_VERSIONS[1..],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn generic_classes_and_super() {
+    check_fixture(
+        r#"class Base[T]:
+    def method(self):
+        return "base"
+def record(cls):
+    return cls
+@record
+class Child[T: int](Base[T], metaclass=type):
+    value: T
+    def method(self):
+        return super().method() + super(Child, self).method()
+"#,
+        "result = Child().method(), repr(Child.__orig_bases__), repr(Child.__annotations__)",
+    );
+}
