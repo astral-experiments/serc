@@ -166,6 +166,29 @@ fn branches_preserve_call_order() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn embedded_operands_keep_their_grouping() {
+    check_fixture(
+        "pairs = {(1, 2): 3, (4,): 5}\ndef f(x=(bound := (1, 2)), *, y=(other := (4,))):\n    return pairs[x], pairs[y]\n",
+        "result = f(), bound, other, f.__defaults__, f.__kwdefaults__",
+    );
+    check_fixture_on(
+        "def f(x: (bound := 1)):\n    return x\ndef outer():\n    def inner(x: (yield 2)):\n        return x\n    yield inner.__annotations__\n",
+        "it = outer()\nresult = bound, f.__annotations__, next(it), it.send(3)",
+        &[serc::PythonVersion::Py312, serc::PythonVersion::Py313],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn identifiers_allow_unicode_continuation_characters() {
+    check_fixture(
+        "Q\u{307} = 1\nx\u{e0100} = 2\n",
+        "result = Q\u{307}, x\u{e0100}",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn definitions_preserve_bindings() {
     check_fixture(
         "def outer(x=3, *, k=4):\n    def inner(y):\n        return x + y\n    return inner\n",

@@ -762,10 +762,7 @@ impl Body<'_, '_, '_> {
 }
 
 fn identifier(name: &str) -> Result<&str, String> {
-    if name.len() > 1024
-        || name.is_empty()
-        || !name.chars().all(|c| c == '_' || c.is_alphanumeric())
-    {
+    if name.len() > 1024 || !ruff_python_stdlib::identifiers::is_identifier(name) {
         return Err("unsupported identifier".into());
     }
     Ok(name)

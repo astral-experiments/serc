@@ -1323,6 +1323,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ruff_python_stdlib"
+version = "0.0.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a3c016c3a80572fda4ecf43fe9213812bd45dce2e3ae617403ef76bea1326d89"
+dependencies = [
+ "bitflags",
+ "unicode-ident",
+]
+
+[[package]]
 name = "ruff_python_trivia"
 version = "0.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1472,6 +1482,7 @@ dependencies = [
  "ruff_python_codegen",
  "ruff_python_literal",
  "ruff_python_parser",
+ "ruff_python_stdlib",
  "ruff_source_file",
  "ruff_text_size",
  "rustc-hash",

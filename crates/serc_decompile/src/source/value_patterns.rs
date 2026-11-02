@@ -2,10 +2,12 @@
 //! additional copy for an `as` binding is discarded on pattern failure.
 use std::fmt::Write as _;
 
+use ruff_python_codegen::{Generator, Indentation};
+use ruff_source_file::LineEnding;
+
 use super::{
     Body, Instruction, PythonVersion, Value,
     comparisons::operator,
-    definitions::render,
     patterns::{case, write_suite},
 };
 
@@ -104,7 +106,7 @@ impl Body<'_, '_, '_> {
                 .fragment(ops, test.operand, test.compare, level)?
                 .expression()?;
             let parsed = ruff_python_parser::parse_expression(&text).map_err(|e| e.to_string())?;
-            render(parsed.expr())
+            Generator::new(&Indentation::default(), LineEnding::Lf).expr(parsed.expr())
         })
     }
 
