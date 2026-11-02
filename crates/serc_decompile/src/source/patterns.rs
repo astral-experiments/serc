@@ -20,7 +20,11 @@ fn target(ops: &[Instruction], i: usize, end: usize) -> Result<usize, String> {
 }
 
 pub(super) fn case(out: &mut String, pattern: &str, suite: &str) {
-    writeln!(out, "case {pattern}:").unwrap();
+    write_suite(out, format_args!("case {pattern}"), suite);
+}
+
+pub(super) fn write_suite(out: &mut String, header: std::fmt::Arguments<'_>, suite: &str) {
+    writeln!(out, "{header}:").unwrap();
     for line in suite.lines() {
         writeln!(out, "    {line}").unwrap();
     }

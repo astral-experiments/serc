@@ -422,6 +422,36 @@ assert result == (0, 'unused', [0])",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_successful_match_can_skip_the_remaining_cases() {
+    check_fixture(
+        r"def resolve(name, ready, log):
+    match name:
+        case 'a':
+            return 1
+        case 'b':
+            log.append('b')
+            if ready:
+                return 2
+        case 'b':
+            return 'retried'
+        case 'c':
+            if ready:
+                return 3
+    raise KeyError(name)
+",
+        r"result = []
+for name in 'abcd':
+    for ready in [False, True]:
+        try:
+            result.append(resolve(name, ready, result))
+        except KeyError as e:
+            result.append(e.args)
+assert result == [1, 1, 'b', ('b',), 'b', 2, ('c',), 3, ('d',), ('d',)]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn conditional_none_value_is_distinct_from_a_guard_return() {
     check_fixture(
         r"def keep(reset, value):
