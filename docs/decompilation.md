@@ -280,6 +280,11 @@ On 3.14.5, the largest gaps by number of unmatched code objects are in `idlelib`
 object, so a single lost method can also cause its enclosing class and module to
 miss.
 
+Add `--compare-with /path/to/older/serc` to check for regressions in individual
+functions as well as modules. The report lists previously matching scopes by
+filename, qualified name, and occurrence, and the command exits nonzero if any
+were lost.
+
 The Ruff sample (`--corpus ruff`) uses the same revision and fixture directories
 as the strict check.
 

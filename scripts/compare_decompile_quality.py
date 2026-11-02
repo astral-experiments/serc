@@ -37,18 +37,18 @@ def measure(command, cache, filename, original, counts):
         )
     except subprocess.TimeoutExpired:
         counts["timeouts"] += 1
-        return
+        return set()
     if run.returncode:
         counts["nonzero_exits"] += 1
     if not run.stdout.strip():
         counts["empty_outputs"] += 1
         if run.returncode:
-            return
+            return set()
     try:
         recovered = compile(run.stdout, filename, "exec", dont_inherit=True, optimize=0)
     except (ValueError, SyntaxError, RecursionError):
         counts["invalid_source"] += 1
-        return
+        return set()
     counts["compilable_modules"] += 1
     if b"# serc: detached function " in run.stdout:
         sections = sum(
@@ -65,11 +65,17 @@ def measure(command, cache, filename, original, counts):
     candidates = defaultdict(deque)
     for scope in scopes(recovered):
         candidates[scope.co_qualname].append(scope)
+    matches = set()
+    occurrences = Counter()
     for scope in scopes(original):
-        peers = candidates.get(scope.co_qualname)
+        name = scope.co_qualname
+        occurrences[name] += 1
+        peers = candidates.get(name)
         if peers and corpus.fingerprint(scope) == corpus.fingerprint(peers.popleft()):
+            matches.add((name, occurrences[name]))
             counts["matching_code_objects"] += 1
             counts["matching_modules"] += scope is original
+    return matches
 
 
 def main():
@@ -78,6 +84,12 @@ def main():
     parser.add_argument("pycdc", type=Path)
     parser.add_argument(
         "--corpus", choices=("stdlib", "stdlib-packages", "ruff"), default="stdlib"
+    )
+    parser.add_argument(
+        "--compare-with",
+        type=Path,
+        metavar="OLDER_SERC",
+        help="report previously matching scopes that no longer match and exit nonzero",
     )
     args = parser.parse_args()
     sys.path.insert(0, str(corpus.ROOT / "crates/serc/scripts"))
@@ -125,6 +137,10 @@ def main():
         "serc": [args.serc.resolve(), "decompile"],
         "pycdc": [args.pycdc.resolve()],
     }
+    previous = [args.compare_with.resolve(), "decompile"] if args.compare_with else None
+    regressions = {}
+    gained = 0
+    baseline = Counter()
     packages = defaultdict(lambda: defaultdict(Counter))
     with warnings.catch_warnings(), tempfile.TemporaryDirectory() as scratch:
         warnings.simplefilter("ignore", SyntaxWarning)
@@ -150,15 +166,23 @@ def main():
             )
             for tool, command in commands.items():
                 result = Counter()
-                measure(command, cache, filename, code, result)
+                matches = measure(command, cache, filename, code, result)
+                if previous and tool == "serc":
+                    old = measure(previous, cache, filename, code, baseline)
+                    gained += len(matches - old)
+                    if lost := old - matches:
+                        regressions[filename] = sorted(lost)
                 totals[tool].update(result)
                 if package is not None:
                     package[tool].update(result)
     report = {"python": version, "corpus": args.corpus, "inputs": counts, **totals}
     if packages:
         report["packages"] = packages
+    if previous:
+        report.update(baseline=baseline, gained_scopes=gained, regressions=regressions)
     print(json.dumps(report, indent=2))
+    return bool(regressions)
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
