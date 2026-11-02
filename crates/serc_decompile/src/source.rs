@@ -1,5 +1,6 @@
 mod annotations;
 mod classes;
+mod comparisons;
 mod comprehensions;
 mod conditionals;
 mod definitions;
@@ -582,30 +583,8 @@ impl Body<'_, '_, '_> {
                 let rhs = self.expr()?;
                 let lhs = self.expr()?;
                 let operator = match op.name {
-                    "IS_OP" => {
-                        if a == 0 {
-                            "is"
-                        } else {
-                            "is not"
-                        }
-                    }
-                    "CONTAINS_OP" => {
-                        if a == 0 {
-                            "in"
-                        } else {
-                            "not in"
-                        }
-                    }
-                    "COMPARE_OP" => {
-                        let shift = if self.m.version == PythonVersion::Py312 {
-                            4
-                        } else {
-                            5
-                        };
-                        ["<", "<=", "==", "!=", ">", ">="]
-                            .get((a >> shift) as usize)
-                            .copied()
-                            .ok_or("unknown comparison")?
+                    "IS_OP" | "CONTAINS_OP" | "COMPARE_OP" => {
+                        comparisons::operator(op, self.m.version).ok_or("unknown comparison")?
                     }
                     "BINARY_SUBSCR" => "[]",
                     _ => *[

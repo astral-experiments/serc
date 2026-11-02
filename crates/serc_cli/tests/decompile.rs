@@ -603,3 +603,24 @@ def rotate(x, y, z):
         "result = a, rotate(4, 5, 6), events",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn comparison_chains_short_circuit() {
+    check_fixture(
+        r"events = []
+def log(value):
+    events.append(value)
+    return value
+def chain(a, b, c):
+    return log(a) < log(b) <= log(c)
+def branch(a, b, c):
+    if log(a) < log(b) < log(c):
+        return a
+    return c
+def mixed(a, b, c):
+    return [a is b is not c, a not in c == b]
+",
+        "result = chain(3, 2, 1), chain(1, 2, 2), branch(3, 2, 1), branch(1, 2, 3), mixed(1, [0], [0]), events",
+    );
+}

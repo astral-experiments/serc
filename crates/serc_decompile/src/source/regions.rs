@@ -185,6 +185,7 @@ impl Body<'_, '_, '_> {
                     self.annotation_site()?;
                     Ok(i + 2)
                 }
+                "SWAP" if super::comparisons::is_link(&ops[i..end]) => self.comparison_chain(ops, i, end, level),
                 "SWAP"
                     if op.arg == 2
                         && i + 1 < end
