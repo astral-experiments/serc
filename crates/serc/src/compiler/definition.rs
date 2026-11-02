@@ -2285,48 +2285,52 @@ fn function_annotations(
 }
 
 pub(super) fn clean_doc(docstring: &str) -> String {
-    let expanded = if docstring.contains('\t') {
+    let mut tabs = docstring.match_indices('\t');
+    let expanded = if let Some(first) = tabs.next() {
         let mut expanded = String::with_capacity(docstring.len());
-        let mut column = 0_usize;
-        for character in docstring.chars() {
-            match character {
-                '\t' => {
-                    let spaces = 8 - column % 8;
-                    expanded.extend(std::iter::repeat_n(' ', spaces));
-                    column += spaces;
-                }
-                '\n' | '\r' => {
-                    expanded.push(character);
-                    column = 0;
-                }
-                _ => {
-                    expanded.push(character);
-                    column += 1;
-                }
-            }
+        let mut start = 0;
+        for (tab, _) in std::iter::once(first).chain(tabs) {
+            let span = &docstring[start..tab];
+            expanded.push_str(span);
+            // A tab ends on an eight-column boundary. Only characters after the
+            // previous tab or line break affect the width of this tab.
+            let line = span.rsplit(['\r', '\n']).next().unwrap_or_default();
+            let spaces = 8 - line.chars().count() % 8;
+            expanded.push_str(&"        "[..spaces]);
+            start = tab + 1;
         }
+        expanded.push_str(&docstring[start..]);
         std::borrow::Cow::Owned(expanded)
     } else {
         std::borrow::Cow::Borrowed(docstring)
     };
 
     let mut lines = expanded.split_inclusive('\n');
-    let margin = lines
-        .clone()
-        .skip(1)
-        .filter_map(|line| {
-            let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
-            line.as_bytes()
-                .get(indentation)
-                .is_some_and(|byte| *byte != b'\n')
-                .then_some(indentation)
-        })
-        .min()
-        .unwrap_or(0);
-
     let Some(first) = lines.next() else {
         return expanded.into_owned();
     };
+    let mut margin = usize::MAX;
+    for line in lines.clone() {
+        let indentation = line.bytes().take_while(|byte| *byte == b' ').count();
+        if line
+            .as_bytes()
+            .get(indentation)
+            .is_some_and(|byte| *byte != b'\n')
+        {
+            margin = margin.min(indentation);
+            if margin == 0 {
+                break;
+            }
+        }
+    }
+    // An unindented line, or a body of only blank lines, leaves the tail intact.
+    if margin == 0 || margin == usize::MAX {
+        return if first.starts_with(' ') {
+            expanded.trim_start_matches(' ').to_owned()
+        } else {
+            expanded.into_owned()
+        };
+    }
     let mut cleaned = String::with_capacity(expanded.len());
     cleaned.push_str(first.trim_start_matches(' '));
     for line in lines {

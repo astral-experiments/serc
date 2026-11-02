@@ -3107,6 +3107,11 @@ fn cleans_docstrings_like_cpython() {
         "first\n  second\nthird\n"
     );
     assert_eq!(clean_doc("\tfirst\n\t\tsecond"), "first\nsecond");
+    assert_eq!(
+        clean_doc("1é😀\tX\tZ\r界\tΩ\nno indent\n"),
+        "1é😀     X       Z\r界       Ω\nno indent\n"
+    );
+    assert_eq!(clean_doc("\tfirst\n    \n  "), "first\n    \n  ");
 }
 
 #[test]
