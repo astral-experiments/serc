@@ -87,8 +87,9 @@ class ReleaseTests(unittest.TestCase):
     def test_publishing_requires_serc_main(self):
         version = CHECK["release_version"](ROOT)
         for repository, ref, allowed in (
-            ("astral-sh/serc", "refs/heads/main", True),
-            ("astral-sh/serc", "refs/heads/feature", False),
+            ("astral-experiments/serc", "refs/heads/main", True),
+            ("astral-experiments/serc", "refs/heads/feature", False),
+            ("astral-sh/serc", "refs/heads/main", False),
             ("example/serc", "refs/heads/main", False),
         ):
             with self.subTest(repository=repository, ref=ref):

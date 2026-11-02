@@ -21,8 +21,8 @@ classifiers = [
 ]
 
 [project.urls]
-Repository = "https://github.com/astral-sh/serc"
-Releases = "https://github.com/astral-sh/serc/releases"
+Repository = "https://github.com/astral-experiments/serc"
+Releases = "https://github.com/astral-experiments/serc/releases"
 
 [tool.maturin]
 bindings = "bin"

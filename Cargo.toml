@@ -9,8 +9,8 @@ ruff_python_parser = { git = "https://github.com/astral-sh/ruff", rev = "9d0f58b
 [workspace.package]
 edition = "2024"
 rust-version = "1.96.0"
-homepage = "https://github.com/astral-sh/serc"
-repository = "https://github.com/astral-sh/serc"
+homepage = "https://github.com/astral-experiments/serc"
+repository = "https://github.com/astral-experiments/serc"
 authors = ["Charlie Marsh"]
 license = "MIT OR Apache-2.0"
 
