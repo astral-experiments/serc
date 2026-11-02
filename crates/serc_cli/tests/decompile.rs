@@ -898,3 +898,36 @@ a, b = Flag('a', False), Flag('b', True)
 result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is a, log",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn managers_resume_after_await_and_preserve_exception_suppression() {
+    check_fixture(
+        "async def run(m, n, cb):\n    with m as v:\n        await cb(v)\n    async with n as w:\n        await cb(w)\n        await cb(3)\n    return 9\n",
+        r"import asyncio
+from contextlib import contextmanager, asynccontextmanager
+log = []
+@contextmanager
+def sync():
+    log.append('enter')
+    try: yield 1
+    finally: log.append('exit')
+@asynccontextmanager
+async def manager(suppress):
+    log.append('aenter')
+    try: yield 2
+    except ValueError:
+        log.append('caught')
+        if not suppress: raise
+    finally: log.append('aexit')
+async def cb(value):
+    log.append(value)
+    await asyncio.sleep(0)
+    if value == fail: raise ValueError
+answers = []
+for fail, suppress in [(0, False), (2, True), (2, False), (1, True)]:
+    try: answers.append(asyncio.run(run(sync(), manager(suppress), cb)))
+    except ValueError: answers.append('raised')
+result = answers, log",
+    );
+}

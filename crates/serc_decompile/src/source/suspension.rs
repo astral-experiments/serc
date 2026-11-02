@@ -17,32 +17,8 @@ impl Body<'_, '_, '_> {
 
     pub(super) fn suspension_scope(&mut self, bc: &Bytecode) -> Result<(), String> {
         let ops = &bc.ops;
-        if let Some(with) = ops.iter().position(|op| op.name == "WITH_EXCEPT_START")
-            && let Some(handler) = with.checked_sub(1)
-            && let Some(h) = bc.handlers.iter().find(|h| h.target == ops[handler].offset)
-        {
-            let enter = ops
-                .iter()
-                .position(|op| op.name == "BEFORE_ASYNC_WITH" || op.name == "COPY")
-                .ok_or("missing async manager entry")?;
-            self.region(ops, 0, enter, 0)?;
-            let cm = self.expr()?;
-            let idx = |offset| {
-                ops.binary_search_by_key(&offset, |op| op.offset)
-                    .map_err(|_| "invalid async handler")
-            };
-            let start = idx(h.start)?;
-            let end = idx(h.end)?;
-            let (item, body_start, seed) = self.manager_item(cm, ops, start, end)?;
-            let suite = self.seeded(ops, body_start, end, 0, seed)?.suite()?;
-            self.block(&format!("async with {item}:"), &suite)?;
-            let close = find(ops, end, handler, "END_SEND")?;
-            let ret = ops[close + 1..handler]
-                .iter()
-                .position(|op| matches!(op.name, "RETURN_VALUE" | "RETURN_CONST"))
-                .map(|n| close + 1 + n)
-                .ok_or("unsupported async manager continuation")?;
-            return self.region(ops, close + 2, ret + 1, 0);
+        if ops.iter().any(|op| op.name == "WITH_EXCEPT_START") {
+            return self.suspended_managers(bc);
         }
         // A suspended body can end with a raise, even when another path
         // returns. The StopIteration handler marks the end of the normal CFG.
@@ -66,6 +42,110 @@ impl Body<'_, '_, '_> {
             .rposition(|op| matches!(op.name, "RETURN_VALUE" | "RETURN_CONST"))
             .ok_or("generator has no return")?;
         self.region(ops, 0, stop + 1, 0)
+    }
+
+    fn suspended_managers(&mut self, bc: &Bytecode) -> Result<(), String> {
+        let ops = &bc.ops;
+        let index = |offset| {
+            ops.binary_search_by_key(&offset, |op| op.offset)
+                .map_err(|_| "invalid suspended manager boundary")
+        };
+        // The normal path precedes the out-of-line throw and manager handlers.
+        let normal_end = bc
+            .handlers
+            .iter()
+            .filter_map(|h| index(h.target).ok())
+            .filter(|&i| {
+                matches!(ops[i].name, "CLEANUP_THROW" | "PUSH_EXC_INFO")
+                    || (ops[i].name, ops[i].arg)
+                        == (
+                            "CALL_INTRINSIC_1",
+                            UnaryIntrinsic::STOPITERATION_ERROR.argument(),
+                        )
+            })
+            .min()
+            .ok_or("missing suspended manager cleanup")?;
+        let mut cursor = 0;
+        let mut ranges = bc.handlers.iter();
+        while let Some(entry) = ranges.next() {
+            let start = index(entry.start)?;
+            if start >= normal_end {
+                break;
+            }
+            let handler = index(entry.target)?;
+            if start < cursor
+                || !entry.lasti
+                || ops[handler].name != "PUSH_EXC_INFO"
+                || ops
+                    .get(handler + 1)
+                    .is_none_or(|op| op.name != "WITH_EXCEPT_START")
+            {
+                continue;
+            }
+            let asynchronous = ops
+                .get(handler + 2)
+                .is_some_and(|op| (op.name, op.arg) == ("GET_AWAITABLE", 2));
+            let protocol_end = if asynchronous {
+                ops[cursor..start]
+                    .iter()
+                    .rposition(|op| (op.name, op.arg) == ("GET_AWAITABLE", 1))
+                    .map(|n| cursor + n)
+                    .ok_or("missing awaited manager entry")?
+            } else {
+                start
+            };
+            let enter = cursor
+                + super::exceptions::manager_entry(&ops[cursor..protocol_end], asynchronous)?;
+            self.region(ops, cursor, enter, 0)?;
+            let manager = self.expr()?;
+
+            // Await temporarily protects the yield with a CLEANUP_THROW handler.
+            // Its resume must return to exactly the same manager at the same depth.
+            let mut end = entry.end;
+            while let [suspend, resume, ..] = ranges.as_slice()
+                && suspend.start == end
+                && suspend.end == resume.start
+                && (resume.target, resume.depth, resume.lasti)
+                    == (entry.target, entry.depth, entry.lasti)
+                && ops[index(suspend.start)?].name == "YIELD_VALUE"
+                && ops[index(suspend.target)?].name == "CLEANUP_THROW"
+            {
+                end = resume.end;
+                ranges.nth(1);
+            }
+            let end = index(end)?;
+            if end > normal_end || start >= end {
+                return Err("unsupported suspended manager extent".into());
+            }
+            let (item, body, seed) = self.manager_item(manager, ops, start, end)?;
+            let (suite, returns) = self.seeded(ops, body, end, 0, seed)?.pending_return()?;
+            let header = if asynchronous { "async with" } else { "with" };
+            self.block(&format!("{header} {item}:"), &suite)?;
+
+            let call = find(ops, end, normal_end, "CALL")?;
+            let close = if asynchronous {
+                if ops
+                    .get(call + 1)
+                    .is_none_or(|op| (op.name, op.arg) != ("GET_AWAITABLE", 2))
+                {
+                    return Err("missing awaited manager exit".into());
+                }
+                find(ops, call + 2, normal_end, "END_SEND")?
+            } else {
+                call
+            };
+            if ops.get(close + 1).is_none_or(|op| op.name != "POP_TOP") {
+                return Err("unsupported suspended manager exit".into());
+            }
+            cursor = close + 2;
+            if returns {
+                if ops.get(cursor).is_none_or(|op| op.name != "RETURN_VALUE") {
+                    return Err("unsupported return through suspended manager".into());
+                }
+                return Ok(());
+            }
+        }
+        self.region(ops, cursor, normal_end, 0)
     }
 
     pub(super) fn delegated(

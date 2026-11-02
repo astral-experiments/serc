@@ -19,17 +19,28 @@ fn is_manager_handler(ops: &[Instruction], entry: &Handler) -> Result<bool, Stri
 }
 
 /// Locate the implicit manager protocol immediately before a protected binding.
-fn manager_entry(ops: &[Instruction]) -> Result<usize, String> {
+pub(super) fn manager_entry(ops: &[Instruction], asynchronous: bool) -> Result<usize, String> {
+    let (before_with, enter_method, exit_method) = if asynchronous {
+        (
+            "BEFORE_ASYNC_WITH",
+            SpecialMethod::__AENTER__,
+            SpecialMethod::__AEXIT__,
+        )
+    } else {
+        (
+            "BEFORE_WITH",
+            SpecialMethod::__ENTER__,
+            SpecialMethod::__EXIT__,
+        )
+    };
     match ops {
-        [.., before] if before.name == "BEFORE_WITH" => Ok(ops.len() - 1),
+        [.., before] if before.name == before_with => Ok(ops.len() - 1),
         [.., copy, exit, swap2, swap3, enter, call]
             if (copy.name, copy.arg) == ("COPY", 1)
-                && (exit.name, exit.arg)
-                    == ("LOAD_SPECIAL", SpecialMethod::__EXIT__.argument())
+                && (exit.name, exit.arg) == ("LOAD_SPECIAL", exit_method.argument())
                 && (swap2.name, swap2.arg) == ("SWAP", 2)
                 && (swap3.name, swap3.arg) == ("SWAP", 3)
-                && (enter.name, enter.arg)
-                    == ("LOAD_SPECIAL", SpecialMethod::__ENTER__.argument())
+                && (enter.name, enter.arg) == ("LOAD_SPECIAL", enter_method.argument())
                 && (call.name, call.arg) == ("CALL", 0) =>
         {
             Ok(ops.len() - 6)
@@ -348,7 +359,7 @@ impl Body<'_, '_, '_> {
             if start >= end || end > *normal_end {
                 return Err("unsupported manager layout".into());
             }
-            let enter = manager_entry(&ops[..start])?;
+            let enter = manager_entry(&ops[..start], false)?;
             let manager = if let Some(previous) = previous_body {
                 self.seeded(ops, previous, enter, 0, std::mem::take(&mut seed))?
                     .expression()?

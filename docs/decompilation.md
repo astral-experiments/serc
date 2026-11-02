@@ -52,7 +52,10 @@ formatted and template strings.
 
 Exception recovery handles selected typed and bare handlers, multi-item and
 consecutive synchronous context managers, and handlers whose `try: pass` body
-CPython optimized away. Match recovery handles value and singleton patterns,
+CPython optimized away. A generator or coroutine can suspend inside a context
+manager. Recovery follows the manager's exception-table entries across an
+`await` and distinguishes `with` from `async with` at each entry and exit.
+Match recovery handles value and singleton patterns,
 alternatives, guards, captures, and selected sequence, mapping, and class
 patterns. Nested or overlapping cases can still exceed these recognizers.
 
