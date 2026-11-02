@@ -143,10 +143,14 @@ by the skipped instructions can have its own listing. The appendix has a
 separate 16 MiB output budget. Reaching it leaves a truncation comment in the
 output.
 
-A function can have a complete-looking body that omits an exception path. If its
-candidate recompiles with a different exception table at all three optimization
-levels, serc warns on its definition and lists the original blocks. The body
-remains executable. Functions with an explicit gap already have a listing.
+A function can have a complete-looking body that omits a branch or an
+exception path. When its normal control flow or exception table differs after
+recompilation at all three optimization levels, serc warns on the definition
+and lists the original blocks. The body remains executable. The normal-flow
+check compares the jump and fallthrough destinations of each block in
+instruction order and distinguishes returns from raises. Changes to offsets,
+operands, or inline caches alone do not trigger it. Functions with an explicit
+gap already have a listing.
 
 Use `serc decompile --strict FILE.pyc` to require whole-module verification. In
 strict mode a refusal writes the reason to stderr and leaves stdout empty.

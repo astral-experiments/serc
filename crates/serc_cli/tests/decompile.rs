@@ -1334,6 +1334,65 @@ assert asyncio.run(scope['first'](ok, [])) == 7 and scope['reader'](3) == 4
 
 #[cfg(feature = "decompile")]
 #[test]
+fn normal_flow_warnings_list_the_original_successors() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("guard.pyc");
+    let recovered = temp.path().join("guard.py");
+    for version in common::PYTHON_VERSIONS {
+        let built = common::python_command(version).args(["-c", r"import dis, importlib.util, marshal, sys, types
+from pathlib import Path
+code = compile('def keep(x): return x\ndef route(a, b, effect):\n    if a and b: effect()\n', 'guard.py', 'exec')
+constants = list(code.co_consts)
+index = next(i for i, c in enumerate(constants) if isinstance(c, types.CodeType) and c.co_name == 'route')
+route = constants[index]
+# Share the two false exits, leaving the second copy of the return in place.
+first, second = [op for op in dis.get_instructions(route) if op.opname == 'POP_JUMP_IF_FALSE']
+assert first.argval != second.argval
+ops = bytearray(route.co_code)
+ops[first.offset + 1] += (second.argval - first.argval) // 2
+constants[index] = route.replace(co_code=bytes(ops))
+Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(code.replace(co_consts=tuple(constants))))"])
+            .arg(&cache).output().unwrap();
+        assert!(built.status.success(), "{built:?}");
+        let output = Command::new(env!("CARGO_BIN_EXE_serc"))
+            .arg("decompile")
+            .arg(&cache)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let source = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            source.contains("def route(a, b, effect):  # serc: normal control flow differs"),
+            "{source}"
+        );
+        assert_eq!(
+            source
+                .matches("# serc: normal control flow differs")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches("# serc: original blocks").count(), 1);
+        fs_err::write(&recovered, source).unwrap();
+        let checked = common::python_command(version).args(["-c", r"import dis, marshal, re, runpy, sys, types
+from pathlib import Path
+route = next(c for c in marshal.loads(Path(sys.argv[1]).read_bytes()[16:]).co_consts if isinstance(c, types.CodeType) and c.co_name == 'route')
+listing = Path(sys.argv[2]).read_text().split('# serc: original blocks (normal control flow differs) in route ')[1]
+ops = list(dis.get_instructions(route))
+assert [(int(m[1]), m[2]) for m in re.finditer(r'^# +(\d+)  (\w+) ', listing, re.M)] == [(op.offset, op.opname) for op in ops]
+assert [int(n) for n in re.findall(r'^# block .* jump (\d+)$', listing, re.M)] == [op.argval for op in ops if op.opname == 'POP_JUMP_IF_FALSE']
+scope = runpy.run_path(sys.argv[2])
+calls = []
+for a in [False, True]:
+    for b in [False, True]:
+        scope['route'](a, b, lambda: calls.append((a, b)))
+assert calls == [(True, True)] and scope['keep'](42) == 42"])
+            .arg(&cache).arg(&recovered).output().unwrap();
+        assert!(checked.status.success(), "{checked:?}");
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original.py");

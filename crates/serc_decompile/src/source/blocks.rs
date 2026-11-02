@@ -57,7 +57,7 @@ pub(super) fn append(
     source: &mut String,
     gaps: Vec<Gap>,
     placed: &FxHashSet<Id>,
-    warned: Vec<Id>,
+    warned: &super::warnings::Warnings,
 ) -> Result<(), String> {
     let mut pending = BTreeMap::<Id, Vec<Range<usize>>>::new();
     for gap in gaps {
@@ -65,10 +65,9 @@ pub(super) fn append(
             pending.entry(gap.scope).or_default().push(gap.ops);
         }
     }
-    for &id in &warned {
+    for &id in warned.keys() {
         pending.entry(id).or_default().push(0..usize::MAX);
     }
-    let warned: FxHashSet<_> = warned.into_iter().collect();
     let mut seen = FxHashSet::default();
     let end = source.len() + MAX_LISTING;
     let mut listing = Listing { source, end };
@@ -84,12 +83,11 @@ pub(super) fn append(
         )?;
         let flow = Graph::build(&bc, m.version, code.stack_size)?;
         let constants = m.tuple(code.constants)?;
-        let warning = warned.contains(&id);
-        let label = if warning {
-            "original blocks (exception table differs)"
-        } else {
-            "unplaced blocks"
-        };
+        let warning = warned.get(&id);
+        let label = warning.map_or_else(
+            || "unplaced blocks".to_owned(),
+            |w| format!("original blocks ({})", w.description()),
+        );
         if !listing.line(format_args!(
             "\n# serc: {label} in {} (original line {}, code {})",
             comment(m.text(code.qualname)?),
@@ -110,7 +108,7 @@ pub(super) fn append(
             // A lost class, lambda, or compiler-generated scope may have no
             // Python definition in either the source or the detached appendix.
             for op in &bc.ops[range.clone()] {
-                if !warning
+                if warning.is_none()
                     && op.name == "LOAD_CONST"
                     && let Some(&child) = constants.get(op.arg as usize)
                     && matches!(m.objects[child], Object::Code(_))

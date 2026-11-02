@@ -1,4 +1,4 @@
-//! Match a retained definition to its recompiled exception table before
+//! Match a retained definition to its recompiled control flow before
 //! attaching a warning. The original cache does not record its optimize level.
 use std::collections::BTreeMap;
 
@@ -14,8 +14,36 @@ use serc_bytecode::target::code_flags;
 
 use super::{Candidate, Id, MAX_WORK, Module, Object, identifier};
 
-pub(super) const WARNING: &str =
-    "  # serc: exception table differs after recompilation (see original blocks)";
+const PREFIX: &str = "  # serc: ";
+const SUFFIX: &str = " after recompilation (see original blocks)";
+
+#[derive(Clone, Copy)]
+pub(super) struct Difference {
+    line: usize,
+    exceptions: bool,
+    flow: bool,
+}
+
+impl Difference {
+    fn confirmed(self) -> bool {
+        self.exceptions || self.flow
+    }
+
+    pub(super) fn description(self) -> &'static str {
+        match (self.exceptions, self.flow) {
+            (true, true) => "exception table and normal control flow differ",
+            (true, false) => "exception table differs",
+            (false, true) => "normal control flow differs",
+            (false, false) => unreachable!("only confirmed differences are annotated"),
+        }
+    }
+
+    pub(super) fn annotation_len(self) -> usize {
+        PREFIX.len() + self.description().len() + SUFFIX.len()
+    }
+}
+
+pub(super) type Warnings = BTreeMap<Id, Difference>;
 
 fn children<'a>(
     m: &'a Module<'_>,
@@ -37,11 +65,16 @@ fn children<'a>(
 
 /// Pair children within their parent in constant-table order. If a repeated
 /// definition was dropped, its remaining namesakes cannot be paired reliably.
-fn differences(m: &Module<'_>, candidate: &Module<'_>) -> Option<FxHashMap<Id, usize>> {
+fn differences(
+    m: &Module<'_>,
+    candidate: &Module<'_>,
+    explicit: &FxHashSet<Id>,
+) -> Option<Warnings> {
     let mut pending = vec![(m.root, candidate.root)];
     let mut seen = FxHashSet::default();
-    let mut different = FxHashMap::default();
+    let mut different = Warnings::default();
     let mut budget = MAX_WORK;
+    let mut flow_budget = MAX_WORK;
     while let Some((id, other)) = pending.pop() {
         if !seen.insert((id, other)) {
             continue;
@@ -51,11 +84,30 @@ fn differences(m: &Module<'_>, candidate: &Module<'_>) -> Option<FxHashMap<Id, u
         let left = m.bytes(code.exceptions).ok()?;
         let right = candidate.bytes(recovered.exceptions).ok()?;
         budget = budget.checked_sub(1 + left.len() + right.len())?;
-        if left != right
+        if !explicit.contains(&id)
             && code.flags & code_flags::CO_OPTIMIZED != 0
             && identifier(m.text(code.name).ok()?).is_ok()
         {
-            different.insert(id, recovered.first_line);
+            let original = m.bytes(code.bytecode).ok()?;
+            let compiled = candidate.bytes(recovered.bytecode).ok()?;
+            // Reserve a separate budget so graph comparison cannot displace
+            // an otherwise reportable exception-table mismatch.
+            let flow = if let Some(rest) = flow_budget.checked_sub(original.len() + compiled.len())
+            {
+                flow_budget = rest;
+                original != compiled
+                    && crate::flow::same_normal_flow(m.version, original, compiled) == Ok(false)
+            } else {
+                false
+            };
+            let difference = Difference {
+                line: recovered.first_line,
+                exceptions: left != right,
+                flow,
+            };
+            if difference.confirmed() {
+                different.insert(id, difference);
+            }
         }
         let mut peers = children(candidate, other, &mut budget)?;
         for (name, ids) in children(m, id, &mut budget)? {
@@ -104,60 +156,74 @@ pub(super) fn annotate(
     m: &Module<'_>,
     candidate: &mut Candidate,
     mut compile: impl FnMut(&str, OptimizationLevel) -> Option<Vec<u8>>,
-) -> Vec<Id> {
+) -> Warnings {
     let explicit: FxHashSet<_> = candidate.unplaced.iter().map(|gap| gap.scope).collect();
-    let mut remaining: Option<FxHashMap<Id, usize>> = None;
+    let mut remaining: Option<Warnings> = None;
     for level in [
         OptimizationLevel::Zero,
         OptimizationLevel::One,
         OptimizationLevel::Two,
     ] {
         let Some(bytes) = compile(&candidate.source, level) else {
-            return Vec::new();
+            return Warnings::default();
         };
         let Ok(other) = read(&bytes) else {
-            return Vec::new();
+            return Warnings::default();
         };
         if m.version != other.version {
-            return Vec::new();
+            return Warnings::default();
         }
-        let Some(mut differences) = differences(m, &other) else {
-            return Vec::new();
+        let Some(differences) = differences(m, &other, &explicit) else {
+            return Warnings::default();
         };
-        differences.retain(|id, _| !explicit.contains(id));
         if let Some(remaining) = &mut remaining {
-            remaining.retain(|id, line| differences.get(id) == Some(line));
+            remaining.retain(|id, previous| {
+                let Some(current) = differences.get(id) else {
+                    return false;
+                };
+                previous.exceptions &= current.exceptions;
+                previous.flow &= current.flow;
+                previous.line == current.line && previous.confirmed()
+            });
         } else {
             remaining = Some(differences);
         }
-        if remaining.as_ref().is_none_or(FxHashMap::is_empty) {
-            return Vec::new();
+        if remaining.as_ref().is_none_or(Warnings::is_empty) {
+            return Warnings::default();
         }
     }
     let Some(remaining) = remaining else {
-        return Vec::new();
+        return Warnings::default();
     };
     let Ok(parsed) = ruff_python_parser::parse_module(&candidate.source) else {
-        return Vec::new();
+        return Warnings::default();
     };
     let mut headers = Headers {
         locations: remaining
-            .into_iter()
-            .filter_map(|(id, line)| Some(((line, m.text(m.code(id).ok()?.name).ok()?), id)))
+            .iter()
+            .filter_map(|(&id, diff)| Some(((diff.line, m.text(m.code(id).ok()?.name).ok()?), id)))
             .collect(),
         lines: LineIndex::from_source_text(&candidate.source),
         tokens: parsed.tokens(),
         edits: Vec::new(),
     };
     headers.visit_body(parsed.suite());
-    let mut source =
-        String::with_capacity(candidate.source.len() + headers.edits.len() * WARNING.len());
+    let mut source = String::with_capacity(
+        candidate.source.len()
+            + remaining
+                .values()
+                .map(|d| d.annotation_len())
+                .sum::<usize>(),
+    );
     let mut start = 0;
-    let mut warned = Vec::new();
+    let mut warned = Warnings::default();
     for (end, id) in headers.edits {
         source.push_str(&candidate.source[start..end]);
-        source.push_str(WARNING);
-        warned.push(id);
+        let difference = remaining[&id];
+        source.push_str(PREFIX);
+        source.push_str(difference.description());
+        source.push_str(SUFFIX);
+        warned.insert(id, difference);
         start = end;
     }
     source.push_str(&candidate.source[start..]);

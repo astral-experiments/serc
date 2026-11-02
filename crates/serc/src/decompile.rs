@@ -83,8 +83,49 @@ mod tests {
             assert_eq!(
                 output
                     .source
-                    .contains("def f():  # serc: exception table differs"),
+                    .contains("def f():  # serc: exception table and normal control flow differ"),
                 matching_level.is_none(),
+            );
+        }
+    }
+
+    #[test]
+    fn normal_flow_warnings_require_different_edges_at_every_level() {
+        let original = "def route(a, b):\n    if a and b: work()\n    return a + 1\n";
+        let cache = |source: &str| {
+            crate::compile(source, "route.py")
+                .unwrap()
+                .to_timestamp_pyc(0, 0)
+        };
+        let input = cache(original);
+        // Changing which successor short-circuits keeps the block count.
+        let different_flow = cache(&original.replace("a and b", "a or b"));
+        let same_flow = cache(&original.replace("a + 1", "a - 1"));
+        for matching_level in [None, Some(crate::OptimizationLevel::Two)] {
+            let output = serc_decompile::decompile_pyc_with_mode(
+                &input,
+                DecompileMode::BestEffort,
+                |_, _, _, level| {
+                    Some(if Some(level) == matching_level {
+                        same_flow.clone()
+                    } else {
+                        different_flow.clone()
+                    })
+                },
+            )
+            .unwrap();
+            assert!(output.verification_error.is_some());
+            assert_eq!(
+                output
+                    .source
+                    .contains("def route(a, b):  # serc: normal control flow differs"),
+                matching_level.is_none()
+            );
+            assert_eq!(
+                output
+                    .source
+                    .contains("# serc: original blocks (normal control flow differs) in route "),
+                matching_level.is_none()
             );
         }
     }

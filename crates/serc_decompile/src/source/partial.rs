@@ -70,7 +70,7 @@ pub(crate) fn partial(
     };
     work.definitions.extend(implicit);
     let warned = super::warnings::annotate(m, &mut candidate, compile);
-    detached::append(m, candidate, &mut work, warned)
+    detached::append(m, candidate, &mut work, &warned)
 }
 
 impl Body<'_, '_, '_> {
