@@ -184,8 +184,15 @@ Library callers can use `serc::decompile_pyc_with_mode` to inspect
 Verified output supplies one spelling that produces those executable fields.
 Comments, original formatting, location tables, and code removed by CPython
 optimization generally cannot be recovered. Traceback line numbers can change.
-The decompiler preserves class line numbers when they appear as executable
-constants and can refuse a module if it cannot reproduce them.
+
+Since 3.13, a class exposes its first line as `__firstlineno__`. Strict
+verification checks this executable constant. Best-effort output also inserts
+blank lines before class definitions, including their decorators, to reproduce
+it. Serc pairs classes by qualified name and occurrence within the same parent.
+It skips ambiguous occurrences and leaves an already aligned class in place. A
+single insertion is limited to 1,024 lines, and the padded source must fit the 1
+MiB source budget. Blank lines do not count against the space for detached
+bodies or original block listings.
 
 CPython sometimes keeps a name, local binding, or constant after removing the
 statement that introduced it. If ordinary recovery cannot reproduce those

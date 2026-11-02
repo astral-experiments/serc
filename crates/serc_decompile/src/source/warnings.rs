@@ -12,7 +12,7 @@ use serc_bytecode::OptimizationLevel;
 use serc_bytecode::marshal::reader::read;
 use serc_bytecode::target::code_flags;
 
-use super::{Candidate, Id, MAX_WORK, Module, Object, identifier};
+use super::{Candidate, Id, MAX_WORK, Module, identifier};
 
 const PREFIX: &str = "  # serc: ";
 const SUFFIX: &str = " after recompilation (see original blocks)";
@@ -54,46 +54,20 @@ impl Difference {
 
 pub(super) type Warnings = BTreeMap<Id, Difference>;
 
-fn children<'a>(
-    m: &'a Module<'_>,
-    id: Id,
-    budget: &mut usize,
-) -> Option<BTreeMap<&'a str, Vec<Id>>> {
-    let constants = m.tuple(m.code(id).ok()?.constants).ok()?;
-    *budget = budget.checked_sub(1 + constants.len())?;
-    let mut groups = BTreeMap::<_, Vec<_>>::new();
-    for &child in constants {
-        if let Object::Code(code) = &m.objects[child] {
-            let name = m.text(code.qualname).ok()?;
-            *budget = budget.checked_sub(name.len())?;
-            groups.entry(name).or_default().push(child);
-        }
-    }
-    Some(groups)
-}
-
-/// Pair children within their parent in constant-table order. If a repeated
-/// definition was dropped, its remaining namesakes cannot be paired reliably.
 fn differences(
     m: &Module<'_>,
     candidate: &Module<'_>,
     explicit: &FxHashSet<Id>,
 ) -> Option<Warnings> {
-    let mut pending = vec![(m.root, candidate.root)];
-    let mut seen = FxHashSet::default();
     let mut different = Warnings::default();
-    let mut budget = MAX_WORK;
     let mut function_flow_budget = MAX_WORK;
     let mut module_flow_budget = MAX_WORK;
-    while let Some((id, other)) = pending.pop() {
-        if !seen.insert((id, other)) {
-            continue;
-        }
+    super::paired::visit(m, candidate, |id, other, budget| {
         let code = m.code(id).ok()?;
         let recovered = candidate.code(other).ok()?;
         let left = m.bytes(code.exceptions).ok()?;
         let right = candidate.bytes(recovered.exceptions).ok()?;
-        budget = budget.checked_sub(1 + left.len() + right.len())?;
+        *budget = budget.checked_sub(1 + left.len() + right.len())?;
         if id == m.root
             || (!explicit.contains(&id)
                 && code.flags & code_flags::CO_OPTIMIZED != 0
@@ -125,15 +99,8 @@ fn differences(
                 different.insert(id, difference);
             }
         }
-        let mut peers = children(candidate, other, &mut budget)?;
-        for (name, ids) in children(m, id, &mut budget)? {
-            if let Some(others) = peers.remove(name)
-                && ids.len() == others.len()
-            {
-                pending.extend(ids.into_iter().zip(others));
-            }
-        }
-    }
+        Some(())
+    })?;
     Some(different)
 }
 
@@ -171,6 +138,7 @@ impl<'a> StatementVisitor<'a> for Headers<'_> {
 pub(super) fn annotate(
     m: &Module<'_>,
     candidate: &mut Candidate,
+    mut first: Option<Vec<u8>>,
     mut compile: impl FnMut(&str, OptimizationLevel) -> Option<Vec<u8>>,
 ) -> Warnings {
     let explicit: FxHashSet<_> = candidate.unplaced.iter().map(|gap| gap.scope).collect();
@@ -180,7 +148,12 @@ pub(super) fn annotate(
         OptimizationLevel::One,
         OptimizationLevel::Two,
     ] {
-        let Some(bytes) = compile(&candidate.source, level) else {
+        let bytes = if level == OptimizationLevel::Zero {
+            first.take()
+        } else {
+            compile(&candidate.source, level)
+        };
+        let Some(bytes) = bytes else {
             return Warnings::default();
         };
         let Ok(other) = read(&bytes) else {

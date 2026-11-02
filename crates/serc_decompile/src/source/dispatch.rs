@@ -151,8 +151,8 @@ impl Body<'_, '_, '_> {
             if !arm.body.is_empty() || arm.kind.is_none() || success >= handler {
                 return None;
             }
-            if !super::regions::constant_return(ops, tail.end)
-                .is_some_and(|(start, _)| start == tail.start)
+            if super::regions::constant_return(ops, tail.end)
+                .is_none_or(|(start, _)| start != tail.start)
             {
                 continuation = tail.clone();
                 arm.exit = Exit::Jump(continuation.start);

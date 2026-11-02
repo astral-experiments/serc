@@ -64,18 +64,20 @@ mod tests {
         let original = "def f():\n    try: work()\n    except KeyError: raise\n    return 1\n";
         let input = cache(original);
         // A different return value still prevents whole-module verification.
-        let same_table = cache(&original.replace("return 1", "return 2"));
-        let different_table = cache("def f():\n    work()\n    return 2\n");
+        let same_table = original.replace("return 1", "return 2");
+        let different_table = "def f():\n    work()\n    return 2\n";
         for matching_level in [None, Some(crate::OptimizationLevel::Two)] {
             let output = serc_decompile::decompile_pyc_with_mode(
                 &input,
                 DecompileMode::BestEffort,
-                |_, _, _, level| {
-                    Some(if Some(level) == matching_level {
-                        same_table.clone()
+                |source, _, _, level| {
+                    let (prefix, _) = source.split_once("def f(")?;
+                    let body = if Some(level) == matching_level {
+                        &same_table
                     } else {
-                        different_table.clone()
-                    })
+                        different_table
+                    };
+                    Some(cache(&format!("{prefix}{body}")))
                 },
             )
             .unwrap();
@@ -100,18 +102,20 @@ mod tests {
         };
         let input = cache(original);
         // Changing which successor short-circuits keeps the block count.
-        let different_flow = cache(&original.replace("a and b", "a or b"));
-        let same_flow = cache(&original.replace("a + 1", "a - 1"));
+        let different_flow = original.replace("a and b", "a or b");
+        let same_flow = original.replace("a + 1", "a - 1");
         for matching_level in [None, Some(crate::OptimizationLevel::Two)] {
             let output = serc_decompile::decompile_pyc_with_mode(
                 &input,
                 DecompileMode::BestEffort,
-                |_, _, _, level| {
-                    Some(if Some(level) == matching_level {
-                        same_flow.clone()
+                |source, _, _, level| {
+                    let (prefix, _) = source.split_once("def route(")?;
+                    let body = if Some(level) == matching_level {
+                        &same_flow
                     } else {
-                        different_flow.clone()
-                    })
+                        &different_flow
+                    };
+                    Some(cache(&format!("{prefix}{body}")))
                 },
             )
             .unwrap();
