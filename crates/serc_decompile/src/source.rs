@@ -184,13 +184,18 @@ fn recover_scope<'m>(
     });
     if let Err(reason) = result {
         if body.work.partial {
-            return body.partial_scope(name, &reason, &bc);
+            return body.partial_scope(&reason, &bc);
         }
         return Err(format!("{name}: {reason}"));
     }
     body.emit_stub(None)?;
     if let Some(guard) = live_guard {
         body.guard_statement(&guard)?;
+    }
+    if body.work.partial
+        && let Err(error) = ruff_python_parser::parse_module(&body.lines)
+    {
+        return body.partial_scope(&format!("invalid reconstructed scope: {error}"), &bc);
     }
     Ok(body.lines)
 }

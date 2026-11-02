@@ -56,37 +56,78 @@ pub(crate) fn partial(m: &Module<'_>, candidate: Option<String>) -> Result<Strin
 }
 
 impl Body<'_, '_, '_> {
-    pub(super) fn partial_scope(
-        &mut self,
-        name: &str,
-        reason: &str,
-        bc: &Bytecode,
-    ) -> Result<String, String> {
+    pub(super) fn partial_scope(&mut self, reason: &str, bc: &Bytecode) -> Result<String, String> {
         // A failed compound statement can leave an incomplete try or decorated
         // definition in the buffer. Only retain a syntactically complete prefix.
         if ruff_python_parser::parse_module(&self.lines).is_err() {
             self.lines.clear();
         }
-        self.line(&format!(
-            "...  # serc: unrecovered remainder of {}: {}",
-            comment(name),
-            comment(reason)
-        ))?;
-        // Include the scope's instruction offsets for inspection even when the
-        // first statement is unsupported. Keep the fallback bounded.
         let offset = reason
             .rsplit_once("byte ")
             .and_then(|(_, rest)| rest.split_whitespace().next()?.parse::<usize>().ok());
         let start = offset
             .and_then(|at| bc.ops.binary_search_by_key(&at, |op| op.offset).ok())
             .unwrap_or(0);
+        self.gap(reason, &bc.ops[start..], true)?;
+        Ok(std::mem::take(&mut self.lines))
+    }
+
+    /// Resume at an empty stack in the same straight-line block, or where both
+    /// forward arms rejoin with an empty stack. Never move a branch arm into
+    /// the surrounding suite just because it happens to be next in the file.
+    pub(super) fn resume_after(
+        &mut self,
+        ops: &[super::Instruction],
+        i: usize,
+    ) -> Result<Option<usize>, String> {
+        let range = self.flow.block(i).ops.clone();
+        let Some(mut height) = self.flow.block(i).height else {
+            return Ok(None);
+        };
+        self.charge(range.len())?;
+        for (index, op) in ops[range.clone()].iter().enumerate() {
+            let (pop, push) =
+                serc_bytecode::target::stack_counts_for(self.m.version, op.opcode, op.arg);
+            let Some(after) = height.checked_sub(pop).and_then(|n| n.checked_add(push)) else {
+                return Ok(None);
+            };
+            height = after;
+            let next = range.start + index + 1;
+            if next > i && next < range.end && height == 0 {
+                return Ok(Some(next));
+            }
+        }
+        Ok(self
+            .flow
+            .join(i)
+            .filter(|&n| n > i && self.flow.block(n).height == Some(0)))
+    }
+
+    pub(super) fn gap(
+        &mut self,
+        reason: &str,
+        ops: &[super::Instruction],
+        remainder: bool,
+    ) -> Result<(), String> {
+        let name = comment(self.m.text(self.code.qualname)?);
+        let extent = if remainder {
+            "remainder of"
+        } else {
+            "statement in"
+        };
+        self.line(&format!(
+            "...  # serc: unrecovered {extent} {name}: {}",
+            comment(reason)
+        ))?;
+        // Include original instruction offsets without allowing a damaged or
+        // unusually large scope to consume the whole source budget.
         let mut excerpt = String::new();
-        for op in bc.ops.iter().skip(start).take(12) {
+        for op in ops.iter().take(12) {
             writeln!(excerpt, "# {:>4}  {} {}", op.offset, op.name, op.arg).unwrap();
         }
         for line in excerpt.lines() {
             self.line(line)?;
         }
-        Ok(std::mem::take(&mut self.lines))
+        Ok(())
     }
 }

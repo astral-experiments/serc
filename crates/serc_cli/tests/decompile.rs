@@ -810,7 +810,7 @@ fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
     let cache = temp.path().join("module.pyc");
     let recovered = temp.path().join("recovered.py");
     let source = format!(
-        "before = 7\ndef large():\n    return '{}'\ndef after(x):\n    return x + before\n",
+        "before = 7\nif before:\n    lost = '{0}'\nelse:\n    wrongly_hoisted()\ndef large():\n    return '{0}'\ndef after(x):\n    return x + before\n",
         "x".repeat(200_000)
     );
     fs_err::write(&original, source).unwrap();
@@ -829,6 +829,8 @@ fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
         assert!(text.starts_with("# serc: best-effort decompilation\n"));
         assert!(text.contains("def large():\n    ...  # serc: unrecovered remainder of large"));
         assert!(text.contains("def after(x):"));
+        assert!(text.contains("# serc: unrecovered statement in <module>"));
+        assert!(!text.contains("wrongly_hoisted()"));
         fs_err::write(&recovered, text).unwrap();
         let checked = common::python_command(version)
             .args([

@@ -13,7 +13,7 @@ pub(super) struct Block {
     fallthrough: Option<usize>,
     handler: Option<(usize, Handler)>,
     predecessors: Vec<usize>,
-    height: Option<usize>,
+    pub(super) height: Option<usize>,
 }
 
 pub(super) struct Graph {

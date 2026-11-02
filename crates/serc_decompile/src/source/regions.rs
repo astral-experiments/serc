@@ -117,209 +117,268 @@ impl Body<'_, '_, '_> {
         if level > 32 || end > ops.len() || start > end {
             return Err("unsupported region bounds or nesting".into());
         }
+        let partial = self.work.partial
+            && level == 0
+            && start == 0
+            && end == ops.len()
+            && self.m.bytes(self.code.exceptions)?.is_empty();
+        let mut prefix = self.lines.len();
         let mut i = start;
         while i < end {
-            let op = ops[i];
-            let next = match op.name {
-                // CPython builds a constant set display by updating an empty
-                // set from a frozenset constant. Its elements belong directly
-                // in the display, including when that display is itself starred.
-                "BUILD_SET"
-                    if op.arg == 0
-                        && let [constant, update, ..] = &ops[i + 1..end]
-                        && constant.name == "LOAD_CONST"
-                        && (update.name, update.arg) == ("SET_UPDATE", 1)
-                        && matches!(
-                            self.m.objects[self.item(self.code.constants, constant.arg)?],
-                            Object::FrozenSet(_)
-                        ) =>
-                {
-                    self.constant(constant.arg)?;
-                    Ok(i + 3)
-                }
-                "BUILD_TUPLE"
-                    if op.arg == 3
-                        && ops[i + 1..end]
-                            .first()
-                            .is_some_and(super::type_params::is_alias_intrinsic) =>
-                {
-                    self.make_alias()?;
-                    Ok(i + 2)
-                }
-                "CALL_INTRINSIC_1"
-                    if op.arg
-                        == serc_bytecode::target::operands::UnaryIntrinsic::IMPORT_STAR
-                            .argument()
-                        && i + 1 < end
-                        && ops[i + 1].name == "POP_TOP" =>
-                {
-                    self.import_star()?;
-                    Ok(i + 2)
-                }
-                "LOAD_LOCALS" if self.class && self.class_parameters(&ops[i..end])? => Ok(i + 3),
-                "COPY" if self.class && op.arg == 1
-                    && let [store, ret, ..] = &ops[i + 1..end]
-                    && store.name == "STORE_NAME" && ret.name == "RETURN_VALUE"
-                    && self.name(self.code.names, store.arg)? == "__classcell__"
-                    && matches!(self.stack.last(), Some(Value::Expr(value)) if value == "__class__") => {
-                    self.pop()?;
-                    Ok(i + 3)
-                }
-                "COPY" if op.arg == 1
-                    && matches!(self.stack.last(), Some(Value::Expr(_)))
-                    && let Ok(targets) = self.chained_targets(&ops[..end], i + 1) => {
-                    let rhs = self.expr()?;
-                    self.line(&format!("{} = {rhs}", targets.target))?;
-                    self.stack.extend(targets.seed);
-                    Ok(targets.next)
-                }
-                "COPY"
-                    if op.arg == 1
-                        && i + 1 < end
-                        && matches!(
-                            ops[i + 1].name,
-                            "STORE_FAST" | "STORE_NAME" | "STORE_DEREF" | "STORE_GLOBAL"
-                        ) =>
-                {
-                    let rhs = self.expr()?;
-                    let store = ops[i + 1];
-                    let table = if matches!(store.name, "STORE_NAME" | "STORE_GLOBAL") {
-                        self.code.names
-                    } else {
-                        self.code.locals
-                    };
-                    let lhs = self.name(table, store.arg)?;
-                    self.push(format!("({lhs} := {rhs})"))?;
-                    Ok(i + 2)
-                }
-                "SET_ADD"
-                    if i + 1 < end
-                        && ops[i + 1].name == "POP_TOP"
-                        && !self.annotations.is_empty() =>
-                {
-                    self.annotation_site()?;
-                    Ok(i + 2)
-                }
-                "SWAP" if super::comparisons::is_link(&ops[i..end]) => self.comparison_chain(ops, i, end, level),
-                "SWAP"
-                    if op.arg == 2
-                        && i + 1 < end
-                        && ops[i + 1].name == "POP_TOP"
-                        && matches!(
-                            self.stack.as_slice(),
-                            [.., Value::Import(_), Value::Member(_)]
-                        ) =>
-                {
-                    // A dotted import walks the package before binding its final member.
-                    self.pop()?;
-                    Ok(i + 2)
-                }
-                "SWAP" if matches!(op.arg, 2 | 3) && matches!(ops[i + 1..end].first().map(|op| op.name),
-                    Some("STORE_NAME" | "STORE_FAST" | "STORE_FAST_STORE_FAST" | "STORE_GLOBAL" | "STORE_DEREF" | "UNPACK_SEQUENCE" | "UNPACK_EX")) => {
-                    self.parallel_assignment(ops, i + 1, end, op.arg as usize, false)
-                }
-                "STORE_FAST" | "STORE_FAST_STORE_FAST"
-                    if super::operands::local_store_run(&ops[i..end], self.stack.len()) && self.stack.iter().all(|v| matches!(v, Value::Expr(_))) => {
-                    self.parallel_assignment(ops, i, end, self.stack.len(), true)
-                }
-                "KW_NAMES" if i + 1 < end && ops[i + 1].name == "CALL" => {
-                    self.constant(op.arg)?;
-                    let keys = self.expr()?;
-                    self.keyword_call(ops[i + 1].arg, &keys)?;
-                    Ok(i + 2)
-                }
-                "UNPACK_SEQUENCE" | "UNPACK_EX" => {
-                    let rhs = self.expr()?;
-                    let binding = self.binding(ops, i, end)?;
-                    self.line(&format!("{} = {rhs}", binding.target))?;
-                    self.stack.extend(binding.seed);
-                    Ok(binding.next)
-                }
-                "RETURN_GENERATOR" if i + 1 < end && ops[i + 1].name == "POP_TOP" => Ok(i + 2),
-                "GET_AWAITABLE" | "GET_YIELD_FROM_ITER" => self.delegated(ops, i, end),
-                "GET_ITER" | "GET_AITER"
-                    if ops
-                        .get(i + 1)
-                        .is_some_and(|next| next.name == "CALL" && next.arg == 0) =>
-                {
-                    Ok(i + 1)
-                }
-                "GET_ITER"
-                    if self.m.version == serc_bytecode::PythonVersion::Py315 && op.arg == 3 =>
-                {
-                    self.delegated(ops, i, end)
-                }
-                "GET_AITER" if i + 1 < end && ops[i + 1].name == "GET_ANEXT" => {
-                    self.async_loop(ops, i, end, level)
-                }
-                "GET_ITER" | "GET_AITER" if i + 1 < end && ops[i + 1].name == "LOAD_FAST_AND_CLEAR" => {
-                    self.comprehension(ops, i + 1, end, level)
-                }
-                "LOAD_FAST_AND_CLEAR" => self.comprehension(ops, i, end, level),
-                "JUMP_BACKWARD" | "JUMP_FORWARD" if self.loop_transfer(ops, i).is_some() => {
-                    self.line(self.loop_transfer(ops, i).unwrap())?;
-                    Ok(i + 1)
-                }
-                "NOP" | "POP_TOP" | "POP_ITER"
-                    if self.stack.is_empty() && self.folded_break(ops, i, end) =>
-                {
-                    self.line("break")?;
-                    Ok(self.flow.block(i).ops.end)
-                }
-                "POP_TOP" | "POP_ITER"
-                    if self.stack.is_empty()
-                        && i + 1 < end
-                        && (self.loop_transfer(ops, i + 1) == Some("break")
-                            || (ops[i + 1].name == "POP_TOP"
-                                && i + 2 < end
-                                && self.loop_transfer(ops, i + 2) == Some("break"))) =>
-                {
-                    Ok(i + 1)
-                }
-                "MATCH_SEQUENCE" | "MATCH_MAPPING" | "MATCH_CLASS" => {
-                    self.match_cases(ops, i, end, level)
-                }
-                "COPY"
-                    if i + 1 < end
-                        && matches!(ops[i + 1].name, "MATCH_SEQUENCE" | "MATCH_MAPPING") =>
-                {
-                    self.match_cases(ops, i, end, level)
-                }
-                "COPY" if let Some(count) = super::operands::augmented_load(&ops[i..end]) => {
-                    self.augmented_store(ops, i + count, count, end, level)
-                }
-                "COPY" if super::value_patterns::header(&ops[..end], i, self.m.version).is_some() => self.value_cases(ops, i, end, level),
-                "COPY" if op.arg == 1 => self.boolean(ops, i, end, level),
-                "GET_ITER" if ops.get(i + 1).is_some_and(|next| next.name == "FOR_ITER") => {
-                    self.for_loop(ops, i + 1, end, level)
-                }
-                "POP_JUMP_IF_FALSE"
-                | "POP_JUMP_IF_TRUE"
-                | "POP_JUMP_IF_NONE"
-                | "POP_JUMP_IF_NOT_NONE" => self.conditional(ops, i, end, level),
-                "TO_BOOL"
-                    if ops
-                        .get(i + 1)
-                        .is_some_and(|op| op.name.starts_with("POP_JUMP_IF_") || op.name == "UNARY_NOT") =>
-                {
-                    Ok(i + 1)
-                }
-                "TO_BOOL" => {
-                    // CPython folds double negation to a truth conversion. A
-                    // call to bool would introduce a (possibly shadowed) name.
-                    let value = self.expr()?;
-                    self.push(format!("(not not {value})"))?;
-                    Ok(i + 1)
-                }
-                _ => self.step(op).map(|()| i + 1),
+            if partial && self.stack.is_empty() {
+                prefix = self.lines.len();
             }
-            .map_err(|err| format!("byte {} ({}): {err}", op.offset, op.name))?;
+            let op = ops[i];
+            let next = match self.region_step(ops, i, end, level) {
+                Ok(next) => next,
+                Err(reason) if partial => {
+                    self.lines.truncate(prefix);
+                    self.stack.clear();
+                    let next = self.resume_after(ops, i)?.unwrap_or(end);
+                    self.gap(&reason, &ops[i..next], next == end)?;
+                    next
+                }
+                Err(reason) => return Err(format!("byte {} ({}): {reason}", op.offset, op.name)),
+            };
             if next <= i || next > end {
                 return Err(format!("branch escapes region at byte {}", op.offset));
+            }
+            if partial && self.stack.is_empty() && self.lines.len() > prefix {
+                self.charge(self.lines.len() - prefix)?;
+                if let Err(error) = ruff_python_parser::parse_module(&self.lines[prefix..]) {
+                    self.lines.truncate(prefix);
+                    self.gap(
+                        &format!("invalid reconstructed statement: {error}"),
+                        &ops[i..next],
+                        false,
+                    )?;
+                }
             }
             i = next;
         }
         Ok(())
+    }
+
+    fn region_step(
+        &mut self,
+        ops: &[Instruction],
+        i: usize,
+        end: usize,
+        level: usize,
+    ) -> Result<usize, String> {
+        let op = ops[i];
+        match op.name {
+            // CPython builds a constant set display by updating an empty
+            // set from a frozenset constant. Its elements belong directly
+            // in the display, including when that display is itself starred.
+            "BUILD_SET"
+                if op.arg == 0
+                    && let [constant, update, ..] = &ops[i + 1..end]
+                    && constant.name == "LOAD_CONST"
+                    && (update.name, update.arg) == ("SET_UPDATE", 1)
+                    && matches!(
+                        self.m.objects[self.item(self.code.constants, constant.arg)?],
+                        Object::FrozenSet(_)
+                    ) =>
+            {
+                self.constant(constant.arg)?;
+                Ok(i + 3)
+            }
+            "BUILD_TUPLE"
+                if op.arg == 3
+                    && ops[i + 1..end]
+                        .first()
+                        .is_some_and(super::type_params::is_alias_intrinsic) =>
+            {
+                self.make_alias()?;
+                Ok(i + 2)
+            }
+            "CALL_INTRINSIC_1"
+                if op.arg
+                    == serc_bytecode::target::operands::UnaryIntrinsic::IMPORT_STAR.argument()
+                    && i + 1 < end
+                    && ops[i + 1].name == "POP_TOP" =>
+            {
+                self.import_star()?;
+                Ok(i + 2)
+            }
+            "LOAD_LOCALS" if self.class && self.class_parameters(&ops[i..end])? => Ok(i + 3),
+            "COPY"
+                if self.class
+                    && op.arg == 1
+                    && let [store, ret, ..] = &ops[i + 1..end]
+                    && store.name == "STORE_NAME"
+                    && ret.name == "RETURN_VALUE"
+                    && self.name(self.code.names, store.arg)? == "__classcell__"
+                    && matches!(self.stack.last(), Some(Value::Expr(value)) if value == "__class__") =>
+            {
+                self.pop()?;
+                Ok(i + 3)
+            }
+            "COPY"
+                if op.arg == 1
+                    && matches!(self.stack.last(), Some(Value::Expr(_)))
+                    && let Ok(targets) = self.chained_targets(&ops[..end], i + 1) =>
+            {
+                let rhs = self.expr()?;
+                self.line(&format!("{} = {rhs}", targets.target))?;
+                self.stack.extend(targets.seed);
+                Ok(targets.next)
+            }
+            "COPY"
+                if op.arg == 1
+                    && i + 1 < end
+                    && matches!(
+                        ops[i + 1].name,
+                        "STORE_FAST" | "STORE_NAME" | "STORE_DEREF" | "STORE_GLOBAL"
+                    ) =>
+            {
+                let rhs = self.expr()?;
+                let store = ops[i + 1];
+                let table = if matches!(store.name, "STORE_NAME" | "STORE_GLOBAL") {
+                    self.code.names
+                } else {
+                    self.code.locals
+                };
+                let lhs = self.name(table, store.arg)?;
+                self.push(format!("({lhs} := {rhs})"))?;
+                Ok(i + 2)
+            }
+            "SET_ADD"
+                if i + 1 < end && ops[i + 1].name == "POP_TOP" && !self.annotations.is_empty() =>
+            {
+                self.annotation_site()?;
+                Ok(i + 2)
+            }
+            "SWAP" if super::comparisons::is_link(&ops[i..end]) => {
+                self.comparison_chain(ops, i, end, level)
+            }
+            "SWAP"
+                if op.arg == 2
+                    && i + 1 < end
+                    && ops[i + 1].name == "POP_TOP"
+                    && matches!(
+                        self.stack.as_slice(),
+                        [.., Value::Import(_), Value::Member(_)]
+                    ) =>
+            {
+                // A dotted import walks the package before binding its final member.
+                self.pop()?;
+                Ok(i + 2)
+            }
+            "SWAP"
+                if matches!(op.arg, 2 | 3)
+                    && matches!(
+                        ops[i + 1..end].first().map(|op| op.name),
+                        Some(
+                            "STORE_NAME"
+                                | "STORE_FAST"
+                                | "STORE_FAST_STORE_FAST"
+                                | "STORE_GLOBAL"
+                                | "STORE_DEREF"
+                                | "UNPACK_SEQUENCE"
+                                | "UNPACK_EX"
+                        )
+                    ) =>
+            {
+                self.parallel_assignment(ops, i + 1, end, op.arg as usize, false)
+            }
+            "STORE_FAST" | "STORE_FAST_STORE_FAST"
+                if super::operands::local_store_run(&ops[i..end], self.stack.len())
+                    && self.stack.iter().all(|v| matches!(v, Value::Expr(_))) =>
+            {
+                self.parallel_assignment(ops, i, end, self.stack.len(), true)
+            }
+            "KW_NAMES" if i + 1 < end && ops[i + 1].name == "CALL" => {
+                self.constant(op.arg)?;
+                let keys = self.expr()?;
+                self.keyword_call(ops[i + 1].arg, &keys)?;
+                Ok(i + 2)
+            }
+            "UNPACK_SEQUENCE" | "UNPACK_EX" => {
+                let rhs = self.expr()?;
+                let binding = self.binding(ops, i, end)?;
+                self.line(&format!("{} = {rhs}", binding.target))?;
+                self.stack.extend(binding.seed);
+                Ok(binding.next)
+            }
+            "RETURN_GENERATOR" if i + 1 < end && ops[i + 1].name == "POP_TOP" => Ok(i + 2),
+            "GET_AWAITABLE" | "GET_YIELD_FROM_ITER" => self.delegated(ops, i, end),
+            "GET_ITER" | "GET_AITER"
+                if ops
+                    .get(i + 1)
+                    .is_some_and(|next| next.name == "CALL" && next.arg == 0) =>
+            {
+                Ok(i + 1)
+            }
+            "GET_ITER" if self.m.version == serc_bytecode::PythonVersion::Py315 && op.arg == 3 => {
+                self.delegated(ops, i, end)
+            }
+            "GET_AITER" if i + 1 < end && ops[i + 1].name == "GET_ANEXT" => {
+                self.async_loop(ops, i, end, level)
+            }
+            "GET_ITER" | "GET_AITER" if i + 1 < end && ops[i + 1].name == "LOAD_FAST_AND_CLEAR" => {
+                self.comprehension(ops, i + 1, end, level)
+            }
+            "LOAD_FAST_AND_CLEAR" => self.comprehension(ops, i, end, level),
+            "JUMP_BACKWARD" | "JUMP_FORWARD" if self.loop_transfer(ops, i).is_some() => {
+                self.line(self.loop_transfer(ops, i).unwrap())?;
+                Ok(i + 1)
+            }
+            "NOP" | "POP_TOP" | "POP_ITER"
+                if self.stack.is_empty() && self.folded_break(ops, i, end) =>
+            {
+                self.line("break")?;
+                Ok(self.flow.block(i).ops.end)
+            }
+            "POP_TOP" | "POP_ITER"
+                if self.stack.is_empty()
+                    && i + 1 < end
+                    && (self.loop_transfer(ops, i + 1) == Some("break")
+                        || (ops[i + 1].name == "POP_TOP"
+                            && i + 2 < end
+                            && self.loop_transfer(ops, i + 2) == Some("break"))) =>
+            {
+                Ok(i + 1)
+            }
+            "MATCH_SEQUENCE" | "MATCH_MAPPING" | "MATCH_CLASS" => {
+                self.match_cases(ops, i, end, level)
+            }
+            "COPY"
+                if i + 1 < end && matches!(ops[i + 1].name, "MATCH_SEQUENCE" | "MATCH_MAPPING") =>
+            {
+                self.match_cases(ops, i, end, level)
+            }
+            "COPY" if let Some(count) = super::operands::augmented_load(&ops[i..end]) => {
+                self.augmented_store(ops, i + count, count, end, level)
+            }
+            "COPY" if super::value_patterns::header(&ops[..end], i, self.m.version).is_some() => {
+                self.value_cases(ops, i, end, level)
+            }
+            "COPY" if op.arg == 1 => self.boolean(ops, i, end, level),
+            "GET_ITER" if ops.get(i + 1).is_some_and(|next| next.name == "FOR_ITER") => {
+                self.for_loop(ops, i + 1, end, level)
+            }
+            "POP_JUMP_IF_FALSE"
+            | "POP_JUMP_IF_TRUE"
+            | "POP_JUMP_IF_NONE"
+            | "POP_JUMP_IF_NOT_NONE" => self.conditional(ops, i, end, level),
+            "TO_BOOL"
+                if ops.get(i + 1).is_some_and(|op| {
+                    op.name.starts_with("POP_JUMP_IF_") || op.name == "UNARY_NOT"
+                }) =>
+            {
+                Ok(i + 1)
+            }
+            "TO_BOOL" => {
+                // CPython folds double negation to a truth conversion. A
+                // call to bool would introduce a (possibly shadowed) name.
+                let value = self.expr()?;
+                self.push(format!("(not not {value})"))?;
+                Ok(i + 1)
+            }
+            _ => self.step(op).map(|()| i + 1),
+        }
     }
 
     fn boolean(
