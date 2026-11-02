@@ -25,7 +25,7 @@ The [benchmark](BENCHMARKS.md#project-compilation) used 16 CPython workers and
 32 Serc workers for every package on the same 32-vCPU machine.
 
 <p align="center">
-  <img src="docs/assets/benchmarks/project-compilation.svg" width="800" alt="Median compile times for CPython and Serc. Airflow took 324 vs. 79 ms (4.1× faster with Serc), Django 358 vs. 94 ms (3.8×), NumPy 432 vs. 131 ms (3.3×), and Transformers 832 vs. 288 ms (2.9×).">
+  <img src="docs/assets/benchmarks/project-compilation.svg" width="100%" alt="Median compile times for CPython and Serc. Airflow took 324 vs. 79 ms (4.1× faster with Serc), Django 358 vs. 94 ms (3.8×), NumPy 432 vs. 131 ms (3.3×), and Transformers 832 vs. 288 ms (2.9×).">
 </p>
 
 But Serc is also experimental! And so may emit incorrect bytecode in some cases.
