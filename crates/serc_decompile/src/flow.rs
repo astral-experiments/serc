@@ -124,6 +124,10 @@ impl Graph {
         &self.blocks[self.owner[i]]
     }
 
+    pub(super) fn reachable(&self, i: usize) -> bool {
+        self.block(i).height.is_some()
+    }
+
     pub(super) fn jump(&self, i: usize) -> Option<usize> {
         let b = &self.blocks[*self.owner.get(i)?];
         (b.ops.end == i + 1)

@@ -4,6 +4,7 @@ mod comparisons;
 mod comprehensions;
 mod conditionals;
 mod definitions;
+mod elided_tries;
 mod exceptions;
 mod layout;
 mod loops;

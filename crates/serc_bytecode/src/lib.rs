@@ -1,6 +1,8 @@
 //! Target identities, semantic opcodes, and marshal formats shared by serc's compiler and decompiler.
 #[cfg(feature = "read")]
 pub mod instructions;
+#[cfg(feature = "read")]
+pub mod locations;
 pub mod marshal;
 pub mod target;
 

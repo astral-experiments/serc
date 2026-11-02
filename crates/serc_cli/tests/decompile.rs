@@ -674,3 +674,24 @@ class Last: pass
         "result = first.__name__, C.C.__qualname__, C().get(), Last.__name__",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn handlers_survive_an_elided_try_suite() {
+    check_fixture(
+        r"events = []
+try:
+    pass
+except ValueError as error:
+    events.append(str(error))
+except TypeError:
+    events.append(2)
+try:
+    pass
+except:
+    events.append(3)
+events.append(4)
+",
+        "result = events",
+    );
+}
