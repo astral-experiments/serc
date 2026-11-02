@@ -5,6 +5,7 @@ mod verify;
 
 use serc_bytecode::marshal::reader::read;
 use serc_bytecode::{OptimizationLevel, PythonVersion};
+use source::synthetic::Mode::{DeadSuites, LiveGuards, Ordinary};
 use std::fmt;
 
 /// A cache file is invalid, unsupported, or could not be faithfully reconstructed.
@@ -57,7 +58,6 @@ pub fn decompile_pyc(
     // Try explicit pass statements only after the simpler spelling fails.
     let mut saw_nop = true;
     let mut hints: Option<source::synthetic::Hints> = None;
-    use source::synthetic::Mode::{DeadSuites, LiveGuards, Ordinary};
     for (mode, preserve_nops) in [Ordinary, DeadSuites, LiveGuards]
         .into_iter()
         .flat_map(|mode| [(mode, false), (mode, true)])
