@@ -294,3 +294,182 @@ fn discarded_statements_keep_tracing_instructions() {
         "result = f()",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_context_managers_unwind_in_reverse_order() {
+    check_fixture(
+        "def f(outer, middle, inner, work):\n    with outer as a, middle as b, inner:\n        work(a, b)\n    return 42\n",
+        r"
+log = []
+class Manager:
+    def __init__(self, name, suppress=False):
+        self.name, self.suppress = name, suppress
+    def __enter__(self):
+        log.append(('enter', self.name))
+        return self.name
+    def __exit__(self, exc, value, tb):
+        log.append(('exit', self.name, exc.__name__ if exc else None))
+        return self.suppress
+def fail(a, b):
+    log.append((a, b))
+    raise ValueError()
+normal = f(Manager('a'), Manager('b'), Manager('c'), lambda a,b: log.append((a,b)))
+suppressed = f(Manager('a'), Manager('b', True), Manager('c'), fail)
+result = normal, suppressed, log",
+    );
+    check_fixture(
+        "def f(a, b, work):\n    with a, b:\n        return work()\n",
+        "from contextlib import nullcontext, suppress\nresult = f(nullcontext(), nullcontext(), lambda: 17), f(nullcontext(), suppress(ValueError), lambda: int('x'))",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn assignment_targets_are_evaluated_once() {
+    check_fixture(
+        "def update(obj, key, value):\n    obj().attr += value()\n    obj()[key()] *= value()\n    obj()[key():key()] += [value()]\n    del obj().attr\n    del obj()[key()]\n",
+        r"
+log = []
+class Box(list):
+    attr = 10
+box = Box([2,3,4])
+def obj():
+    log.append('obj')
+    return box
+def key():
+    log.append('key')
+    return 1
+def value():
+    log.append('value')
+    return 3
+update(obj,key,value)
+result = list(box), box.attr, log",
+    );
+    check_fixture(
+        "v = 1\ndef outer():\n    x = 2\n    def inner():\n        global v\n        nonlocal x\n        del x, v\n        t = 3\n        del t\n    inner()\n",
+        "outer()\nresult = 'v' in globals()",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn unpacking_targets_preserve_binding_order_and_scope() {
+    check_fixture(
+        "def assign(rows):\n    (first, last), (*span, tail) = rows\n    return first, last, span, tail\ndef loop(rows, emit):\n    for head, (a, *middle, z) in rows:\n        emit((head, a, middle, z))\n",
+        "log = []\nloop([(0, [1, 2, 3, 4]), (5, [6, 7])], log.append)\nresult = assign(((1,2),(3,4,5))), log",
+    );
+    check_fixture(
+        "def comp(rows):\n    a = 'outer'\n    values = {a: b for a, *b in rows if a}\n    return values, a\ndef gen(rows):\n    return (a + b for a, b in rows)\n",
+        "result = comp([(0,1), (2,3,4), (5,)]), list(gen([(1,2), (4,5)]))",
+    );
+    check_fixture(
+        "def manage(cm, log):\n    with cm as (a, *rest):\n        log((a, rest))\nasync def consume(rows, log):\n    async for a, (b, *c) in rows:\n        log((a, b, c))\nasync def manage_async(cm, log):\n    async with cm as (a, b):\n        log((a, b))\n",
+        "import asyncio, contextlib\nlog=[]\nmanage(contextlib.nullcontext((1,2,3)), log.append)\nasync def rows(): yield (1, (2,3,4))\nasyncio.run(consume(rows(), log.append))\nasyncio.run(manage_async(contextlib.nullcontext((4,5)), log.append))\nresult=log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn comprehension_clauses_preserve_iteration_and_filter_order() {
+    check_fixture(
+        "def f(rows, project, select):\n    return [(a, b if b else 0) for a, values in rows if select(a) for b in project(values) if b is None or select(b)]\n",
+        r"
+log = []
+def select(a):
+    log.append(('select', a))
+    return a
+def project(values):
+    log.append(('project', values))
+    return values
+result = f([(0, [9]), (1, [None, 0, 3]), (2, [])], project, select), log",
+    );
+    check_fixture(
+        "def mapping(rows):\n    return {key: item for row in rows if row for key, items in row for item in items if not item}\ndef unique(groups):\n    return {item for group in groups for item in group if item is None}\n",
+        "result = mapping([[], [('a', [1, 0]), ('b', [None])]]), unique([[1,None],[],[None]])",
+    );
+    check_fixture(
+        "def nested(rows):\n    x = 'outer'\n    result = [[x for x in row] for row in rows]\n    return result, x\n",
+        "result = nested([[1,2],[],[3]])",
+    );
+    check_fixture(
+        "def gen(rows, visit):\n    return (visit(b) for a in rows if a for b in a if b)\n",
+        r"
+log = []
+def rows():
+    for row in ([], [0, 4, 5], [6]):
+        log.append(('row', row))
+        yield row
+def visit(value):
+    log.append(('visit', value))
+    return value
+g = gen(rows(), visit)
+before = list(log)
+first = next(g)
+after_first = list(log)
+result = before, first, after_first, list(g), log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn starred_collections_evaluate_elements_in_order() {
+    check_fixture(
+        "def build(f, spread, call):\n    a = [f(1), *spread(2), f(3)]\n    b = {f(4), *spread(5), f(6)}\n    c = (f(7), *spread(8), f(9))\n    d = call(f(10), *spread(11), f(12), token=f(13))\n    return a, b, c, d\n",
+        r"
+log = []
+def f(n):
+    log.append(n)
+    return n
+def spread(n):
+    log.append(n)
+    yield n
+    log.append(-n)
+    yield -n
+result = build(f, spread, lambda *args, **kw: (args, kw)), log",
+    );
+    check_fixture(
+        "def f(x, y):\n    return [*(x(), y()), 1], {*(1, 2), x()}, (3, *y(), (4,5)), [1, 2, 3], {1, 2, 3}, {*{1, 2, 3}, x()}\n",
+        "result = f(lambda: 42, lambda: (0,))",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn unpacking_comprehensions_use_the_target_iteration_order() {
+    check_fixture_on(
+        "def f(rows, maps):\n    return [*row for row in rows if row], {*row for row in rows}, {**m for group in maps for m in group}\ndef gen(rows):\n    return (*row for row in rows if row)\n",
+        "result = f([[1,2], [], [3,2]], [[{'a':1}, {'b':2}], [{'a':3}]]), list(gen([[], [4,5], [6]]))",
+        &[serc::PythonVersion::Py315],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn consecutive_managers_keep_separate_exception_paths() {
+    check_fixture(
+        "def run(manager, emit):\n    with manager(1) as a, manager(2) as b:\n        emit(a, b)\n    emit('between')\n    with manager(3) as c:\n        emit(c)\n    emit('done')\n    return 17\n",
+        r"
+def scenario(fail, suppress):
+    events = []
+    class Manager:
+        def __init__(self, n):
+            self.n = n
+        def __enter__(self):
+            events.append(('enter', self.n))
+            return self.n
+        def __exit__(self, typ, value, tb):
+            events.append(('exit', self.n, typ.__name__ if typ else None))
+            return self.n == suppress
+    def emit(*values):
+        events.append(values)
+        if values[0] == fail:
+            raise ValueError()
+    try:
+        value = run(Manager, emit)
+    except ValueError:
+        value = 'raised'
+    return value, events
+result = [scenario(*args) for args in [(0,0), (1,0), (1,1), (3,3), ('between',3)]]",
+    );
+}

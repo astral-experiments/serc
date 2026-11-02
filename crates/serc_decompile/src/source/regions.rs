@@ -2,7 +2,7 @@
 //! stack; values that survive a join must be expressible as a Python expression.
 use std::fmt::Write as _;
 
-use super::{Body, Instruction, Value};
+use super::{Body, Instruction, Object, Value};
 
 pub(super) struct Fragment {
     lines: String,
@@ -20,6 +20,13 @@ impl Fragment {
             Err("region is not a single expression".into())
         }
     }
+    pub(super) fn key_value(mut self) -> Result<(String, String), String> {
+        let Some(Value::Expr(value)) = self.stack.pop() else {
+            return Err("missing comprehension value".into());
+        };
+        Ok((self.expression()?, value))
+    }
+
     pub(super) fn pending_return(mut self) -> Result<(String, bool), String> {
         match self.stack.pop() {
             None => Ok((self.lines, false)),
@@ -110,6 +117,22 @@ impl Body<'_, '_, '_> {
         while i < end {
             let op = ops[i];
             let next = match op.name {
+                // CPython builds a constant set display by updating an empty
+                // set from a frozenset constant. Its elements belong directly
+                // in the display, including when that display is itself starred.
+                "BUILD_SET"
+                    if op.arg == 0
+                        && let [constant, update, ..] = &ops[i + 1..end]
+                        && constant.name == "LOAD_CONST"
+                        && (update.name, update.arg) == ("SET_UPDATE", 1)
+                        && matches!(
+                            self.m.objects[self.item(self.code.constants, constant.arg)?],
+                            Object::FrozenSet(_)
+                        ) =>
+                {
+                    self.constant(constant.arg)?;
+                    Ok(i + 3)
+                }
                 "CALL_INTRINSIC_1"
                     if op.arg
                         == serc_bytecode::target::operands::UnaryIntrinsic::IMPORT_STAR
@@ -166,7 +189,13 @@ impl Body<'_, '_, '_> {
                     self.keyword_call(ops[i + 1].arg, &keys)?;
                     Ok(i + 2)
                 }
-                "UNPACK_SEQUENCE" => self.unpack_names(ops, i, end),
+                "UNPACK_SEQUENCE" | "UNPACK_EX" => {
+                    let rhs = self.expr()?;
+                    let binding = self.binding(ops, i, end)?;
+                    self.line(&format!("{} = {rhs}", binding.target))?;
+                    self.stack.extend(binding.seed);
+                    Ok(binding.next)
+                }
                 "RETURN_GENERATOR" if i + 1 < end && ops[i + 1].name == "POP_TOP" => Ok(i + 2),
                 "GET_AWAITABLE" | "GET_YIELD_FROM_ITER" => self.delegated(ops, i, end),
                 "GET_ITER"
@@ -210,6 +239,9 @@ impl Body<'_, '_, '_> {
                         && matches!(ops[i + 1].name, "MATCH_SEQUENCE" | "MATCH_MAPPING") =>
                 {
                     self.match_cases(ops, i, end, level)
+                }
+                "COPY" if let Some(count) = super::operands::augmented_load(&ops[i..end]) => {
+                    self.augmented_store(ops, i + count, count, end, level)
                 }
                 "COPY" if op.arg == 1 => self.boolean(ops, i, end, level),
                 "GET_ITER" if ops.get(i + 1).is_some_and(|next| next.name == "FOR_ITER") => {
@@ -297,13 +329,7 @@ impl Body<'_, '_, '_> {
         {
             return Err("unsupported for-loop exit".into());
         }
-        let store = ops[header + 1];
-        let table = match store.name {
-            "STORE_NAME" => self.code.names,
-            "STORE_FAST" => self.code.locals,
-            _ => return Err("unsupported for-loop binding".into()),
-        };
-        let name = self.name(table, store.arg)?.to_owned();
+        let binding = self.binding(ops, header + 1, exit - 1)?;
         let iterable = self.expr()?;
         let after_cleanup = exit
             + 1
@@ -312,7 +338,7 @@ impl Body<'_, '_, '_> {
                     .is_some_and(|op| matches!(op.name, "POP_ITER" | "POP_TOP")),
             );
         let mut after_else = None;
-        for index in header + 2..exit - 1 {
+        for index in binding.next..exit - 1 {
             if ops[index].name == "JUMP_FORWARD" {
                 let dest = destination(ops, index)?;
                 if dest >= after_cleanup && dest <= end {
@@ -324,9 +350,11 @@ impl Body<'_, '_, '_> {
             }
         }
         let outer = self.loop_edges.replace((header, after_else));
-        let suite = self.fragment(ops, header + 2, exit - 1, level)?.suite()?;
+        let suite = self
+            .seeded(ops, binding.next, exit - 1, level, binding.seed)?
+            .suite()?;
         self.loop_edges = outer;
-        self.block(&format!("for {name} in {iterable}:"), &suite)?;
+        self.block(&format!("for {} in {iterable}:", binding.target), &suite)?;
         if let Some(after) = after_else
             && after > after_cleanup
         {

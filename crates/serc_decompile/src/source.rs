@@ -1,4 +1,5 @@
 mod annotations;
+mod comprehensions;
 mod definitions;
 mod exceptions;
 mod operands;
@@ -154,16 +155,22 @@ fn recover_scope(
     if body.suspended() {
         body.suspension_scope(&bc)
     } else if bc.ops.iter().any(|op| op.name == "LOAD_FAST_AND_CLEAR")
-        && bc
-            .ops
-            .iter()
-            .any(|op| matches!(op.name, "LIST_APPEND" | "SET_ADD" | "MAP_ADD"))
+        && bc.ops.iter().any(comprehensions::is_collection_insert)
     {
-        let stop = bc
+        // Nested comprehensions can place the inner unwind code before the
+        // outer handler. The normal path ends at the first cleanup after a return.
+        let mut handlers = bc
             .handlers
-            .first()
-            .and_then(|h| bc.ops.binary_search_by_key(&h.target, |op| op.offset).ok())
-            .unwrap_or(bc.ops.len());
+            .iter()
+            .filter_map(|h| bc.ops.binary_search_by_key(&h.target, |op| op.offset).ok());
+        let first = handlers.next().unwrap_or(bc.ops.len());
+        let stop = handlers
+            .filter(|&i| {
+                i > 0
+                    && matches!(bc.ops[i - 1].name, "RETURN_VALUE" | "RETURN_CONST")
+                    && (bc.ops[i].name, bc.ops[i].arg) == ("SWAP", 2)
+            })
+            .fold(first, usize::min);
         body.region(&bc.ops, 0, stop, 0)
     } else if bc.handlers.is_empty() {
         body.region(&bc.ops, 0, bc.ops.len(), 0)
@@ -447,6 +454,23 @@ impl Body<'_, '_, '_> {
                 let attr = self.name(self.code.names, a >> 1)?;
                 self.load_callable(format!("({obj}).{attr}"), a & 1 != 0)?;
             }
+            "DELETE_NAME" | "DELETE_GLOBAL" | "DELETE_FAST" | "DELETE_DEREF" => {
+                let table = if matches!(op.name, "DELETE_NAME" | "DELETE_GLOBAL") {
+                    self.code.names
+                } else {
+                    self.code.locals
+                };
+                self.line(&format!("del {}", self.name(table, a)?))?;
+            }
+            "DELETE_ATTR" => {
+                let obj = self.expr()?;
+                self.line(&format!("del ({obj}).{}", self.name(self.code.names, a)?))?;
+            }
+            "DELETE_SUBSCR" => {
+                let index = self.index()?;
+                let obj = self.expr()?;
+                self.line(&format!("del ({obj})[{index}]"))?;
+            }
             "STORE_NAME" | "STORE_FAST" | "STORE_DEREF" | "STORE_GLOBAL" => {
                 let tuple = if matches!(op.name, "STORE_NAME" | "STORE_GLOBAL") {
                     self.code.names
@@ -485,7 +509,7 @@ impl Body<'_, '_, '_> {
                     .ok_or("expected argument list")?;
                 self.push(format!("({elements},)"))?;
             }
-            "LIST_EXTEND" | "SET_UPDATE" => self.extend_literal(op)?,
+            "LIST_EXTEND" | "SET_UPDATE" | "LIST_APPEND" | "SET_ADD" => self.update_literal(op)?,
             "STORE_ATTR" | "STORE_SUBSCR" | "STORE_SLICE" | "BINARY_SLICE" | "BUILD_SLICE" => {
                 self.subscript_or_attribute(op)?;
             }
