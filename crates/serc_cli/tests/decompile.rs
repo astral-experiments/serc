@@ -531,3 +531,18 @@ class Derived(Base, metaclass=type):
         "result = events, Derived.__base__.__name__",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn complex_constants_and_multidimensional_slices() {
+    check_fixture(
+        r"values = (12.25j, -3j, 2+3j, -0j, 2-0j, 1e999, -1e999, 1e999j)
+class Echo:
+    def __getitem__(self, key):
+        return key
+def keys(x, n):
+    return x[3, 1:4], x[n:, :n:2], x[n:,], x[:,]
+",
+        "result = repr(values), keys(Echo(), 2)",
+    );
+}

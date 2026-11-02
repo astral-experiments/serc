@@ -308,15 +308,33 @@ impl Body<'_, '_, '_> {
 
     fn constant(&mut self, arg: u32) -> Result<(), String> {
         let id = self.item(self.code.constants, arg)?;
-        if matches!(self.m.objects[id], Object::Code(_)) {
-            self.stack.push(Value::Code(id));
-            Ok(())
-        } else if let Object::Slice(ids) = self.m.objects[id] {
-            operands::constant_slice(self, ids)
-        } else {
-            let text = literal(self.m, id, 0, &mut self.work.budget)?;
-            self.push(text)
+        match &self.m.objects[id] {
+            Object::Code(_) => self.stack.push(Value::Code(id)),
+            Object::Slice(ids) => {
+                let text = operands::constant_slice(self, *ids)?;
+                self.stack.push(Value::Slice(text));
+            }
+            Object::Tuple(items)
+                if items
+                    .iter()
+                    .any(|&i| matches!(self.m.objects[i], Object::Slice(_))) =>
+            {
+                let mut parts = Vec::new();
+                for &item in items {
+                    parts.push(if let Object::Slice(ids) = self.m.objects[item] {
+                        operands::constant_slice(self, ids)?
+                    } else {
+                        literal(self.m, item, 0, &mut self.work.budget)?
+                    });
+                }
+                self.push_slice_tuple(&parts)?;
+            }
+            _ => {
+                let text = literal(self.m, id, 0, &mut self.work.budget)?;
+                self.push(text)?;
+            }
         }
+        Ok(())
     }
 
     fn call(&mut self, argc: u32, keys: &[String]) -> Result<(), String> {
@@ -624,6 +642,24 @@ impl Body<'_, '_, '_> {
                 let fields = self.interpolations(a)?;
                 self.stack.push(Value::Interpolations(fields));
             }
+            "BUILD_TUPLE"
+                if self
+                    .stack
+                    .get(self.stack.len().saturating_sub(a as usize)..)
+                    .is_some_and(|items| {
+                        items.iter().any(|item| matches!(item, Value::Slice(_)))
+                    }) =>
+            {
+                if a as usize > self.stack.len() {
+                    return Err("too few tuple operands".into());
+                }
+                let mut items = Vec::new();
+                for _ in 0..a {
+                    items.push(self.index()?);
+                }
+                items.reverse();
+                self.push_slice_tuple(&items)?;
+            }
             "BUILD_LIST" | "BUILD_TUPLE" | "BUILD_SET" => {
                 let args = self.args(a)?.join(", ");
                 let expr = match op.name {
@@ -692,6 +728,37 @@ fn identifier(name: &str) -> Result<&str, String> {
     Ok(name)
 }
 
+fn float_literal(value: f64) -> Result<String, String> {
+    if value.is_nan() {
+        return Err("unsupported NaN literal".into());
+    }
+    Ok(if value == f64::INFINITY {
+        "1e309".into()
+    } else if value == f64::NEG_INFINITY {
+        "-1e309".into()
+    } else {
+        format!("{value:?}")
+    })
+}
+
+fn complex_literal(real: f64, imag: f64) -> Result<String, String> {
+    let magnitude = float_literal(imag.abs())?;
+    if real.to_bits() == 0 && imag.is_sign_positive() {
+        return Ok(format!("{magnitude}j"));
+    }
+    // A negated imaginary literal has a negative real zero. Preserve both
+    // signs even when the imaginary component is itself zero.
+    if real.to_bits() == (-0.0_f64).to_bits() {
+        return Ok(if imag.is_sign_negative() {
+            format!("(-{magnitude}j)")
+        } else {
+            format!("(-(0.0 - {magnitude}j))")
+        });
+    }
+    let sign = if imag.is_sign_negative() { "-" } else { "+" };
+    Ok(format!("({} {sign} {magnitude}j)", float_literal(real)?))
+}
+
 fn literal(m: &Module<'_>, id: Id, depth: usize, work: &mut usize) -> Result<String, String> {
     if depth > 32 || *work == 0 {
         return Err("constant expansion limit exceeded".into());
@@ -702,8 +769,9 @@ fn literal(m: &Module<'_>, id: Id, depth: usize, work: &mut usize) -> Result<Str
         Object::Bool(v) => if *v { "True" } else { "False" }.into(),
         Object::Ellipsis => "...".into(),
         Object::Int(i) => i.to_string(),
-        Object::Float(bits) if f64::from_bits(*bits).is_finite() => {
-            format!("{:?}", f64::from_bits(*bits))
+        Object::Float(bits) => float_literal(f64::from_bits(*bits))?,
+        Object::Complex(real, imag) => {
+            complex_literal(f64::from_bits(*real), f64::from_bits(*imag))?
         }
         Object::Bytes(bytes) => {
             if bytes.len() > MAX_SOURCE / 4 {
