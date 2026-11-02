@@ -9,6 +9,7 @@ mod patterns;
 mod regions;
 mod strings;
 mod suspension;
+mod type_params;
 use definitions::{Definition, Import};
 
 use ruff_python_ast::str::TripleQuotes;
@@ -210,6 +211,8 @@ enum Value {
     Function(Definition),
     BuildClass,
     Class(Definition, Vec<String>),
+    TypeAlias(Definition),
+    TypeParams(Vec<String>),
     Import(Import),
     Member(String),
 }
@@ -409,6 +412,7 @@ impl Body<'_, '_, '_> {
                 self.line(&format!("{name} {operator}= {rhs}"))
             }
             Value::Function(def) => self.definition(name, &def),
+            Value::TypeAlias(def) => self.alias_definition(name, &def),
             Value::Class(def, bases) => self.class_definition(name, &def, &bases),
             Value::Import(import) => self.line(&import.statement(name)?),
             Value::Member(member) => {

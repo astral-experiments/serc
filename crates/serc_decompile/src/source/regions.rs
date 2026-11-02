@@ -130,6 +130,15 @@ impl Body<'_, '_, '_> {
                     self.constant(constant.arg)?;
                     Ok(i + 3)
                 }
+                "BUILD_TUPLE"
+                    if op.arg == 3
+                        && ops[i + 1..end]
+                            .first()
+                            .is_some_and(super::type_params::is_alias_intrinsic) =>
+                {
+                    self.make_alias()?;
+                    Ok(i + 2)
+                }
                 "CALL_INTRINSIC_1"
                     if op.arg
                         == serc_bytecode::target::operands::UnaryIntrinsic::IMPORT_STAR

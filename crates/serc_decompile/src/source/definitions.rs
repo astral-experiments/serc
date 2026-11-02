@@ -13,7 +13,7 @@ pub(super) struct Definition {
     keywords: Vec<(String, String)>,
     decorators: Vec<String>,
     annotations: Vec<(String, String)>,
-    type_params: Vec<String>,
+    pub(super) type_params: Vec<String>,
 }
 
 pub(super) fn string_value(text: &str) -> Result<String, String> {
@@ -289,9 +289,9 @@ impl Body<'_, '_, '_> {
                     .text(self.m.code(id)?.name)?
                     .starts_with("<generic parameters of ")
             {
-                let def = self.generic(id)?;
+                let definition = self.generic(id)?;
                 self.stack.truncate(slot);
-                return Ok(Some(Value::Function(def)));
+                return Ok(Some(definition));
             }
             if matches!(
                 &self.stack[slot..],
@@ -505,23 +505,7 @@ impl Body<'_, '_, '_> {
     }
 
     fn lazy_annotations(&mut self, id: Id) -> Result<Vec<(String, String)>, String> {
-        let (mut body, bc) = self.wrapper(id)?;
-        let branch = bc
-            .ops
-            .iter()
-            .find(|op| op.name == "POP_JUMP_IF_FALSE")
-            .and_then(|op| op.jump)
-            .ok_or("unsupported annotation guard")?;
-        let start = bc
-            .ops
-            .binary_search_by_key(&branch, |op| op.offset)
-            .map_err(|_| "invalid annotation target")?;
-        let end = bc.ops.len() - 1;
-        if bc.ops[end].name != "RETURN_VALUE" {
-            return Err("unsupported annotation result".into());
-        }
-        body.region(&bc.ops, start, end, 0)?;
-        let result = body.expr()?;
+        let result = self.lazy_value(id, false)?;
         let parsed = ruff_python_parser::parse_expression(&result).map_err(|e| e.to_string())?;
         let Expr::Dict(map) = parsed.expr() else {
             return Err("expected annotation map".into());
@@ -535,45 +519,5 @@ impl Body<'_, '_, '_> {
                 Ok((key.value.to_str().to_owned(), render(&item.value)))
             })
             .collect()
-    }
-
-    fn generic(&mut self, id: Id) -> Result<Definition, String> {
-        use serc_bytecode::target::operands::UnaryIntrinsic;
-        let (mut body, bc) = self.wrapper(id)?;
-        let tuple = bc
-            .ops
-            .iter()
-            .position(|op| op.name == "BUILD_TUPLE")
-            .ok_or("unsupported type parameter tuple")?;
-        let mut params = Vec::new();
-        for pair in bc.ops[..tuple].windows(2) {
-            if pair[0].name == "LOAD_CONST" && pair[1].name == "CALL_INTRINSIC_1" {
-                let name = identifier(body.m.text(body.item(body.code.constants, pair[0].arg)?)?)?;
-                let prefix = if pair[1].arg == UnaryIntrinsic::TYPEVAR.argument() {
-                    ""
-                } else if pair[1].arg == UnaryIntrinsic::PARAMSPEC.argument() {
-                    "**"
-                } else if pair[1].arg == UnaryIntrinsic::TYPEVARTUPLE.argument() {
-                    "*"
-                } else {
-                    return Err("unsupported type parameter bound".into());
-                };
-                params.push(format!("{prefix}{name}"));
-            }
-        }
-        if params.len() != bc.ops[tuple].arg as usize {
-            return Err("unsupported generic parameter layout".into());
-        }
-        let swap = bc
-            .ops
-            .iter()
-            .rposition(|op| op.name == "SWAP")
-            .ok_or("unsupported generic result")?;
-        body.region(&bc.ops, tuple + 1, swap, 0)?;
-        let Value::Function(mut def) = body.pop()? else {
-            return Err("expected generic function".into());
-        };
-        def.type_params = params;
-        Ok(def)
     }
 }

@@ -546,3 +546,22 @@ def keys(x, n):
         "result = repr(values), keys(Echo(), 2)",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn lazy_type_aliases_and_bounds() {
+    check_fixture(
+        r"type Empty = None
+type Forward = Later
+type Pair[T: (str, bytes), U: T] = tuple[T, U]
+class Later:
+    type Element = int
+",
+        "result = Forward.__value__.__name__, Pair.__value__.__args__, Later.Element.__value__; result = repr(result)",
+    );
+    check_fixture_on(
+        "type Params[T: int = int, *Ts = *tuple[str, ...]] = T\n",
+        "result = repr(Params.__type_params__[0].__default__)",
+        &common::PYTHON_VERSIONS[1..],
+    );
+}
