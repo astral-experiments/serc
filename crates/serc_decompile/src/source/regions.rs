@@ -4,6 +4,25 @@ use std::fmt::Write as _;
 
 use super::{Body, Instruction, Object, Value};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct ConstantReturn(&'static str, u32);
+
+pub(super) fn constant_return(ops: &[Instruction], end: usize) -> Option<(usize, ConstantReturn)> {
+    let op = ops.get(end.checked_sub(1)?)?;
+    match op.name {
+        "RETURN_CONST" => Some((end - 1, ConstantReturn(op.name, op.arg))),
+        "RETURN_VALUE" => {
+            let load = ops.get(end.checked_sub(2)?)?;
+            matches!(
+                load.name,
+                "LOAD_CONST" | "LOAD_SMALL_INT" | "LOAD_COMMON_CONSTANT"
+            )
+            .then_some((end - 2, ConstantReturn(load.name, load.arg)))
+        }
+        _ => None,
+    }
+}
+
 pub(super) struct Fragment {
     lines: String,
     pub(super) stack: Vec<Value>,
@@ -128,13 +147,17 @@ impl Body<'_, '_, '_> {
             && self.stack.is_empty()
             && self.flow.unprotected_suite(start..end);
         let mut i = start;
+        let mut operand_start = None;
         while i < end {
+            if self.stack.is_empty() {
+                operand_start = Some(i);
+            }
             if partial && self.stack.is_empty() {
                 self.partial_start = i;
                 self.partial_prefix = self.lines.len();
             }
             let op = ops[i];
-            let next = match self.region_step(ops, i, end, level) {
+            let next = match self.region_step(ops, i, end, level, operand_start) {
                 Ok(next) => next,
                 Err(reason) if partial => {
                     self.lines.truncate(self.partial_prefix);
@@ -180,11 +203,12 @@ impl Body<'_, '_, '_> {
         i: usize,
         end: usize,
         level: usize,
+        operand_start: Option<usize>,
     ) -> Result<usize, String> {
         if let Some(handler) = self.handlers.remove(&i) {
             // The protected fragment re-enters this same instruction. Leave other
             // entries available, including nested tries in the exception suite.
-            let result = self.suspended_handler(ops, i, end, level, &handler);
+            let result = self.protected_region(ops, i, end, level, &handler);
             self.handlers.insert(i, handler);
             if let Some(next) = result? {
                 return Ok(next);
@@ -287,7 +311,7 @@ impl Body<'_, '_, '_> {
                 Ok(i + 2)
             }
             "SWAP" if super::comparisons::is_link(&ops[i..end]) => {
-                self.comparison_chain(ops, i, end, level)
+                self.comparison_chain(ops, i, end, level, operand_start)
             }
             "SWAP"
                 if op.arg == 2
@@ -387,7 +411,7 @@ impl Body<'_, '_, '_> {
             "POP_JUMP_IF_FALSE"
             | "POP_JUMP_IF_TRUE"
             | "POP_JUMP_IF_NONE"
-            | "POP_JUMP_IF_NOT_NONE" => self.conditional(ops, i, end, level),
+            | "POP_JUMP_IF_NOT_NONE" => self.conditional(ops, i, end, level, operand_start),
             "TO_BOOL"
                 if ops.get(i + 1).is_some_and(|op| {
                     op.name.starts_with("POP_JUMP_IF_") || op.name == "UNARY_NOT"

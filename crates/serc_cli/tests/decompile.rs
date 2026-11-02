@@ -285,6 +285,121 @@ fn formatted_displays_remain_interpolations() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_backedge_retests_the_owning_while_condition() {
+    check_fixture(
+        r"def wake(waiters):
+    while waiters:
+        waiter = waiters.popleft()
+        if not waiter.done():
+            waiter.set_result(None)
+            break
+",
+        r"from collections import deque
+result = []
+class Waiter:
+    def __init__(self, value):
+        self.value = value
+        self.checked = False
+    def done(self):
+        assert not self.checked, 'retested the previous waiter'
+        self.checked = True
+        result.append(self.value)
+        return self.value
+    def set_result(self, value): result.append('woke')
+for values in ([], [True, True], [True, False, False]):
+    waiters = deque(map(Waiter, values))
+    wake(waiters)
+    result.append(len(waiters))
+assert result == [0, True, True, 0, True, False, 'woke', 1]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn while_predicate_can_span_the_inlined_any_call() {
+    check_fixture_on(
+        r"def drain(rows):
+    while any(row for row in rows):
+        for row in rows:
+            if row:
+                row.pop()
+    return rows
+",
+        "result = [drain([]), drain([[1, 2], [], [3]])]",
+        &[serc::PythonVersion::Py314, serc::PythonVersion::Py315],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn copied_while_conditions_can_suspend_or_receive_a_continue() {
+    check_fixture(
+        r"def poll(check, events):
+    while (yield from check()):
+        events.append('ok')
+
+def drain(values, events):
+    while values:
+        if values.pop():
+            continue
+        events.append('zero')
+",
+        r"result = []
+answers = iter([True, True, False])
+def check():
+    yield 'poll'
+    return next(answers)
+result += list(poll(check, result))
+drain([0, 1, 0], result)
+assert result == ['ok', 'ok', 'poll', 'poll', 'poll', 'zero', 'zero']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn conditional_none_value_is_distinct_from_a_guard_return() {
+    check_fixture(
+        r"def keep(reset, value):
+    return None if reset else value
+",
+        "result = [keep(True, 1), keep(False, 2)]",
+    );
+    check_fixture_on(
+        "def pair(a, b):\n    return None if a is None else (a, b)\n",
+        "result = [pair(None, 2), pair(1, 2)]",
+        &[serc::PythonVersion::Py312, serc::PythonVersion::Py313],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn conditional_guards_keep_distinct_function_exits() {
+    check_fixture(
+        r"def emit(ready, allowed, events):
+    if ready and allowed():
+        events.append('done')
+
+def guard(skip, ready, events):
+    if skip:
+        return
+    if ready:
+        events.append('ran')
+",
+        r"result = []
+def check():
+    result.append('checked')
+    return True
+emit(False, check, result)
+emit(True, check, result)
+guard(True, True, result)
+guard(False, False, result)
+guard(False, True, result)
+assert result == ['checked', 'done', 'ran']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn nested_conditional_arms_share_the_outer_jump() {
     check_fixture(
         "def limits(high, low, call):\n    if high is None:\n        if low is None:\n            hi = call(1)\n        else:\n            lo = low\n            hi = call(4) * lo\n    else:\n        hi = high\n    return hi + call(2)\n",
@@ -1029,6 +1144,55 @@ for run in (value, constant, resume):
 assert result == ['cleanup', 42, 'cleanup', 'cancelled',
                   'cleanup', True, 'cleanup', 'cancelled',
                   'cleanup', 'resumed', None, 'cleanup', 'cancelled']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn guarded_tries_keep_handlers_in_their_original_branches() {
+    check_fixture(
+        r"def hooks(first, second):
+    if first:
+        try:
+            first()
+        except ValueError:
+            pass
+    if second:
+        try:
+            second()
+        except ValueError:
+            pass
+",
+        r"result = []
+def fail():
+    result.append(1)
+    raise ValueError
+def other(): raise KeyError
+hooks(fail, lambda: result.append(2))
+hooks(None, fail)
+try: hooks(other, lambda: result.append('skipped'))
+except KeyError: result.append(3)
+assert result == [1, 2, 1, 3]",
+    );
+    check_fixture(
+        r"def read(hook, ready, work, finish):
+    try:
+        if hook:
+            hook()
+        while ready():
+            work()
+        return ready()
+    finally:
+        finish()
+",
+        r"result = []
+def work(): result.append('work')
+def done(): result.append('finished')
+def fail(): raise ValueError
+assert read(None, lambda: not result, work, done) is False
+try: read(fail, lambda: True, work, done)
+except ValueError: result.append('raised')
+assert result == ['work', 'finished', 'finished', 'raised']",
     );
 }
 

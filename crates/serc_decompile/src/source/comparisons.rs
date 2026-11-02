@@ -57,6 +57,7 @@ impl Body<'_, '_, '_> {
         first: usize,
         end: usize,
         level: usize,
+        header: Option<usize>,
     ) -> Result<usize, String> {
         let ops = &ops[..end];
         let (branch, value) = guard(ops, first).ok_or("unsupported comparison guard")?;
@@ -107,7 +108,7 @@ impl Body<'_, '_, '_> {
                 return Ok(join);
             }
 
-            return self.comparison_predicate(ops, operand, cleanup, chain, level);
+            return self.comparison_predicate(ops, header, operand, cleanup, chain, level);
         }
     }
 
@@ -151,6 +152,7 @@ impl Body<'_, '_, '_> {
     fn comparison_predicate(
         &mut self,
         ops: &[Instruction],
+        header: Option<usize>,
         operand: usize,
         cleanup: usize,
         mut chain: String,
@@ -193,6 +195,7 @@ impl Body<'_, '_, '_> {
             return Err("comparison failures have different destinations".into());
         }
         let predicate = Predicate {
+            header,
             value: chain,
             fallthrough_true,
             branch,

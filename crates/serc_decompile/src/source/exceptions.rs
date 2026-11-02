@@ -71,6 +71,16 @@ impl Body<'_, '_, '_> {
         handlers: &[Handler],
         limit: usize,
     ) -> Result<(), String> {
+        if handlers.len() == bc.handlers.len()
+            && let Some(regions) = super::protected_regions::guarded(bc, &self.flow)
+        {
+            let end = self.flow.normal_end();
+            self.handlers = regions;
+            if self.depth > 0 && !self.class {
+                self.index_terminal_returns(&bc.ops[..end], None);
+            }
+            return self.region(&bc.ops, 0, end, 0);
+        }
         let entry = handlers[0];
         let ops = &bc.ops;
         let index = |offset| boundary(ops, offset);

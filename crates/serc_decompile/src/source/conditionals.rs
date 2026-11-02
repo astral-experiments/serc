@@ -2,6 +2,7 @@ use super::regions::Fragment;
 use super::{Body, Instruction};
 
 pub(super) struct Predicate {
+    pub(super) header: Option<usize>,
     pub(super) value: String,
     pub(super) fallthrough_true: bool,
     pub(super) branch: usize,
@@ -20,6 +21,53 @@ impl Predicate {
 }
 
 impl Body<'_, '_, '_> {
+    /// CPython may give each short-circuit edge a distinct copy of the same
+    /// implicit function exit. Only a suffix of unprotected, empty-stack
+    /// return blocks is interchangeable with falling off the end of the def.
+    /// A generator can have its implicit `StopIteration` handler on those exits.
+    pub(super) fn index_terminal_returns(
+        &mut self,
+        ops: &[Instruction],
+        stop_handler: Option<usize>,
+    ) {
+        let mut start = ops.len();
+        while start > 0 {
+            let block = self.flow.block(start - 1);
+            if block.height != Some(0)
+                || self
+                    .flow
+                    .handler(block.ops.start)
+                    .is_some_and(|h| !(Some(h.target) == stop_handler && h.depth == 0 && h.lasti))
+                || !self.none_return(&ops[block.ops.clone()])
+            {
+                break;
+            }
+            start = block.ops.start;
+        }
+        self.terminal_returns = start..ops.len();
+    }
+
+    fn none_return(&self, ops: &[Instruction]) -> bool {
+        let load = match ops {
+            [ret] if ret.name == "RETURN_CONST" => ret,
+            // On targets with RETURN_CONST, a separate load and return
+            // can be the None arm of a conditional expression.
+            [load, ret]
+                if ret.name == "RETURN_VALUE" && self.m.version >= super::PythonVersion::Py314 =>
+            {
+                load
+            }
+            _ => return false,
+        };
+        match load.name {
+            "LOAD_CONST" | "RETURN_CONST" => self
+                .item(self.code.constants, load.arg)
+                .is_ok_and(|id| matches!(self.m.objects[id], super::Object::None)),
+            "LOAD_COMMON_CONSTANT" => load.arg == super::CommonConstant::NONE.argument(),
+            _ => false,
+        }
+    }
+
     /// Fold consecutive predicate blocks that share a true or false successor.
     /// A and B only compose when short-circuiting A reaches the same successor
     /// as one outcome of B. Keep the physical fallthrough for suite recovery.
@@ -30,6 +78,7 @@ impl Body<'_, '_, '_> {
         value: String,
         end: usize,
         level: usize,
+        header: Option<usize>,
     ) -> Result<Predicate, String> {
         let fall =
             |i: usize| i + 1 + usize::from(ops.get(i + 1).is_some_and(|op| op.name == "NOT_TAKEN"));
@@ -68,13 +117,19 @@ impl Body<'_, '_, '_> {
                 break;
             }
             let (b_yes, b_no) = arms(next, self.flow.target(next)?);
-            let (operator, invert) = if yes == start && no == b_no {
+            let same_exit = |a, b| {
+                a == b
+                    || (end == self.terminal_returns.end
+                        && self.terminal_returns.contains(&a)
+                        && self.terminal_returns.contains(&b))
+            };
+            let (operator, invert) = if yes == start && same_exit(no, b_no) {
                 ("and", false)
-            } else if yes == start && no == b_yes {
+            } else if yes == start && same_exit(no, b_yes) {
                 ("and", true)
-            } else if no == start && yes == b_yes {
+            } else if no == start && same_exit(yes, b_yes) {
                 ("or", false)
-            } else if no == start && yes == b_no {
+            } else if no == start && same_exit(yes, b_no) {
                 ("or", true)
             } else {
                 break;
@@ -97,6 +152,7 @@ impl Body<'_, '_, '_> {
         }
         let start = fall(branch);
         Ok(Predicate {
+            header,
             value,
             branch,
             suite: start,
@@ -111,9 +167,10 @@ impl Body<'_, '_, '_> {
         i: usize,
         end: usize,
         level: usize,
+        header: Option<usize>,
     ) -> Result<usize, String> {
         let value = self.expr()?;
-        let predicate = self.predicate(ops, i, value, end, level)?;
+        let predicate = self.predicate(ops, i, value, end, level, header)?;
         let fallthrough_end = predicate.target;
         self.conditional_suites(ops, &predicate, fallthrough_end, end, level)
     }
@@ -172,8 +229,8 @@ impl Body<'_, '_, '_> {
             self.block(&format!("if {test}:"), &suite)?;
             return Ok(target);
         }
-        if ops[tail].name == "JUMP_BACKWARD" {
-            return self.while_loop(ops, predicate, &test, end, level);
+        if let Some(latch) = self.while_latch(ops, predicate, end) {
+            return self.while_loop(ops, predicate, &latch, end, level);
         }
         if self.flow.join(i) == Some(target) {
             // Both paths reach the taken target. Only the fallthrough path
@@ -217,6 +274,38 @@ impl Body<'_, '_, '_> {
                 ))?;
             }
             return Ok(join);
+        }
+        if self.loop_edges.is_none() && end == self.terminal_returns.end {
+            // A guard can return immediately, leaving the rest of the function
+            // on its other edge. Keep it separate from any branches in the tail.
+            if self.none_return(&ops[start..fallthrough_end])
+                && !self.terminal_returns.contains(&target)
+                // A conditional expression can return an owned alternate
+                // local where a separate return statement borrows it.
+                && !(target + 2 == end && ops[target].name == "LOAD_FAST"
+                    && self.m.version >= super::PythonVersion::Py314)
+            {
+                self.block(&format!("if {test}:"), "return")?;
+                return Ok(target);
+            }
+            // At function exit CPython may duplicate the implicit None return
+            // into both arms. Hoisting an explicit return creates a shared
+            // successor when the input has two distinct terminal blocks.
+            if self.terminal_returns.contains(&target) {
+                let width = self.flow.block(target).ops.len();
+                let copy = fallthrough_end.checked_sub(width).filter(|&n| {
+                    n > start
+                        && self.none_return(&ops[n..fallthrough_end])
+                        && self.flow.block(n).ops.start < n
+                });
+                if copy.is_some() || self.terminal_returns.len() > width {
+                    let suite = self
+                        .fragment(ops, start, copy.unwrap_or(fallthrough_end), level)?
+                        .suite()?;
+                    self.block(&format!("if {test}:"), &suite)?;
+                    return Ok(end);
+                }
+            }
         }
         let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
         if matches!(ops[tail].name, "RETURN_CONST" | "RETURN_VALUE")
