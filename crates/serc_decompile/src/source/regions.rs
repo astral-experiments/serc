@@ -300,8 +300,15 @@ impl Body<'_, '_, '_> {
                 "TO_BOOL"
                     if ops
                         .get(i + 1)
-                        .is_some_and(|op| op.name.starts_with("POP_JUMP_IF_")) =>
+                        .is_some_and(|op| op.name.starts_with("POP_JUMP_IF_") || op.name == "UNARY_NOT") =>
                 {
+                    Ok(i + 1)
+                }
+                "TO_BOOL" => {
+                    // CPython folds double negation to a truth conversion. A
+                    // call to bool would introduce a (possibly shadowed) name.
+                    let value = self.expr()?;
+                    self.push(format!("(not not {value})"))?;
                     Ok(i + 1)
                 }
                 _ => self.step(op).map(|()| i + 1),

@@ -217,6 +217,14 @@ impl Body<'_, '_, '_> {
                 (split_return(&suite), split_return(&other))
             {
                 if left.is_empty() && right.is_empty() {
+                    // The alternate of a conditional expression returns an owned
+                    // local on 3.14+. A borrowed load here belongs to a separate
+                    // return statement.
+                    if target + 2 == end && ops[target].name == "LOAD_FAST_BORROW" {
+                        self.block(&format!("if {test}:"), &suite)?;
+                        self.line(&format!("return {b}"))?;
+                        return Ok(end);
+                    }
                     self.line(&format!("return {a} if {test} else {b}"))?;
                     return Ok(end);
                 }

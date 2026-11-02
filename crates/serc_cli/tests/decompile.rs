@@ -881,3 +881,20 @@ result = assign(obj, key, value), log",
         "class Obj(dict): pass\nobj = Obj()\nresult = assign(obj, lambda: (2, 3)), obj.attr, obj[1]",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn truth_tests_preserve_user_conversions_and_short_circuit_returns() {
+    check_fixture(
+        "def truth(x):\n    return not x, not not x\ndef choose(read, y):\n    if (x := read()) and y: return x\n    return y\n",
+        r"class Flag:
+    def __init__(self, name, truth):
+        self.name, self.truth = name, truth
+    def __bool__(self):
+        log.append(self.name)
+        return self.truth
+log = []
+a, b = Flag('a', False), Flag('b', True)
+result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is a, log",
+    );
+}
