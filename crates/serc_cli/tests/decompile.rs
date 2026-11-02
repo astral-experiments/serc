@@ -829,8 +829,40 @@ fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
     let cache = temp.path().join("module.pyc");
     let recovered = temp.path().join("recovered.py");
     let source = format!(
-        "before = 7\nif before:\n    lost = '{0}'\nelse:\n    wrongly_hoisted()\ndef large():\n    return '{0}'\ndef after(x):\n    return x + before\ndef protected(flag, action, events):\n    if flag: prefix = '{0}'\n    else: wrongly_hoisted()\n    try: action()\n    except KeyError: events.append('caught')\n    tail = '{0}'\n    events.append('after')\n    return 7\n",
-        "x".repeat(200_000)
+        r"before = 7
+if before:
+    lost = '{big}'
+else:
+    wrongly_hoisted()
+def large():
+    return '{big}'
+def after(x):
+    return x + before
+def protected(flag, action, events):
+    if flag: prefix = '{big}'
+    else: wrongly_hoisted()
+    try: action()
+    except KeyError: events.append('caught')
+    tail = '{big}'
+    events.append('after')
+    return 7
+def outer(events):
+    def get(): return x
+    def put(value):
+        nonlocal x
+        x = value
+    events.append((get, put))
+    try:
+        x = '{big}'
+        return 0
+    except Exception:
+        return put
+def unfinished():
+    def kept(): return 3
+    try: return '{big}'
+    except Exception: return kept
+",
+        big = "x".repeat(200_000)
     );
     fs_err::write(&original, source).unwrap();
     for version in common::PYTHON_VERSIONS {
@@ -855,11 +887,28 @@ fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
             2
         );
         assert!(!text.contains("wrongly_hoisted()"));
+        assert!(text.contains("if False: x = None  # serc: synthetic dead code"));
+        assert!(text.contains("def kept():"));
         fs_err::write(&recovered, text).unwrap();
         let checked = common::python_command(version)
             .args([
                 "-c",
-                "import runpy, sys\nscope = runpy.run_path(sys.argv[1])\nassert scope['after'](5) == 12\nevents = []\ndef fail(): raise KeyError\nfor flag, action in [(True, fail), (False, lambda: None)]:\n assert scope['protected'](flag, action, events) == 7\nassert events == ['caught', 'after', 'after']",
+                r"import runpy, sys
+scope = runpy.run_path(sys.argv[1])
+assert scope['after'](5) == 12
+events = []
+def fail(): raise KeyError
+for flag, action in [(True, fail), (False, lambda: None)]:
+    assert scope['protected'](flag, action, events) == 7
+assert events == ['caught', 'after', 'after']
+events.clear()
+scope['outer'](events)
+get, put = events[0]
+try: get()
+except NameError: pass
+else: raise AssertionError('the omitted assignment initialized the cell')
+put(42)
+assert get() == 42",
             ])
             .arg(&recovered)
             .output()

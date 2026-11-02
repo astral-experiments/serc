@@ -507,6 +507,7 @@ impl<'m, 'data> Body<'m, 'data, '_> {
         Ok((
             Body {
                 stubs: super::synthetic::Stubs::new(),
+                omitted_cell_stores: rustc_hash::FxHashSet::default(),
                 m: self.m,
                 code,
                 stack: Vec::new(),

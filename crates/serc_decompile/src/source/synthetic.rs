@@ -321,7 +321,10 @@ impl Body<'_, '_, '_> {
         }
         self.charge(names.len() + ops.len())?;
         let mut written = vec![false; names.len()];
-        for op in ops {
+        for op in ops
+            .iter()
+            .filter(|op| !self.omitted_cell_stores.contains(&op.offset))
+        {
             local_writes(op, |i| {
                 if let Some(slot) = written.get_mut(i) {
                     *slot = true;

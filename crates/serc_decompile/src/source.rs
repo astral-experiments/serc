@@ -138,6 +138,7 @@ fn recover_scope<'m>(
     };
     let mut body = Body {
         stubs,
+        omitted_cell_stores: rustc_hash::FxHashSet::default(),
         m,
         code,
         stack: Vec::new(),
@@ -228,6 +229,7 @@ struct Body<'m, 'data, 'work> {
     stack: Vec<Value>,
     lines: String,
     stubs: synthetic::Stubs<'m>,
+    omitted_cell_stores: rustc_hash::FxHashSet<usize>,
     flow: crate::flow::Graph,
     loop_edges: Option<loops::Loop>,
     depth: usize,

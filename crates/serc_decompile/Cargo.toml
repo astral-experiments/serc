@@ -18,6 +18,7 @@ ruff_python_codegen = { workspace = true }
 ruff_python_literal = { workspace = true }
 ruff_python_parser = { workspace = true }
 ruff_source_file = { workspace = true }
+ruff_text_size = { workspace = true }
 rustc-hash = { workspace = true }
 serc_bytecode = { path = "../serc_bytecode", version = "0.1.9", features = ["read"] }
 stacker = { workspace = true }

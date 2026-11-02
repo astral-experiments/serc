@@ -1,6 +1,8 @@
 //! Recover independent scopes after an unsupported construct interrupts a module.
 use std::fmt::Write;
 
+use ruff_text_size::Ranged;
+
 use super::{Body, Bytecode, MAX_WORK, Module, Object, Recovery, scope, synthetic};
 
 /// Names in diagnostics originate in the input and must fit on one comment line.
@@ -57,18 +59,22 @@ pub(crate) fn partial(m: &Module<'_>, candidate: Option<String>) -> Result<Strin
 
 impl Body<'_, '_, '_> {
     pub(super) fn partial_scope(&mut self, reason: &str, bc: &Bytecode) -> Result<String, String> {
-        // A failed compound statement can leave an incomplete try or decorated
-        // definition in the buffer. Only retain a syntactically complete prefix.
-        if ruff_python_parser::parse_module(&self.lines).is_err() {
-            self.lines.clear();
-        }
         let offset = reason
             .rsplit_once("byte ")
             .and_then(|(_, rest)| rest.split_whitespace().next()?.parse::<usize>().ok());
         let start = offset
             .and_then(|at| bc.ops.binary_search_by_key(&at, |op| op.offset).ok())
             .unwrap_or(0);
+        self.charge(self.lines.len())?;
+        let prefix = complete_prefix(&self.lines);
+        if prefix < self.lines.len() {
+            self.lines.truncate(prefix);
+            // The abandoned statement may already have emitted a cell write
+            // before the instruction that triggered the error.
+            self.remember_cell_stores(&bc.ops[..start])?;
+        }
         self.gap(reason, &bc.ops[start..], true)?;
+        self.lexical_bindings(&bc.ops)?;
         Ok(std::mem::take(&mut self.lines))
     }
 
@@ -109,6 +115,7 @@ impl Body<'_, '_, '_> {
         ops: &[super::Instruction],
         remainder: bool,
     ) -> Result<(), String> {
+        self.remember_cell_stores(ops)?;
         let name = comment(self.m.text(self.code.qualname)?);
         let extent = if remainder {
             "remainder of"
@@ -130,4 +137,38 @@ impl Body<'_, '_, '_> {
         }
         Ok(())
     }
+
+    fn remember_cell_stores(&mut self, ops: &[super::Instruction]) -> Result<(), String> {
+        self.charge(ops.len())?;
+        self.omitted_cell_stores.extend(
+            ops.iter()
+                .filter(|op| matches!(op.name, "STORE_DEREF" | "DELETE_DEREF"))
+                .map(|op| op.offset),
+        );
+        Ok(())
+    }
+}
+
+/// A failed handler can leave a dangling `try` after complete definitions.
+/// Keep the original slices, including comments marking any synthetic suites.
+fn complete_prefix(source: &str) -> usize {
+    let parsed =
+        ruff_python_parser::parse_unchecked_source(source, ruff_python_ast::PySourceType::Python);
+    let Some(error) = parsed.errors().first() else {
+        return source.len();
+    };
+    let statements = parsed.suite();
+    let mut end = 0;
+    for (i, stmt) in statements.iter().enumerate() {
+        let next = statements
+            .get(i + 1)
+            .map_or(source.len(), |s| s.start().to_usize());
+        if stmt.end() > error.location.start()
+            || ruff_python_parser::parse_module(&source[end..next]).is_err()
+        {
+            break;
+        }
+        end = next;
+    }
+    end
 }
