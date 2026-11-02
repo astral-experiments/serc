@@ -190,7 +190,17 @@ impl Body<'_, '_, '_> {
         if ops[tail].name == "JUMP_FORWARD" {
             // With a returning or looping arm there may be no common forward
             // postdominator. The other arm still jumps over its alternate.
-            let join = self.flow.target(tail)?;
+            let destination = self.flow.target(tail)?;
+            // CPython can send both arms of a nested conditional directly
+            // to the enclosing join. The caller owns the jump at `end`.
+            let join = if destination > end
+                && ops.get(end).is_some_and(|op| op.name == "JUMP_FORWARD")
+                && self.flow.jump(end) == Some(destination)
+            {
+                end
+            } else {
+                destination
+            };
             if join <= target || join > end {
                 return Err("unsupported conditional join".into());
             }

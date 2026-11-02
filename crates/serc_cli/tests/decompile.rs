@@ -281,6 +281,15 @@ fn formatted_displays_remain_interpolations() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn nested_conditional_arms_share_the_outer_jump() {
+    check_fixture(
+        "def limits(high, low, call):\n    if high is None:\n        if low is None:\n            hi = call(1)\n        else:\n            lo = low\n            hi = call(4) * lo\n    else:\n        hi = high\n    return hi + call(2)\n",
+        "log = []\ndef observed(x): log.append(x); return x\nresult = [limits(h, l, observed) for h, l in [(None, None), (None, 3), (8, None), (8, 3)]], log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn private_declarations_keep_their_unmangled_names() {
     check_output(
         "class _Outer:\n    def __method(self, x):\n        def __local(): return x\n        return __local\n    class __Inner:\n        def __method(self): return 7\n    type __Alias = int\n",
