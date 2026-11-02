@@ -460,6 +460,32 @@ result = build(f, spread, lambda *args, **kw: (args, kw)), log",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn raising_handlers_end_before_exception_name_cleanup() {
+    check_output(
+        r"def named(action):
+    try: action()
+    except ValueError as error:
+        raise RuntimeError('wrapped') from error
+    return 42
+def unnamed(action):
+    try: action()
+    except ValueError: raise
+    return 43
+",
+        r"def value(): raise ValueError('v')
+def key(): raise KeyError('k')
+result = []
+for f in [named, unnamed]:
+    for action in [lambda: None, value, key]:
+        try: result.append(f(action))
+        except Exception as exc: result.append((type(exc).__name__, repr(exc.__cause__)))",
+        &common::PYTHON_VERSIONS,
+        |source| assert!(!source.starts_with("# serc: best-effort"), "{source}"),
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn incremental_dictionaries_preserve_order_across_chunks() {
     // CPython inserts 16- and 17-pair runs individually. Larger displays
     // merge multiple such runs, and unpackings can also split a run.

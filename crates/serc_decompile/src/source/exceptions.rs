@@ -82,7 +82,17 @@ impl Body<'_, '_, '_> {
         }
         self.region(ops, 0, start, 0)?;
         let (suite, returns) = self.fragment(ops, start, end, 0)?.pending_return()?;
-        self.block("try:", &suite)?;
+        // A one-line try suite can omit the tracing NOP before its first
+        // protected instruction. The formatted candidate also tries a block.
+        if start > 0 && ops[start - 1].name != "NOP" && suite.lines().count() == 1
+            && ruff_python_parser::parse_module(&suite).is_ok_and(|parsed| {
+                matches!(parsed.suite().as_slice(), [stmt] if !ruff_python_ast::helpers::is_compound_statement(stmt))
+            })
+        {
+            self.line(&format!("try: {}", suite.trim_end()))?;
+        } else {
+            self.block("try:", &suite)?;
+        }
         let star = ops
             .get(handler + 1)
             .is_some_and(|op| op.name == "BUILD_LIST");
@@ -120,7 +130,7 @@ impl Body<'_, '_, '_> {
             let clause = if ops[pop].name == "POP_TOP" {
                 kind
             } else {
-                let names = if ops[pop].name == "STORE_NAME" {
+                let names = if matches!(ops[pop].name, "STORE_NAME" | "STORE_GLOBAL") {
                     self.code.names
                 } else {
                     self.code.locals
@@ -133,6 +143,8 @@ impl Body<'_, '_, '_> {
                     .iter()
                     .find(|h| h.start == first)
                     .and_then(|h| index(h.end).ok())
+            } else if let Some(end) = self.raising_handler_end(ops, matched, pop) {
+                Some(end)
             } else {
                 ops[pop + 1..]
                     .iter()
@@ -189,6 +201,53 @@ impl Body<'_, '_, '_> {
         } else {
             self.region(ops, next, handler, 0)
         }
+    }
+
+    /// A handler that always raises has no normal `POP_EXCEPT`. Its failed
+    /// match jumps to `RERAISE`. A bound exception also has an out-of-line
+    /// cleanup that clears the name on the way out.
+    fn raising_handler_end(
+        &self,
+        ops: &[Instruction],
+        matched: usize,
+        binding: usize,
+    ) -> Option<usize> {
+        let jump = matched + 1;
+        let failed = self.flow.jump(jump)?;
+        if ops[jump].name != "POP_JUMP_IF_FALSE"
+            || failed <= binding + 1
+            || (ops[failed].name, ops[failed].arg) != ("RERAISE", 0)
+        {
+            return None;
+        }
+        let end = if ops[binding].name == "POP_TOP" {
+            failed
+        } else {
+            let cleanup = failed.checked_sub(4)?;
+            let [none, store, delete, reraise] = &ops[cleanup..failed] else {
+                return None;
+            };
+            let unwind = self.flow.handler(binding + 1)?;
+            let loads_none = match none.name {
+                "LOAD_CONST" => matches!(
+                    self.m.objects[self.item(self.code.constants, none.arg).ok()?],
+                    super::Object::None
+                ),
+                "LOAD_COMMON_CONSTANT" => none.arg == super::CommonConstant::NONE.argument(),
+                _ => false,
+            };
+            if (unwind.target, unwind.depth, unwind.lasti) != (none.offset, 1, true)
+                || !loads_none
+                || (store.name, store.arg) != (ops[binding].name, ops[binding].arg)
+                || delete.name.strip_prefix("DELETE_") != store.name.strip_prefix("STORE_")
+                || delete.arg != store.arg
+                || (reraise.name, reraise.arg) != ("RERAISE", 1)
+            {
+                return None;
+            }
+            cleanup
+        };
+        (end > binding + 1 && ops[end - 1].name == "RAISE_VARARGS").then_some(end)
     }
 
     /// Follow the failed-match edge to each subsequent handler. When the try
