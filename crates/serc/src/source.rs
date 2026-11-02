@@ -107,9 +107,14 @@ pub fn decode_source(bytes: &[u8]) -> Result<Cow<'_, str>, SourceDecodeError> {
 pub(crate) fn decode_source_with_codec(
     bytes: &[u8],
 ) -> Result<DecodedSource<'_>, SourceDecodeError> {
-    if bytes.contains(&0) {
-        return Err(SourceDecodeError::NullByte);
-    }
+    let has_carriage_return = if let Some(index) = memchr::memchr2(0, b'\r', bytes) {
+        if bytes[index] == 0 || memchr::memchr(0, &bytes[index + 1..]).is_some() {
+            return Err(SourceDecodeError::NullByte);
+        }
+        true
+    } else {
+        false
+    };
     let (bytes, has_bom) = bytes
         .strip_prefix(UTF8_BOM)
         .map_or((bytes, false), |bytes| (bytes, true));
@@ -142,7 +147,11 @@ pub(crate) fn decode_source_with_codec(
             Cow::Borrowed(std::str::from_utf8(bytes).expect("ASCII is valid UTF-8"))
         }
         SourceEncoding::Utf8(_) => {
-            Cow::Borrowed(std::str::from_utf8(bytes).map_err(SourceDecodeError::InvalidUtf8)?)
+            // Preserve the standard decoder's exact invalid-byte diagnostics on the error path.
+            let text = simdutf8::basic::from_utf8(bytes)
+                .or_else(|_| std::str::from_utf8(bytes))
+                .map_err(SourceDecodeError::InvalidUtf8)?;
+            Cow::Borrowed(text)
         }
         SourceEncoding::Latin1 => Cow::Owned(bytes.iter().copied().map(char::from).collect()),
         SourceEncoding::Iso885915
@@ -159,7 +168,11 @@ pub(crate) fn decode_source_with_codec(
     let (codec, registry_name) =
         declared.map_or((None, None), |name| codec_registry_effects(name, encoding));
     Ok(DecodedSource {
-        source: normalize_decoded_source(source),
+        source: if has_carriage_return {
+            normalize_decoded_source(source)
+        } else {
+            source
+        },
         codec,
         registry_name,
     })
@@ -371,16 +384,19 @@ fn euc_jp_override(sequence: &[u8]) -> Option<char> {
 }
 
 fn normalize_decoded_source(source: Cow<'_, str>) -> Cow<'_, str> {
-    match source {
-        Cow::Borrowed(source) => normalize_newlines(source),
-        Cow::Owned(source) => {
-            if source.as_bytes().contains(&b'\r') {
-                Cow::Owned(normalize_newlines(&source).into_owned())
-            } else {
-                Cow::Owned(source)
-            }
-        }
+    let mut returns = memchr::memchr_iter(b'\r', source.as_bytes());
+    let Some(first) = returns.next() else {
+        return source;
+    };
+    let mut normalized = String::with_capacity(source.len());
+    let mut copied = 0;
+    for index in std::iter::once(first).chain(returns) {
+        normalized.push_str(&source[copied..index]);
+        normalized.push('\n');
+        copied = index + 1 + usize::from(source.as_bytes().get(index + 1) == Some(&b'\n'));
     }
+    normalized.push_str(&source[copied..]);
+    Cow::Owned(normalized)
 }
 
 fn classify_source_encoding(name: &str) -> Option<SourceEncoding> {
@@ -439,33 +455,7 @@ fn classify_latin1_encoding(name: &str) -> bool {
 }
 
 pub(crate) fn normalize_source(source: &str) -> Cow<'_, str> {
-    normalize_newlines(source)
-}
-
-fn normalize_newlines(source: &str) -> Cow<'_, str> {
-    if !source.as_bytes().contains(&b'\r') {
-        return Cow::Borrowed(source);
-    }
-
-    let mut normalized = String::with_capacity(source.len());
-    let mut copied = 0;
-    let mut index = 0;
-    let bytes = source.as_bytes();
-    while index < bytes.len() {
-        if bytes[index] != b'\r' {
-            index += 1;
-            continue;
-        }
-        normalized.push_str(&source[copied..index]);
-        normalized.push('\n');
-        index += 1;
-        if bytes.get(index) == Some(&b'\n') {
-            index += 1;
-        }
-        copied = index;
-    }
-    normalized.push_str(&source[copied..]);
-    Cow::Owned(normalized)
+    normalize_decoded_source(Cow::Borrowed(source))
 }
 
 fn declared_encoding(bytes: &[u8]) -> Option<&str> {
@@ -650,6 +640,16 @@ mod tests {
             normalize_source("pass\n"),
             Cow::Borrowed("pass\n")
         ));
+    }
+
+    #[test]
+    fn null_byte_after_carriage_return_precedes_encoding_errors() {
+        for source in [b"# coding: unknown\r\n\0".as_slice(), b"\r\xff\0"] {
+            assert!(matches!(
+                decode_source(source),
+                Err(SourceDecodeError::NullByte)
+            ));
+        }
     }
 
     #[test]

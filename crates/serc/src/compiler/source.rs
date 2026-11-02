@@ -12,7 +12,7 @@ use ruff_python_ast::{
     StringLiteralFlags, StringLiteralValue, Suite,
 };
 use ruff_python_codegen::{Generator, Indentation, Mode as CodegenMode};
-use ruff_source_file::{LineEnding, LineIndex};
+use ruff_source_file::LineEnding;
 use ruff_text_size::{Ranged, TextLen, TextRange, TextSize};
 use rustc_hash::{FxHashMap, FxHashSet};
 
@@ -204,7 +204,7 @@ pub(super) struct CompilationContext<'source> {
     pub(super) filename: CodeFilename,
     pub(super) source: &'source str,
     pub(super) tokens: &'source Tokens,
-    line_index: LineIndex,
+    line_starts: Vec<TextSize>,
     pub(super) optimized_locations: FxHashMap<TextRange, super::optimization::OptimizedLocation>,
     pub(super) scopes: ScopeArena,
     original_generator_functions: Option<FxHashSet<TextRange>>,
@@ -462,13 +462,20 @@ impl<'source> CompilationContext<'source> {
             .keys()
             .any(|name| !name.is_ascii())
             .then(RefCell::default);
+        // Source decoding has already normalized line endings. Locations need only byte offsets.
+        let mut line_starts = Vec::with_capacity(source.len() / 88 + 1);
+        line_starts.push(TextSize::new(0));
+        line_starts.extend(
+            memchr::memchr_iter(b'\n', source.as_bytes())
+                .map(|newline| TextSize::try_from(newline + 1).expect("source length fits in u32")),
+        );
         let mut context = Self {
             python_version,
             native_build_profile,
             filename,
             source,
             tokens,
-            line_index: LineIndex::from_source_text(source),
+            line_starts,
             optimized_locations: FxHashMap::default(),
             scopes,
             original_generator_functions: None,
@@ -1661,7 +1668,7 @@ impl Compiler<'_> {
         offset: TextSize,
         recent: Option<CachedSourceLine>,
     ) -> CachedSourceLine {
-        let line_starts = self.context.line_index.line_starts();
+        let line_starts = &self.context.line_starts;
         let adjacent = recent.and_then(|line| {
             let current = usize::try_from(line.number).ok()?.checked_sub(1)?;
             if offset >= line.end && !line.is_last {
@@ -1677,8 +1684,8 @@ impl Compiler<'_> {
             }
             None
         });
-        let line_index = adjacent
-            .unwrap_or_else(|| self.context.line_index.line_index(offset).to_zero_indexed());
+        let line_index =
+            adjacent.unwrap_or_else(|| line_starts.partition_point(|&start| start <= offset) - 1);
         let start = line_starts[line_index];
         let end = line_starts
             .get(line_index + 1)
