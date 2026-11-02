@@ -885,7 +885,9 @@ def outer(events):
         return put
 def unfinished():
     def kept(): return 3
-    try: return '{big}'
+    try:
+        action()
+        return '{big}'
     except Exception: return kept
 ",
         big = "x".repeat(200_000)

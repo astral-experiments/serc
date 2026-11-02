@@ -59,6 +59,13 @@ recovery handles value and singleton patterns, alternatives, guards, captures,
 and selected sequence, mapping, and class patterns. Nested or overlapping cases
 can still exceed these recognizers.
 
+CPython can build long dictionary displays one pair at a time. Recognizing
+those insertions lets recovery continue past the configuration dictionary in
+3.14.5's `turtle.py`, where 182 of 250 code objects then match. In `codecs.py`,
+the module begins with a handler that binds an exception and always raises.
+The exception table separates the handler body from CPython's cleanup of the
+bound name. Following its normal continuation recovers 82 of 100 code objects.
+
 ## Verification
 
 The decompiler first tries recompiling the entire result with serc on the input
