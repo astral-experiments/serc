@@ -5,6 +5,7 @@ mod verify;
 
 use serc_bytecode::marshal::reader::read;
 use serc_bytecode::{OptimizationLevel, PythonVersion};
+use source::synthetic::Mode::{DeadSuites, LiveGuards, Ordinary};
 use std::fmt;
 
 /// A cache file is invalid, unsupported, or could not be faithfully reconstructed.
@@ -36,6 +37,10 @@ impl std::error::Error for DecompileError {}
 /// nested scope rejects the entire module. The compiler callback receives the
 /// source, original filename, target, and optimization level. It returns a cache
 /// for that candidate or `None` when the candidate cannot be compiled.
+/// Dead suites synthesized to reproduce retained metadata are marked inline
+/// with `# serc: synthetic dead code`.
+/// An always-true guard around a recovered statement is marked separately
+/// with `# serc: synthetic live guard`.
 pub fn decompile_pyc(
     bytes: &[u8],
     mut compile: impl FnMut(&str, &str, PythonVersion, OptimizationLevel) -> Option<Vec<u8>>,
@@ -51,12 +56,30 @@ pub fn decompile_pyc(
     let mut mismatch = None;
     // A NOP can be a user statement or compiler-generated tracing machinery.
     // Try explicit pass statements only after the simpler spelling fails.
-    for preserve_nops in [false, true] {
-        let (sources, saw_nop) = match source::recover(&module, preserve_nops) {
+    let mut saw_nop = true;
+    let mut hints: Option<source::synthetic::Hints> = None;
+    for (mode, preserve_nops) in [Ordinary, DeadSuites, LiveGuards]
+        .into_iter()
+        .flat_map(|mode| [(mode, false), (mode, true)])
+    {
+        if preserve_nops && !saw_nop {
+            continue;
+        }
+        let stubs = if mode != Ordinary {
+            let Some(plan) = hints.as_ref() else { break };
+            if plan.is_empty() {
+                break;
+            }
+            Some(plan)
+        } else {
+            None
+        };
+        let (sources, has_nop) = match source::recover(&module, preserve_nops, stubs, mode) {
             Ok(result) => result,
-            Err(_) if preserve_nops => break,
+            Err(_) if preserve_nops || mode != Ordinary => continue,
             Err(message) => return Err(reconstruct(message)),
         };
+        saw_nop = has_nop;
         for source in sources {
             // The header does not record the optimization level.
             for level in [
@@ -70,14 +93,17 @@ pub fn decompile_pyc(
                     match verify::compare(&module, &candidate) {
                         Ok(()) => return Ok(source),
                         Err(reason) => {
+                            if hints.is_none() && candidate.version == version {
+                                hints = Some(
+                                    source::synthetic::differences(&module, &candidate)
+                                        .unwrap_or_default(),
+                                );
+                            }
                             mismatch.get_or_insert(reason);
                         }
                     }
                 }
             }
-        }
-        if !saw_nop {
-            break;
         }
     }
     Err(DecompileError::Verify(

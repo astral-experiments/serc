@@ -486,11 +486,11 @@ impl Body<'_, '_, '_> {
     }
 }
 
-impl Body<'_, '_, '_> {
+impl<'m, 'data> Body<'m, 'data, '_> {
     pub(super) fn wrapper(
         &mut self,
         id: Id,
-    ) -> Result<(Body<'_, '_, '_>, super::Bytecode), String> {
+    ) -> Result<(Body<'m, 'data, '_>, super::Bytecode), String> {
         if self.depth >= 32 {
             return Err("wrapper nesting limit exceeded".into());
         }
@@ -506,6 +506,7 @@ impl Body<'_, '_, '_> {
         }
         Ok((
             Body {
+                stubs: super::synthetic::Stubs::new(),
                 m: self.m,
                 code,
                 stack: Vec::new(),

@@ -10,6 +10,13 @@ pub(super) struct Fragment {
 }
 
 impl Fragment {
+    pub(super) fn operands(self) -> Result<Vec<Value>, String> {
+        if !self.lines.is_empty() {
+            return Err("statement in assignment target".into());
+        }
+        Ok(self.stack)
+    }
+
     pub(super) fn expression(mut self) -> Result<String, String> {
         if self.lines.is_empty()
             && self.stack.len() == 1
@@ -158,6 +165,14 @@ impl Body<'_, '_, '_> {
                     self.pop()?;
                     Ok(i + 3)
                 }
+                "COPY" if op.arg == 1
+                    && matches!(self.stack.last(), Some(Value::Expr(_)))
+                    && let Ok(targets) = self.chained_targets(&ops[..end], i + 1) => {
+                    let rhs = self.expr()?;
+                    self.line(&format!("{} = {rhs}", targets.target))?;
+                    self.stack.extend(targets.seed);
+                    Ok(targets.next)
+                }
                 "COPY"
                     if op.arg == 1
                         && i + 1 < end
@@ -285,8 +300,15 @@ impl Body<'_, '_, '_> {
                 "TO_BOOL"
                     if ops
                         .get(i + 1)
-                        .is_some_and(|op| op.name.starts_with("POP_JUMP_IF_")) =>
+                        .is_some_and(|op| op.name.starts_with("POP_JUMP_IF_") || op.name == "UNARY_NOT") =>
                 {
+                    Ok(i + 1)
+                }
+                "TO_BOOL" => {
+                    // CPython folds double negation to a truth conversion. A
+                    // call to bool would introduce a (possibly shadowed) name.
+                    let value = self.expr()?;
+                    self.push(format!("(not not {value})"))?;
                     Ok(i + 1)
                 }
                 _ => self.step(op).map(|()| i + 1),

@@ -70,13 +70,34 @@ fn check_fixture(source: &str, exercise: &str) {
 
 #[cfg(feature = "decompile")]
 fn check_fixture_on(source: &str, exercise: &str, versions: &[serc::PythonVersion]) {
+    check_output(source, exercise, versions, |_| {});
+}
+
+#[cfg(feature = "decompile")]
+fn check_output(
+    source: &str,
+    exercise: &str,
+    versions: &[serc::PythonVersion],
+    inspect: impl Fn(&str),
+) {
+    check_output_at(source, exercise, versions, 0, inspect);
+}
+
+#[cfg(feature = "decompile")]
+fn check_output_at(
+    source: &str,
+    exercise: &str,
+    versions: &[serc::PythonVersion],
+    optimize: u8,
+    inspect: impl Fn(&str),
+) {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original.py");
     let recovered = temp.path().join("recovered.py");
     let cache = temp.path().join("file.pyc");
     fs_err::write(&original, source).unwrap();
     for &version in versions {
-        let built = common::python_command(version).args(["-c", "import py_compile, sys; py_compile.compile(sys.argv[1], sys.argv[2], doraise=True)"]).arg(&original).arg(&cache).output().unwrap();
+        let built = common::python_command(version).args(["-c", "import py_compile, sys; py_compile.compile(sys.argv[1], sys.argv[2], optimize=int(sys.argv[3]), doraise=True)"]).arg(&original).arg(&cache).arg(optimize.to_string()).output().unwrap();
         assert!(built.status.success(), "{built:?}");
         let output = Command::new(env!("CARGO_BIN_EXE_serc"))
             .arg("decompile")
@@ -88,6 +109,7 @@ fn check_fixture_on(source: &str, exercise: &str, versions: &[serc::PythonVersio
             "{version}: {}",
             String::from_utf8_lossy(&output.stderr)
         );
+        inspect(std::str::from_utf8(&output.stdout).unwrap());
         fs_err::write(&recovered, output.stdout).unwrap();
         let oracle = common::python_command(version)
             .args([
@@ -95,10 +117,10 @@ fn check_fixture_on(source: &str, exercise: &str, versions: &[serc::PythonVersio
                 r"
 import sys, types
 def load(path):
-    return compile(open(path, encoding='utf-8').read(), '<fixture>', 'exec')
+    return compile(open(path, encoding='utf-8').read(), '<fixture>', 'exec', optimize=int(sys.argv[4]))
 def fields(c):
     return (c.co_code, c.co_flags, c.co_names, c.co_varnames, c.co_cellvars, c.co_freevars,
-            c.co_argcount, c.co_posonlyargcount, c.co_kwonlyargcount, c.co_exceptiontable,
+            c.co_argcount, c.co_posonlyargcount, c.co_kwonlyargcount, c.co_stacksize, c.co_exceptiontable,
             tuple(fields(k) if isinstance(k, types.CodeType) else k for k in c.co_consts))
 def exercise(c):
     scope = {}
@@ -113,6 +135,7 @@ assert exercise(left) == exercise(right)
             .arg(&original)
             .arg(&recovered)
             .arg(exercise)
+            .arg(optimize.to_string())
             .output()
             .unwrap();
         assert!(
@@ -711,5 +734,220 @@ async def consume():
     return left, right, [v async for v in stream]
 ",
         "import asyncio; result = asyncio.run(consume())",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn synthetic_dead_code_is_marked_at_each_site() {
+    check_output(
+        "if False: hidden()\nanswer = 1\nif False: later()\n",
+        "result = answer",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert_eq!(
+                source,
+                "if False: hidden  # serc: synthetic dead code\nanswer = 1\nif False: later  # serc: synthetic dead code\n"
+            );
+        },
+    );
+    check_output(
+        "def unchanged(arg):\n    return arg\ndef f():\n    if False: lost = hidden()\n    return lost\n",
+        "try: f()\nexcept UnboundLocalError: result = unchanged(42)",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert_eq!(source.matches("# serc: synthetic dead code").count(), 1);
+            assert!(source.contains("lost = hidden  # serc: synthetic dead code"));
+        },
+    );
+    check_output(
+        "if 0: pass\nanswer = 1\n",
+        "result = answer",
+        &common::PYTHON_VERSIONS,
+        |source| assert!(source.contains("if 0: pass  # serc: synthetic dead code")),
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn synthetic_dead_code_still_requires_whole_module_verification() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("altered.pyc");
+    for version in common::PYTHON_VERSIONS {
+        let built = common::python_command(version)
+            .args([
+                "-c",
+                r"
+import importlib.util, marshal, sys
+from pathlib import Path
+module = compile('if False: hidden()\ndef f(): return 1\n', 'lost.py', 'exec')
+constants = tuple(c.replace(co_stacksize=c.co_stacksize + 1) if hasattr(c, 'co_stacksize')
+                  else c for c in module.co_consts)
+Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12)
+                              + marshal.dumps(module.replace(co_consts=constants)))",
+            ])
+            .arg(&cache)
+            .output()
+            .unwrap();
+        assert!(built.status.success(), "{built:?}");
+        let output = Command::new(env!("CARGO_BIN_EXE_serc"))
+            .arg("decompile")
+            .arg(&cache)
+            .output()
+            .unwrap();
+        assert!(!output.status.success(), "{version}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn synthetic_yields_and_captures_preserve_function_kinds() {
+    check_output(
+        "def outer(x):\n    async def stream():\n        if False: yield x\n    return stream\n",
+        "import asyncio, inspect\nstream = outer(42)\nasync def collect(): return [n async for n in stream()]\nresult = inspect.isasyncgenfunction(stream), stream.__closure__[0].cell_contents, asyncio.run(collect())",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert_eq!(source.matches("# serc: synthetic dead code").count(), 1);
+            assert!(source.contains("(yield x)  # serc: synthetic dead code"));
+        },
+    );
+    check_output(
+        "def stream():\n    if False: yield ghost()\n    raise LookupError\n",
+        "import inspect\niterator = stream()\ntry: next(iterator)\nexcept LookupError: result = inspect.isgenerator(iterator)",
+        &common::PYTHON_VERSIONS,
+        |source| assert!(source.contains("(yield ghost)  # serc: synthetic dead code")),
+    );
+    check_fixture(
+        "def stream(stop):\n    yield 1\n    if stop: return\n    raise LookupError\n",
+        "a, b = stream(True), stream(False)\nresult = [next(a), next(b), next(a, 2)]\ntry: next(b)\nexcept LookupError: result.append(3)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn live_guards_are_marked_separately_from_dead_suites() {
+    let versions = [serc::PythonVersion::Py314, serc::PythonVersion::Py315];
+    for optimize in 0..=2 {
+        check_output_at(
+            "def stream(arg):\n    if not __debug__: yield arg\n    return 9\nif False: missing()\nanswer = 1\n",
+            "it = stream(42)\nitems = list(it)\nresult = items, answer",
+            &versions,
+            optimize,
+            |source| {
+                assert!(source.contains("missing  # serc: synthetic dead code"));
+                if optimize > 0 {
+                    assert!(
+                        source.contains("if not False: (yield arg)  # serc: synthetic live guard"),
+                        "{source}"
+                    );
+                } else {
+                    assert!(!source.contains("# serc: synthetic live guard"));
+                }
+            },
+        );
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn chained_assignments_evaluate_the_rhs_once_and_targets_in_order() {
+    check_fixture_on(
+        "a: (x := 1)\n",
+        "result = x, __annotations__['a']",
+        &[serc::PythonVersion::Py312, serc::PythonVersion::Py313],
+    );
+    check_output(
+        "def assign(obj, key, value):\n    first = obj()[key()] = second = obj().attr = value()\n    return first is second\n",
+        r"class Obj:
+    def __setitem__(self, key, value): log.append(('item', key, value is token))
+    def __setattr__(self, key, value): log.append(('attr', key, value is token))
+log, token, target = [], object(), Obj()
+def obj():
+    log.append('obj')
+    return target
+def key():
+    log.append('key')
+    return 7
+def value():
+    log.append('value')
+    return token
+result = assign(obj, key, value), log",
+        &common::PYTHON_VERSIONS,
+        |source| assert!(source.contains("first = obj()[key()] = second = obj().attr = value()")),
+    );
+    check_fixture(
+        "def assign(obj, values):\n    a, obj.attr = obj[1], b = values()\n    return a, b\n",
+        "class Obj(dict): pass\nobj = Obj()\nresult = assign(obj, lambda: (2, 3)), obj.attr, obj[1]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn truth_tests_preserve_user_conversions_and_short_circuit_returns() {
+    check_fixture(
+        "def truth(x):\n    return not x, not not x\ndef choose(read, y):\n    if (x := read()) and y: return x\n    return y\n",
+        r"class Flag:
+    def __init__(self, name, truth):
+        self.name, self.truth = name, truth
+    def __bool__(self):
+        log.append(self.name)
+        return self.truth
+log = []
+a, b = Flag('a', False), Flag('b', True)
+result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is a, log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn managers_resume_after_await_and_preserve_exception_suppression() {
+    check_fixture(
+        "async def run(m, n, cb):\n    with m as v:\n        await cb(v)\n    async with n as w:\n        await cb(w)\n        await cb(3)\n    return 9\n",
+        r"import asyncio
+from contextlib import contextmanager, asynccontextmanager
+log = []
+@contextmanager
+def sync():
+    log.append('enter')
+    try: yield 1
+    finally: log.append('exit')
+@asynccontextmanager
+async def manager(suppress):
+    log.append('aenter')
+    try: yield 2
+    except ValueError:
+        log.append('caught')
+        if not suppress: raise
+    finally: log.append('aexit')
+async def cb(value):
+    log.append(value)
+    await asyncio.sleep(0)
+    if value == fail: raise ValueError
+answers = []
+for fail, suppress in [(0, False), (2, True), (2, False), (1, True)]:
+    try: answers.append(asyncio.run(run(sync(), manager(suppress), cb)))
+    except ValueError: answers.append('raised')
+result = answers, log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn short_circuit_none_tests_preserve_identity_and_lookup_order() {
+    check_fixture(
+        "def f(x, read, emit):\n    if x or read() is None: emit(1)\n    if x is None or read() is not None: emit(2)\n    return 3\n",
+        r"log = []
+class Flag:
+    def __bool__(self):
+        log.append('tested')
+        return True
+for x in [False, None, Flag()]:
+    for value in [None, Flag()]:
+        def read():
+            log.append('read')
+            return value
+        f(x, read, log.append)
+result = log",
     );
 }

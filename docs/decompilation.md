@@ -52,7 +52,10 @@ formatted and template strings.
 
 Exception recovery handles selected typed and bare handlers, multi-item and
 consecutive synchronous context managers, and handlers whose `try: pass` body
-CPython optimized away. Match recovery handles value and singleton patterns,
+CPython optimized away. A generator or coroutine can suspend inside a context
+manager. Recovery follows the manager's exception-table entries across an
+`await` and distinguishes `with` from `async with` at each entry and exit.
+Match recovery handles value and singleton patterns,
 alternatives, guards, captures, and selected sequence, mapping, and class
 patterns. Nested or overlapping cases can still exceed these recognizers.
 
@@ -69,6 +72,37 @@ Comments, original formatting, location tables, and code removed by CPython
 optimization generally cannot be recovered. Traceback line numbers can change.
 The decompiler preserves class line numbers when they appear as executable
 constants and can refuse a module if it cannot reproduce them.
+
+CPython sometimes keeps a name, local binding, or constant after removing the
+statement that introduced it. If ordinary recovery cannot reproduce those
+fields, serc can emit a dead suite with an inline marker. For example,
+`if False: hidden()` and `if False: hidden` can produce the same cache. With a
+subsequent assignment to `answer`, serc emits the following source.
+
+```console
+$ serc decompile example.pyc
+if False: hidden  # serc: synthetic dead code
+answer = 1
+```
+
+The marker identifies the entire dead suite. A suite can contain a `yield` to
+preserve a generator function or reference a name captured by a closure.
+
+CPython can also keep a guard constant while retaining the guarded statement.
+For example, on 3.14 and 3.15, compiling `if not __debug__: yield arg` with
+`-O` can leave `False` in the constant table and an unconditional yield in
+the instruction stream. In that case serc can emit an always-true guard.
+
+```console
+$ serc decompile optimized.pyc
+def stream(arg):
+    if not False: (yield arg)  # serc: synthetic live guard
+    return 9
+```
+
+Here the marker applies only to the condition. The `yield` still runs. Both
+markers appear by default in CLI and library output, and the marked source
+must pass whole-module verification.
 
 ## Ruff corpus
 
