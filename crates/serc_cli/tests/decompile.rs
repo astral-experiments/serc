@@ -316,6 +316,33 @@ assert result == [0, True, True, 0, True, False, 'woke', 1]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn the_last_while_arm_can_fall_out_after_earlier_backedges() {
+    check_fixture(
+        r"def walk(node, edge):
+    while node is not None:
+        if edge(node, 'left'):
+            node = node.left
+        elif edge(node, 'right'):
+            node = node.right
+        else:
+            break
+    return node
+",
+        r"class Node: pass
+a, b, leaf = Node(), Node(), Node()
+a.left, b.right = b, leaf
+calls = []
+def edge(node, name):
+    calls.append(name)
+    assert len(calls) <= 5, 'revisited the terminal node'
+    return hasattr(node, name)
+result = walk(a, edge) is leaf, calls
+assert result == (True, ['left', 'left', 'right', 'left', 'right'])",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn while_predicate_can_span_the_inlined_any_call() {
     check_fixture_on(
         r"def drain(rows):

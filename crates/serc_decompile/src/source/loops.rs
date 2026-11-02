@@ -259,9 +259,22 @@ impl Body<'_, '_, '_> {
     ) -> Result<usize, String> {
         let (start, target) = (predicate.suite, predicate.target);
         let active = self.loop_exits(ops, latch.header, start..latch.body_end, target, end)?;
+        let falls_out = latch.body_end == target
+            && self
+                .flow
+                .incoming(target)
+                .any(|from| (start..target).contains(&from));
+        if falls_out && active.after.is_some_and(|after| after > target) {
+            return Err("loop falls into its else suite".into());
+        }
         let outer = self.loop_edges.replace(active);
-        let suite = self.fragment(ops, start, latch.body_end, level)?.suite()?;
+        let mut suite = self.fragment(ops, start, latch.body_end, level)?.suite()?;
         self.loop_edges = outer;
+        if falls_out {
+            // The other body paths jumped back to the header. Falling off the
+            // recovered suite would repeat the loop on its exit path as well.
+            suite.push_str("break\n");
+        }
         self.block(&format!("while {}:", predicate.test(true)), &suite)?;
         if latch.implicit_return && active.after.is_none_or(|after| after == target) {
             // The copied false exits already return None. Writing an explicit
