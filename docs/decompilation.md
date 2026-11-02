@@ -29,7 +29,9 @@ successors separately from exceptional edges, which restore the handler's stack
 depth. A worklist rejects inconsistent stack heights at joins.
 
 Source recovery uses forward postdominators to find where branches rejoin and
-shared successors to combine short-circuit tests. Loop recovery distinguishes
+shared successors to combine short-circuit tests. When CPython gives several
+edges separate copies of a function's implicit `None` return, recovery can
+place a guard at function exit without introducing a shared return block. Loop recovery distinguishes
 exhaustion from explicit breaks, including when CPython copied the return after
 the loop into a break arm. It can also follow consecutive typed handlers with a
 shared return and recover a conditional break through duplicated finally

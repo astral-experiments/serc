@@ -181,11 +181,15 @@ fn recover_scope<'m>(
         flow,
         loop_edges: None,
         handlers: suspended_handlers::Handlers::default(),
+        terminal_returns: 0..0,
         class,
         annotations: Vec::new(),
         depth,
         work,
     };
+    if depth > 0 && !class {
+        body.index_terminal_returns(&bc.ops);
+    }
     body.declarations(&bc.ops)?;
     let result = if body.suspended() {
         body.suspension_scope(&bc)
@@ -269,6 +273,7 @@ struct Body<'m, 'data, 'work> {
     flow: crate::flow::Graph,
     loop_edges: Option<loops::Loop>,
     handlers: suspended_handlers::Handlers,
+    terminal_returns: std::ops::Range<usize>,
     depth: usize,
     class: bool,
     annotations: Vec<(Option<u32>, String, String)>,

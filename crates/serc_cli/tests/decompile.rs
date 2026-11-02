@@ -285,6 +285,33 @@ fn formatted_displays_remain_interpolations() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn conditional_guards_keep_distinct_function_exits() {
+    check_fixture(
+        r"def emit(ready, allowed, events):
+    if ready and allowed():
+        events.append('done')
+
+def guard(skip, ready, events):
+    if skip:
+        return
+    if ready:
+        events.append('ran')
+",
+        r"result = []
+def check():
+    result.append('checked')
+    return True
+emit(False, check, result)
+emit(True, check, result)
+guard(True, True, result)
+guard(False, False, result)
+guard(False, True, result)
+assert result == ['checked', 'done', 'ran']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn nested_conditional_arms_share_the_outer_jump() {
     check_fixture(
         "def limits(high, low, call):\n    if high is None:\n        if low is None:\n            hi = call(1)\n        else:\n            lo = low\n            hi = call(4) * lo\n    else:\n        hi = high\n    return hi + call(2)\n",
