@@ -878,6 +878,21 @@ fn synthetic_yields_and_captures_preserve_function_kinds() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn erased_local_annotation_still_binds_nonlocal_writes() {
+    check_output(
+        "def outer(*args, **kwargs):\n    slot: int\n    def get(): return slot\n    def put(value):\n        nonlocal slot\n        slot = value\n    return get, put\n",
+        "get, put = outer()\ntry: get()\nexcept NameError: empty = True\nput(42)\nresult = empty, get()",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert!(!source.starts_with("# serc: best-effort"), "{source}");
+            assert!(source.contains("if False: slot = None  # serc: synthetic dead code"));
+            assert_eq!(source.matches("# serc: synthetic dead code").count(), 1);
+        },
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn live_guards_are_marked_separately_from_dead_suites() {
     let versions = [serc::PythonVersion::Py314, serc::PythonVersion::Py315];
     for optimize in 0..=2 {

@@ -189,6 +189,9 @@ fn recover_scope<'m>(
         return Err(format!("{name}: {reason}"));
     }
     body.emit_stub(None)?;
+    if body.work.partial || body.work.mode == synthetic::Mode::LexicalBindings {
+        body.lexical_bindings(&bc.ops)?;
+    }
     if let Some(guard) = live_guard {
         body.guard_statement(&guard)?;
     }

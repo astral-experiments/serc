@@ -5,7 +5,7 @@ mod verify;
 
 use serc_bytecode::marshal::reader::{Module, read};
 use serc_bytecode::{OptimizationLevel, PythonVersion};
-use source::synthetic::Mode::{DeadSuites, LiveGuards, Ordinary};
+use source::synthetic::Mode::{DeadSuites, LexicalBindings, LiveGuards, Ordinary};
 use std::fmt;
 
 /// A cache file is invalid, unsupported, or could not be faithfully reconstructed.
@@ -102,18 +102,17 @@ fn verified(
     // Try explicit pass statements only after the simpler spelling fails.
     let mut saw_nop = true;
     let mut hints: Option<source::synthetic::Hints> = None;
-    for (mode, preserve_nops) in [Ordinary, DeadSuites, LiveGuards]
+    for (mode, preserve_nops) in [Ordinary, DeadSuites, LiveGuards, LexicalBindings]
         .into_iter()
         .flat_map(|mode| [(mode, false), (mode, true)])
     {
-        if preserve_nops && !saw_nop {
+        if (preserve_nops && !saw_nop) || (mode == LexicalBindings && mismatch.is_some()) {
             continue;
         }
-        let stubs = if mode != Ordinary {
-            let Some(plan) = hints.as_ref() else { break };
-            if plan.is_empty() {
-                break;
-            }
+        let stubs = if matches!(mode, DeadSuites | LiveGuards) {
+            let Some(plan) = hints.as_ref().filter(|plan| !plan.is_empty()) else {
+                continue;
+            };
             Some(plan)
         } else {
             None
