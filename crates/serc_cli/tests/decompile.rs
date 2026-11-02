@@ -469,7 +469,9 @@ fn incremental_dictionaries_preserve_order_across_chunks() {
             .collect::<Vec<_>>()
             .join(", ");
         check_fixture(
-            &format!("def f(key, value, extra):\n    return {{{entries}, **extra, key(0): value(42)}}\n"),
+            &format!(
+                "def f(key, value, extra):\n    return {{{entries}, **extra, key(0): value(42)}}\n"
+            ),
             "events = []\ndef key(i): events.append(('key', i)); return i % 7\ndef value(i): events.append(('value', i)); return i\nresult = list(f(key, value, {7: 'extra'}).items()), events",
         );
     }
@@ -827,7 +829,7 @@ fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
     let cache = temp.path().join("module.pyc");
     let recovered = temp.path().join("recovered.py");
     let source = format!(
-        "before = 7\nif before:\n    lost = '{0}'\nelse:\n    wrongly_hoisted()\ndef large():\n    return '{0}'\ndef after(x):\n    return x + before\n",
+        "before = 7\nif before:\n    lost = '{0}'\nelse:\n    wrongly_hoisted()\ndef large():\n    return '{0}'\ndef after(x):\n    return x + before\ndef protected(flag, action, events):\n    if flag: prefix = '{0}'\n    else: wrongly_hoisted()\n    try: action()\n    except KeyError: events.append('caught')\n    tail = '{0}'\n    events.append('after')\n    return 7\n",
         "x".repeat(200_000)
     );
     fs_err::write(&original, source).unwrap();
@@ -847,12 +849,17 @@ fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
         assert!(text.contains("def large():\n    ...  # serc: unrecovered remainder of large"));
         assert!(text.contains("def after(x):"));
         assert!(text.contains("# serc: unrecovered statement in <module>"));
+        assert_eq!(
+            text.matches("# serc: unrecovered statement in protected")
+                .count(),
+            2
+        );
         assert!(!text.contains("wrongly_hoisted()"));
         fs_err::write(&recovered, text).unwrap();
         let checked = common::python_command(version)
             .args([
                 "-c",
-                "import runpy, sys; assert runpy.run_path(sys.argv[1])['after'](5) == 12",
+                "import runpy, sys\nscope = runpy.run_path(sys.argv[1])\nassert scope['after'](5) == 12\nevents = []\ndef fail(): raise KeyError\nfor flag, action in [(True, fail), (False, lambda: None)]:\n assert scope['protected'](flag, action, events) == 7\nassert events == ['caught', 'after', 'after']",
             ])
             .arg(&recovered)
             .output()

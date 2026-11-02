@@ -119,9 +119,9 @@ impl Body<'_, '_, '_> {
         }
         let partial = self.work.partial
             && level == 0
-            && start == 0
-            && end == ops.len()
-            && self.m.bytes(self.code.exceptions)?.is_empty();
+            && start < end
+            && self.stack.is_empty()
+            && self.flow.unprotected_suite(start..end);
         let mut prefix = self.lines.len();
         let mut i = start;
         while i < end {
@@ -134,8 +134,11 @@ impl Body<'_, '_, '_> {
                 Err(reason) if partial => {
                     self.lines.truncate(prefix);
                     self.stack.clear();
-                    let next = self.resume_after(ops, i)?.unwrap_or(end);
-                    self.gap(&reason, &ops[i..next], next == end)?;
+                    let next = self
+                        .resume_after(ops, i)?
+                        .filter(|&next| next <= end)
+                        .unwrap_or(end);
+                    self.gap(&reason, &ops[i..next], next == ops.len())?;
                     next
                 }
                 Err(reason) => return Err(format!("byte {} ({}): {reason}", op.offset, op.name)),

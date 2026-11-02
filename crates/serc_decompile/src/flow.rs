@@ -177,6 +177,16 @@ impl Graph {
             .take_while(move |b| !range.is_empty() && b.ops.start < range.end)
             .filter(|b| b.height.is_some())
     }
+
+    /// A gap in this suite can be skipped without crossing into a handler or
+    /// discarding an operand that the caller supplied at entry.
+    pub(super) fn unprotected_suite(&self, range: Range<usize>) -> bool {
+        let first = self.block(range.start);
+        first.ops.start == range.start
+            && first.height == Some(0)
+            && (range.end == self.owner.len() || self.block(range.end).ops.start == range.end)
+            && self.blocks_in(range).all(|block| block.handler.is_none())
+    }
 }
 
 fn check_stack_heights(
