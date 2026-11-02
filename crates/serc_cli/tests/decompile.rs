@@ -452,6 +452,41 @@ assert result == [1, 1, 'b', ('b',), 'b', 2, ('c',), 3, ('d',), ('d',)]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn an_early_return_cleans_up_the_iterator_after_evaluating_its_value() {
+    check_fixture(
+        r"def ready(items, accept):
+    for item in items:
+        if accept(item):
+            return True
+    return False
+
+def first(items, accept, convert):
+    for item in items:
+        if accept(item):
+            return convert(item)
+    return False
+",
+        r"result = []
+class Items:
+    def __iter__(self):
+        try:
+            for value in range(3):
+                result.append(value)
+                yield value
+        finally:
+            result.append('closed')
+def convert(value):
+    result.append('convert')
+    return value + 10
+assert first(Items(), lambda v: v == 1, convert) == 11
+assert ready(Items(), lambda v: v == 0)
+assert not ready([], bool)
+assert result == [0, 1, 'convert', 'closed', 0, 'closed']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn conditional_none_value_is_distinct_from_a_guard_return() {
     check_fixture(
         r"def keep(reset, value):

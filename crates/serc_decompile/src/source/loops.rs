@@ -116,6 +116,47 @@ impl Body<'_, '_, '_> {
             })
     }
 
+    /// A return inside a for suite discards the iterator that the source
+    /// operand stack leaves implicit. A computed return value is moved
+    /// underneath it first. Only consume slots owned by this iterator.
+    pub(super) fn iterator_return(
+        &self,
+        ops: &[Instruction],
+        i: usize,
+        end: usize,
+    ) -> Option<usize> {
+        let header = self.loop_edges?.header;
+        let iter = header.checked_sub(1)?;
+        if ops[header].name != "FOR_ITER" || ops[iter].name != "GET_ITER" {
+            return None;
+        }
+        let (_, slots) = serc_bytecode::target::stack_counts_for(
+            self.m.version,
+            ops[iter].opcode,
+            ops[iter].arg,
+        );
+        if self.flow.block(header).height != Some(slots) {
+            return None;
+        }
+        let computed = match ops[i].name {
+            "SWAP" if ops[i].arg as usize == slots + 1 && self.stack.len() == 1 => true,
+            "POP_TOP" if self.stack.is_empty() => false,
+            _ => return None,
+        };
+        let pop = i + usize::from(computed);
+        let next = pop + slots;
+        let stop = self.flow.block(i).ops.end;
+        if next >= stop || stop > end || ops[pop..next].iter().any(|op| op.name != "POP_TOP") {
+            return None;
+        }
+        let returns = if computed {
+            next + 1 == stop && ops[next].name == "RETURN_VALUE"
+        } else {
+            constant_return(ops, stop).is_some_and(|(load, _)| load == next)
+        };
+        returns.then_some(next)
+    }
+
     fn loop_exits(
         &self,
         ops: &[Instruction],

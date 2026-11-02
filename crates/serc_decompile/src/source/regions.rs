@@ -310,6 +310,13 @@ impl Body<'_, '_, '_> {
                 self.annotation_site()?;
                 Ok(i + 2)
             }
+            "NOP" | "POP_TOP" | "POP_ITER"
+                if self.stack.is_empty() && self.folded_break(ops, i, end) =>
+            {
+                self.line("break")?;
+                Ok(self.flow.block(i).ops.end)
+            }
+            "SWAP" | "POP_TOP" if let Some(next) = self.iterator_return(ops, i, end) => Ok(next),
             "SWAP" if super::comparisons::is_link(&ops[i..end]) => {
                 self.comparison_chain(ops, i, end, level, operand_start)
             }
@@ -379,12 +386,6 @@ impl Body<'_, '_, '_> {
                     && let Some(next) = self.bottom_tested_loop(ops, i, end, level)? =>
             {
                 Ok(next)
-            }
-            "NOP" | "POP_TOP" | "POP_ITER"
-                if self.stack.is_empty() && self.folded_break(ops, i, end) =>
-            {
-                self.line("break")?;
-                Ok(self.flow.block(i).ops.end)
             }
             "POP_TOP" | "POP_ITER"
                 if self.stack.is_empty()
