@@ -1,4 +1,5 @@
 mod annotations;
+mod blocks;
 mod builtin_calls;
 mod classes;
 mod comparisons;
@@ -51,8 +52,19 @@ struct Recovery<'m> {
 }
 
 pub(super) struct Candidate {
-    pub source: String,
-    pub definitions: Vec<Id>,
+    source: String,
+    definitions: Vec<Id>,
+    unplaced: Vec<blocks::Gap>,
+}
+
+impl Candidate {
+    pub(super) fn new(source: String, definitions: Vec<Id>) -> Self {
+        Self {
+            source,
+            definitions,
+            unplaced: Vec::new(),
+        }
+    }
 }
 
 pub(super) fn recover(
@@ -158,9 +170,11 @@ fn recover_scope<'m>(
         omitted_cell_stores: rustc_hash::FxHashSet::default(),
         m,
         code,
+        id,
         stack: Vec::new(),
         lines: String::new(),
         partial_prefix: 0,
+        partial_start: 0,
         flow,
         loop_edges: None,
         class,
@@ -254,10 +268,13 @@ impl Value {
 struct Body<'m, 'data, 'work> {
     m: &'m Module<'data>,
     code: &'m Code,
+    id: Id,
     stack: Vec<Value>,
     lines: String,
     // End of the last complete statement while recovering a partial region.
     partial_prefix: usize,
+    // First instruction of the statement at that checkpoint.
+    partial_start: usize,
     stubs: synthetic::Stubs<'m>,
     omitted_cell_stores: rustc_hash::FxHashSet<usize>,
     flow: crate::flow::Graph,

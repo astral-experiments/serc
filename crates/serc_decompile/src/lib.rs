@@ -147,10 +147,10 @@ fn verified(
                                 && let Some(slot) = fallback.as_deref_mut()
                                 && slot.is_none()
                             {
-                                *slot = Some(source::Candidate {
-                                    source: source.clone(),
-                                    definitions: definitions.clone(),
-                                });
+                                *slot = Some(source::Candidate::new(
+                                    source.clone(),
+                                    definitions.clone(),
+                                ));
                             }
                             mismatch.get_or_insert(reason);
                         }

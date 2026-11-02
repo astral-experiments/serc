@@ -365,14 +365,15 @@ impl Body<'_, '_, '_> {
         for decorator in def.decorators.iter().rev() {
             self.line(&format!("@{decorator}"))?;
         }
-        self.block(
-            &format!(
-                "class {name}{}({}):",
-                def.generic_suffix(),
-                bases.join(", ")
-            ),
-            &body,
-        )
+        let mut header = format!(
+            "class {name}{}({}):",
+            def.generic_suffix(),
+            bases.join(", ")
+        );
+        if self.work.partial {
+            super::detached::mark(&mut header, def.id);
+        }
+        self.block(&header, &body)
     }
 
     pub(super) fn definition(&mut self, name: &str, def: &Definition) -> Result<(), String> {
@@ -547,9 +548,11 @@ impl<'m, 'data> Body<'m, 'data, '_> {
                 omitted_cell_stores: rustc_hash::FxHashSet::default(),
                 m: self.m,
                 code,
+                id,
                 stack: Vec::new(),
                 lines: String::new(),
                 partial_prefix: 0,
+                partial_start: 0,
                 flow,
                 loop_edges: None,
                 class: false,

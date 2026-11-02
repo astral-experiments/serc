@@ -1,5 +1,5 @@
 //! Recover independent scopes after an unsupported construct interrupts a module.
-use std::fmt::Write;
+use std::ops::Range;
 
 use ruff_text_size::Ranged;
 
@@ -56,7 +56,7 @@ pub(crate) fn partial(m: &Module<'_>, candidate: Option<Candidate>) -> Result<St
         definitions: Vec::new(),
         private_class: None,
     };
-    let mut candidate = if let Some(candidate) = candidate {
+    let candidate = if let Some(candidate) = candidate {
         candidate
     } else {
         let source = scope(m, m.root, 0, false, &mut work)?;
@@ -64,28 +64,21 @@ pub(crate) fn partial(m: &Module<'_>, candidate: Option<Candidate>) -> Result<St
             .map_err(|e| format!("invalid partial source: {e}"))?;
         detached::take_marks(source)
     };
-    candidate.definitions.extend(implicit);
-    candidate.definitions.append(&mut work.definitions);
-    Ok(detached::append(m, candidate, &mut work))
+    work.definitions.extend(implicit);
+    detached::append(m, candidate, &mut work)
 }
 
 impl Body<'_, '_, '_> {
     pub(super) fn partial_scope(&mut self, reason: &str, bc: &Bytecode) -> Result<String, String> {
-        let offset = reason
-            .rsplit_once("byte ")
-            .and_then(|(_, rest)| rest.split_whitespace().next()?.parse::<usize>().ok());
-        let start = offset
-            .and_then(|at| bc.ops.binary_search_by_key(&at, |op| op.offset).ok())
-            .unwrap_or(0);
         self.charge(self.lines.len())?;
         let prefix = complete_prefix(&self.lines);
         if prefix < self.lines.len() {
             self.lines.truncate(prefix);
-            // The abandoned statement may already have emitted a cell write
-            // before the instruction that triggered the error.
-            self.remember_cell_stores(&bc.ops[..start])?;
+            // A syntactically incomplete suite may have been discarded before
+            // the last checkpoint. Include its whole scope for context.
+            self.partial_start = 0;
         }
-        self.gap(reason, &bc.ops[start..], true)?;
+        self.gap(reason, &bc.ops, self.partial_start..bc.ops.len(), true)?;
         self.lexical_bindings(&bc.ops)?;
         Ok(std::mem::take(&mut self.lines))
     }
@@ -125,9 +118,10 @@ impl Body<'_, '_, '_> {
         &mut self,
         reason: &str,
         ops: &[super::Instruction],
+        range: Range<usize>,
         remainder: bool,
     ) -> Result<(), String> {
-        self.remember_cell_stores(ops)?;
+        self.remember_cell_stores(&ops[range.clone()])?;
         let name = comment(self.m.text(self.code.qualname)?);
         let extent = if remainder {
             "remainder of"
@@ -135,19 +129,13 @@ impl Body<'_, '_, '_> {
             "statement in"
         };
         self.line(&format!(
-            "...  # serc: unrecovered {extent} {name}: {}",
+            "...  {}{} {} {} # serc: unrecovered {extent} {name}: {}",
+            super::blocks::MARK,
+            self.id,
+            range.start,
+            range.end,
             comment(reason)
-        ))?;
-        // Include original instruction offsets without allowing a damaged or
-        // unusually large scope to consume the whole source budget.
-        let mut excerpt = String::new();
-        for op in ops.iter().take(12) {
-            writeln!(excerpt, "# {:>4}  {} {}", op.offset, op.name, op.arg).unwrap();
-        }
-        for line in excerpt.lines() {
-            self.line(line)?;
-        }
-        Ok(())
+        ))
     }
 
     fn remember_cell_stores(&mut self, ops: &[super::Instruction]) -> Result<(), String> {

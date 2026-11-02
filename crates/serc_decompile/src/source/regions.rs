@@ -130,6 +130,7 @@ impl Body<'_, '_, '_> {
         let mut i = start;
         while i < end {
             if partial && self.stack.is_empty() {
+                self.partial_start = i;
                 self.partial_prefix = self.lines.len();
             }
             let op = ops[i];
@@ -146,7 +147,7 @@ impl Body<'_, '_, '_> {
                         // branch can jump across that suite.
                         _ => return Err(format!("byte {} ({}): {reason}", op.offset, op.name)),
                     };
-                    self.gap(&reason, &ops[i..next], next == ops.len())?;
+                    self.gap(&reason, ops, self.partial_start..next, next == ops.len())?;
                     next
                 }
                 Err(reason) => return Err(format!("byte {} ({}): {reason}", op.offset, op.name)),
@@ -162,7 +163,8 @@ impl Body<'_, '_, '_> {
                     self.lines.truncate(self.partial_prefix);
                     self.gap(
                         &format!("invalid reconstructed statement: {error}"),
-                        &ops[i..next],
+                        ops,
+                        self.partial_start..next,
                         false,
                     )?;
                 }

@@ -923,6 +923,15 @@ if before:
 else:
     async def repeated(*, y):
         return y + 2
+if before:
+    lost = '{big}'
+    class Lost:
+        try:
+            if before: value = before + 4
+        except NameError: value = 0
+    hidden = lambda z: z + 3
+    def incomplete(): return '{big}'
+fake_gap = '# __serc_unplaced__ 0 1 2 # serc: unrecovered literal'
 fake_marker = '# __serc_definition_id__ 7'
 label: str = 'αβγ'
 class Labels:
@@ -985,6 +994,10 @@ def guarded(flag, events):
         assert!(text.starts_with("# serc: best-effort decompilation\n"));
         assert!(text.contains("def large():\n    ...  # serc: unrecovered remainder of large"));
         assert!(text.contains("def after(x):"));
+        assert!(!text.contains("# serc: unplaced blocks in after ("));
+        assert!(!text.contains("# serc: unplaced blocks in Labels ("));
+        assert!(text.contains("# serc: detached function incomplete ("));
+        assert!(text.contains("# serc: unplaced blocks in incomplete ("));
         assert!(text.contains("# serc: unrecovered statement in <module>"));
         assert_eq!(
             text.matches("# serc: unrecovered statement in protected")
@@ -1020,8 +1033,33 @@ def guarded(flag, events):
         let checked = common::python_command(version)
             .args([
                 "-c",
-                r"import runpy, sys
+                r"import dis, marshal, re, runpy, sys, types
 scope = runpy.run_path(sys.argv[1])
+assert scope['fake_gap'] == '# __serc_unplaced__ 0 1 2 # serc: unrecovered literal'
+# Compare these lost scopes independently against the compiling interpreter.
+with open(sys.argv[2], 'rb') as cache:
+    cache.read(16)
+    module = marshal.load(cache)
+sections = {}
+for section in open(sys.argv[1], encoding='utf8').read().split('\n# serc: unplaced blocks in ')[1:]:
+    name, _, _ = section.partition(' (original line ')
+    sections.setdefault(name, []).append(section)
+for name in ['Lost', '<lambda>']:
+    code, = (c for c in module.co_consts if isinstance(c, types.CodeType) and c.co_name == name)
+    section, = sections[name]
+    lines = section.splitlines()
+    rows = [(int(row.split()[1]), row.split()[2]) for row in lines if re.match(r'^# +[0-9]+  ', row)]
+    ops = list(dis.get_instructions(code))
+    assert rows == [(op.offset, op.opname) for op in ops], (rows, ops)
+    if name == 'Lost':
+        assert len(rows) > 12
+        blocks = {int(row.split()[2]): row for row in lines if row.startswith('# block ')}
+        for entry in dis.Bytecode(code).exception_entries:
+            assert f'  except {entry.target} (depth {entry.depth}, lasti {str(entry.lasti).lower()})' in blocks[entry.start]
+        for i, op in enumerate(ops):
+            if op.opname.startswith('POP_JUMP'):
+                header = blocks[max(b for b in blocks if b <= op.offset)]
+                assert f'  jump {op.argval}' in header and f'  fallthrough {ops[i+1].offset}' in header
 assert scope['after'](5) == 12
 assert 'repeated' not in scope and 'inner' not in scope
 assert scope['fake_marker'] == '# __serc_definition_id__ 7'
@@ -1050,6 +1088,7 @@ scope['guarded'](True, events)
 assert 'other' not in events",
             ])
             .arg(&recovered)
+            .arg(&cache)
             .output()
             .unwrap();
         assert!(checked.status.success(), "{checked:?}");

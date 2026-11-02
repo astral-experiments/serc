@@ -171,11 +171,24 @@ impl Graph {
     }
 
     pub(super) fn blocks_in(&self, range: Range<usize>) -> impl Iterator<Item = &Block> {
-        let first = self.owner[range.start];
+        self.blocks_covering(range).filter(|b| b.height.is_some())
+    }
+
+    pub(super) fn fallthrough(&self, block: &Block) -> Option<usize> {
+        self.blocks.get(block.fallthrough?).map(|b| b.ops.start)
+    }
+
+    /// Include unreachable blocks and both endpoint blocks when only part of
+    /// a block was consumed by a recovered statement.
+    pub(super) fn blocks_covering(&self, range: Range<usize>) -> impl Iterator<Item = &Block> {
+        let first = self
+            .owner
+            .get(range.start)
+            .copied()
+            .unwrap_or(self.blocks.len());
         self.blocks[first..]
             .iter()
             .take_while(move |b| !range.is_empty() && b.ops.start < range.end)
-            .filter(|b| b.height.is_some())
     }
 
     /// A gap in this suite can be skipped without crossing into a handler or

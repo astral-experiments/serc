@@ -8,7 +8,7 @@ use serc_bytecode::target::code_flags;
 
 use super::{
     Bytecode, Candidate, CommonConstant, Definition, Id, MAX_SOURCE, Module, Object, Recovery,
-    comment, definitions::function_prefix, identifier, scope,
+    blocks, comment, definitions::function_prefix, identifier, scope,
 };
 
 const MARK: &str = "# __serc_definition_id__ ";
@@ -40,13 +40,11 @@ pub(super) fn mark(header: &mut String, id: Id) {
 }
 
 pub(super) fn take_marks(source: String) -> Candidate {
-    let mut definitions = Vec::new();
-    if !source.contains(MARK) {
-        return Candidate {
-            source,
-            definitions,
-        };
+    if !source.contains(MARK) && !source.contains(blocks::MARK) {
+        return Candidate::new(source, Vec::new());
     }
+    let mut definitions = Vec::new();
+    let mut unplaced = Vec::new();
     let parsed = ruff_python_parser::parse_unchecked_source(&source, PySourceType::Python);
     let mut clean = String::with_capacity(source.len());
     let mut start = 0;
@@ -62,12 +60,18 @@ pub(super) fn take_marks(source: String) -> Candidate {
             clean.push_str(source[start..token.start().to_usize()].trim_end_matches(' '));
             start = token.end().to_usize();
             definitions.push(id);
+        } else if let Some((gap, public)) = blocks::read_mark(&source[token.range()]) {
+            clean.push_str(&source[start..token.start().to_usize()]);
+            clean.push_str(public);
+            start = token.end().to_usize();
+            unplaced.push(gap);
         }
     }
     clean.push_str(&source[start..]);
     Candidate {
         source: clean,
         definitions,
+        unplaced,
     }
 }
 
@@ -75,12 +79,16 @@ pub(super) fn append<'m>(
     m: &'m Module<'_>,
     candidate: Candidate,
     work: &mut Recovery<'m>,
-) -> String {
+) -> Result<String, String> {
     let Candidate {
         mut source,
         definitions,
+        mut unplaced,
     } = candidate;
     let mut placed: FxHashSet<_> = definitions.into_iter().collect();
+    // Compiler helpers need no detached function, but their instructions still
+    // belong in the listing if the expression using them was discarded.
+    let mut helpers: FxHashSet<_> = work.definitions.drain(..).collect();
     let mut visited = FxHashSet::default();
     let mut pending = vec![m.root];
     while let Some(id) = pending.pop() {
@@ -109,7 +117,10 @@ pub(super) fn append<'m>(
                 .copied()
                 .filter(|&child| matches!(m.objects[child], Object::Code(_))),
         );
-        if code.flags & code_flags::CO_OPTIMIZED == 0 || placed.contains(&id) {
+        if code.flags & code_flags::CO_OPTIMIZED == 0
+            || placed.contains(&id)
+            || helpers.contains(&id)
+        {
             continue;
         }
         let Ok(name) = m.text(code.name).and_then(identifier) else {
@@ -145,8 +156,11 @@ pub(super) fn append<'m>(
         for line in lines {
             writeln!(source, "#     {line}").unwrap();
         }
+        placed.insert(id);
+        unplaced.extend(body.unplaced);
         placed.extend(body.definitions);
-        placed.extend(work.definitions.drain(..));
+        helpers.extend(work.definitions.drain(..));
     }
-    source
+    blocks::append(m, &mut source, unplaced, &placed)?;
+    Ok(source)
 }
