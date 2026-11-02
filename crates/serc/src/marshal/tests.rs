@@ -1202,14 +1202,15 @@ fn borrowed_set_and_slice_keys_keep_canonical_hashes_without_drop_glue() {
     ] {
         let key = constant_key(&value);
         let mut expected = FxHasher::default();
-        std::mem::discriminant(&key).hash(&mut expected);
         match &value {
             Constant::FrozenSet(values) => {
-                let mut members: Vec<_> = values.iter().map(constant_key).collect();
-                members.sort_unstable();
-                members.hash(&mut expected);
+                let reversed = Constant::FrozenSet(values.iter().rev().cloned().collect());
+                let reversed_key = constant_key(&reversed);
+                assert_eq!(key, reversed_key);
+                reversed_key.hash(&mut expected);
             }
             Constant::Slice { lower, upper, step } => {
+                std::mem::discriminant(&key).hash(&mut expected);
                 for member in [lower, upper, step] {
                     constant_key(member).hash(&mut expected);
                 }

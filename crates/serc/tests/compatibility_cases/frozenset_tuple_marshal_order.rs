@@ -62,6 +62,27 @@ fn matches_cpython_frozenset_scalar_explicit_intern_marshal_order() {
 }
 
 #[test]
+fn matches_cpython_large_short_ascii_frozenset_order() {
+    let members = (0..72)
+        .rev()
+        .map(|index| format!("'name.{index}', 'word{index}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let longest_short = "x".repeat(255);
+    for tail in [
+        format!("'{longest_short}'"),
+        format!("'x{longest_short}'"),
+        "'公', 257".to_string(),
+    ] {
+        let source = format!(
+            "shared = 'name.8'\ndef contains(value):\n    return value in {{{members}, '', '\\x00', {tail}}}\n\
+             def reordered(value):\n    return value in {{{tail}, '\\x00', '', {members}}}\n"
+        );
+        common::assert_matches_cpython_marshal(&source, "large_ascii_frozenset_order.py");
+    }
+}
+
+#[test]
 fn matches_cpython_frozenset_startup_string_identity() {
     for member in ["error", "missing", "other", "timestamp", "u7", "unknown"] {
         let source = format!(
