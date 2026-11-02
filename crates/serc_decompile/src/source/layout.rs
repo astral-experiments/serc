@@ -9,12 +9,13 @@ use ruff_source_file::LineIndex;
 use std::collections::BTreeMap;
 
 use super::{MAX_SOURCE, Module, Object};
+use serc_bytecode::target::code_flags::CO_NEWLOCALS;
 
 pub(super) fn class_candidates(m: &Module<'_>, candidates: &mut Vec<String>) -> Result<(), String> {
     let mut targets: BTreeMap<&str, Vec<usize>> = BTreeMap::default();
     for obj in &m.objects {
         if let Object::Code(code) = obj
-            && code.flags & serc_bytecode::target::code_flags::CO_NEWLOCALS == 0
+            && code.flags & CO_NEWLOCALS == 0
             && !m.text(code.name)?.starts_with('<')
         {
             targets
@@ -43,6 +44,20 @@ struct Suites<'a> {
     index: LineIndex,
     classes: Vec<(usize, &'a str)>,
     inline: Vec<bool>,
+}
+
+impl<'a> Suites<'a> {
+    fn collect(source: &str, stmts: &'a [Stmt]) -> Self {
+        let mut suites = Self {
+            index: LineIndex::from_source_text(source),
+            classes: Vec::new(),
+            inline: vec![false; source.lines().count()],
+        };
+        for stmt in stmts {
+            suites.visit_stmt(stmt);
+        }
+        suites
+    }
 }
 
 impl<'a> Visitor<'a> for Suites<'a> {
@@ -79,14 +94,7 @@ impl<'a> Visitor<'a> for Suites<'a> {
 fn class_layout(source: &str, targets: &BTreeMap<&str, Vec<usize>>) -> Option<String> {
     let module = ruff_python_parser::parse_module(source).ok()?;
     let lines: Vec<_> = source.lines().collect();
-    let mut suites = Suites {
-        index: LineIndex::from_source_text(source),
-        classes: Vec::new(),
-        inline: vec![false; lines.len()],
-    };
-    for stmt in module.suite() {
-        suites.visit_stmt(stmt);
-    }
+    let suites = Suites::collect(source, module.suite());
     let mut offsets: BTreeMap<&str, usize> = BTreeMap::default();
     let mut result = String::new();
     let mut start = 0;
@@ -124,4 +132,60 @@ fn class_layout(source: &str, targets: &BTreeMap<&str, Vec<usize>>) -> Option<St
         result.push('\n');
     }
     (result.len() <= MAX_SOURCE && result != source).then_some(result)
+}
+
+/// Align placed class definitions in a partial module. The recompiled header
+/// line includes decorators, nested scopes and the best-effort preamble.
+pub(super) fn partial(m: &Module<'_>, candidate: &Module<'_>, source: &str) -> Option<String> {
+    if candidate.version != m.version {
+        return None;
+    }
+    let mut targets = BTreeMap::new();
+    super::paired::visit(m, candidate, |id, other, _| {
+        let original = m.code(id).ok()?;
+        let recovered = candidate.code(other).ok()?;
+        let name = m.text(original.name).ok()?;
+        if original.flags & CO_NEWLOCALS == 0
+            && recovered.flags & CO_NEWLOCALS == 0
+            && !name.starts_with('<')
+            && candidate.text(recovered.name).ok()? == name
+        {
+            targets.insert((recovered.first_line, name), original.first_line);
+        }
+        Some(())
+    })?;
+    if targets.is_empty() {
+        return None;
+    }
+    let parsed = ruff_python_parser::parse_module(source).ok()?;
+    let suites = Suites::collect(source, parsed.suite());
+    let sites = suites
+        .classes
+        .into_iter()
+        .filter_map(|(index, name)| Some((index + 1, *targets.get(&(index + 1, name))?)))
+        .collect::<Vec<_>>();
+    // Inserting before a class that already has the right line would move it.
+    let start = sites
+        .iter()
+        .rposition(|(line, wanted)| line == wanted)
+        .map_or(0, |i| i + 1);
+    let mut result = String::new();
+    let mut copied = 0;
+    let mut extra = 0;
+    for &(line, wanted) in &sites[start..] {
+        let gap = wanted.saturating_sub(line + extra);
+        if gap == 0 || gap > 1024 || source.len() + extra + gap > MAX_SOURCE {
+            continue;
+        }
+        let at = suites.index.line_starts()[line - 1].to_usize();
+        result.push_str(&source[copied..at]);
+        result.extend(std::iter::repeat_n('\n', gap));
+        copied = at;
+        extra += gap;
+    }
+    if extra == 0 {
+        return None;
+    }
+    result.push_str(&source[copied..]);
+    Some(result)
 }

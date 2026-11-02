@@ -80,14 +80,16 @@ pub(super) fn append<'m>(
     candidate: Candidate,
     work: &mut Recovery<'m>,
     warned: &super::warnings::Warnings,
+    formatting_bytes: usize,
 ) -> Result<String, String> {
     let Candidate {
         mut source,
         definitions,
         mut unplaced,
     } = candidate;
-    // Inserting diagnostics on def lines must not displace detached bodies.
-    let limit = MAX_SOURCE + warned.values().map(|w| w.annotation_len()).sum::<usize>();
+    // Padding and diagnostics must not displace detached bodies.
+    let limit =
+        MAX_SOURCE + formatting_bytes + warned.values().map(|w| w.annotation_len()).sum::<usize>();
     let mut placed: FxHashSet<_> = definitions.into_iter().collect();
     // Compiler helpers need no detached function, but their instructions still
     // belong in the listing if the expression using them was discarded.

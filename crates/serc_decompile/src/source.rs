@@ -13,6 +13,7 @@ mod exceptions;
 mod layout;
 mod loops;
 mod operands;
+mod paired;
 mod partial;
 pub(super) use partial::{comment, partial};
 mod patterns;

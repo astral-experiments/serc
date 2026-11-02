@@ -2,6 +2,9 @@
 use std::ops::Range;
 
 use ruff_text_size::Ranged;
+use serc_bytecode::marshal::reader::read;
+use serc_bytecode::target::code_flags::CO_NEWLOCALS;
+use serc_bytecode::{OptimizationLevel, PythonVersion};
 
 use super::{
     Body, Bytecode, Candidate, MAX_WORK, Module, Object, Recovery, detached, scope, synthetic,
@@ -26,8 +29,10 @@ pub(crate) fn comment(text: &str) -> String {
 pub(crate) fn partial(
     m: &Module<'_>,
     candidate: Option<Candidate>,
-    compile: impl FnMut(&str, serc_bytecode::OptimizationLevel) -> Option<Vec<u8>>,
-) -> Result<(String, String), String> {
+    reason: &str,
+    mut compile: impl FnMut(&str, OptimizationLevel) -> Option<Vec<u8>>,
+) -> Result<String, String> {
+    const HEADER: &str = "# serc: best-effort decompilation\n";
     // A malformed graph is still an input error. Validate even scopes the source
     // pass may skip when their parent contains an unsupported statement.
     if m.text(m.code(m.root)?.name)? != "<module>" {
@@ -35,6 +40,7 @@ pub(crate) fn partial(
     }
     let mut budget = MAX_WORK;
     let mut implicit = Vec::new();
+    let mut align_classes = false;
     for (id, obj) in m.objects.iter().enumerate() {
         if let Object::Code(code) = obj {
             let bytes = m.bytes(code.bytecode)?;
@@ -44,7 +50,14 @@ pub(crate) fn partial(
                 .ok_or("bytecode validation work limit exceeded")?;
             let bc = Bytecode::decode(m.version, bytes, handlers)?;
             crate::flow::Graph::build(&bc, m.version, code.stack_size)?;
-            if m.text(code.name)? == "__annotate__" && detached::annotation_helper(&bc) {
+            let name = m.text(code.name)?;
+            if m.version >= PythonVersion::Py313
+                && code.flags & CO_NEWLOCALS == 0
+                && !name.starts_with('<')
+            {
+                align_classes = true;
+            }
+            if name == "__annotate__" && detached::annotation_helper(&bc) {
                 implicit.push(id);
             }
         }
@@ -69,12 +82,26 @@ pub(crate) fn partial(
         detached::take_marks(source)
     };
     work.definitions.extend(implicit);
-    let warned = super::warnings::annotate(m, &mut candidate, compile);
-    let note = warned
-        .get(&m.root)
-        .map(|d| d.module_note())
-        .unwrap_or_default();
-    Ok((detached::append(m, candidate, &mut work, &warned)?, note))
+    let unformatted = candidate.source.len();
+    candidate
+        .source
+        .insert_str(0, &format!("{HEADER}\n# {}\n", comment(reason)));
+    let mut first = compile(&candidate.source, OptimizationLevel::Zero);
+    if align_classes
+        && let Some(other) = first.as_deref().and_then(|bytes| read(bytes).ok())
+        && let Some(aligned) = super::layout::partial(m, &other, &candidate.source)
+    {
+        candidate.source = aligned;
+        first = compile(&candidate.source, OptimizationLevel::Zero);
+    }
+    let formatting_bytes = candidate.source.len() - unformatted;
+    let warned = super::warnings::annotate(m, &mut candidate, first, compile);
+    let mut result = detached::append(m, candidate, &mut work, &warned, formatting_bytes)?;
+    if let Some(difference) = warned.get(&m.root) {
+        // The blank header line reserves the module diagnostic's location.
+        result.insert_str(HEADER.len(), &difference.module_note());
+    }
+    Ok(result)
 }
 
 impl Body<'_, '_, '_> {

@@ -1737,9 +1737,12 @@ if before:
 fake_gap = '# __serc_unplaced__ 0 1 2 # serc: unrecovered literal'
 fake_marker = '# __serc_definition_id__ 7'
 label: str = 'αβγ'
+def identity(cls): return cls
+{padding}@identity
 class Labels:
     label: str = 'αβγ'
     size: int = 3
+{padding}    class Nested: pass
 def annotated(x: int): return x
 if before:
     lost = '{big}'
@@ -1779,7 +1782,8 @@ def guarded(flag, events):
         events.append('other')
     return events
 ",
-        big = "x".repeat(200_000)
+        big = "x".repeat(200_000),
+        padding = "\n".repeat(32)
     );
     fs_err::write(&original, source).unwrap();
     for version in common::PYTHON_VERSIONS {
@@ -1849,6 +1853,13 @@ assert scope['fake_gap'] == '# __serc_unplaced__ 0 1 2 # serc: unrecovered liter
 with open(sys.argv[2], 'rb') as cache:
     cache.read(16)
     module = marshal.load(cache)
+if sys.version_info >= (3, 13):
+    labels, = (c for c in module.co_consts if isinstance(c, types.CodeType) and c.co_name == 'Labels')
+    nested, = (c for c in labels.co_consts if isinstance(c, types.CodeType) and c.co_name == 'Nested')
+    assert scope['Labels'].__firstlineno__ == labels.co_firstlineno
+    assert scope['Labels'].Nested.__firstlineno__ == nested.co_firstlineno
+else:
+    assert '\n' * 32 not in open(sys.argv[1], encoding='utf8').read()
 sections = {}
 for section in re.split(r'\n# serc: (?:unplaced blocks|original blocks \([^)]+\)) in ', open(sys.argv[1], encoding='utf8').read())[1:]:
     name, _, _ = section.partition(' (original line ')
