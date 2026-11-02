@@ -66,6 +66,11 @@ recovery handles value and singleton patterns, alternatives, guards, captures,
 and selected sequence, mapping, and class patterns. Nested or overlapping cases
 can still exceed these recognizers.
 
+In `asyncio.__getattr__` on 3.14 and 3.15, two platform checks in literal cases
+can reach the same `raise AttributeError` after the match. A failed platform
+check leaves the match even if a later case could match the same value. Both
+targets reproduce the function's executable fields.
+
 In `asyncio.Queue._wakeup_next`, a backedge follows the test of the current
 waiter but returns to the test of the queue. On 3.12 and 3.13, CPython emits a
 second copy of the queue test at the bottom of the loop. On 3.14 and 3.15, the
@@ -74,6 +79,11 @@ completed waiter advances the loop to the next item. In 3.14's
 `asyncio.graph._build_graph_for_future`, two arms jump back to the header. The
 third falls past both jumps, so recovery emits a `break`. The same layout occurs
 in the interactive interpreter's dotted-name parser and backspace handler.
+
+A return inside a `for` loop can remove the iterator from beneath a computed
+return value. Recovery checks how many slots the target uses for the iterator.
+In `asyncio.Semaphore._wake_up_next`, it preserves the early return after waking
+a waiter and the separate return on exhaustion on all four targets.
 
 For a protected `await`, CPython temporarily sends throws from `YIELD_VALUE` to
 `CLEANUP_THROW`. Both the resumed path and the cleanup can reach the user's
@@ -159,6 +169,12 @@ compares the jump and fallthrough destinations of each block in instruction
 order and distinguishes returns from raises. If those edges and the exception
 table match, differences in instructions or their operands do not produce a
 function warning. Functions with an explicit gap already have a listing.
+
+If the module's own normal flow or exception table differs at every optimization
+level, the best-effort header names the difference. The appendix lists the
+module's original blocks once, including any blocks already covered by a gap.
+The comparison examines the module's import-time instructions separately from
+the code in its classes and functions.
 
 Use `serc decompile --strict FILE.pyc` to require whole-module verification. In
 strict mode a refusal writes the reason to stderr and leaves stdout empty.

@@ -75,13 +75,17 @@ pub fn decompile_pyc_with_mode(
         Err(error) if mode == DecompileMode::BestEffort => {
             let code = module.code(module.root).map_err(DecompileError::Read)?;
             let filename = module.text(code.filename).map_err(DecompileError::Read)?;
-            let result = source::partial(&module, fallback, |source, level| {
+            let (result, module_note) = source::partial(&module, fallback, |source, level| {
                 compile(source, filename, module.version, level)
             })
             .map_err(|reason| DecompileError::Reconstruct(module.version, reason))?;
             let note = source::comment(&error.to_string());
             Ok(DecompileOutput {
-                source: format!("# serc: best-effort decompilation\n\n# {note}\n{result}"),
+                // Use the header's existing blank line. Moving a class
+                // changes its observable __firstlineno__ on newer targets.
+                source: format!(
+                    "# serc: best-effort decompilation\n{module_note}\n# {note}\n{result}"
+                ),
                 verification_error: Some(error),
             })
         }

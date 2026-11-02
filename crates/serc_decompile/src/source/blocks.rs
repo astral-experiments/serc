@@ -66,7 +66,7 @@ pub(super) fn append(
         }
     }
     for &id in warned.keys() {
-        pending.entry(id).or_default().push(0..usize::MAX);
+        pending.entry(id).or_default();
     }
     let mut seen = FxHashSet::default();
     let end = source.len() + MAX_LISTING;
@@ -98,18 +98,16 @@ pub(super) fn append(
         }
         ranges.sort_unstable_by_key(|r| r.start);
         let mut covered = 0;
-        let mut listed = 0;
-        for mut range in ranges {
+        for range in &mut ranges {
             range.start = range.start.max(covered);
             range.end = range.end.min(bc.ops.len());
-            if range.is_empty() {
+            if range.start >= range.end {
                 continue;
             }
             // A lost class, lambda, or compiler-generated scope may have no
             // Python definition in either the source or the detached appendix.
             for op in &bc.ops[range.clone()] {
-                if warning.is_none()
-                    && op.name == "LOAD_CONST"
+                if op.name == "LOAD_CONST"
                     && let Some(&child) = constants.get(op.arg as usize)
                     && matches!(m.objects[child], Object::Code(_))
                     && !placed.contains(&child)
@@ -122,6 +120,15 @@ pub(super) fn append(
                 }
             }
             covered = range.end;
+        }
+        // A module can have explicit gaps as well as a confirmed mismatch.
+        // Walk the children of its gaps, then list the whole graph once.
+        if warning.is_some() {
+            ranges.clear();
+            ranges.push(0..bc.ops.len());
+        }
+        let mut listed = 0;
+        for mut range in ranges {
             range.start = range.start.max(listed);
             for block in flow.blocks_covering(range) {
                 let start = block.ops.start;

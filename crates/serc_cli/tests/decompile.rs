@@ -1696,6 +1696,12 @@ def guarded(flag, events):
         assert!(output.status.success(), "{output:?}");
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(text.starts_with("# serc: best-effort decompilation\n"));
+        assert_eq!(
+            text.lines().nth(1),
+            Some(
+                "# serc: module normal control flow differs after recompilation (see original blocks)"
+            )
+        );
         assert!(text.contains("def large():\n    ...  # serc: unrecovered remainder of large"));
         assert!(text.contains("def after(x):"));
         assert!(!text.contains("# serc: unplaced blocks in after ("));
@@ -1745,11 +1751,11 @@ with open(sys.argv[2], 'rb') as cache:
     cache.read(16)
     module = marshal.load(cache)
 sections = {}
-for section in open(sys.argv[1], encoding='utf8').read().split('\n# serc: unplaced blocks in ')[1:]:
+for section in re.split(r'\n# serc: (?:unplaced blocks|original blocks \([^)]+\)) in ', open(sys.argv[1], encoding='utf8').read())[1:]:
     name, _, _ = section.partition(' (original line ')
     sections.setdefault(name, []).append(section)
-for name in ['Lost', '<lambda>']:
-    code, = (c for c in module.co_consts if isinstance(c, types.CodeType) and c.co_name == name)
+for name in ['<module>', 'Lost', '<lambda>']:
+    code, = (c for c in (module, *module.co_consts) if isinstance(c, types.CodeType) and c.co_name == name)
     section, = sections[name]
     lines = section.splitlines()
     rows = [(int(row.split()[1]), row.split()[2]) for row in lines if re.match(r'^# +[0-9]+  ', row)]

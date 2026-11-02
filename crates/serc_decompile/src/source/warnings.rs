@@ -1,4 +1,4 @@
-//! Match a retained definition to its recompiled control flow before
+//! Match each scope to its recompiled control flow before
 //! attaching a warning. The original cache does not record its optimize level.
 use std::collections::BTreeMap;
 
@@ -19,7 +19,8 @@ const SUFFIX: &str = " after recompilation (see original blocks)";
 
 #[derive(Clone, Copy)]
 pub(super) struct Difference {
-    line: usize,
+    // The module has no definition line to annotate.
+    line: Option<usize>,
     exceptions: bool,
     flow: bool,
 }
@@ -39,7 +40,15 @@ impl Difference {
     }
 
     pub(super) fn annotation_len(self) -> usize {
-        PREFIX.len() + self.description().len() + SUFFIX.len()
+        if self.line.is_some() {
+            PREFIX.len() + self.description().len() + SUFFIX.len()
+        } else {
+            0
+        }
+    }
+
+    pub(super) fn module_note(self) -> String {
+        format!("# serc: module {}{SUFFIX}", self.description())
     }
 }
 
@@ -74,7 +83,8 @@ fn differences(
     let mut seen = FxHashSet::default();
     let mut different = Warnings::default();
     let mut budget = MAX_WORK;
-    let mut flow_budget = MAX_WORK;
+    let mut function_flow_budget = MAX_WORK;
+    let mut module_flow_budget = MAX_WORK;
     while let Some((id, other)) = pending.pop() {
         if !seen.insert((id, other)) {
             continue;
@@ -84,24 +94,30 @@ fn differences(
         let left = m.bytes(code.exceptions).ok()?;
         let right = candidate.bytes(recovered.exceptions).ok()?;
         budget = budget.checked_sub(1 + left.len() + right.len())?;
-        if !explicit.contains(&id)
-            && code.flags & code_flags::CO_OPTIMIZED != 0
-            && identifier(m.text(code.name).ok()?).is_ok()
+        if id == m.root
+            || (!explicit.contains(&id)
+                && code.flags & code_flags::CO_OPTIMIZED != 0
+                && identifier(m.text(code.name).ok()?).is_ok())
         {
             let original = m.bytes(code.bytecode).ok()?;
             let compiled = candidate.bytes(recovered.bytecode).ok()?;
             // Reserve a separate budget so graph comparison cannot displace
             // an otherwise reportable exception-table mismatch.
+            let flow_budget = if id == m.root {
+                &mut module_flow_budget
+            } else {
+                &mut function_flow_budget
+            };
             let flow = if let Some(rest) = flow_budget.checked_sub(original.len() + compiled.len())
             {
-                flow_budget = rest;
+                *flow_budget = rest;
                 original != compiled
                     && crate::flow::same_normal_flow(m.version, original, compiled) == Ok(false)
             } else {
                 false
             };
             let difference = Difference {
-                line: recovered.first_line,
+                line: (id != m.root).then_some(recovered.first_line),
                 exceptions: left != right,
                 flow,
             };
@@ -201,7 +217,7 @@ pub(super) fn annotate(
     let mut headers = Headers {
         locations: remaining
             .iter()
-            .filter_map(|(&id, diff)| Some(((diff.line, m.text(m.code(id).ok()?.name).ok()?), id)))
+            .filter_map(|(&id, diff)| Some(((diff.line?, m.text(m.code(id).ok()?.name).ok()?), id)))
             .collect(),
         lines: LineIndex::from_source_text(&candidate.source),
         tokens: parsed.tokens(),
@@ -217,6 +233,9 @@ pub(super) fn annotate(
     );
     let mut start = 0;
     let mut warned = Warnings::default();
+    if let Some(&difference) = remaining.get(&m.root) {
+        warned.insert(m.root, difference);
+    }
     for (end, id) in headers.edits {
         source.push_str(&candidate.source[start..end]);
         let difference = remaining[&id];

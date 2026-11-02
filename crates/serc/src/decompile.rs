@@ -80,6 +80,7 @@ mod tests {
             )
             .unwrap();
             assert!(output.verification_error.is_some());
+            assert!(!output.source.contains("# serc: module "));
             assert_eq!(
                 output
                     .source
@@ -115,6 +116,7 @@ mod tests {
             )
             .unwrap();
             assert!(output.verification_error.is_some());
+            assert!(!output.source.contains("# serc: module "));
             assert_eq!(
                 output
                     .source
@@ -127,6 +129,61 @@ mod tests {
                     .contains("# serc: original blocks (normal control flow differs) in route "),
                 matching_level.is_none()
             );
+        }
+    }
+
+    #[test]
+    fn module_warnings_compare_its_own_edges_at_every_level() {
+        let cache = |source: &str| {
+            crate::compile(source, "module.py")
+                .unwrap()
+                .to_timestamp_pyc(0, 0)
+        };
+        for (original, changed, reason) in [
+            (
+                "if a and b: work(1)\n",
+                "if a or b: work(1)\n",
+                "normal control flow differs",
+            ),
+            (
+                "try: work(1)\nexcept KeyError: raise\n",
+                "sentinel()\ntry: work(1)\nexcept KeyError: raise\n",
+                "exception table differs",
+            ),
+            (
+                "try: work(1)\nexcept KeyError: raise\n",
+                "work(1)\n",
+                "exception table and normal control flow differ",
+            ),
+        ] {
+            let input = cache(original);
+            let same_graph = cache(&original.replace('1', "2"));
+            let different = cache(changed);
+            for matching in [None, Some(crate::OptimizationLevel::Two)] {
+                let result = serc_decompile::decompile_pyc_with_mode(
+                    &input,
+                    DecompileMode::BestEffort,
+                    |_, _, _, level| {
+                        Some(if Some(level) == matching {
+                            same_graph.clone()
+                        } else {
+                            different.clone()
+                        })
+                    },
+                )
+                .unwrap();
+                assert!(result.verification_error.is_some());
+                let note =
+                    format!("# serc: module {reason} after recompilation (see original blocks)");
+                let listing = format!("# serc: original blocks ({reason}) in <module> ");
+                if matching.is_none() {
+                    assert_eq!(result.source.lines().nth(1), Some(note.as_str()));
+                    assert_eq!(result.source.matches(&listing).count(), 1);
+                } else {
+                    assert_eq!(result.source.lines().nth(1), Some(""));
+                    assert!(!result.source.contains("# serc: original blocks"));
+                }
+            }
         }
     }
 
