@@ -259,8 +259,12 @@ impl Body<'_, '_, '_> {
         Ok(())
     }
 
-    pub(super) fn special_call(&mut self, argc: u32) -> Result<Option<Value>, String> {
-        if argc == 0 && self.stack.len() >= 2 {
+    pub(super) fn special_call(
+        &mut self,
+        argc: u32,
+        keys: &[String],
+    ) -> Result<Option<Value>, String> {
+        if argc == 0 && keys.is_empty() && self.stack.len() >= 2 {
             let slot = self.stack.len() - 2;
             if let [Value::Function(def), Value::Expr(_)] = &self.stack[slot..]
                 && self.m.text(self.m.code(def.id)?.name)? == "<genexpr>"
@@ -289,13 +293,18 @@ impl Body<'_, '_, '_> {
                 self.stack.truncate(slot);
                 return Ok(Some(Value::Function(def)));
             }
-        }
-        if argc == 0 && matches!(self.stack.last(), Some(Value::Function(_))) {
-            let Value::Function(mut def) = self.pop()? else {
-                unreachable!()
-            };
-            def.decorators.push(self.expr()?);
-            return Ok(Some(Value::Function(def)));
+            if matches!(
+                &self.stack[slot..],
+                [Value::Expr(_), Value::Function(_) | Value::Class(..)]
+            ) {
+                let mut decorated = self.pop()?;
+                let decorator = self.expr()?;
+                match &mut decorated {
+                    Value::Function(def) | Value::Class(def, _) => def.decorators.push(decorator),
+                    _ => unreachable!(),
+                }
+                return Ok(Some(decorated));
+            }
         }
         let Some(start) = self.stack.len().checked_sub(argc as usize + 2) else {
             return Ok(None);
@@ -314,7 +323,7 @@ impl Body<'_, '_, '_> {
         if !is_class {
             return Ok(None);
         }
-        let bases = self.args(argc.checked_sub(2).ok_or("missing class arguments")?)?;
+        let bases = self.call_args(argc.checked_sub(2).ok_or("missing class arguments")?, keys)?;
         let name = self.expr()?;
         let Value::Function(def) = self.pop()? else {
             return Err("expected class body".into());
@@ -328,16 +337,19 @@ impl Body<'_, '_, '_> {
             return Err("unsupported dynamic class name".into());
         }
         self.stack.truncate(start);
-        Ok(Some(Value::Class(def.id, bases)))
+        Ok(Some(Value::Class(def, bases)))
     }
 
     pub(super) fn class_definition(
         &mut self,
         name: &str,
-        id: Id,
+        def: &Definition,
         bases: &[String],
     ) -> Result<(), String> {
-        let body = scope(self.m, id, self.depth + 1, true, self.work)?;
+        let body = scope(self.m, def.id, self.depth + 1, true, self.work)?;
+        for decorator in def.decorators.iter().rev() {
+            self.line(&format!("@{decorator}"))?;
+        }
         self.block(&format!("class {name}({}):", bases.join(", ")), &body)
     }
 

@@ -82,20 +82,30 @@ fn class_layout(
 ) -> Option<String> {
     let mut result = String::new();
     let mut lineno = 1;
+    let mut decorators = None;
     for line in source.split_inclusive('\n') {
+        if line.trim_start().starts_with('@') {
+            decorators.get_or_insert((result.len(), lineno));
+            result.push_str(line);
+            lineno += 1;
+            continue;
+        }
+        let (start, first_line) = decorators.take().unwrap_or((result.len(), lineno));
         if let Some(name) = line
             .trim_start()
             .strip_prefix("class ")
             .and_then(|s| s.split(['(', '[', ':']).next())
             && let Some(&Some(target)) = lines.get(name)
-            && target > lineno
+            && target > first_line
         {
-            let gap = target - lineno;
+            let gap = target - first_line;
             if gap.checked_add(result.len())?.checked_add(source.len())? > MAX_SOURCE {
                 return None;
             }
+            let preceding = result.split_off(start);
             result.extend(std::iter::repeat_n('\n', gap));
-            lineno = target;
+            result.push_str(&preceding);
+            lineno += gap;
         }
         result.push_str(line);
         lineno += 1;
@@ -199,7 +209,7 @@ enum Value {
     Code(Id),
     Function(Definition),
     BuildClass,
-    Class(Id, Vec<String>),
+    Class(Definition, Vec<String>),
     Import(Import),
     Member(String),
 }
@@ -309,12 +319,12 @@ impl Body<'_, '_, '_> {
         }
     }
 
-    fn call(&mut self, argc: u32) -> Result<(), String> {
-        if let Some(result) = self.special_call(argc)? {
+    fn call(&mut self, argc: u32, keys: &[String]) -> Result<(), String> {
+        if let Some(result) = self.special_call(argc, keys)? {
             self.stack.push(result);
             return Ok(());
         }
-        let args = self.args(argc)?;
+        let args = self.call_args(argc, keys)?;
         self.emit_call(&args)
     }
 
@@ -381,7 +391,7 @@ impl Body<'_, '_, '_> {
                 self.line(&format!("{name} {operator}= {rhs}"))
             }
             Value::Function(def) => self.definition(name, &def),
-            Value::Class(id, bases) => self.class_definition(name, id, &bases),
+            Value::Class(def, bases) => self.class_definition(name, &def, &bases),
             Value::Import(import) => self.line(&import.statement(name)?),
             Value::Member(member) => {
                 let Some(Value::Import(import)) = self.stack.last_mut() else {
@@ -495,7 +505,7 @@ impl Body<'_, '_, '_> {
                     self.line(&expr)?;
                 }
             }
-            "CALL" => self.call(a)?,
+            "CALL" => self.call(a, &[])?,
             "CALL_KW" => {
                 let keys = self.expr()?;
                 self.keyword_call(a, &keys)?;

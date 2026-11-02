@@ -131,17 +131,20 @@ impl Body<'_, '_, '_> {
     }
 
     pub(super) fn keyword_call(&mut self, argc: u32, keys: &str) -> Result<(), String> {
-        let keys = tuple_items(keys)?;
+        self.call(argc, &tuple_items(keys)?)
+    }
+
+    pub(super) fn call_args(&mut self, argc: u32, keys: &[String]) -> Result<Vec<String>, String> {
         let mut args = self.args(argc)?;
         let first = args
             .len()
             .checked_sub(keys.len())
             .ok_or("invalid keyword argument count")?;
         for (arg, key) in args[first..].iter_mut().zip(keys) {
-            let key = string_value(&key)?;
+            let key = string_value(key)?;
             *arg = format!("{}={arg}", identifier(&key)?);
         }
-        self.emit_call(&args)
+        Ok(args)
     }
 
     pub(super) fn update_literal(&mut self, op: Instruction) -> Result<(), String> {

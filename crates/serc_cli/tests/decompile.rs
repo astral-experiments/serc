@@ -507,3 +507,27 @@ fn exception_edges_and_loop_cleanup() {
         "result = []\ndef fail(e): raise e\nfor work in [lambda: 0, lambda: fail(ValueError()), lambda: fail(TypeError()), lambda: fail(KeyError())]:\n    try: result.append(f(work, result.append))\n    except KeyError: result.append('unmatched')",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn decorated_classes_and_metaclasses() {
+    check_fixture(
+        r#"events = []
+def mark(which):
+    events.append(which)
+    def decorate(cls):
+        events.append(cls.__name__ + which)
+        return cls
+    return decorate
+
+class Base:
+    pass
+
+@mark("outer")
+@mark("inner")
+class Derived(Base, metaclass=type):
+    pass
+"#,
+        "result = events, Derived.__base__.__name__",
+    );
+}
