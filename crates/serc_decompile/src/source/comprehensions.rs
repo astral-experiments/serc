@@ -1,4 +1,4 @@
-//! Recover synchronous comprehension clauses from their nested iterator loops.
+//! Recover comprehension clauses from synchronous and asynchronous iterator loops.
 use std::fmt::Write as _;
 
 use super::{Body, Instruction, Value};
@@ -11,38 +11,10 @@ pub(super) fn is_collection_insert(op: &Instruction) -> bool {
         )
 }
 
-fn loop_exit(ops: &[Instruction], header: usize, end: usize) -> Result<usize, String> {
-    let exit = ops[header]
-        .jump
-        .and_then(|target| ops.binary_search_by_key(&target, |op| op.offset).ok())
-        .ok_or("invalid comprehension exit")?;
-    if exit <= header + 1
-        || exit >= end
-        || ops[exit].name != "END_FOR"
-        || (ops[exit - 1].name, ops[exit - 1].jump) != ("JUMP_BACKWARD", Some(ops[header].offset))
-    {
-        return Err("unsupported comprehension backedge".into());
-    }
-    Ok(exit)
-}
-
-/// If the outer backedge follows an inner iterator's cleanup, that iterator
-/// supplies the next `for` clause. An iterator in the element is consumed before
-/// the result is appended and does not share this cleanup.
-fn inner_header(ops: &[Instruction], start: usize, back: usize) -> Result<Option<usize>, String> {
-    let mut tail = back;
-    if tail > start && matches!(ops[tail - 1].name, "POP_ITER" | "POP_TOP") {
-        tail -= 1;
-    }
-    if tail <= start || ops[tail - 1].name != "END_FOR" {
-        return Ok(None);
-    }
-    let end = ops[tail - 1].offset;
-    ops[start..tail - 1]
-        .iter()
-        .position(|op| op.name == "FOR_ITER" && op.jump == Some(end))
-        .map(|n| Some(start + n))
-        .ok_or_else(|| "missing inner comprehension header".into())
+struct Iteration {
+    bind: usize,
+    back: usize,
+    exit: usize,
 }
 
 fn clause_boundary(
@@ -54,7 +26,7 @@ fn clause_boundary(
     Ok(if let Some(child) = child {
         // 3.13 can emit two GET_ITERs for an inner clause.
         let mut get_iter = child;
-        while get_iter > start && ops[get_iter - 1].name == "GET_ITER" {
+        while get_iter > start && matches!(ops[get_iter - 1].name, "GET_ITER" | "GET_AITER") {
             get_iter -= 1;
         }
         if get_iter == child {
@@ -76,6 +48,85 @@ fn clause_boundary(
 }
 
 impl Body<'_, '_, '_> {
+    fn iteration(
+        &self,
+        ops: &[Instruction],
+        header: usize,
+        end: usize,
+    ) -> Result<Iteration, String> {
+        let asynchronous = ops[header].name == "GET_ANEXT";
+        let target = if asynchronous {
+            self.flow.handler(header).map(|h| h.target)
+        } else {
+            ops[header].jump
+        };
+        let exit = target
+            .and_then(|offset| ops.binary_search_by_key(&offset, |op| op.offset).ok())
+            .filter(|&i| i > header + 1 && i < end)
+            .ok_or("invalid comprehension exit")?;
+        let (bind, back) = if asynchronous {
+            if ops[exit].name != "END_ASYNC_FOR" {
+                return Err("invalid async comprehension exit".into());
+            }
+            let send = (header + 1..exit)
+                .find(|&i| ops[i].name == "SEND")
+                .ok_or("missing async iterator send")?;
+            let ready = self.flow.target(send)?;
+            if ready <= send || ready >= exit || ops[ready].name != "END_SEND" {
+                return Err("invalid async iterator value".into());
+            }
+            // Filters also branch back to GET_ANEXT. The last normal backedge
+            // precedes exhaustion even when several awaits share an area for
+            // their out-of-line CLEANUP_THROW blocks.
+            let back = self
+                .flow
+                .incoming(header)
+                .rev()
+                .find(|&i| {
+                    i > ready
+                        && i < exit
+                        && ops[i].name == "JUMP_BACKWARD"
+                        && self.flow.jump(i) == Some(header)
+                })
+                .ok_or("missing async comprehension latch")?;
+            (ready + 1, back)
+        } else {
+            if ops[exit].name != "END_FOR" {
+                return Err("invalid synchronous comprehension exit".into());
+            }
+            (header + 1, exit - 1)
+        };
+        if ops[back].name != "JUMP_BACKWARD" || self.flow.jump(back) != Some(header) {
+            return Err("unsupported comprehension backedge".into());
+        }
+        Ok(Iteration { bind, back, exit })
+    }
+
+    /// An inner clause finishes its iterator immediately before the outer latch.
+    fn inner_header(
+        &self,
+        ops: &[Instruction],
+        start: usize,
+        back: usize,
+    ) -> Result<Option<usize>, String> {
+        let mut tail = back;
+        if tail > start && matches!(ops[tail - 1].name, "POP_ITER" | "POP_TOP") {
+            tail -= 1;
+        }
+        if tail <= start || !matches!(ops[tail - 1].name, "END_FOR" | "END_ASYNC_FOR") {
+            return Ok(None);
+        }
+        let exit = ops[tail - 1].offset;
+        (start..tail - 1)
+            .find(|&i| match ops[i].name {
+                "FOR_ITER" => ops[i].jump == Some(exit),
+                "GET_ANEXT" => self.flow.handler(i).is_some_and(|h| h.target == exit),
+                _ => false,
+            })
+            .map(Some)
+            .ok_or_else(|| "missing inner comprehension header".into())
+    }
+
     pub(super) fn comprehension(
         &mut self,
         ops: &[Instruction],
@@ -86,19 +137,22 @@ impl Body<'_, '_, '_> {
         let mut iterable = self.expr()?;
         let outer = ops[start..end]
             .iter()
-            .position(|op| op.name == "FOR_ITER")
+            .position(|op| matches!(op.name, "FOR_ITER" | "GET_ANEXT"))
             .map(|n| start + n)
             .ok_or("missing comprehension header")?;
-        let outer_exit = loop_exit(ops, outer, end)?;
+        let mut iteration = self.iteration(ops, outer, end)?;
+        let outer_exit = iteration.exit;
         let mut header = outer;
-        let mut exit = outer_exit;
         let mut clauses = String::new();
         for _ in 0..32 {
-            let back = exit - 1;
-            let binding = self.binding(ops, header + 1, back)?;
+            let back = iteration.back;
+            let binding = self.binding(ops, iteration.bind, back)?;
+            if ops[header].name == "GET_ANEXT" {
+                clauses.push_str(" async");
+            }
             write!(clauses, " for {} in ({iterable})", binding.target).unwrap();
             self.charge(back - binding.next)?;
-            let child = inner_header(ops, binding.next, back)?;
+            let child = self.inner_header(ops, binding.next, back)?;
             let boundary = clause_boundary(ops, binding.next, back, child)?;
             let mut element = binding.next;
             let mut seed = binding.seed;
@@ -130,12 +184,12 @@ impl Body<'_, '_, '_> {
             let body = self.seeded(ops, element, boundary, level, seed)?;
             if let Some(child) = child {
                 iterable = body.expression()?;
-                exit = loop_exit(ops, child, back)?;
+                iteration = self.iteration(ops, child, back)?;
                 // 3.15 expands a starred generator element with an anonymous
                 // inner loop that yields each item directly, without binding it.
                 if self.m.version == serc_bytecode::PythonVersion::Py315
                     && self.m.text(self.code.name)? == "<genexpr>"
-                    && let [item, resume, pop] = &ops[child + 1..exit - 1]
+                    && let [item, resume, pop] = &ops[iteration.bind..iteration.back]
                     && (item.name, resume.name, pop.name) == ("YIELD_VALUE", "RESUME", "POP_TOP")
                 {
                     self.push(format!("(*({iterable}){clauses})"))?;
@@ -220,6 +274,16 @@ impl Body<'_, '_, '_> {
             && self.m.version >= serc_bytecode::PythonVersion::Py313
         {
             restore += 1;
+        }
+        if restore < end && ops[restore].name == "JUMP_FORWARD" {
+            let join = self.flow.target(restore)?;
+            if join <= restore + 1
+                || join >= end
+                || (ops[join - 1].name, ops[join - 1].arg) != ("RERAISE", 0)
+            {
+                return Err("invalid comprehension unwind continuation".into());
+            }
+            restore = join;
         }
         if restore >= end || saved.is_empty() {
             return Err("missing comprehension local restore".into());

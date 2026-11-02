@@ -222,7 +222,7 @@ impl Body<'_, '_, '_> {
                 }
                 "RETURN_GENERATOR" if i + 1 < end && ops[i + 1].name == "POP_TOP" => Ok(i + 2),
                 "GET_AWAITABLE" | "GET_YIELD_FROM_ITER" => self.delegated(ops, i, end),
-                "GET_ITER"
+                "GET_ITER" | "GET_AITER"
                     if ops
                         .get(i + 1)
                         .is_some_and(|next| next.name == "CALL" && next.arg == 0) =>
@@ -237,7 +237,7 @@ impl Body<'_, '_, '_> {
                 "GET_AITER" if i + 1 < end && ops[i + 1].name == "GET_ANEXT" => {
                     self.async_loop(ops, i, end, level)
                 }
-                "GET_ITER" if i + 1 < end && ops[i + 1].name == "LOAD_FAST_AND_CLEAR" => {
+                "GET_ITER" | "GET_AITER" if i + 1 < end && ops[i + 1].name == "LOAD_FAST_AND_CLEAR" => {
                     self.comprehension(ops, i + 1, end, level)
                 }
                 "LOAD_FAST_AND_CLEAR" => self.comprehension(ops, i, end, level),

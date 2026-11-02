@@ -695,3 +695,21 @@ events.append(4)
         "result = events",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn async_comprehension_clause_order() {
+    check_fixture(
+        r"async def items(rows):
+    for row in rows:
+        yield row
+async def consume():
+    rows = [[1, 0], [2, 3]]
+    left = [v async for row in items(rows) for v in row if v]
+    right = {v: v+1 for row in rows async for v in items(row) if v}
+    stream = (v async for row in items(rows) async for v in items(row) if v)
+    return left, right, [v async for v in stream]
+",
+        "import asyncio; result = asyncio.run(consume())",
+    );
+}
