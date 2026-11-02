@@ -186,12 +186,13 @@ fn recover_scope<'m>(
     body.declarations(&bc.ops)?;
     let result = if body.suspended() {
         body.suspension_scope(&bc)
-    } else if let Some(stop) = comprehensions::normal_end(&bc) {
-        body.region(&bc.ops, 0, stop, 0)
-    } else if bc.handlers.is_empty() {
-        body.region(&bc.ops, 0, bc.ops.len(), 0)
     } else {
-        body.protected(&bc)
+        let (handlers, end) = comprehensions::protection(&bc)?;
+        if handlers.is_empty() {
+            body.region(&bc.ops, 0, end, 0)
+        } else {
+            body.protected(&bc, handlers, end)
+        }
     }
     .and_then(|()| {
         if body.stack.is_empty() {

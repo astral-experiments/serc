@@ -1,6 +1,8 @@
 //! Recover comprehension clauses from synchronous and asynchronous iterator loops.
 use std::fmt::Write as _;
 
+use serc_bytecode::instructions::Handler;
+
 use super::{Body, Bytecode, Instruction, Value};
 
 pub(super) fn is_collection_insert(op: &Instruction) -> bool {
@@ -11,36 +13,41 @@ pub(super) fn is_collection_insert(op: &Instruction) -> bool {
         )
 }
 
-/// An inlined comprehension has handlers that restore its saved locals. A
-/// user-written handler in the same scope still needs a try/except statement.
-pub(super) fn normal_end(bc: &Bytecode) -> Option<usize> {
-    if !bc.ops.iter().any(|op| op.name == "LOAD_FAST_AND_CLEAR")
+/// Split leading comprehension restores from user handlers. A restore after
+/// the last return starts the out-of-line cleanup, even when a later try has
+/// its own handler after it. Inline restores are jumped over on success.
+pub(super) fn protection(bc: &Bytecode) -> Result<(&[Handler], usize), String> {
+    let mut handlers = bc.handlers.as_slice();
+    let len = bc.ops.len();
+    if handlers.is_empty()
+        || !bc.ops.iter().any(|op| op.name == "LOAD_FAST_AND_CLEAR")
         || !bc.ops.iter().any(is_collection_insert)
     {
-        return None;
+        return Ok((handlers, len));
     }
-    let mut first = bc.ops.len();
-    let mut after_return = bc.ops.len();
-    for handler in &bc.handlers {
+    let mut first = len;
+    let mut after_return = len;
+    while let Some((entry, rest)) = handlers.split_first() {
         let target = bc
             .ops
-            .binary_search_by_key(&handler.target, |op| op.offset)
-            .ok()?;
-        if (bc.ops[target].name, bc.ops[target].arg) != ("SWAP", 2) {
-            return None;
+            .binary_search_by_key(&entry.target, |op| op.offset)
+            .map_err(|_| "invalid comprehension handler")?;
+        if !matches!(&bc.ops[target..], [swap, pop, ..] if (swap.name, swap.arg) == ("SWAP", 2) && pop.name == "POP_TOP")
+        {
+            break;
         }
         first = first.min(target);
-        // A nested comprehension can place its own restore inline, jumping
-        // around it on success, before an out-of-line restore after a return.
         if target > 0 && matches!(bc.ops[target - 1].name, "RETURN_VALUE" | "RETURN_CONST") {
             after_return = after_return.min(target);
         }
+        handlers = rest;
     }
-    Some(if after_return == bc.ops.len() {
+    let end = if handlers.is_empty() && after_return == len {
         first
     } else {
         after_return
-    })
+    };
+    Ok((handlers, end))
 }
 
 struct Iteration {

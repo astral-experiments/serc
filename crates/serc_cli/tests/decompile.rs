@@ -922,6 +922,10 @@ fn comprehensions_inside_returning_exception_handlers() {
         "def exports(module):\n    try:\n        return list(module.__all__)\n    except AttributeError:\n        return [n for n in dir(module) if n[0] != '_']\n",
         "class Explicit: __all__ = ('_keep',)\nclass Implicit: visible = 1\nresult = exports(Explicit), exports(Implicit)\nassert result == (['_keep'], ['visible'])",
     );
+    check_fixture(
+        "def values(items, work):\n    before = [x + 1 for x in items]\n    try: work()\n    except KeyError: before.append(5)\n    return before\n",
+        "def fail(): raise KeyError\nresult = values([1], fail), values([3], lambda: None)\nassert result == ([2,5],[4])",
+    );
 }
 
 #[cfg(feature = "decompile")]
