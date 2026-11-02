@@ -18,12 +18,15 @@ An experimental CPython bytecode compiler, written in Rust.
 Serc produces byte-for-byte identical output on an extensive corpus of
 real-world Python code, including [Django](https://github.com/django/django),
 [Airflow](https://github.com/apache/airflow), and
-[Transformers](https://github.com/huggingface/transformers), >40% faster than
-CPython's built-in compiler:
+[Transformers](https://github.com/huggingface/transformers).
 
-| Project                 |              Serc | CPython 3.14.5 `compileall` | Speedup |
-| ----------------------- | ----------------: | --------------------------: | ------: |
-| NumPy 2.4.6 (505 files) | 1.194 s ± 0.023 s |           1.739 s ± 0.060 s |   1.46× |
+Serc compiled these four packages in 65–76% less time than CPython's `compileall`.
+The [benchmark](BENCHMARKS.md#project-compilation) used 16 CPython workers and
+32 Serc workers for every package on the same 32-vCPU machine.
+
+<p align="center">
+  <img src="docs/assets/benchmarks/project-compilation.svg" width="800" alt="Median compile times for CPython and Serc. Airflow took 324 vs. 79 ms (4.1× faster with Serc), Django 358 vs. 94 ms (3.8×), NumPy 432 vs. 131 ms (3.3×), and Transformers 832 vs. 288 ms (2.9×).">
+</p>
 
 But Serc is also experimental! And so may emit incorrect bytecode in some cases.
 

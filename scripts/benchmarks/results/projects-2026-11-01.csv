@@ -1,0 +1,449 @@
+stage,project,round,pair,position,compiler,workers,warmup,wall_seconds
+sweep,Airflow core,1,2,1,CPython,8,1,0.433269825
+sweep,Airflow core,1,2,2,Serc,8,1,0.121983143
+sweep,Airflow core,1,3,1,Serc,16,1,0.089644414
+sweep,Airflow core,1,3,2,CPython,16,1,0.342560351
+sweep,Transformers,1,5,1,Serc,16,1,0.425549847
+sweep,Transformers,1,5,2,CPython,16,1,0.906388059
+sweep,Django,1,24,1,Serc,16,1,0.104456693
+sweep,Django,1,24,2,CPython,16,1,0.39818397
+sweep,NumPy,1,35,1,CPython,32,1,0.475156875
+sweep,NumPy,1,35,2,Serc,32,1,0.137618692
+sweep,Django,1,40,1,CPython,32,1,0.422814532
+sweep,Django,1,40,2,Serc,32,1,0.092859674
+sweep,Transformers,1,57,1,CPython,8,1,1.29647787
+sweep,Transformers,1,57,2,Serc,8,1,0.6822441
+sweep,Transformers,1,65,1,Serc,4,1,1.351895723
+sweep,Transformers,1,65,2,CPython,4,1,2.429499988
+sweep,NumPy,1,67,1,Serc,8,1,0.182765369
+sweep,NumPy,1,67,2,CPython,8,1,0.543535612
+sweep,NumPy,1,68,1,CPython,4,1,0.729486629
+sweep,NumPy,1,68,2,Serc,4,1,0.310581229
+sweep,Airflow core,1,72,1,Serc,4,1,0.202714495
+sweep,Airflow core,1,72,2,CPython,4,1,0.501417844
+sweep,Django,1,103,1,CPython,8,1,0.429487041
+sweep,Django,1,103,2,Serc,8,1,0.149267032
+sweep,Airflow core,1,109,1,CPython,32,1,0.379460057
+sweep,Airflow core,1,109,2,Serc,32,1,0.093273378
+sweep,NumPy,1,112,1,CPython,16,1,0.459718759
+sweep,NumPy,1,112,2,Serc,16,1,0.127399969
+sweep,Django,1,113,1,Serc,4,1,0.256378705
+sweep,Django,1,113,2,CPython,4,1,0.551923897
+sweep,Transformers,1,127,1,Serc,32,1,0.305351831
+sweep,Transformers,1,127,2,CPython,32,1,0.734057673
+sweep,Airflow core,2,129,1,CPython,4,0,0.496575646
+sweep,Airflow core,2,129,2,Serc,4,0,0.206770149
+sweep,NumPy,2,130,1,Serc,4,0,0.322381345
+sweep,NumPy,2,130,2,CPython,4,0,0.743829078
+sweep,Transformers,2,139,1,CPython,16,0,0.925695655
+sweep,Transformers,2,139,2,Serc,16,0,0.415941139
+sweep,Django,2,143,1,CPython,4,0,0.58952879
+sweep,Django,2,143,2,Serc,4,0,0.277730806
+sweep,Airflow core,2,156,1,Serc,32,0,0.084726153
+sweep,Airflow core,2,156,2,CPython,32,0,0.376931299
+sweep,Airflow core,2,164,1,CPython,16,0,0.319766128
+sweep,Airflow core,2,164,2,Serc,16,0,0.08922619
+sweep,Transformers,2,166,1,Serc,8,0,0.752085928
+sweep,Transformers,2,166,2,CPython,8,0,1.356359639
+sweep,NumPy,2,181,1,Serc,32,0,0.144863453
+sweep,NumPy,2,181,2,CPython,32,0,0.537842472
+sweep,Django,2,194,1,Serc,32,0,0.098100821
+sweep,Django,2,194,2,CPython,32,0,0.425761007
+sweep,Transformers,2,197,1,CPython,32,0,0.789144573
+sweep,Transformers,2,197,2,Serc,32,0,0.314508495
+sweep,Transformers,2,202,1,CPython,4,0,2.303612642
+sweep,Transformers,2,202,2,Serc,4,0,1.299391561
+sweep,NumPy,2,210,1,Serc,16,0,0.126563946
+sweep,NumPy,2,210,2,CPython,16,0,0.421669758
+sweep,Airflow core,2,213,1,Serc,8,0,0.117998365
+sweep,Airflow core,2,213,2,CPython,8,0,0.380386921
+sweep,NumPy,2,216,1,CPython,8,0,0.558282429
+sweep,NumPy,2,216,2,Serc,8,0,0.173673012
+sweep,Django,2,242,1,CPython,16,0,0.390007216
+sweep,Django,2,242,2,Serc,16,0,0.105256249
+sweep,Django,2,250,1,Serc,8,0,0.15811617
+sweep,Django,2,250,2,CPython,8,0,0.421067079
+sweep,Transformers,3,269,1,Serc,4,0,1.312377023
+sweep,Transformers,3,269,2,CPython,4,0,2.291377122
+sweep,Airflow core,3,270,1,CPython,32,0,0.396674227
+sweep,Airflow core,3,270,2,Serc,32,0,0.086507512
+sweep,NumPy,3,279,1,CPython,32,0,0.508963406
+sweep,NumPy,3,279,2,Serc,32,0,0.126514748
+sweep,Transformers,3,282,1,Serc,16,0,0.44517676
+sweep,Transformers,3,282,2,CPython,16,0,0.941602616
+sweep,Django,3,284,1,Serc,16,0,0.112316304
+sweep,Django,3,284,2,CPython,16,0,0.364084781
+sweep,NumPy,3,295,1,Serc,8,0,0.200753124
+sweep,NumPy,3,295,2,CPython,8,0,0.561034594
+sweep,Django,3,303,1,Serc,4,0,0.268788227
+sweep,Django,3,303,2,CPython,4,0,0.549630513
+sweep,Django,3,306,1,CPython,32,0,0.391942426
+sweep,Django,3,306,2,Serc,32,0,0.089547548
+sweep,Airflow core,3,319,1,Serc,16,0,0.079266299
+sweep,Airflow core,3,319,2,CPython,16,0,0.328584976
+sweep,NumPy,3,321,1,CPython,4,0,0.739701417
+sweep,NumPy,3,321,2,Serc,4,0,0.294583896
+sweep,NumPy,3,346,1,CPython,16,0,0.486779893
+sweep,NumPy,3,346,2,Serc,16,0,0.123691634
+sweep,Airflow core,3,354,1,Serc,4,0,0.194082288
+sweep,Airflow core,3,354,2,CPython,4,0,0.5542529
+sweep,Transformers,3,371,1,Serc,32,0,0.29485115
+sweep,Transformers,3,371,2,CPython,32,0,0.729345222
+sweep,Airflow core,3,376,1,CPython,8,0,0.373710573
+sweep,Airflow core,3,376,2,Serc,8,0,0.12029418
+sweep,Transformers,3,377,1,CPython,8,0,1.314118735
+sweep,Transformers,3,377,2,Serc,8,0,0.782084032
+sweep,Django,3,384,1,CPython,8,0,0.397502579
+sweep,Django,3,384,2,Serc,8,0,0.149746976
+sweep,Airflow core,4,392,1,Serc,8,0,0.11940118
+sweep,Airflow core,4,392,2,CPython,8,0,0.370086649
+sweep,Transformers,4,410,1,CPython,32,0,0.792338224
+sweep,Transformers,4,410,2,Serc,32,0,0.310795857
+sweep,NumPy,4,422,1,Serc,16,0,0.139425729
+sweep,NumPy,4,422,2,CPython,16,0,0.479697012
+sweep,Transformers,4,426,1,CPython,4,0,2.33785576
+sweep,Transformers,4,426,2,Serc,4,0,1.348478421
+sweep,NumPy,4,427,1,Serc,4,0,0.308104588
+sweep,NumPy,4,427,2,CPython,4,0,0.805898859
+sweep,Django,4,430,1,CPython,16,0,0.382570984
+sweep,Django,4,430,2,Serc,16,0,0.107159809
+sweep,Airflow core,4,433,1,Serc,32,0,0.111631501
+sweep,Airflow core,4,433,2,CPython,32,0,0.378059158
+sweep,Transformers,4,439,1,Serc,8,0,0.69157199
+sweep,Transformers,4,439,2,CPython,8,0,1.275553015
+sweep,Airflow core,4,453,1,CPython,4,0,0.465833393
+sweep,Airflow core,4,453,2,Serc,4,0,0.212692184
+sweep,Transformers,4,459,1,CPython,16,0,0.903917316
+sweep,Transformers,4,459,2,Serc,16,0,0.402110591
+sweep,NumPy,4,462,1,Serc,32,0,0.136568191
+sweep,NumPy,4,462,2,CPython,32,0,0.493638532
+sweep,Django,4,465,1,Serc,32,0,0.094036206
+sweep,Django,4,465,2,CPython,32,0,0.413141489
+sweep,Django,4,491,1,Serc,8,0,0.15494827
+sweep,Django,4,491,2,CPython,8,0,0.425961981
+sweep,Airflow core,4,492,1,CPython,16,0,0.326471147
+sweep,Airflow core,4,492,2,Serc,16,0,0.087313546
+sweep,Django,4,509,1,CPython,4,0,0.568573593
+sweep,Django,4,509,2,Serc,4,0,0.263248455
+sweep,NumPy,4,512,1,CPython,8,0,0.5277682
+sweep,NumPy,4,512,2,Serc,8,0,0.171795747
+sweep,Transformers,5,513,1,CPython,8,0,1.323685047
+sweep,Transformers,5,513,2,Serc,8,0,0.687012012
+sweep,Django,5,516,1,Serc,4,0,0.269797483
+sweep,Django,5,516,2,CPython,4,0,0.558560306
+sweep,NumPy,5,518,1,CPython,4,0,0.74683844
+sweep,NumPy,5,518,2,Serc,4,0,0.310488445
+sweep,Airflow core,5,536,1,Serc,4,0,0.215069294
+sweep,Airflow core,5,536,2,CPython,4,0,0.541118628
+sweep,Django,5,542,1,CPython,8,0,0.431458404
+sweep,Django,5,542,2,Serc,8,0,0.158069928
+sweep,Airflow core,5,548,1,Serc,16,0,0.085710481
+sweep,Airflow core,5,548,2,CPython,16,0,0.318237219
+sweep,Transformers,5,561,1,Serc,4,0,1.355364249
+sweep,Transformers,5,561,2,CPython,4,0,2.272034529
+sweep,Django,5,563,1,Serc,16,0,0.100911842
+sweep,Django,5,563,2,CPython,16,0,0.353609336
+sweep,Transformers,5,565,1,Serc,16,0,0.403234716
+sweep,Transformers,5,565,2,CPython,16,0,0.897555264
+sweep,NumPy,5,575,1,CPython,16,0,0.44181696
+sweep,NumPy,5,575,2,Serc,16,0,0.158507599
+sweep,NumPy,5,581,1,CPython,32,0,0.515475961
+sweep,NumPy,5,581,2,Serc,32,0,0.123911587
+sweep,NumPy,5,604,1,Serc,8,0,0.187098807
+sweep,NumPy,5,604,2,CPython,8,0,0.508038545
+sweep,Airflow core,5,608,1,CPython,8,0,0.413394752
+sweep,Airflow core,5,608,2,Serc,8,0,0.120506166
+sweep,Airflow core,5,609,1,CPython,32,0,0.389959939
+sweep,Airflow core,5,609,2,Serc,32,0,0.083542724
+sweep,Django,5,625,1,CPython,32,0,0.42791864
+sweep,Django,5,625,2,Serc,32,0,0.093711128
+sweep,Transformers,5,639,1,Serc,32,0,0.267668594
+sweep,Transformers,5,639,2,CPython,32,0,0.648320155
+refine,Django,1,1,1,CPython,8,0,0.399147149
+refine,Django,1,1,2,Serc,8,0,0.156714908
+refine,Django,1,2,1,CPython,16,0,0.366709596
+refine,Django,1,2,2,Serc,16,0,0.104405076
+refine,Transformers,1,3,1,Serc,4,0,1.322066598
+refine,Transformers,1,3,2,CPython,4,0,2.381879243
+refine,Django,1,4,1,Serc,32,0,0.106562091
+refine,Django,1,4,2,CPython,32,0,0.453051863
+refine,Django,1,5,1,Serc,4,0,0.264648609
+refine,Django,1,5,2,CPython,4,0,0.555028673
+refine,Transformers,1,6,1,CPython,32,0,0.641730094
+refine,Transformers,1,6,2,Serc,32,0,0.29925231
+refine,NumPy,1,7,1,CPython,32,0,0.42808869
+refine,NumPy,1,7,2,Serc,32,0,0.122305774
+refine,Airflow core,1,8,1,CPython,8,0,0.370148286
+refine,Airflow core,1,8,2,Serc,8,0,0.114591261
+refine,NumPy,1,9,1,CPython,4,0,0.740473441
+refine,NumPy,1,9,2,Serc,4,0,0.315381336
+refine,Airflow core,1,10,1,Serc,32,0,0.086219943
+refine,Airflow core,1,10,2,CPython,32,0,0.355316544
+refine,Transformers,1,11,1,Serc,8,0,0.687034002
+refine,Transformers,1,11,2,CPython,8,0,1.304652839
+refine,Airflow core,1,12,1,Serc,4,0,0.198859009
+refine,Airflow core,1,12,2,CPython,4,0,0.510835082
+refine,Transformers,1,13,1,CPython,16,0,0.802267242
+refine,Transformers,1,13,2,Serc,16,0,0.403099637
+refine,Airflow core,1,14,1,CPython,16,0,0.33623446
+refine,Airflow core,1,14,2,Serc,16,0,0.084952644
+refine,NumPy,1,15,1,Serc,8,0,0.177756406
+refine,NumPy,1,15,2,CPython,8,0,0.509491767
+refine,NumPy,1,16,1,CPython,16,0,0.437202802
+refine,NumPy,1,16,2,Serc,16,0,0.112762297
+refine,Django,2,17,1,Serc,8,0,0.150618825
+refine,Django,2,17,2,CPython,8,0,0.411137513
+refine,NumPy,2,18,1,Serc,32,0,0.123222692
+refine,NumPy,2,18,2,CPython,32,0,0.474614325
+refine,Airflow core,2,19,1,CPython,32,0,0.354953852
+refine,Airflow core,2,19,2,Serc,32,0,0.083089267
+refine,Transformers,2,20,1,Serc,16,0,0.400142289
+refine,Transformers,2,20,2,CPython,16,0,0.828570843
+refine,NumPy,2,21,1,Serc,16,0,0.117616569
+refine,NumPy,2,21,2,CPython,16,0,0.461231425
+refine,NumPy,2,22,1,Serc,4,0,0.319991955
+refine,NumPy,2,22,2,CPython,4,0,0.794097199
+refine,Transformers,2,23,1,Serc,32,0,0.293109163
+refine,Transformers,2,23,2,CPython,32,0,0.783200995
+refine,Django,2,24,1,Serc,16,0,0.101097159
+refine,Django,2,24,2,CPython,16,0,0.366235933
+refine,Transformers,2,25,1,CPython,8,0,1.270914232
+refine,Transformers,2,25,2,Serc,8,0,0.688052103
+refine,Django,2,26,1,CPython,4,0,0.555096196
+refine,Django,2,26,2,Serc,4,0,0.280813738
+refine,NumPy,2,27,1,CPython,8,0,0.519442851
+refine,NumPy,2,27,2,Serc,8,0,0.171213709
+refine,Airflow core,2,28,1,Serc,8,0,0.113486637
+refine,Airflow core,2,28,2,CPython,8,0,0.371286705
+refine,Transformers,2,29,1,CPython,4,0,2.258635795
+refine,Transformers,2,29,2,Serc,4,0,1.358112373
+refine,Airflow core,2,30,1,CPython,4,0,0.486113696
+refine,Airflow core,2,30,2,Serc,4,0,0.202988018
+refine,Airflow core,2,31,1,Serc,16,0,0.083198561
+refine,Airflow core,2,31,2,CPython,16,0,0.350123788
+refine,Django,2,32,1,CPython,32,0,0.416008182
+refine,Django,2,32,2,Serc,32,0,0.087867942
+refine,Django,3,33,1,CPython,16,0,0.362995527
+refine,Django,3,33,2,Serc,16,0,0.101615634
+refine,Transformers,3,34,1,CPython,32,0,0.666371161
+refine,Transformers,3,34,2,Serc,32,0,0.295594223
+refine,Airflow core,3,35,1,CPython,8,0,0.382837792
+refine,Airflow core,3,35,2,Serc,8,0,0.115000786
+refine,Transformers,3,36,1,CPython,16,0,0.805852867
+refine,Transformers,3,36,2,Serc,16,0,0.397089311
+refine,NumPy,3,37,1,CPython,32,0,0.456086023
+refine,NumPy,3,37,2,Serc,32,0,0.141893693
+refine,Django,3,38,1,Serc,4,0,0.276847712
+refine,Django,3,38,2,CPython,4,0,0.549665411
+refine,Airflow core,3,39,1,Serc,4,0,0.211385391
+refine,Airflow core,3,39,2,CPython,4,0,0.471622339
+refine,Django,3,40,1,CPython,8,0,0.399549348
+refine,Django,3,40,2,Serc,8,0,0.14775754
+refine,NumPy,3,41,1,CPython,16,0,0.436329285
+refine,NumPy,3,41,2,Serc,16,0,0.124196727
+refine,Transformers,3,42,1,Serc,4,0,1.349275911
+refine,Transformers,3,42,2,CPython,4,0,2.344616899
+refine,NumPy,3,43,1,CPython,4,0,0.789733442
+refine,NumPy,3,43,2,Serc,4,0,0.297791622
+refine,Airflow core,3,44,1,Serc,32,0,0.08255912
+refine,Airflow core,3,44,2,CPython,32,0,0.359940997
+refine,Django,3,45,1,Serc,32,0,0.096254964
+refine,Django,3,45,2,CPython,32,0,0.393358183
+refine,NumPy,3,46,1,Serc,8,0,0.171288799
+refine,NumPy,3,46,2,CPython,8,0,0.529344607
+refine,Transformers,3,47,1,Serc,8,0,0.73493516
+refine,Transformers,3,47,2,CPython,8,0,1.344268921
+refine,Airflow core,3,48,1,CPython,16,0,0.375673562
+refine,Airflow core,3,48,2,Serc,16,0,0.107007348
+refine,Airflow core,4,49,1,Serc,16,0,0.084459218
+refine,Airflow core,4,49,2,CPython,16,0,0.337045766
+refine,NumPy,4,50,1,Serc,32,0,0.154232877
+refine,NumPy,4,50,2,CPython,32,0,0.515807191
+refine,Airflow core,4,51,1,CPython,4,0,0.479977389
+refine,Airflow core,4,51,2,Serc,4,0,0.198226229
+refine,Django,4,52,1,Serc,8,0,0.146216223
+refine,Django,4,52,2,CPython,8,0,0.415831538
+refine,Transformers,4,53,1,CPython,8,0,1.385130442
+refine,Transformers,4,53,2,Serc,8,0,0.735842178
+refine,NumPy,4,54,1,Serc,16,0,0.119640852
+refine,NumPy,4,54,2,CPython,16,0,0.471079475
+refine,Transformers,4,55,1,Serc,16,0,0.401203044
+refine,Transformers,4,55,2,CPython,16,0,0.82895238
+refine,NumPy,4,56,1,CPython,8,0,0.528286097
+refine,NumPy,4,56,2,Serc,8,0,0.192140482
+refine,Airflow core,4,57,1,Serc,8,0,0.1290373
+refine,Airflow core,4,57,2,CPython,8,0,0.370510765
+refine,Airflow core,4,58,1,CPython,32,0,0.460016497
+refine,Airflow core,4,58,2,Serc,32,0,0.086711783
+refine,NumPy,4,59,1,Serc,4,0,0.312041218
+refine,NumPy,4,59,2,CPython,4,0,0.757027182
+refine,Transformers,4,60,1,CPython,4,0,2.265114151
+refine,Transformers,4,60,2,Serc,4,0,1.352794972
+refine,Django,4,61,1,CPython,4,0,0.573658021
+refine,Django,4,61,2,Serc,4,0,0.269654261
+refine,Django,4,62,1,Serc,16,0,0.100387425
+refine,Django,4,62,2,CPython,16,0,0.385464726
+refine,Transformers,4,63,1,Serc,32,0,0.317399886
+refine,Transformers,4,63,2,CPython,32,0,0.694835601
+refine,Django,4,64,1,CPython,32,0,0.402679739
+refine,Django,4,64,2,Serc,32,0,0.097745544
+refine,NumPy,5,65,1,CPython,4,0,0.74979361
+refine,NumPy,5,65,2,Serc,4,0,0.323785099
+refine,Airflow core,5,66,1,Serc,4,0,0.201112581
+refine,Airflow core,5,66,2,CPython,4,0,0.499030402
+refine,Django,5,67,1,CPython,8,0,0.416508839
+refine,Django,5,67,2,Serc,8,0,0.153276834
+refine,Django,5,68,1,Serc,4,0,0.266726977
+refine,Django,5,68,2,CPython,4,0,0.568179149
+refine,Django,5,69,1,CPython,16,0,0.349164623
+refine,Django,5,69,2,Serc,16,0,0.105995632
+refine,Django,5,70,1,Serc,32,0,0.140233249
+refine,Django,5,70,2,CPython,32,0,0.434412027
+refine,Airflow core,5,71,1,Serc,32,0,0.080161545
+refine,Airflow core,5,71,2,CPython,32,0,0.366128351
+refine,Airflow core,5,72,1,CPython,16,0,0.336197198
+refine,Airflow core,5,72,2,Serc,16,0,0.079475071
+refine,NumPy,5,73,1,CPython,32,0,0.469648668
+refine,NumPy,5,73,2,Serc,32,0,0.145923009
+refine,NumPy,5,74,1,CPython,16,0,0.440224659
+refine,NumPy,5,74,2,Serc,16,0,0.127331195
+refine,Airflow core,5,75,1,CPython,8,0,0.360362964
+refine,Airflow core,5,75,2,Serc,8,0,0.119001528
+refine,Transformers,5,76,1,Serc,8,0,0.688328337
+refine,Transformers,5,76,2,CPython,8,0,1.397740122
+refine,Transformers,5,77,1,CPython,16,0,0.830955813
+refine,Transformers,5,77,2,Serc,16,0,0.395970791
+refine,Transformers,5,78,1,Serc,4,0,1.295020293
+refine,Transformers,5,78,2,CPython,4,0,2.352663117
+refine,NumPy,5,79,1,Serc,8,0,0.197630678
+refine,NumPy,5,79,2,CPython,8,0,0.530982338
+refine,Transformers,5,80,1,CPython,32,0,0.711849076
+refine,Transformers,5,80,2,Serc,32,0,0.312609205
+refine,Transformers,6,81,1,Serc,16,0,0.383562299
+refine,Transformers,6,81,2,CPython,16,0,0.917441045
+refine,Transformers,6,82,1,Serc,32,0,0.302118616
+refine,Transformers,6,82,2,CPython,32,0,0.694822093
+refine,NumPy,6,83,1,CPython,8,0,0.514693049
+refine,NumPy,6,83,2,Serc,8,0,0.173217721
+refine,Django,6,84,1,CPython,32,0,0.407829598
+refine,Django,6,84,2,Serc,32,0,0.088520523
+refine,NumPy,6,85,1,Serc,32,0,0.132230279
+refine,NumPy,6,85,2,CPython,32,0,0.458918451
+refine,Airflow core,6,86,1,CPython,32,0,0.349023919
+refine,Airflow core,6,86,2,Serc,32,0,0.085580578
+refine,Airflow core,6,87,1,Serc,8,0,0.114870789
+refine,Airflow core,6,87,2,CPython,8,0,0.368342804
+refine,Django,6,88,1,Serc,16,0,0.1006689
+refine,Django,6,88,2,CPython,16,0,0.348935238
+refine,Airflow core,6,89,1,CPython,4,0,0.500251088
+refine,Airflow core,6,89,2,Serc,4,0,0.196726644
+refine,Django,6,90,1,CPython,4,0,0.544364918
+refine,Django,6,90,2,Serc,4,0,0.261713994
+refine,NumPy,6,91,1,Serc,16,0,0.113468765
+refine,NumPy,6,91,2,CPython,16,0,0.447406296
+refine,Airflow core,6,92,1,Serc,16,0,0.083990228
+refine,Airflow core,6,92,2,CPython,16,0,0.33655607
+refine,Transformers,6,93,1,CPython,8,0,1.293595247
+refine,Transformers,6,93,2,Serc,8,0,0.76912197
+refine,Django,6,94,1,Serc,8,0,0.156104339
+refine,Django,6,94,2,CPython,8,0,0.459470638
+refine,NumPy,6,95,1,Serc,4,0,0.302736905
+refine,NumPy,6,95,2,CPython,4,0,0.746995272
+refine,Transformers,6,96,1,CPython,4,0,2.401863617
+refine,Transformers,6,96,2,Serc,4,0,1.332217637
+confirm,Airflow core,1,1,1,Serc,32,1,0.081053815
+confirm,Airflow core,1,1,2,CPython,16,1,0.31797455
+confirm,Django,1,2,1,Serc,32,1,0.083544239
+confirm,Django,1,2,2,CPython,16,1,0.394751641
+confirm,Transformers,1,3,1,Serc,32,1,0.299418844
+confirm,Transformers,1,3,2,CPython,16,1,0.819016529
+confirm,NumPy,1,4,1,CPython,16,1,0.469478815
+confirm,NumPy,1,4,2,Serc,32,1,0.158912006
+confirm,Django,2,5,1,CPython,16,1,0.357945142
+confirm,Django,2,5,2,Serc,32,1,0.089466199
+confirm,Transformers,2,6,1,CPython,16,1,0.860432561
+confirm,Transformers,2,6,2,Serc,32,1,0.272497039
+confirm,Airflow core,2,7,1,CPython,16,1,0.313584453
+confirm,Airflow core,2,7,2,Serc,32,1,0.078025024
+confirm,NumPy,2,8,1,Serc,32,1,0.132655402
+confirm,NumPy,2,8,2,CPython,16,1,0.431989785
+confirm,Airflow core,3,9,1,Serc,32,0,0.074284783
+confirm,Airflow core,3,9,2,CPython,16,0,0.327367569
+confirm,NumPy,3,10,1,CPython,16,0,0.438359971
+confirm,NumPy,3,10,2,Serc,32,0,0.128243727
+confirm,Django,3,11,1,Serc,32,0,0.099003191
+confirm,Django,3,11,2,CPython,16,0,0.35716763
+confirm,Transformers,3,12,1,Serc,32,0,0.281774606
+confirm,Transformers,3,12,2,CPython,16,0,0.838774207
+confirm,Django,4,13,1,CPython,16,0,0.38674728
+confirm,Django,4,13,2,Serc,32,0,0.091977068
+confirm,NumPy,4,14,1,Serc,32,0,0.130514646
+confirm,NumPy,4,14,2,CPython,16,0,0.429249637
+confirm,Airflow core,4,15,1,CPython,16,0,0.323360451
+confirm,Airflow core,4,15,2,Serc,32,0,0.075071296
+confirm,Transformers,4,16,1,CPython,16,0,0.845840712
+confirm,Transformers,4,16,2,Serc,32,0,0.297671953
+confirm,Django,5,17,1,Serc,32,0,0.102962962
+confirm,Django,5,17,2,CPython,16,0,0.364960551
+confirm,NumPy,5,18,1,CPython,16,0,0.537687237
+confirm,NumPy,5,18,2,Serc,32,0,0.130929913
+confirm,Airflow core,5,19,1,Serc,32,0,0.080532152
+confirm,Airflow core,5,19,2,CPython,16,0,0.345211692
+confirm,Transformers,5,20,1,Serc,32,0,0.316158021
+confirm,Transformers,5,20,2,CPython,16,0,0.830556168
+confirm,Transformers,6,21,1,CPython,16,0,0.830920113
+confirm,Transformers,6,21,2,Serc,32,0,0.296736548
+confirm,Airflow core,6,22,1,CPython,16,0,0.323838471
+confirm,Airflow core,6,22,2,Serc,32,0,0.082137676
+confirm,Django,6,23,1,CPython,16,0,0.358874026
+confirm,Django,6,23,2,Serc,32,0,0.125594619
+confirm,NumPy,6,24,1,Serc,32,0,0.158184538
+confirm,NumPy,6,24,2,CPython,16,0,0.429168683
+confirm,Airflow core,7,25,1,Serc,32,0,0.077290134
+confirm,Airflow core,7,25,2,CPython,16,0,0.32364955
+confirm,Transformers,7,26,1,Serc,32,0,0.282504954
+confirm,Transformers,7,26,2,CPython,16,0,0.821785412
+confirm,NumPy,7,27,1,CPython,16,0,0.415676359
+confirm,NumPy,7,27,2,Serc,32,0,0.116675508
+confirm,Django,7,28,1,Serc,32,0,0.083723259
+confirm,Django,7,28,2,CPython,16,0,0.339712617
+confirm,NumPy,8,29,1,Serc,32,0,0.142919372
+confirm,NumPy,8,29,2,CPython,16,0,0.417798565
+confirm,Django,8,30,1,CPython,16,0,0.357884588
+confirm,Django,8,30,2,Serc,32,0,0.094407855
+confirm,Airflow core,8,31,1,CPython,16,0,0.322113222
+confirm,Airflow core,8,31,2,Serc,32,0,0.076847634
+confirm,Transformers,8,32,1,CPython,16,0,0.814851973
+confirm,Transformers,8,32,2,Serc,32,0,0.287450638
+confirm,NumPy,9,33,1,CPython,16,0,0.416555952
+confirm,NumPy,9,33,2,Serc,32,0,0.130655392
+confirm,Django,9,34,1,Serc,32,0,0.092091785
+confirm,Django,9,34,2,CPython,16,0,0.331585256
+confirm,Airflow core,9,35,1,Serc,32,0,0.077957579
+confirm,Airflow core,9,35,2,CPython,16,0,0.309763279
+confirm,Transformers,9,36,1,Serc,32,0,0.287145192
+confirm,Transformers,9,36,2,CPython,16,0,0.840093726
+confirm,Transformers,10,37,1,CPython,16,0,0.849269663
+confirm,Transformers,10,37,2,Serc,32,0,0.306311077
+confirm,Django,10,38,1,CPython,16,0,0.363421384
+confirm,Django,10,38,2,Serc,32,0,0.0898552
+confirm,NumPy,10,39,1,Serc,32,0,0.130588311
+confirm,NumPy,10,39,2,CPython,16,0,0.434649255
+confirm,Airflow core,10,40,1,CPython,16,0,0.341165652
+confirm,Airflow core,10,40,2,Serc,32,0,0.082544229
+confirm,Transformers,11,41,1,Serc,32,0,0.286774778
+confirm,Transformers,11,41,2,CPython,16,0,0.834054493
+confirm,Airflow core,11,42,1,Serc,32,0,0.096048842
+confirm,Airflow core,11,42,2,CPython,16,0,0.342273514
+confirm,NumPy,11,43,1,CPython,16,0,0.457176756
+confirm,NumPy,11,43,2,Serc,32,0,0.15580476
+confirm,Django,11,44,1,Serc,32,0,0.093581718
+confirm,Django,11,44,2,CPython,16,0,0.359775948
+confirm,Transformers,12,45,1,CPython,16,0,0.787502382
+confirm,Transformers,12,45,2,Serc,32,0,0.288049284
+confirm,Django,12,46,1,CPython,16,0,0.335008098
+confirm,Django,12,46,2,Serc,32,0,0.105013011
+confirm,Airflow core,12,47,1,CPython,16,0,0.320834022
+confirm,Airflow core,12,47,2,Serc,32,0,0.085582996
+confirm,NumPy,12,48,1,Serc,32,0,0.120797236
+confirm,NumPy,12,48,2,CPython,16,0,0.439732785
