@@ -28,10 +28,10 @@ ROOTS = [
 ]
 # Baseline complete modules recovered from this Ruff revision.
 MINIMUM_VERIFIED = {
-    "3.12.14": 1593,
-    "3.13.15": 1549,
-    "3.14.5": 1550,
-    "3.15.0rc2": 1564,
+    "3.12.14": 1754,
+    "3.13.15": 1748,
+    "3.14.5": 1752,
+    "3.15.0rc2": 1766,
 }
 FIELDS = (
     "co_name",
@@ -79,10 +79,33 @@ def object_count(code):
     )
 
 
-def measure(binary, inputs):
+def check_cache(binary, cache, filename, code):
+    try:
+        run = subprocess.run(
+            [binary, "decompile", cache], capture_output=True, timeout=30, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return "error", "decompiler timed out"
+    if run.returncode == 2 and not run.stdout:
+        return "refused", run.stderr.decode(errors="replace").strip().removeprefix(
+            f"serc: {cache}: "
+        )
+    if run.returncode:
+        return "error", f"exit {run.returncode}: {run.stderr[-500:]!r}"
+    try:
+        recovered = compile(run.stdout, filename, "exec", dont_inherit=True, optimize=0)
+    except (SyntaxError, ValueError) as exc:
+        return "error", f"invalid source: {exc}"
+    if fingerprint(code) != fingerprint(recovered):
+        return "error", "different executable fields after recompilation"
+    return "verified", None
+
+
+def measure(binary, inputs, baseline=None):
     counts = Counter()
     refusals = Counter()
     errors = {}
+    regressions = {}
     with tempfile.TemporaryDirectory() as scratch:
         cache = Path(scratch) / "input.pyc"
         for path in inputs:
@@ -101,43 +124,36 @@ def measure(binary, inputs):
             cache.write_bytes(
                 importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(code)
             )
-            try:
-                run = subprocess.run(
-                    [binary, "decompile", cache],
-                    capture_output=True,
-                    timeout=30,
-                    check=False,
-                )
-            except subprocess.TimeoutExpired:
-                errors[filename] = "decompiler timed out"
+            status, detail = check_cache(binary, cache, filename, code)
+            if status == "error":
+                errors[filename] = detail
                 continue
-            if run.returncode == 2 and not run.stdout:
-                reason = run.stderr.decode(errors="replace").strip().rsplit(": ", 1)[-1]
+            if status == "refused":
+                reason = detail.rsplit(": ", 1)[-1]
                 refusals[re.sub(r" at byte \d+", "", reason)] += 1
                 counts["refused"] += 1
-                continue
-            if run.returncode:
-                errors[filename] = f"exit {run.returncode}: {run.stderr[-500:]!r}"
-                continue
-            try:
-                recovered = compile(
-                    run.stdout, filename, "exec", dont_inherit=True, optimize=0
-                )
-            except (SyntaxError, ValueError) as exc:
-                errors[filename] = f"invalid source: {exc}"
-                continue
-            if fingerprint(code) != fingerprint(recovered):
-                errors[filename] = "different executable fields after recompilation"
+                if baseline is not None:
+                    previous, problem = check_cache(baseline, cache, filename, code)
+                    if previous == "verified":
+                        regressions[filename] = detail
+                    elif previous == "error":
+                        errors[filename] = f"baseline: {problem}"
                 continue
             counts["verified_modules"] += 1
             counts["verified_code_objects"] += objects
-    return dict(counts), refusals, errors
+    return dict(counts), refusals, errors, regressions
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
         "serc", type=Path, help="serc executable built with --features decompile"
+    )
+    parser.add_argument(
+        "--compare-with",
+        type=Path,
+        metavar="SERC",
+        help="fail if the previous serc verifies a file that this build refuses",
     )
     args = parser.parse_args()
     subprocess.run([ROOT / "scripts/check-ruff-pin"], stdout=sys.stderr, check=True)
@@ -174,7 +190,9 @@ def main():
         parser.error("Ruff corpus file count has changed")
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SyntaxWarning)
-        counts, refusals, errors = measure(args.serc.resolve(), inputs)
+        counts, refusals, errors, regressions = measure(
+            args.serc.resolve(), inputs, args.compare_with and args.compare_with.resolve()
+        )
     result = {
         "python": version,
         "cpython_commit": target.TARGET_COMMIT,
@@ -185,6 +203,8 @@ def main():
         "refusals": dict(refusals.most_common()),
         "errors": errors,
     }
+    if args.compare_with:
+        result["regressions"] = regressions
     print(json.dumps(result, indent=2, ensure_ascii=True))
     if counts.get("verified_modules", 0) < MINIMUM_VERIFIED[version]:
         print(
@@ -192,7 +212,7 @@ def main():
             file=sys.stderr,
         )
         return 1
-    return int(bool(errors))
+    return int(bool(errors or regressions))
 
 
 if __name__ == "__main__":

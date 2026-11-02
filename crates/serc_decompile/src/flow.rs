@@ -124,6 +124,18 @@ impl Graph {
         &self.blocks[self.owner[i]]
     }
 
+    /// Last instructions of incoming normal blocks, in layout order.
+    pub(super) fn incoming(&self, i: usize) -> impl DoubleEndedIterator<Item = usize> + '_ {
+        self.block(i)
+            .predecessors
+            .iter()
+            .map(|&id| self.blocks[id].ops.end - 1)
+    }
+
+    pub(super) fn reachable(&self, i: usize) -> bool {
+        self.block(i).height.is_some()
+    }
+
     pub(super) fn jump(&self, i: usize) -> Option<usize> {
         let b = &self.blocks[*self.owner.get(i)?];
         (b.ops.end == i + 1)

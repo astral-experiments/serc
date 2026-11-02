@@ -179,7 +179,7 @@ f = next(c for c in co.co_consts if hasattr(c, 'co_code'))
 print(platform.python_version())
 print((importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(co)).hex())
 for i in dis.get_instructions(f):
- print(i.offset, i.opname, i.arg or 0, i.argval if i.opcode in dis.hasjrel else '-')
+ print(i.offset, i.opname, i.arg or 0, i.argval if i.opcode in dis.hasjrel else '-', i.positions.lineno if i.positions.lineno is not None else '-')
 for e in dis.Bytecode(f).exception_entries:
  print(e.start, e.end, e.target, e.depth, int(e.lasti))
 ";
@@ -224,13 +224,21 @@ for e in dis.Bytecode(f).exception_entries:
                 module.bytes(f.exceptions).unwrap(),
             )
             .unwrap();
-            let instructions = decoded.ops.iter().map(|op| {
+            let positions = crate::locations::instruction_lines(
+                module.bytes(f.locations).unwrap(),
+                f.first_line,
+                module.bytes(f.bytecode).unwrap().len(),
+                &decoded.ops,
+            )
+            .unwrap();
+            let instructions = decoded.ops.iter().zip(positions).map(|(op, line)| {
                 format!(
-                    "{} {} {} {}",
+                    "{} {} {} {} {}",
                     op.offset,
                     op.name,
                     op.arg,
-                    op.jump.map_or_else(|| "-".to_owned(), |n| n.to_string())
+                    op.jump.map_or_else(|| "-".to_owned(), |n| n.to_string()),
+                    line.map_or_else(|| "-".to_owned(), |n| n.to_string())
                 )
             });
             let entries = decoded.handlers.iter().map(|h| {

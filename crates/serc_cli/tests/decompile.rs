@@ -654,3 +654,62 @@ def bind(value):
         "result = [classify(x) for x in [17, 0, False, None, 'z']], [bind(x) for x in [0, 3, 4]], [group(x) for x in [0, 1, 3, None, 9, 2]], events",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn class_layout_matches_each_occurrence() {
+    check_fixture(
+        r"class C: pass
+first = C
+class C: pass
+def item(): return 3
+
+def decorate(cls): return cls
+@decorate
+class C:
+    class C: pass
+    def get(self): return item()
+class Last: pass
+",
+        "result = first.__name__, C.C.__qualname__, C().get(), Last.__name__",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn handlers_survive_an_elided_try_suite() {
+    check_fixture(
+        r"events = []
+try:
+    pass
+except ValueError as error:
+    events.append(str(error))
+except TypeError:
+    events.append(2)
+try:
+    pass
+except:
+    events.append(3)
+events.append(4)
+",
+        "result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn async_comprehension_clause_order() {
+    check_fixture(
+        r"async def items(rows):
+    for row in rows:
+        yield row
+async def consume():
+    rows = [[1, 0], [2, 3]]
+    left = [v async for row in items(rows) for v in row if v]
+    right = {v: v+1 for row in rows async for v in items(row) if v}
+    stream = (v async for row in items(rows) async for v in items(row) if v)
+    return left, right, [v async for v in stream]
+",
+        "import asyncio; result = asyncio.run(consume())",
+    );
+}

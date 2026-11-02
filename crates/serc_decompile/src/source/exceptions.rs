@@ -46,6 +46,9 @@ impl Body<'_, '_, '_> {
         let start = index(entry.start)?;
         let end = index(entry.end)?;
         let handler = index(entry.target)?;
+        if ops[start].name == "PUSH_EXC_INFO" && !self.flow.reachable(start) {
+            return self.elided_tries(bc, start);
+        }
         if handler < end || ops[handler].name != "PUSH_EXC_INFO" {
             return Err(format!(
                 "unsupported exception region at byte {}",
