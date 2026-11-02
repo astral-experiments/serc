@@ -1774,9 +1774,21 @@ pub(super) fn unique_frozenset_constants<T: Borrow<Constant>>(
 ) -> Vec<Constant> {
     let constants = constants.into_iter();
     let mut unique = Vec::with_capacity(constants.size_hint().0);
+    let mut integers =
+        (constants.size_hint().0 >= CONSTANT_INDEX_THRESHOLD).then(FxHashSet::default);
     let mut strings: Option<HashTable<(u64, usize)>> = None;
     for constant in constants {
         let value = constant.borrow();
+        if let Some(seen) = &mut integers {
+            if let Constant::Int(number) = value {
+                if seen.insert(*number) {
+                    unique.push(into_constant(constant));
+                }
+                continue;
+            }
+            // Later numeric values can compare equal across variants, including True and 1.
+            integers = None;
+        }
         // Strings cannot compare equal to another constant variant.
         let duplicate =
             if matches!(value, Constant::String(_)) && unique.len() >= CONSTANT_INDEX_THRESHOLD {
@@ -5162,8 +5174,11 @@ def outer(argument):
     }
 
     #[test]
-    fn frozenset_string_indices_preserve_first_representatives() {
-        let mut values = vec![
+    fn frozenset_indices_preserve_first_representatives() {
+        let mut values = (64..80).map(Constant::Int).collect::<Vec<_>>();
+        values.extend([
+            Constant::Int(64),
+            Constant::Float(64.0),
             Constant::Bool(true),
             Constant::Int(1),
             Constant::Float(1.0),
@@ -5173,7 +5188,7 @@ def outer(argument):
             Constant::Tuple(vec![Constant::Int(1)]),
             Constant::Bytes(b"member 0".to_vec()),
             Constant::SurrogateString(b"member 0".to_vec()),
-        ];
+        ]);
         for index in 0..64 {
             values.push(Constant::String(format!("member {index}")));
             values.push(Constant::String(format!("member {}", index / 2)));
