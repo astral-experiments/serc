@@ -287,7 +287,7 @@ packages in subdirectories are outside this sample.
 | CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
 | --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
 | 3.12.14   |     164 |                         164 / 51 |                          24 / 3 |                           6,364 / 97 / 8,040 |
-| 3.13.15   |     153 |                        153 / 153 |                          25 / 1 |                            6,015 / 1 / 7,720 |
+| 3.13.15   |     153 |                        153 / 153 |                          25 / 1 |                            6,016 / 1 / 7,720 |
 | 3.14.5    |     154 |                          154 / 0 |                          24 / 0 |                            6,204 / 0 / 8,064 |
 | 3.15.0rc2 |     152 |                          152 / 0 |                          21 / 0 |                            6,333 / 0 / 8,259 |
 
@@ -351,6 +351,11 @@ standard-library comparison. Ruff reports these changes without failing.
 Repeated definitions are paired within their parent when the counts agree. If a
 previously placed function is missing, ambiguous, or now contains a marked gap,
 it appears in `newly_unplaced`. That list is informational.
+
+The table check caught a regression in 3.13's `pickle._Pickler.save_global`.
+Moving a guarded raise out of the `try` statement's `else` suite preserved the
+normal edges but dropped a tracing `NOP`, shifting the exception handler by two
+bytes. Restoring the `else` reproduced the function's executable fields.
 
 The `pycdc_only` map lists every scope that pycdc matched and serc missed. Any
 entry fails either standard-library comparison, even if serc matches more scopes
