@@ -31,9 +31,9 @@ depth. A worklist rejects inconsistent stack heights at joins.
 Source recovery uses forward postdominators to find where branches rejoin and
 shared successors to combine short-circuit tests. When CPython gives several
 edges separate copies of a function's implicit `None` return, recovery can
-place a guard at function exit without introducing a shared return block. Loop recovery distinguishes
-exhaustion from explicit breaks, including when CPython copied the return after
-the loop into a break arm. It can also follow consecutive typed handlers with a
+place a guard at function exit without introducing a shared return block.
+Loop recovery distinguishes exhaustion from explicit breaks, including when
+CPython copied the return after the loop into a break arm. It can also follow consecutive typed handlers with a
 shared return and recover a conditional break through duplicated finally
 cleanup. Backedges end a forward region. More complex cyclic graphs and
 exception layouts can still be refused.
@@ -60,6 +60,12 @@ manager. Recovery follows the manager's exception-table entries across an
 recovery handles value and singleton patterns, alternatives, guards, captures,
 and selected sequence, mapping, and class patterns. Nested or overlapping cases
 can still exceed these recognizers.
+
+In `asyncio.Queue._wakeup_next`, a backedge follows the test of the current
+waiter but returns to the test of the queue. On 3.12 and 3.13, CPython emits a
+second copy of the queue test at the bottom of the loop. On 3.14 and 3.15,
+the jump targets the top of the loop directly. Recovery checks that destination
+so a completed waiter advances the loop to the next item.
 
 For a protected `await`, CPython temporarily sends throws from `YIELD_VALUE`
 to `CLEANUP_THROW`. Both the resumed path and the cleanup can reach the

@@ -285,6 +285,37 @@ fn formatted_displays_remain_interpolations() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_backedge_retests_the_owning_while_condition() {
+    check_fixture(
+        r"def wake(waiters):
+    while waiters:
+        waiter = waiters.popleft()
+        if not waiter.done():
+            waiter.set_result(None)
+            break
+",
+        r"from collections import deque
+result = []
+class Waiter:
+    def __init__(self, value):
+        self.value = value
+        self.checked = False
+    def done(self):
+        assert not self.checked, 'retested the previous waiter'
+        self.checked = True
+        result.append(self.value)
+        return self.value
+    def set_result(self, value): result.append('woke')
+for values in ([], [True, True], [True, False, False]):
+    waiters = deque(map(Waiter, values))
+    wake(waiters)
+    result.append(len(waiters))
+assert result == [0, True, True, 0, True, False, 'woke', 1]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn conditional_guards_keep_distinct_function_exits() {
     check_fixture(
         r"def emit(ready, allowed, events):

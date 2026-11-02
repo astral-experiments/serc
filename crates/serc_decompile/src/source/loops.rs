@@ -149,51 +149,111 @@ impl Body<'_, '_, '_> {
         self.loop_else(ops, after_cleanup, active, level)
     }
 
+    /// Walk back to the first instruction producing the predicate. A latch
+    /// returning to an earlier statement in the same block belongs to an outer
+    /// loop, even if it immediately precedes this conditional's other arm.
+    fn condition_start(&self, ops: &[Instruction], branch: usize) -> Option<usize> {
+        let mut inputs = 1usize;
+        for i in (self.flow.block(branch).ops.start..branch).rev() {
+            let op = ops[i];
+            let (pops, pushes) =
+                serc_bytecode::target::stack_counts_for(self.m.version, op.opcode, op.arg);
+            inputs = inputs.checked_sub(pushes)? + pops;
+            if inputs == 0 {
+                return Some(i);
+            }
+        }
+        None
+    }
+
+    pub(super) fn while_latch(
+        &self,
+        ops: &[Instruction],
+        predicate: &Predicate,
+        end: usize,
+    ) -> Option<usize> {
+        let (start, exit) = (predicate.suite, predicate.target);
+        if start >= exit {
+            return None;
+        }
+        let backedge = |target| {
+            self.flow.incoming(target).rev().find(|&i| {
+                (start..exit).contains(&i)
+                    && ops[i].name == "JUMP_BACKWARD"
+                    && self.flow.jump(i) == Some(target)
+            })
+        };
+        if let Some(header) = self.condition_start(ops, predicate.first)
+            && self.flow.block(header).ops.start == header
+            && let Some(latch) = backedge(header)
+        {
+            return Some(latch);
+        }
+
+        // 3.12 and 3.13 jump back to the body after a second copy of the
+        // predicate. Its false edge may reach a copy of the loop's return.
+        let latch = backedge(start)?;
+        if latch <= start || ops[latch - 1].name != ops[predicate.branch].name {
+            return None;
+        }
+        let dest = self.flow.jump(latch - 1)?;
+        let same_exit = (dest == exit && latch + 1 == exit)
+            || (dest == latch + 1
+                && constant_return(ops, exit).is_some_and(|(at, value)| {
+                    let stop = exit + (exit - at);
+                    at == dest && stop <= end && constant_return(ops, stop) == Some((exit, value))
+                }));
+        same_exit.then_some(latch)
+    }
+
     pub(super) fn while_loop(
         &mut self,
         ops: &[Instruction],
         predicate: &Predicate,
-        test: &str,
+        latch: usize,
         end: usize,
         level: usize,
     ) -> Result<usize, String> {
-        let (i, start, target) = (predicate.branch, predicate.suite, predicate.target);
-        let tail = target - 1;
-        let back = self.flow.target(tail)?;
-        let body_end = if back <= i {
-            tail
-        } else if back == start && tail > start && ops[tail - 1].jump == ops[i].jump {
-            // CPython 3.12 duplicates the condition at the bottom. Match
-            // its complete operand sequence before removing the copy.
-            let mut before = i;
-            let mut copy = tail - 1;
-            let mut inputs = 1usize;
-            while inputs > 0 {
-                if before == 0 || copy <= start {
-                    return Err("incomplete copied loop condition".into());
-                }
-                before -= 1;
-                copy -= 1;
-                let op = ops[before];
-                if op.opcode != ops[copy].opcode || op.arg != ops[copy].arg {
-                    return Err("distinct copied loop condition".into());
-                }
-                let (pops, pushes) =
-                    serc_bytecode::target::stack_counts_for(self.m.version, op.opcode, op.arg);
-                inputs = inputs
-                    .checked_sub(pushes)
-                    .ok_or("shared operand in copied loop condition")?
-                    + pops;
+        let (start, target) = (predicate.suite, predicate.target);
+        let back = self.flow.target(latch)?;
+        let body_end = if back == start {
+            let condition = self
+                .condition_start(ops, predicate.branch)
+                .ok_or("missing copied loop predicate")?;
+            let width = predicate.branch - condition;
+            let copy = (latch - 1)
+                .checked_sub(width)
+                .filter(|&n| n >= start)
+                .ok_or("incomplete copied loop condition")?;
+            if !super::comparisons::same_instructions(
+                &ops[condition..predicate.branch],
+                &ops[copy..latch - 1],
+            ) {
+                return Err("distinct copied loop condition".into());
             }
             copy
+        } else if latch + 1 == target {
+            latch
         } else {
-            return Err("unsupported loop condition".into());
+            // An early backedge is a continue. A different path still has
+            // statements between that edge and the condition's exit.
+            target
         };
         let active = self.loop_exits(ops, back, start..body_end, target, end)?;
         let outer = self.loop_edges.replace(active);
         let suite = self.fragment(ops, start, body_end, level)?.suite()?;
         self.loop_edges = outer;
-        self.block(&format!("while {test}:"), &suite)?;
+        self.block(&format!("while {}:", predicate.test(true)), &suite)?;
+        if back == start
+            && self.flow.jump(latch - 1) != Some(target)
+            && self.terminal_returns.contains(&target)
+            && self.terminal_returns.end == end
+            && active.after.is_none_or(|after| after == target)
+        {
+            // The copied false exits already return None. Writing an explicit
+            // post-loop return would merge their distinct return blocks.
+            return Ok(end);
+        }
         self.loop_else(ops, target, active, level)
     }
 }

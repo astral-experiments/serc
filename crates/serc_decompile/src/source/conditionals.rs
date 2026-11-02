@@ -2,6 +2,7 @@ use super::regions::Fragment;
 use super::{Body, Instruction};
 
 pub(super) struct Predicate {
+    pub(super) first: usize,
     pub(super) value: String,
     pub(super) fallthrough_true: bool,
     pub(super) branch: usize,
@@ -136,6 +137,7 @@ impl Body<'_, '_, '_> {
         }
         let start = fall(branch);
         Ok(Predicate {
+            first,
             value,
             branch,
             suite: start,
@@ -211,8 +213,8 @@ impl Body<'_, '_, '_> {
             self.block(&format!("if {test}:"), &suite)?;
             return Ok(target);
         }
-        if ops[tail].name == "JUMP_BACKWARD" {
-            return self.while_loop(ops, predicate, &test, end, level);
+        if let Some(latch) = self.while_latch(ops, predicate, end) {
+            return self.while_loop(ops, predicate, latch, end, level);
         }
         if self.flow.join(i) == Some(target) {
             // Both paths reach the taken target. Only the fallthrough path
