@@ -64,7 +64,10 @@ to `CLEANUP_THROW`. Both the resumed path and the cleanup can reach the
 user's handler. Following those edges places the cancellation handlers inside
 the loops in `asyncio.Queue.get` and `Queue.put`, including the nested
 `except ValueError` around removal of the waiter. Both methods recompile to
-matching executable fields on all four targets.
+matching executable fields on all four targets. For `finally`, recovery
+compares the cleanup on the normal path with the exceptional copy, including
+the destinations of jumps within each copy. This recovers the cleanup in
+`asyncio.sleep` and `asyncio.Event.wait` across all four targets.
 
 CPython can build long dictionary displays one pair at a time. Recognizing those
 insertions lets recovery continue past the configuration dictionary in 3.14.5's

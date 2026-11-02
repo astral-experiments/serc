@@ -996,6 +996,44 @@ assert result == [1, 2, 42]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn finally_runs_on_suspension_return_and_cancellation() {
+    check_fixture(
+        r"async def value(work, events):
+    try:
+        return await work()
+    finally:
+        events.append('cleanup')
+
+async def constant(work, events):
+    try:
+        await work()
+        return True
+    finally:
+        events.append('cleanup')
+
+async def resume(work, events):
+    try:
+        await work()
+    finally:
+        events.append('cleanup')
+    events.append('resumed')
+",
+        r"import asyncio
+result = []
+async def ok(): return 42
+async def cancel(): raise asyncio.CancelledError
+for run in (value, constant, resume):
+    result.append(asyncio.run(run(ok, result)))
+    try: asyncio.run(run(cancel, result))
+    except asyncio.CancelledError: result.append('cancelled')
+assert result == ['cleanup', 42, 'cleanup', 'cancelled',
+                  'cleanup', True, 'cleanup', 'cancelled',
+                  'cleanup', 'resumed', None, 'cleanup', 'cancelled']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn mismatched_exception_tables_mark_only_the_affected_function() {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original.py");
