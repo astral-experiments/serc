@@ -1,4 +1,5 @@
 mod annotations;
+mod builtin_calls;
 mod classes;
 mod comparisons;
 mod comprehensions;
@@ -240,6 +241,16 @@ enum Value {
     Member(String),
 }
 
+impl Value {
+    fn expression_text(self) -> Option<String> {
+        match self {
+            Self::Expr(value) => Some(value),
+            Self::Formatted(field) => Some(format!("f\"{field}\"")),
+            _ => None,
+        }
+    }
+}
+
 struct Body<'m, 'data, 'work> {
     m: &'m Module<'data>,
     code: &'m Code,
@@ -317,10 +328,10 @@ impl Body<'_, '_, '_> {
 
     fn expr(&mut self) -> Result<String, String> {
         match self.pop()? {
-            Value::Expr(value) => Ok(value),
-            Value::Formatted(field) => Ok(format!("f\"{field}\"")),
             Value::Function(def) => self.lambda(&def),
-            _ => Err("expected expression".into()),
+            value => value
+                .expression_text()
+                .ok_or_else(|| "expected expression".into()),
         }
     }
 

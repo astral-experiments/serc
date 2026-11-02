@@ -20,7 +20,7 @@ impl Fragment {
     pub(super) fn expression(mut self) -> Result<String, String> {
         if self.lines.is_empty()
             && self.stack.len() == 1
-            && let Some(Value::Expr(value)) = self.stack.pop()
+            && let Some(value) = self.stack.pop().and_then(Value::expression_text)
         {
             Ok(value)
         } else {
@@ -28,7 +28,7 @@ impl Fragment {
         }
     }
     pub(super) fn key_value(mut self) -> Result<(String, String), String> {
-        let Some(Value::Expr(value)) = self.stack.pop() else {
+        let Some(value) = self.stack.pop().and_then(Value::expression_text) else {
             return Err("missing comprehension value".into());
         };
         Ok((self.expression()?, value))
@@ -37,7 +37,10 @@ impl Fragment {
     pub(super) fn pending_return(mut self) -> Result<(String, bool), String> {
         match self.stack.pop() {
             None => Ok((self.lines, false)),
-            Some(Value::Expr(value)) if self.stack.is_empty() => {
+            Some(value) if self.stack.is_empty() => {
+                let value = value
+                    .expression_text()
+                    .ok_or("unsupported protected stack outcome")?;
                 writeln!(self.lines, "return {value}").unwrap();
                 Ok((self.lines, true))
             }
@@ -213,6 +216,18 @@ impl Body<'_, '_, '_> {
                 Ok(i + 2)
             }
             "LOAD_LOCALS" if self.class && self.class_parameters(&ops[i..end])? => Ok(i + 3),
+            "COPY"
+                if op.arg == 1
+                    && let [constant, compare, branch, ..] = &ops[i + 1..end]
+                    && constant.name == "LOAD_COMMON_CONSTANT"
+                    && (compare.name, compare.arg) == ("IS_OP", 0)
+                    && branch.name == "POP_JUMP_IF_FALSE"
+                    && let Some(all) = super::builtin_calls::truth_builtin(constant.arg)
+                    && let Some(fallback) =
+                        self.optimized_truth_generator(&ops[..end], i + 3, all)? =>
+            {
+                Ok(fallback)
+            }
             "COPY"
                 if self.class
                     && op.arg == 1

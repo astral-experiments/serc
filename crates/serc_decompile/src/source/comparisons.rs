@@ -42,7 +42,7 @@ fn guard(ops: &[Instruction], link: usize) -> Option<(usize, bool)> {
     (ops.get(at)?.name == "POP_JUMP_IF_FALSE").then_some((at, copied))
 }
 
-fn same_instructions(left: &[Instruction], right: &[Instruction]) -> bool {
+pub(super) fn same_instructions(left: &[Instruction], right: &[Instruction]) -> bool {
     left.len() == right.len()
         && left
             .iter()

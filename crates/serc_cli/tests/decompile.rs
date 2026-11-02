@@ -277,6 +277,10 @@ fn formatted_displays_remain_interpolations() {
         "def show(x):\n    return f\"{ {'a': x}!r}\", f\"nested { {f'{ {x} }'} } end\"\n",
         "result = show(42)",
     );
+    check_fixture(
+        "def fields(xs):\n    return {f':{x}' for x in xs}, {f'{x}': f'{x!r}' for x in xs}\n",
+        "result = fields(['a', 2])",
+    );
 }
 
 #[cfg(feature = "decompile")]
@@ -289,6 +293,15 @@ fn nested_conditional_arms_share_the_outer_jump() {
     check_fixture(
         "def validate(hi, lo, bound):\n    if not hi >= lo >= bound():\n        raise ValueError(lo)\n    return hi, lo\n",
         "calls = []\ndef bound(): calls.append(1); return 0\nvalues = []\nfor h, l in [(4, 3), (1, 2), (2, -1)]:\n    try: values.append(validate(h, l, bound))\n    except ValueError as e: values.append(e.args)\nresult = values, calls",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn optimized_generator_calls_keep_short_circuiting_and_shadowing() {
+    check_fixture(
+        "def both(xs, log):\n    a = all(log(x) for x in xs)\n    b = any(log(x) for x in xs)\n    return a, b\ndef first(xs): return any(x for x in xs)\n",
+        "seen = []\ndef observe(x): seen.append(x); return x\nresult = [both([1, 0, 2], observe), first([]), seen.copy()]\nall = any = tuple\nresult += [both([0, 2], observe), first([3, 4]), seen.copy()]",
     );
 }
 
