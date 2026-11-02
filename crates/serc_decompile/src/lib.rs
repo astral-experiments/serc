@@ -38,6 +38,8 @@ impl std::error::Error for DecompileError {}
 /// for that candidate or `None` when the candidate cannot be compiled.
 /// Dead suites synthesized to reproduce retained metadata are marked inline
 /// with `# serc: synthetic dead code`.
+/// An always-true guard around a recovered statement is marked separately
+/// with `# serc: synthetic live guard`.
 pub fn decompile_pyc(
     bytes: &[u8],
     mut compile: impl FnMut(&str, &str, PythonVersion, OptimizationLevel) -> Option<Vec<u8>>,
@@ -55,11 +57,15 @@ pub fn decompile_pyc(
     // Try explicit pass statements only after the simpler spelling fails.
     let mut saw_nop = true;
     let mut hints: Option<source::synthetic::Hints> = None;
-    for (synthetic, preserve_nops) in [(false, false), (false, true), (true, false), (true, true)] {
+    use source::synthetic::Mode::{DeadSuites, LiveGuards, Ordinary};
+    for (mode, preserve_nops) in [Ordinary, DeadSuites, LiveGuards]
+        .into_iter()
+        .flat_map(|mode| [(mode, false), (mode, true)])
+    {
         if preserve_nops && !saw_nop {
             continue;
         }
-        let stubs = if synthetic {
+        let stubs = if mode != Ordinary {
             let Some(plan) = hints.as_ref() else { break };
             if plan.is_empty() {
                 break;
@@ -68,9 +74,9 @@ pub fn decompile_pyc(
         } else {
             None
         };
-        let (sources, has_nop) = match source::recover(&module, preserve_nops, stubs) {
+        let (sources, has_nop) = match source::recover(&module, preserve_nops, stubs, mode) {
             Ok(result) => result,
-            Err(_) if preserve_nops || synthetic => continue,
+            Err(_) if preserve_nops || mode != Ordinary => continue,
             Err(message) => return Err(reconstruct(message)),
         };
         saw_nop = has_nop;

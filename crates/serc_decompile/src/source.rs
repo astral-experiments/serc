@@ -39,23 +39,26 @@ struct Recovery<'m> {
     preserve_nops: bool,
     saw_nop: bool,
     synthetic: Option<&'m synthetic::Hints>,
-    emitted_stub: bool,
+    mode: synthetic::Mode,
+    emitted: bool,
 }
 
 pub(super) fn recover(
     m: &Module<'_>,
     preserve_nops: bool,
     synthetic: Option<&synthetic::Hints>,
+    mode: synthetic::Mode,
 ) -> Result<(Vec<String>, bool), String> {
     let mut work = Recovery {
         budget: MAX_WORK,
         preserve_nops,
         saw_nop: false,
         synthetic,
-        emitted_stub: false,
+        mode,
+        emitted: false,
     };
     let text = scope(m, m.root, 0, false, &mut work)?;
-    if synthetic.is_some() && !work.emitted_stub {
+    if mode != synthetic::Mode::Ordinary && !work.emitted {
         return Ok((Vec::new(), work.saw_nop));
     }
     let parsed = ruff_python_parser::parse_module(&text)
@@ -63,7 +66,7 @@ pub(super) fn recover(
     let mut candidates = Vec::new();
     // The AST generator discards comments. Keep each synthetic marker on the
     // source line that will be recompiled and returned to the caller.
-    if !work.emitted_stub {
+    if mode == synthetic::Mode::Ordinary {
         let indent = Indentation::default();
         let mut result = String::new();
         for stmt in parsed.suite() {
@@ -120,7 +123,11 @@ fn recover_scope<'m>(
     .map_err(|e| format!("{name}: {e}"))?;
     let flow = crate::flow::Graph::build(&bc, m.version, code.stack_size)
         .map_err(|e| format!("{name}: {e}"))?;
-    let stubs = if let Some(hint) = work.synthetic.and_then(|hints| hints.get(&id)) {
+    let hint = work.synthetic.and_then(|hints| hints.get(&id));
+    let live_guard = hint
+        .filter(|_| work.mode == synthetic::Mode::LiveGuards)
+        .and_then(|hint| hint.live_guard(&bc.ops));
+    let stubs = if let Some(hint) = hint.filter(|_| live_guard.is_none()) {
         hint.place(m, code, &bc.ops)?
     } else {
         synthetic::Stubs::new()
@@ -169,6 +176,9 @@ fn recover_scope<'m>(
         return Err(format!("{name}: unused stack values at end"));
     }
     body.emit_stub(None)?;
+    if let Some(guard) = live_guard {
+        body.guard_statement(&guard)?;
+    }
     Ok(body.lines)
 }
 

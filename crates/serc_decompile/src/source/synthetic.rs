@@ -21,11 +21,18 @@ pub(super) type Stubs<'a> = BTreeMap<Option<usize>, Stub<'a>>;
 
 pub(crate) type Hints = FxHashMap<Id, Hint>;
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Mode {
+    Ordinary,
+    DeadSuites,
+    LiveGuards,
+}
+
 pub(crate) struct Hint {
     names: Vec<usize>,
     locals: Vec<usize>,
     captures: Vec<usize>,
-    guard: Option<String>,
+    guard: Option<Guard>,
     generator: bool,
 }
 
@@ -105,7 +112,10 @@ pub(crate) fn differences(m: &Module<'_>, candidate: &Module<'_>) -> Result<Hint
             && a.first()
                 .is_some_and(|&i| matches!(m.objects[i], Object::None))
         {
-            guard = Some("None".into());
+            guard = Some(Guard {
+                literal: "None".into(),
+                truthy: false,
+            });
         }
         if needs_suite || guard.is_some() {
             hints.insert(
@@ -135,9 +145,14 @@ pub(crate) fn differences(m: &Module<'_>, candidate: &Module<'_>) -> Result<Hint
     Ok(hints)
 }
 
-// Use only side-effect-free scalar literals. For a truthy retained constant
-// the right operand keeps the guard false.
-fn guard(m: &Module<'_>, id: Option<Id>, budget: &mut usize) -> Option<String> {
+#[derive(PartialEq, Eq)]
+struct Guard {
+    literal: String,
+    truthy: bool,
+}
+
+// Only literals whose truth value is known without executing Python.
+fn guard(m: &Module<'_>, id: Option<Id>, budget: &mut usize) -> Option<Guard> {
     let id = id?;
     let truthy = match &m.objects[id] {
         Object::None => false,
@@ -151,14 +166,27 @@ fn guard(m: &Module<'_>, id: Option<Id>, budget: &mut usize) -> Option<String> {
         _ => return None,
     };
     let literal = super::literal(m, id, 0, budget).ok()?;
-    Some(if truthy {
-        format!("{literal} and False")
-    } else {
-        literal
-    })
+    Some(Guard { literal, truthy })
 }
 
 impl Hint {
+    pub(super) fn live_guard(&self, ops: &[Instruction]) -> Option<String> {
+        let guard = self.guard.as_ref()?;
+        if !self.names.is_empty()
+            || !self.locals.is_empty()
+            || !self.captures.is_empty()
+            || self.generator
+            || ops.iter().any(|op| op.name == "NOP")
+        {
+            return None;
+        }
+        Some(if guard.truthy {
+            guard.literal.clone()
+        } else {
+            format!("not {}", guard.literal)
+        })
+    }
+
     pub(super) fn place<'a>(
         &self,
         m: &'a Module<'_>,
@@ -220,7 +248,13 @@ impl Hint {
         })?;
         if self.guard.is_some() || self.generator || !self.captures.is_empty() {
             let stub = stubs.entry(nops.first().copied()).or_default();
-            stub.guard.clone_from(&self.guard);
+            stub.guard = self.guard.as_ref().map(|g| {
+                if g.truthy {
+                    format!("{} and False", g.literal)
+                } else {
+                    g.literal.clone()
+                }
+            });
             stub.generator = self.generator;
             for &i in &self.captures {
                 stub.names.push(identifier(m.text(locals[i])?)?);
@@ -259,6 +293,42 @@ fn place_names<'a>(
 }
 
 impl Body<'_, '_, '_> {
+    // Keep the live statement on its original line. Putting it on a new line
+    // can cause CPython to insert a tracing NOP before it.
+    pub(super) fn guard_statement(&mut self, guard: &str) -> Result<(), String> {
+        use ruff_python_ast::Stmt;
+        self.charge(self.lines.len())?;
+        let parsed = ruff_python_parser::parse_module(&self.lines)
+            .map_err(|_| "unsupported live guard body")?;
+        let range = parsed
+            .suite()
+            .iter()
+            .find_map(|stmt| match stmt {
+                Stmt::Assign(s) => Some(s.range),
+                Stmt::AugAssign(s) => Some(s.range),
+                Stmt::Expr(s) if !s.value.is_string_literal_expr() => Some(s.range),
+                Stmt::Raise(s) => Some(s.range),
+                Stmt::Return(s) => Some(s.range),
+                _ => None,
+            })
+            .ok_or("missing live guard statement")?;
+        let start = range.start().to_usize();
+        let end = range.end().to_usize();
+        if self.lines[start..end].contains('\n') || !self.lines[end..].starts_with('\n') {
+            return Err("unsupported multiline live guard".into());
+        }
+        let prefix = format!("if {guard}: ");
+        let marker = "  # serc: synthetic live guard";
+        self.charge(prefix.len() + marker.len())?;
+        if self.lines.len() + prefix.len() + marker.len() > super::MAX_SOURCE {
+            return Err("source size limit exceeded".into());
+        }
+        self.lines.insert_str(end, marker);
+        self.lines.insert_str(start, &prefix);
+        self.work.emitted = true;
+        Ok(())
+    }
+
     pub(super) fn emit_stub(&mut self, site: Option<usize>) -> Result<bool, String> {
         let Some(stub) = self.stubs.remove(&site) else {
             return Ok(false);
@@ -302,7 +372,7 @@ impl Body<'_, '_, '_> {
         out.push_str(&value);
         out.push_str("  # serc: synthetic dead code");
         self.line(&out)?;
-        self.work.emitted_stub = true;
+        self.work.emitted |= self.work.mode == Mode::DeadSuites;
         Ok(true)
     }
 }

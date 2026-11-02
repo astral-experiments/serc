@@ -7,6 +7,7 @@ use crate::{CompileOptions, compile_with_options};
 /// The cache magic selects one of serc's pinned targets. Each nested scope
 /// must reproduce its executable fields when recompiled. Dead suites synthesized
 /// to reproduce metadata carry the comment `# serc: synthetic dead code`.
+/// Synthetic conditions around live statements carry `# serc: synthetic live guard`.
 pub fn decompile_pyc(bytes: &[u8]) -> Result<String, DecompileError> {
     serc_decompile::decompile_pyc(
         bytes,

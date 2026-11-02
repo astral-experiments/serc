@@ -82,11 +82,24 @@ if False: hidden  # serc: synthetic dead code
 answer = 1
 ```
 
-The marker identifies the entire synthetic suite. It is included by default in
-CLI and library output. A synthetic suite can contain a `yield` to preserve a
-generator function or reference a name captured by a closure. Its guard is
-always false. The marked source must pass the same whole-module verification as
-any other output.
+The marker identifies the entire dead suite. A suite can contain a `yield` to
+preserve a generator function or reference a name captured by a closure.
+
+CPython can also keep a guard constant while retaining the guarded statement.
+For example, on 3.14 and 3.15, compiling `if not __debug__: yield arg` with
+`-O` can leave `False` in the constant table and an unconditional yield in
+the instruction stream. In that case serc can emit an always-true guard.
+
+```console
+$ serc decompile optimized.pyc
+def stream(arg):
+    if not False: (yield arg)  # serc: synthetic live guard
+    return 9
+```
+
+Here the marker applies only to the condition. The `yield` still runs. Both
+markers appear by default in CLI and library output, and the marked source
+must pass whole-module verification.
 
 ## Ruff corpus
 

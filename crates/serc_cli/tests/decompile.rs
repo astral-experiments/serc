@@ -80,13 +80,24 @@ fn check_output(
     versions: &[serc::PythonVersion],
     inspect: impl Fn(&str),
 ) {
+    check_output_at(source, exercise, versions, 0, inspect);
+}
+
+#[cfg(feature = "decompile")]
+fn check_output_at(
+    source: &str,
+    exercise: &str,
+    versions: &[serc::PythonVersion],
+    optimize: u8,
+    inspect: impl Fn(&str),
+) {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original.py");
     let recovered = temp.path().join("recovered.py");
     let cache = temp.path().join("file.pyc");
     fs_err::write(&original, source).unwrap();
     for &version in versions {
-        let built = common::python_command(version).args(["-c", "import py_compile, sys; py_compile.compile(sys.argv[1], sys.argv[2], doraise=True)"]).arg(&original).arg(&cache).output().unwrap();
+        let built = common::python_command(version).args(["-c", "import py_compile, sys; py_compile.compile(sys.argv[1], sys.argv[2], optimize=int(sys.argv[3]), doraise=True)"]).arg(&original).arg(&cache).arg(optimize.to_string()).output().unwrap();
         assert!(built.status.success(), "{built:?}");
         let output = Command::new(env!("CARGO_BIN_EXE_serc"))
             .arg("decompile")
@@ -106,7 +117,7 @@ fn check_output(
                 r"
 import sys, types
 def load(path):
-    return compile(open(path, encoding='utf-8').read(), '<fixture>', 'exec')
+    return compile(open(path, encoding='utf-8').read(), '<fixture>', 'exec', optimize=int(sys.argv[4]))
 def fields(c):
     return (c.co_code, c.co_flags, c.co_names, c.co_varnames, c.co_cellvars, c.co_freevars,
             c.co_argcount, c.co_posonlyargcount, c.co_kwonlyargcount, c.co_stacksize, c.co_exceptiontable,
@@ -124,6 +135,7 @@ assert exercise(left) == exercise(right)
             .arg(&original)
             .arg(&recovered)
             .arg(exercise)
+            .arg(optimize.to_string())
             .output()
             .unwrap();
         assert!(
@@ -810,6 +822,31 @@ fn synthetic_yields_and_captures_preserve_function_kinds() {
         "def stream(stop):\n    yield 1\n    if stop: return\n    raise LookupError\n",
         "a, b = stream(True), stream(False)\nresult = [next(a), next(b), next(a, 2)]\ntry: next(b)\nexcept LookupError: result.append(3)",
     );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn live_guards_are_marked_separately_from_dead_suites() {
+    let versions = [serc::PythonVersion::Py314, serc::PythonVersion::Py315];
+    for optimize in 0..=2 {
+        check_output_at(
+            "def stream(arg):\n    if not __debug__: yield arg\n    return 9\nif False: missing()\nanswer = 1\n",
+            "it = stream(42)\nitems = list(it)\nresult = items, answer",
+            &versions,
+            optimize,
+            |source| {
+                assert!(source.contains("missing  # serc: synthetic dead code"));
+                if optimize > 0 {
+                    assert!(
+                        source.contains("if not False: (yield arg)  # serc: synthetic live guard"),
+                        "{source}"
+                    );
+                } else {
+                    assert!(!source.contains("# serc: synthetic live guard"));
+                }
+            },
+        );
+    }
 }
 
 #[cfg(feature = "decompile")]
