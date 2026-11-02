@@ -460,6 +460,23 @@ result = build(f, spread, lambda *args, **kw: (args, kw)), log",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn incremental_dictionaries_preserve_order_across_chunks() {
+    // CPython inserts 16- and 17-pair runs individually. Larger displays
+    // merge multiple such runs, and unpackings can also split a run.
+    for size in [15, 16, 17, 18, 35] {
+        let entries = (0..size)
+            .map(|i| format!("key({i}): value({i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        check_fixture(
+            &format!("def f(key, value, extra):\n    return {{{entries}, **extra, key(0): value(42)}}\n"),
+            "events = []\ndef key(i): events.append(('key', i)); return i % 7\ndef value(i): events.append(('value', i)); return i\nresult = list(f(key, value, {7: 'extra'}).items()), events",
+        );
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn unpacking_comprehensions_use_the_target_iteration_order() {
     check_fixture_on(
         "def f(rows, maps):\n    return [*row for row in rows if row], {*row for row in rows}, {**m for group in maps for m in group}\ndef gen(rows):\n    return (*row for row in rows if row)\n",

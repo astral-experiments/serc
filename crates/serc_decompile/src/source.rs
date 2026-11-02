@@ -541,7 +541,15 @@ impl Body<'_, '_, '_> {
                 self.keyword_call(a, &keys)?;
             }
             "CALL_FUNCTION_EX" => self.expanded_call(a)?,
-            "DICT_UPDATE" | "DICT_MERGE" if a == 1 => self.merge_map()?,
+            "DICT_UPDATE" | "DICT_MERGE" if a == 1 => {
+                let other = self.expr()?;
+                self.append_dict_item(&format!("**({other})"))?;
+            }
+            "MAP_ADD" if a == 1 => {
+                let value = self.expr()?;
+                let key = self.expr()?;
+                self.append_dict_item(&format!("{key}: {value}"))?;
+            }
             "CALL_INTRINSIC_1"
                 if a == serc_bytecode::target::operands::UnaryIntrinsic::LIST_TO_TUPLE
                     .argument() =>
