@@ -286,6 +286,10 @@ fn nested_conditional_arms_share_the_outer_jump() {
         "def limits(high, low, call):\n    if high is None:\n        if low is None:\n            hi = call(1)\n        else:\n            lo = low\n            hi = call(4) * lo\n    else:\n        hi = high\n    return hi + call(2)\n",
         "log = []\ndef observed(x): log.append(x); return x\nresult = [limits(h, l, observed) for h, l in [(None, None), (None, 3), (8, None), (8, 3)]], log",
     );
+    check_fixture(
+        "def validate(hi, lo, bound):\n    if not hi >= lo >= bound():\n        raise ValueError(lo)\n    return hi, lo\n",
+        "calls = []\ndef bound(): calls.append(1); return 0\nvalues = []\nfor h, l in [(4, 3), (1, 2), (2, -1)]:\n    try: values.append(validate(h, l, bound))\n    except ValueError as e: values.append(e.args)\nresult = values, calls",
+    );
 }
 
 #[cfg(feature = "decompile")]
