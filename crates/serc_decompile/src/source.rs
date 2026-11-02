@@ -46,6 +46,7 @@ struct Recovery<'m> {
     emitted: bool,
     partial: bool,
     definitions: Vec<Id>,
+    private_class: Option<Id>,
 }
 
 pub(super) struct Candidate {
@@ -68,6 +69,7 @@ pub(super) fn recover(
         emitted: false,
         partial: false,
         definitions: Vec::new(),
+        private_class: None,
     };
     let text = scope(m, m.root, 0, false, &mut work)?;
     if mode != synthetic::Mode::Ordinary && !work.emitted {
@@ -103,9 +105,15 @@ fn scope<'m>(
     class: bool,
     work: &mut Recovery<'m>,
 ) -> Result<String, String> {
-    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
+    let enclosing = work.private_class;
+    if class {
+        work.private_class = Some(m.code(id)?.name);
+    }
+    let result = stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
         recover_scope(m, id, depth, class, work)
-    })
+    });
+    work.private_class = enclosing;
+    result
 }
 
 fn recover_scope<'m>(

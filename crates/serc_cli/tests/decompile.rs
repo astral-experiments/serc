@@ -281,6 +281,21 @@ fn formatted_displays_remain_interpolations() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn private_declarations_keep_their_unmangled_names() {
+    check_output(
+        "class _Outer:\n    def __method(self, x):\n        def __local(): return x\n        return __local\n    class __Inner:\n        def __method(self): return 7\n    type __Alias = int\n",
+        "f = _Outer()._Outer__method(42)\ninner = _Outer._Outer__Inner\nalias = _Outer._Outer__Alias\nresult = f(), f.__qualname__, inner.__qualname__, inner()._Inner__method(), alias.__name__, alias.__value__",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert!(source.contains("def __method("), "{source}");
+            assert!(source.contains("class __Inner"), "{source}");
+            assert!(source.contains("type __Alias ="), "{source}");
+        },
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn corpus_operand_layouts() {
     check_fixture(
         "import os\nimport sys as alias\nx: int = 3\ny: str\nclass C:\n    n: int = 42\n    def read(self, k: int) -> int:\n        return self.n + k\n",
