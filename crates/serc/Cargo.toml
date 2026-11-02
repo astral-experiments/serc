@@ -17,8 +17,10 @@ doctest = false
 workspace = true
 
 [dependencies]
+dashu-int = { workspace = true }
 encoding_rs = { workspace = true }
 hashbrown = { workspace = true }
+memchr = { workspace = true }
 ruff_index = { workspace = true }
 ruff_python_ast = { workspace = true }
 ruff_python_codegen = { workspace = true }
@@ -27,6 +29,7 @@ ruff_python_parser = { workspace = true }
 ruff_source_file = { workspace = true }
 ruff_text_size = { workspace = true }
 rustc-hash = { workspace = true }
+simdutf8 = { workspace = true }
 siphasher = { workspace = true }
 smallvec = { workspace = true }
 stacker = { workspace = true }
