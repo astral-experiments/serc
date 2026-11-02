@@ -170,7 +170,13 @@ impl Body<'_, '_, '_> {
         header: Option<usize>,
     ) -> Result<usize, String> {
         let value = self.expr()?;
-        let predicate = self.predicate(ops, i, value, end, level, header)?;
+        let mut predicate = self.predicate(ops, i, value, end, level, header)?;
+        if let Some(latch) = self.enclosing_continue_latch(ops, &predicate, end) {
+            predicate.suite = predicate.target;
+            predicate.target = end;
+            predicate.fallthrough_true = !predicate.fallthrough_true;
+            return self.while_loop(ops, &predicate, &latch, end, level);
+        }
         let fallthrough_end = predicate.target;
         self.conditional_suites(ops, &predicate, fallthrough_end, end, level)
     }

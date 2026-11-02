@@ -1,6 +1,8 @@
+use std::fmt::Write as _;
+
 use super::conditionals::Predicate;
 use super::regions::{ConstantReturn, constant_return};
-use super::{Body, Instruction};
+use super::{Body, Instruction, Value};
 
 pub(super) struct WhileLatch {
     header: usize,
@@ -11,12 +13,76 @@ pub(super) struct WhileLatch {
 #[derive(Clone, Copy)]
 pub(super) struct Loop {
     header: usize,
+    body_end: usize,
     after: Option<usize>,
     // CPython may copy the continuation's constant return into a break arm.
     copied_return: Option<ConstantReturn>,
 }
 
 impl Body<'_, '_, '_> {
+    /// A straight-line `while True` body can end in a conditional exit
+    /// followed by an unconditional backedge. Older targets jump over the
+    /// backedge on the exit path and leave the leading NOP outside the loop.
+    pub(super) fn bottom_tested_loop(
+        &mut self,
+        ops: &[Instruction],
+        nop: usize,
+        end: usize,
+        level: usize,
+    ) -> Result<Option<usize>, String> {
+        if nop + 1 >= end {
+            return Ok(None);
+        }
+        let block = self.flow.block(nop + 1);
+        let header = block.ops.start;
+        let branch = block.ops.end - 1;
+        if header < nop || branch + 1 >= end {
+            return Ok(None);
+        }
+        let fall = branch + 1 + usize::from(ops[branch + 1].name == "NOT_TAKEN");
+        if fall >= end
+            || self.flow.jump(branch) != Some(fall + 1)
+            || !self.flow.entered_from(branch + 1, branch..branch + 1)
+        {
+            return Ok(None);
+        }
+        let (jump, exits_on_jump) = match ops[fall].name {
+            "JUMP_BACKWARD" => (fall, true),
+            "JUMP_FORWARD"
+                if fall + 1 < end
+                    && self.flow.jump(fall) == Some(fall + 2)
+                    && self.flow.entered_from(fall + 1, branch..branch + 1) =>
+            {
+                (fall + 1, false)
+            }
+            _ => return Ok(None),
+        };
+        if ops[jump].name != "JUMP_BACKWARD" || self.flow.jump(jump) != Some(header) {
+            return Ok(None);
+        }
+        let mut body = self.fragment(ops, nop + 1, branch, level)?;
+        let value = body
+            .stack
+            .pop()
+            .and_then(Value::expression_text)
+            .ok_or("missing loop predicate")?;
+        let test = match (ops[branch].name, exits_on_jump) {
+            ("POP_JUMP_IF_TRUE", true) | ("POP_JUMP_IF_FALSE", false) => value,
+            ("POP_JUMP_IF_FALSE", true) | ("POP_JUMP_IF_TRUE", false) => format!("not ({value})"),
+            ("POP_JUMP_IF_NONE", true) | ("POP_JUMP_IF_NOT_NONE", false) => {
+                format!("({value}) is None")
+            }
+            ("POP_JUMP_IF_NOT_NONE", true) | ("POP_JUMP_IF_NONE", false) => {
+                format!("({value}) is not None")
+            }
+            _ => return Err("unsupported loop predicate".into()),
+        };
+        let mut suite = body.suite()?;
+        writeln!(suite, "if {test}:\n    break").unwrap();
+        self.block("while True:", &suite)?;
+        Ok(Some(jump + 1))
+    }
+
     pub(super) fn loop_transfer(&self, ops: &[Instruction], i: usize) -> Option<&'static str> {
         let active = self.loop_edges?;
         if !matches!(ops[i].name, "JUMP_BACKWARD" | "JUMP_FORWARD") {
@@ -60,6 +126,7 @@ impl Body<'_, '_, '_> {
     ) -> Result<Loop, String> {
         let mut active = Loop {
             header,
+            body_end: body.end,
             after: None,
             copied_return: None,
         };
@@ -139,7 +206,18 @@ impl Body<'_, '_, '_> {
         } else if matches!(
             ops[exit - 1].name,
             "RETURN_VALUE" | "RETURN_CONST" | "RAISE_VARARGS" | "JUMP_FORWARD"
-        ) {
+        ) || (ops[exit - 1].name == "JUMP_BACKWARD"
+            && self
+                .flow
+                .jump(exit - 1)
+                .is_some_and(|to| (header + 1..exit).contains(&to))
+            && self
+                .flow
+                .incoming(header)
+                .any(|from| (header + 1..exit).contains(&from)))
+        {
+            // A nested loop may own the last jump while an earlier arm
+            // advances the iterator. Keep both transfers in the body.
             exit
         } else {
             return Err("unsupported for-loop latch".into());
@@ -194,6 +272,55 @@ impl Body<'_, '_, '_> {
         })
     }
 
+    /// At the end of a for suite CPython can jump into the inner while body,
+    /// with a copy of the outer continue on each false edge.
+    pub(super) fn enclosing_continue_latch(
+        &self,
+        ops: &[Instruction],
+        predicate: &Predicate,
+        end: usize,
+    ) -> Option<WhileLatch> {
+        let body = predicate.target;
+        let header = predicate.header?;
+        let test = end.checked_sub(2)?;
+        if body != predicate.suite + 1
+            || end >= ops.len()
+            || body > test
+            || self.loop_transfer(ops, predicate.suite) != Some("continue")
+            || ops[end - 1].name != "JUMP_BACKWARD"
+        {
+            return None;
+        }
+        if self.flow.jump(end - 1) == Some(header)
+            && self.flow.block(header).ops.start == header
+            && end == self.loop_edges?.body_end
+        {
+            return Some(WhileLatch {
+                header,
+                body_end: end - 1,
+                implicit_return: false,
+            });
+        }
+        if self.loop_transfer(ops, end) != Some("continue")
+            || self.flow.jump(end - 1) != Some(body)
+            || self.flow.jump(test) != Some(end)
+            || !matches!(
+                (ops[predicate.branch].name, ops[test].name),
+                ("POP_JUMP_IF_TRUE", "POP_JUMP_IF_FALSE")
+                    | ("POP_JUMP_IF_FALSE", "POP_JUMP_IF_TRUE")
+                    | ("POP_JUMP_IF_NONE", "POP_JUMP_IF_NOT_NONE")
+                    | ("POP_JUMP_IF_NOT_NONE", "POP_JUMP_IF_NONE")
+            )
+        {
+            return None;
+        }
+        Some(WhileLatch {
+            header,
+            body_end: self.predicate_copy_start(ops, header, predicate.branch, body, test)?,
+            implicit_return: false,
+        })
+    }
+
     fn copied_while_latch(
         &self,
         ops: &[Instruction],
@@ -219,8 +346,23 @@ impl Body<'_, '_, '_> {
                 return None;
             }
         }
+        Some(WhileLatch {
+            header,
+            body_end: self.predicate_copy_start(ops, header, branch, predicate.suite, test)?,
+            implicit_return,
+        })
+    }
+
+    fn predicate_copy_start(
+        &self,
+        ops: &[Instruction],
+        header: usize,
+        branch: usize,
+        body: usize,
+        test: usize,
+    ) -> Option<usize> {
         let copy = test.checked_sub(branch - header)?;
-        if copy < predicate.suite
+        if copy < body
             || !(header..branch).zip(copy..test).all(|(a, b)| {
                 if ops[a].opcode != ops[b].opcode {
                     return false;
@@ -242,11 +384,7 @@ impl Body<'_, '_, '_> {
         {
             return None;
         }
-        Some(WhileLatch {
-            header,
-            body_end: copy,
-            implicit_return,
-        })
+        Some(copy)
     }
 
     pub(super) fn while_loop(

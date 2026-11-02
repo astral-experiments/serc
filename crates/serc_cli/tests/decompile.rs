@@ -384,6 +384,44 @@ assert result == ['ok', 'ok', 'poll', 'poll', 'poll', 'zero', 'zero']",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_nested_while_exhausts_into_the_enclosing_for() {
+    check_fixture(
+        r"def drain(counts, emit):
+    for n in counts:
+        while n > 0:
+            emit(n)
+            n -= 1
+",
+        r"result = []
+def emit(n):
+    result.append(n)
+    assert len(result) <= 3
+drain([2, 0, 1], emit)
+assert result == [2, 1, 1]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_trailing_break_test_repeats_the_whole_loop_body() {
+    check_fixture(
+        r"def drain(step, log):
+    while True:
+        n = step()
+        if not n:
+            break
+    log.append(n)
+    return n
+",
+        r"items = iter([2, 1, 0, 'unused'])
+log = []
+result = drain(items.__next__, log), next(items), log
+assert result == (0, 'unused', [0])",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn conditional_none_value_is_distinct_from_a_guard_return() {
     check_fixture(
         r"def keep(reset, value):

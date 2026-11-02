@@ -374,6 +374,12 @@ impl Body<'_, '_, '_> {
                 self.line(self.loop_transfer(ops, i).unwrap())?;
                 Ok(i + 1)
             }
+            "NOP"
+                if self.stack.is_empty()
+                    && let Some(next) = self.bottom_tested_loop(ops, i, end, level)? =>
+            {
+                Ok(next)
+            }
             "NOP" | "POP_TOP" | "POP_ITER"
                 if self.stack.is_empty() && self.folded_break(ops, i, end) =>
             {
