@@ -654,3 +654,23 @@ def bind(value):
         "result = [classify(x) for x in [17, 0, False, None, 'z']], [bind(x) for x in [0, 3, 4]], [group(x) for x in [0, 1, 3, None, 9, 2]], events",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn class_layout_matches_each_occurrence() {
+    check_fixture(
+        r"class C: pass
+first = C
+class C: pass
+def item(): return 3
+
+def decorate(cls): return cls
+@decorate
+class C:
+    class C: pass
+    def get(self): return item()
+class Last: pass
+",
+        "result = first.__name__, C.C.__qualname__, C().get(), Last.__name__",
+    );
+}

@@ -5,6 +5,7 @@ mod comprehensions;
 mod conditionals;
 mod definitions;
 mod exceptions;
+mod layout;
 mod loops;
 mod operands;
 mod patterns;
@@ -58,63 +59,9 @@ pub(super) fn recover(m: &Module<'_>, preserve_nops: bool) -> Result<(Vec<String
         candidates.push(text);
     }
     if m.version >= PythonVersion::Py313 {
-        // Class bodies store __firstlineno__ as an executable constant.
-        // Restore blank lines before unambiguous class definitions when needed.
-        let mut class_lines = rustc_hash::FxHashMap::default();
-        for obj in &m.objects {
-            if let Object::Code(code) = obj
-                && code.flags & serc_bytecode::target::code_flags::CO_NEWLOCALS == 0
-            {
-                class_lines
-                    .entry(m.text(code.name)?)
-                    .and_modify(|line| *line = None)
-                    .or_insert(Some(code.first_line));
-            }
-        }
-        for i in 0..candidates.len() {
-            if let Some(layout) = class_layout(&candidates[i], &class_lines) {
-                candidates.push(layout);
-            }
-        }
+        layout::class_candidates(m, &mut candidates)?;
     }
     Ok((candidates, work.saw_nop))
-}
-
-fn class_layout(
-    source: &str,
-    lines: &rustc_hash::FxHashMap<&str, Option<usize>>,
-) -> Option<String> {
-    let mut result = String::new();
-    let mut lineno = 1;
-    let mut decorators = None;
-    for line in source.split_inclusive('\n') {
-        if line.trim_start().starts_with('@') {
-            decorators.get_or_insert((result.len(), lineno));
-            result.push_str(line);
-            lineno += 1;
-            continue;
-        }
-        let (start, first_line) = decorators.take().unwrap_or((result.len(), lineno));
-        if let Some(name) = line
-            .trim_start()
-            .strip_prefix("class ")
-            .and_then(|s| s.split(['(', '[', ':']).next())
-            && let Some(&Some(target)) = lines.get(name)
-            && target > first_line
-        {
-            let gap = target - first_line;
-            if gap.checked_add(result.len())?.checked_add(source.len())? > MAX_SOURCE {
-                return None;
-            }
-            let preceding = result.split_off(start);
-            result.extend(std::iter::repeat_n('\n', gap));
-            result.push_str(&preceding);
-            lineno += gap;
-        }
-        result.push_str(line);
-        lineno += 1;
-    }
-    (result.len() != source.len()).then_some(result)
 }
 
 fn scope(
