@@ -1082,6 +1082,33 @@ result = [scenario(run, outer(), inner(), fail)
 
 #[cfg(feature = "decompile")]
 #[test]
+fn guarded_raise_stays_in_the_try_else_suite() {
+    check_fixture_on(
+        r"def resolve(read, expected, finish):
+    try:
+        found = read()
+    except LookupError:
+        raise ValueError('missing') from None
+    else:
+        if found is not expected:
+            raise ValueError('different')
+    return finish(found)
+",
+        r"def check(read, finish):
+    try:
+        return resolve(read, None, finish)
+    except Exception as error:
+        return type(error).__name__, error.args
+def missing(*args):
+    raise KeyError('key')
+result = [check(lambda: None, lambda value: 'ok'), check(missing, missing),
+          check(lambda: 1, missing), check(lambda: None, missing)]",
+        &[serc::PythonVersion::Py313],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn forward_joins_and_loop_exits() {
     check_fixture(
         "def first(xs, emit):\n    for x in xs:\n        emit(x)\n        break\n    else:\n        emit(0)\n    emit(9)\n",

@@ -138,6 +138,27 @@ impl Body<'_, '_, '_> {
         {
             return None;
         }
+        if let [arm] = arms.as_slice()
+            && matches!(arm.exit, Exit::Raise)
+            && success < handler
+        {
+            // A conditional raise at the end of an else suite can jump to a
+            // tracing NOP before the next statement. Moving the guard outside
+            // the else drops that NOP and shifts the out-of-line handler.
+            let branch = self.flow.block(success).ops.end - 1;
+            let next = self.flow.jump(branch)?;
+            if ops[branch].name.starts_with("POP_JUMP_IF_")
+                && (branch + 1..handler).contains(&next)
+                && ops[next - 1].name == "RAISE_VARARGS"
+                && ops[next].name == "NOP"
+            {
+                return Some(Dispatch {
+                    arms,
+                    success: success..next,
+                    continuation: next..handler,
+                });
+            }
+        }
         let mut join = join.unwrap_or(handler);
         let mut continuation = join..handler;
         if let [arm] = arms.as_mut_slice() {
