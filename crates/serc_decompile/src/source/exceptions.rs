@@ -278,6 +278,24 @@ impl Body<'_, '_, '_> {
             let pop = (binding + 1..next)
                 .find(|&i| ops[i].name == "POP_EXCEPT")
                 .ok_or("missing exception cleanup")?;
+            // A computed return is already on the stack when the handler
+            // restores the active exception. The SWAP moves it past that
+            // exception so RETURN_VALUE can consume it after POP_EXCEPT.
+            if pop > binding + 1
+                && (ops[pop - 1].name, ops[pop - 1].arg) == ("SWAP", 2)
+                && pop + 2 == next
+                && ops[pop + 1].name == "RETURN_VALUE"
+            {
+                let (suite, returns) = self
+                    .fragment(ops, binding + 1, pop - 1, 0)?
+                    .pending_return()?;
+                if !returns {
+                    return Err("missing exception return value".into());
+                }
+                self.block(&format!("except {kind}:"), &suite)?;
+                cursor = next;
+                continue;
+            }
             let suite = self.fragment(ops, binding + 1, pop, 0)?.suite()?;
             self.block(&format!("except {kind}:"), &suite)?;
             if !matches!(ops[next - 1].name, "RETURN_CONST" | "RETURN_VALUE") {
@@ -293,8 +311,10 @@ impl Body<'_, '_, '_> {
             continuation = Some(tail);
             cursor = next;
         }
-        for line in continuation.ok_or("missing exception handler")?.lines() {
-            self.line(line)?;
+        if let Some(continuation) = continuation {
+            for line in continuation.lines() {
+                self.line(line)?;
+            }
         }
         Ok(())
     }

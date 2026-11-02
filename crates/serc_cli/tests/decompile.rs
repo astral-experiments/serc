@@ -899,6 +899,15 @@ Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12)
 
 #[cfg(feature = "decompile")]
 #[test]
+fn comprehensions_inside_returning_exception_handlers() {
+    check_fixture(
+        "def exports(module):\n    try:\n        return list(module.__all__)\n    except AttributeError:\n        return [n for n in dir(module) if n[0] != '_']\n",
+        "class Explicit: __all__ = ('_keep',)\nclass Implicit: visible = 1\nresult = exports(Explicit), exports(Implicit)\nassert result == (['_keep'], ['visible'])",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original.py");

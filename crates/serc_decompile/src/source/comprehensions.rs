@@ -1,7 +1,7 @@
 //! Recover comprehension clauses from synchronous and asynchronous iterator loops.
 use std::fmt::Write as _;
 
-use super::{Body, Instruction, Value};
+use super::{Body, Bytecode, Instruction, Value};
 
 pub(super) fn is_collection_insert(op: &Instruction) -> bool {
     op.arg > 1
@@ -9,6 +9,38 @@ pub(super) fn is_collection_insert(op: &Instruction) -> bool {
             op.name,
             "LIST_APPEND" | "SET_ADD" | "MAP_ADD" | "LIST_EXTEND" | "SET_UPDATE" | "DICT_UPDATE"
         )
+}
+
+/// An inlined comprehension has handlers that restore its saved locals. A
+/// user-written handler in the same scope still needs a try/except statement.
+pub(super) fn normal_end(bc: &Bytecode) -> Option<usize> {
+    if !bc.ops.iter().any(|op| op.name == "LOAD_FAST_AND_CLEAR")
+        || !bc.ops.iter().any(is_collection_insert)
+    {
+        return None;
+    }
+    let mut first = bc.ops.len();
+    let mut after_return = bc.ops.len();
+    for handler in &bc.handlers {
+        let target = bc
+            .ops
+            .binary_search_by_key(&handler.target, |op| op.offset)
+            .ok()?;
+        if (bc.ops[target].name, bc.ops[target].arg) != ("SWAP", 2) {
+            return None;
+        }
+        first = first.min(target);
+        // A nested comprehension can place its own restore inline, jumping
+        // around it on success, before an out-of-line restore after a return.
+        if target > 0 && matches!(bc.ops[target - 1].name, "RETURN_VALUE" | "RETURN_CONST") {
+            after_return = after_return.min(target);
+        }
+    }
+    Some(if after_return == bc.ops.len() {
+        first
+    } else {
+        after_return
+    })
 }
 
 struct Iteration {
