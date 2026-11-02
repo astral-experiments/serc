@@ -147,13 +147,17 @@ impl Body<'_, '_, '_> {
             && self.stack.is_empty()
             && self.flow.unprotected_suite(start..end);
         let mut i = start;
+        let mut operand_start = None;
         while i < end {
+            if self.stack.is_empty() {
+                operand_start = Some(i);
+            }
             if partial && self.stack.is_empty() {
                 self.partial_start = i;
                 self.partial_prefix = self.lines.len();
             }
             let op = ops[i];
-            let next = match self.region_step(ops, i, end, level) {
+            let next = match self.region_step(ops, i, end, level, operand_start) {
                 Ok(next) => next,
                 Err(reason) if partial => {
                     self.lines.truncate(self.partial_prefix);
@@ -199,6 +203,7 @@ impl Body<'_, '_, '_> {
         i: usize,
         end: usize,
         level: usize,
+        operand_start: Option<usize>,
     ) -> Result<usize, String> {
         if let Some(handler) = self.handlers.remove(&i) {
             // The protected fragment re-enters this same instruction. Leave other
@@ -306,7 +311,7 @@ impl Body<'_, '_, '_> {
                 Ok(i + 2)
             }
             "SWAP" if super::comparisons::is_link(&ops[i..end]) => {
-                self.comparison_chain(ops, i, end, level)
+                self.comparison_chain(ops, i, end, level, operand_start)
             }
             "SWAP"
                 if op.arg == 2
@@ -406,7 +411,7 @@ impl Body<'_, '_, '_> {
             "POP_JUMP_IF_FALSE"
             | "POP_JUMP_IF_TRUE"
             | "POP_JUMP_IF_NONE"
-            | "POP_JUMP_IF_NOT_NONE" => self.conditional(ops, i, end, level),
+            | "POP_JUMP_IF_NOT_NONE" => self.conditional(ops, i, end, level, operand_start),
             "TO_BOOL"
                 if ops.get(i + 1).is_some_and(|op| {
                     op.name.starts_with("POP_JUMP_IF_") || op.name == "UNARY_NOT"

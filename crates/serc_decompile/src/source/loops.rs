@@ -2,6 +2,12 @@ use super::conditionals::Predicate;
 use super::regions::{ConstantReturn, constant_return};
 use super::{Body, Instruction};
 
+pub(super) struct WhileLatch {
+    header: usize,
+    body_end: usize,
+    implicit_return: bool,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct Loop {
     header: usize,
@@ -149,30 +155,13 @@ impl Body<'_, '_, '_> {
         self.loop_else(ops, after_cleanup, active, level)
     }
 
-    /// Walk back to the first instruction producing the predicate. A latch
-    /// returning to an earlier statement in the same block belongs to an outer
-    /// loop, even if it immediately precedes this conditional's other arm.
-    fn condition_start(&self, ops: &[Instruction], branch: usize) -> Option<usize> {
-        let mut inputs = 1usize;
-        for i in (self.flow.block(branch).ops.start..branch).rev() {
-            let op = ops[i];
-            let (pops, pushes) =
-                serc_bytecode::target::stack_counts_for(self.m.version, op.opcode, op.arg);
-            inputs = inputs.checked_sub(pushes)? + pops;
-            if inputs == 0 {
-                return Some(i);
-            }
-        }
-        None
-    }
-
     pub(super) fn while_latch(
         &self,
         ops: &[Instruction],
         predicate: &Predicate,
         end: usize,
-    ) -> Option<usize> {
-        let (start, exit) = (predicate.suite, predicate.target);
+    ) -> Option<WhileLatch> {
+        let (header, start, exit) = (predicate.header?, predicate.suite, predicate.target);
         if start >= exit {
             return None;
         }
@@ -183,73 +172,98 @@ impl Body<'_, '_, '_> {
                     && self.flow.jump(i) == Some(target)
             })
         };
-        if let Some(header) = self.condition_start(ops, predicate.first)
-            && self.flow.block(header).ops.start == header
-            && let Some(latch) = backedge(header)
+        // 3.12 and 3.13 may duplicate the entire condition at the bottom,
+        // even when a continue in the body jumps to the original condition.
+        if let Some(jump) = backedge(start)
+            && let Some(latch) = self.copied_while_latch(ops, predicate, header, jump, end)
         {
             return Some(latch);
         }
-
-        // 3.12 and 3.13 jump back to the body after a second copy of the
-        // predicate. Its false edge may reach a copy of the loop's return.
-        let latch = backedge(start)?;
-        if latch <= start || ops[latch - 1].name != ops[predicate.branch].name {
+        // A condition can span multiple blocks, e.g. the fast and fallback
+        // paths of any() over a generator. The backedge must re-enter the
+        // expression where it began with an empty operand stack.
+        if self.flow.block(header).ops.start != header {
             return None;
         }
-        let dest = self.flow.jump(latch - 1)?;
-        let same_exit = (dest == exit && latch + 1 == exit)
-            || (dest == latch + 1
-                && constant_return(ops, exit).is_some_and(|(at, value)| {
-                    let stop = exit + (exit - at);
-                    at == dest && stop <= end && constant_return(ops, stop) == Some((exit, value))
-                }));
-        same_exit.then_some(latch)
+        let jump = backedge(header)?;
+        Some(WhileLatch {
+            header,
+            implicit_return: false,
+            // An early continue can precede other statements in the loop.
+            body_end: if jump + 1 == exit { jump } else { exit },
+        })
+    }
+
+    fn copied_while_latch(
+        &self,
+        ops: &[Instruction],
+        predicate: &Predicate,
+        header: usize,
+        jump: usize,
+        end: usize,
+    ) -> Option<WhileLatch> {
+        let (branch, exit) = (predicate.branch, predicate.target);
+        let test = jump.checked_sub(1)?;
+        if ops[test].name != ops[branch].name || self.flow.jump(test)? != jump + 1 {
+            return None;
+        }
+        let implicit_return = jump + 1 != exit
+            && end == self.terminal_returns.end
+            && self.terminal_returns.contains(&(jump + 1))
+            && self.terminal_returns.contains(&exit);
+        if jump + 1 != exit && !implicit_return {
+            // Both tests can exit via separate copies of a constant return.
+            let (at, value) = constant_return(ops, exit)?;
+            let stop = exit + (exit - at);
+            if at != jump + 1 || stop > end || constant_return(ops, stop) != Some((exit, value)) {
+                return None;
+            }
+        }
+        let copy = test.checked_sub(branch - header)?;
+        if copy < predicate.suite
+            || !(header..branch).zip(copy..test).all(|(a, b)| {
+                if ops[a].opcode != ops[b].opcode {
+                    return false;
+                }
+                match (self.flow.jump(a), self.flow.jump(b)) {
+                    // A copied SEND, for example, jumps to its own END_SEND.
+                    (Some(x), Some(y)) if (header..=branch).contains(&x) => {
+                        y == copy + (x - header)
+                    }
+                    (Some(x), Some(y)) => {
+                        x == y
+                            || (self.terminal_returns.contains(&x)
+                                && self.terminal_returns.contains(&y))
+                    }
+                    (None, None) => ops[a].arg == ops[b].arg,
+                    _ => false,
+                }
+            })
+        {
+            return None;
+        }
+        Some(WhileLatch {
+            header,
+            body_end: copy,
+            implicit_return,
+        })
     }
 
     pub(super) fn while_loop(
         &mut self,
         ops: &[Instruction],
         predicate: &Predicate,
-        latch: usize,
+        latch: &WhileLatch,
         end: usize,
         level: usize,
     ) -> Result<usize, String> {
         let (start, target) = (predicate.suite, predicate.target);
-        let back = self.flow.target(latch)?;
-        let body_end = if back == start {
-            let condition = self
-                .condition_start(ops, predicate.branch)
-                .ok_or("missing copied loop predicate")?;
-            let width = predicate.branch - condition;
-            let copy = (latch - 1)
-                .checked_sub(width)
-                .filter(|&n| n >= start)
-                .ok_or("incomplete copied loop condition")?;
-            if !super::comparisons::same_instructions(
-                &ops[condition..predicate.branch],
-                &ops[copy..latch - 1],
-            ) {
-                return Err("distinct copied loop condition".into());
-            }
-            copy
-        } else if latch + 1 == target {
-            latch
-        } else {
-            // An early backedge is a continue. A different path still has
-            // statements between that edge and the condition's exit.
-            target
-        };
-        let active = self.loop_exits(ops, back, start..body_end, target, end)?;
+        let active = self.loop_exits(ops, latch.header, start..latch.body_end, target, end)?;
         let outer = self.loop_edges.replace(active);
-        let suite = self.fragment(ops, start, body_end, level)?.suite()?;
+        let suite = self.fragment(ops, start, latch.body_end, level)?.suite()?;
         self.loop_edges = outer;
         self.block(&format!("while {}:", predicate.test(true)), &suite)?;
-        if back == start
-            && self.flow.jump(latch - 1) != Some(target)
-            && self.terminal_returns.contains(&target)
-            && self.terminal_returns.end == end
-            && active.after.is_none_or(|after| after == target)
-        {
+        if latch.implicit_return && active.after.is_none_or(|after| after == target) {
             // The copied false exits already return None. Writing an explicit
             // post-loop return would merge their distinct return blocks.
             return Ok(end);

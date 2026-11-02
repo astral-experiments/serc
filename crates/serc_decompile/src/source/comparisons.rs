@@ -57,6 +57,7 @@ impl Body<'_, '_, '_> {
         first: usize,
         end: usize,
         level: usize,
+        header: Option<usize>,
     ) -> Result<usize, String> {
         let ops = &ops[..end];
         let (branch, value) = guard(ops, first).ok_or("unsupported comparison guard")?;
@@ -68,7 +69,6 @@ impl Body<'_, '_, '_> {
         let left = self.expr()?;
         let cmp = operator(ops[first + 2], self.m.version).ok_or("unknown comparison")?;
         let mut chain = format!("({left} {cmp} {right}");
-        let first_branch = branch;
         let mut branch = branch;
         loop {
             let mut operand = after_branch(ops, branch);
@@ -108,7 +108,7 @@ impl Body<'_, '_, '_> {
                 return Ok(join);
             }
 
-            return self.comparison_predicate(ops, first_branch, operand, cleanup, chain, level);
+            return self.comparison_predicate(ops, header, operand, cleanup, chain, level);
         }
     }
 
@@ -152,7 +152,7 @@ impl Body<'_, '_, '_> {
     fn comparison_predicate(
         &mut self,
         ops: &[Instruction],
-        first: usize,
+        header: Option<usize>,
         operand: usize,
         cleanup: usize,
         mut chain: String,
@@ -195,7 +195,7 @@ impl Body<'_, '_, '_> {
             return Err("comparison failures have different destinations".into());
         }
         let predicate = Predicate {
-            first,
+            header,
             value: chain,
             fallthrough_true,
             branch,

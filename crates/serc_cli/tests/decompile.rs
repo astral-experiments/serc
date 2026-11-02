@@ -316,6 +316,63 @@ assert result == [0, True, True, 0, True, False, 'woke', 1]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn while_predicate_can_span_the_inlined_any_call() {
+    check_fixture_on(
+        r"def drain(rows):
+    while any(row for row in rows):
+        for row in rows:
+            if row:
+                row.pop()
+    return rows
+",
+        "result = [drain([]), drain([[1, 2], [], [3]])]",
+        &[serc::PythonVersion::Py314, serc::PythonVersion::Py315],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn copied_while_conditions_can_suspend_or_receive_a_continue() {
+    check_fixture(
+        r"def poll(check, events):
+    while (yield from check()):
+        events.append('ok')
+
+def drain(values, events):
+    while values:
+        if values.pop():
+            continue
+        events.append('zero')
+",
+        r"result = []
+answers = iter([True, True, False])
+def check():
+    yield 'poll'
+    return next(answers)
+result += list(poll(check, result))
+drain([0, 1, 0], result)
+assert result == ['ok', 'ok', 'poll', 'poll', 'poll', 'zero', 'zero']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn conditional_none_value_is_distinct_from_a_guard_return() {
+    check_fixture(
+        r"def keep(reset, value):
+    return None if reset else value
+",
+        "result = [keep(True, 1), keep(False, 2)]",
+    );
+    check_fixture_on(
+        "def pair(a, b):\n    return None if a is None else (a, b)\n",
+        "result = [pair(None, 2), pair(1, 2)]",
+        &[serc::PythonVersion::Py312, serc::PythonVersion::Py313],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn conditional_guards_keep_distinct_function_exits() {
     check_fixture(
         r"def emit(ready, allowed, events):

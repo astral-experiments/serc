@@ -2,7 +2,7 @@ use super::regions::Fragment;
 use super::{Body, Instruction};
 
 pub(super) struct Predicate {
-    pub(super) first: usize,
+    pub(super) header: Option<usize>,
     pub(super) value: String,
     pub(super) fallthrough_true: bool,
     pub(super) branch: usize,
@@ -24,12 +24,20 @@ impl Body<'_, '_, '_> {
     /// CPython may give each short-circuit edge a distinct copy of the same
     /// implicit function exit. Only a suffix of unprotected, empty-stack
     /// return blocks is interchangeable with falling off the end of the def.
-    pub(super) fn index_terminal_returns(&mut self, ops: &[Instruction]) {
+    /// A generator can have its implicit `StopIteration` handler on those exits.
+    pub(super) fn index_terminal_returns(
+        &mut self,
+        ops: &[Instruction],
+        stop_handler: Option<usize>,
+    ) {
         let mut start = ops.len();
         while start > 0 {
             let block = self.flow.block(start - 1);
             if block.height != Some(0)
-                || self.flow.handler(block.ops.start).is_some()
+                || self
+                    .flow
+                    .handler(block.ops.start)
+                    .is_some_and(|h| !(Some(h.target) == stop_handler && h.depth == 0 && h.lasti))
                 || !self.none_return(&ops[block.ops.clone()])
             {
                 break;
@@ -42,7 +50,13 @@ impl Body<'_, '_, '_> {
     fn none_return(&self, ops: &[Instruction]) -> bool {
         let load = match ops {
             [ret] if ret.name == "RETURN_CONST" => ret,
-            [load, ret] if ret.name == "RETURN_VALUE" => load,
+            // On targets with RETURN_CONST, a separate load and return
+            // can be the None arm of a conditional expression.
+            [load, ret]
+                if ret.name == "RETURN_VALUE" && self.m.version >= super::PythonVersion::Py314 =>
+            {
+                load
+            }
             _ => return false,
         };
         match load.name {
@@ -64,6 +78,7 @@ impl Body<'_, '_, '_> {
         value: String,
         end: usize,
         level: usize,
+        header: Option<usize>,
     ) -> Result<Predicate, String> {
         let fall =
             |i: usize| i + 1 + usize::from(ops.get(i + 1).is_some_and(|op| op.name == "NOT_TAKEN"));
@@ -137,7 +152,7 @@ impl Body<'_, '_, '_> {
         }
         let start = fall(branch);
         Ok(Predicate {
-            first,
+            header,
             value,
             branch,
             suite: start,
@@ -152,9 +167,10 @@ impl Body<'_, '_, '_> {
         i: usize,
         end: usize,
         level: usize,
+        header: Option<usize>,
     ) -> Result<usize, String> {
         let value = self.expr()?;
-        let predicate = self.predicate(ops, i, value, end, level)?;
+        let predicate = self.predicate(ops, i, value, end, level, header)?;
         let fallthrough_end = predicate.target;
         self.conditional_suites(ops, &predicate, fallthrough_end, end, level)
     }
@@ -214,7 +230,7 @@ impl Body<'_, '_, '_> {
             return Ok(target);
         }
         if let Some(latch) = self.while_latch(ops, predicate, end) {
-            return self.while_loop(ops, predicate, latch, end, level);
+            return self.while_loop(ops, predicate, &latch, end, level);
         }
         if self.flow.join(i) == Some(target) {
             // Both paths reach the taken target. Only the fallthrough path
@@ -264,6 +280,10 @@ impl Body<'_, '_, '_> {
             // on its other edge. Keep it separate from any branches in the tail.
             if self.none_return(&ops[start..fallthrough_end])
                 && !self.terminal_returns.contains(&target)
+                // A conditional expression can return an owned alternate
+                // local where a separate return statement borrows it.
+                && !(target + 2 == end && ops[target].name == "LOAD_FAST"
+                    && self.m.version >= super::PythonVersion::Py314)
             {
                 self.block(&format!("if {test}:"), "return")?;
                 return Ok(target);

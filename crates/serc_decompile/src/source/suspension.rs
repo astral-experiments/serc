@@ -22,27 +22,38 @@ impl Body<'_, '_, '_> {
         }
         // A suspended body can end with a raise, even when another path
         // returns. The StopIteration handler marks the end of the normal CFG.
-        if let [body @ .., handler, reraise] = ops.as_slice()
-            && (handler.name, handler.arg)
-                == (
-                    "CALL_INTRINSIC_1",
-                    UnaryIntrinsic::STOPITERATION_ERROR.argument(),
-                )
-            && (reraise.name, reraise.arg) == ("RERAISE", 1)
+        let stop_handler = match ops.as_slice() {
+            [.., handler, reraise]
+                if (handler.name, handler.arg)
+                    == (
+                        "CALL_INTRINSIC_1",
+                        UnaryIntrinsic::STOPITERATION_ERROR.argument(),
+                    )
+                    && (reraise.name, reraise.arg) == ("RERAISE", 1) =>
+            {
+                Some(handler.offset)
+            }
+            _ => None,
+        };
+        let end = if stop_handler.is_some()
             && !bc.handlers.is_empty()
             && bc
                 .handlers
                 .iter()
-                .all(|h| h.target == handler.offset && h.depth == 0 && h.lasti)
+                .all(|h| Some(h.target) == stop_handler && h.depth == 0 && h.lasti)
         {
-            return self.region(ops, 0, body.len(), 0);
+            ops.len() - 2
+        } else {
+            self.handlers = super::protected_regions::suspended(bc, &self.flow);
+            ops.iter()
+                .rposition(|op| matches!(op.name, "RETURN_VALUE" | "RETURN_CONST"))
+                .ok_or("generator has no return")?
+                + 1
+        };
+        if self.depth > 0 && !self.class {
+            self.index_terminal_returns(&ops[..end], stop_handler);
         }
-        self.handlers = super::protected_regions::suspended(bc, &self.flow);
-        let stop = ops
-            .iter()
-            .rposition(|op| matches!(op.name, "RETURN_VALUE" | "RETURN_CONST"))
-            .ok_or("generator has no return")?;
-        self.region(ops, 0, stop + 1, 0)
+        self.region(ops, 0, end, 0)
     }
 
     fn suspended_managers(&mut self, bc: &Bytecode) -> Result<(), String> {

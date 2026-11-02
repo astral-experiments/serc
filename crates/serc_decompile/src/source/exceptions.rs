@@ -77,7 +77,7 @@ impl Body<'_, '_, '_> {
             let end = self.flow.normal_end();
             self.handlers = regions;
             if self.depth > 0 && !self.class {
-                self.index_terminal_returns(&bc.ops[..end]);
+                self.index_terminal_returns(&bc.ops[..end], None);
             }
             return self.region(&bc.ops, 0, end, 0);
         }

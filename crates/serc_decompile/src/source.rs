@@ -187,8 +187,8 @@ fn recover_scope<'m>(
         depth,
         work,
     };
-    if depth > 0 && !class {
-        body.index_terminal_returns(&bc.ops);
+    if depth > 0 && !class && !body.suspended() {
+        body.index_terminal_returns(&bc.ops, None);
     }
     body.declarations(&bc.ops)?;
     let result = if body.suspended() {
