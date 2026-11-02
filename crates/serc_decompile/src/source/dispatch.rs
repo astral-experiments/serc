@@ -132,17 +132,36 @@ impl Body<'_, '_, '_> {
             });
             cursor = next;
         }
-        if arms.len() < 2
+        if arms.is_empty()
             || !(cursor == cleanup
                 || (cursor + 1 == cleanup && (ops[cursor].name, ops[cursor].arg) == ("RERAISE", 0)))
         {
             return None;
         }
         let join = join.unwrap_or(handler);
+        let mut continuation = join..handler;
+        if let [arm] = arms.as_mut_slice() {
+            // A lone empty handler may return a constant, or fall through to
+            // a separate return after a successful else has exited. In the
+            // latter case the expression runs after POP_EXCEPT has restored
+            // the previous exception.
+            let Exit::Return(tail) = &arm.exit else {
+                return None;
+            };
+            if !arm.body.is_empty() || arm.kind.is_none() || success >= handler {
+                return None;
+            }
+            if !super::regions::constant_return(ops, tail.end)
+                .is_some_and(|(start, _)| start == tail.start)
+            {
+                continuation = tail.clone();
+                arm.exit = Exit::Jump(continuation.start);
+            }
+        }
         Some(Dispatch {
             arms,
             success: success..join,
-            continuation: join..handler,
+            continuation,
         })
     }
 

@@ -1307,6 +1307,40 @@ Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12)
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_single_handler_keeps_its_return_separate_from_the_success_path() {
+    check_fixture(
+        r"def lookup(obj):
+    try:
+        method = obj.method
+    except AttributeError:
+        pass
+    else:
+        return method()
+    return obj.fallback
+
+def present(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        return False
+    else:
+        return bool(value)
+",
+        r"import sys
+class WithMethod:
+    def method(self): return 'method'
+class WithoutMethod:
+    @property
+    def fallback(self):
+        assert sys.exception() is None
+        return 'fallback'
+result = [lookup(WithMethod()), lookup(WithoutMethod()), present({}, 1), present({1: 5}, 1)]
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn comprehensions_inside_returning_exception_handlers() {
     check_fixture(
         "def exports(module):\n    try:\n        return list(module.__all__)\n    except AttributeError:\n        return [n for n in dir(module) if n[0] != '_']\n",
