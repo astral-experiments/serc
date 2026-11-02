@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare serc and pycdc on caches compiled by the running CPython."""
+"""Compare serc and pycdc, requiring serc to match every pycdc scope in the stdlib."""
 
 from __future__ import annotations
 
@@ -139,6 +139,7 @@ def main():
     }
     previous = [args.compare_with.resolve(), "decompile"] if args.compare_with else None
     regressions = {}
+    pycdc_only = {}
     gained = 0
     baseline = Counter()
     packages = defaultdict(lambda: defaultdict(Counter))
@@ -164,9 +165,11 @@ def main():
             cache.write_bytes(
                 importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(code)
             )
+            matched = {}
             for tool, command in commands.items():
                 result = Counter()
                 matches = measure(command, cache, filename, code, result)
+                matched[tool] = matches
                 if previous and tool == "serc":
                     old = measure(previous, cache, filename, code, baseline)
                     gained += len(matches - old)
@@ -175,13 +178,21 @@ def main():
                 totals[tool].update(result)
                 if package is not None:
                     package[tool].update(result)
-    report = {"python": version, "corpus": args.corpus, "inputs": counts, **totals}
+            if extra := matched["pycdc"] - matched["serc"]:
+                pycdc_only[filename] = sorted(extra)
+    report = {
+        "python": version,
+        "corpus": args.corpus,
+        "inputs": counts,
+        **totals,
+        "pycdc_only": pycdc_only,
+    }
     if packages:
         report["packages"] = packages
     if previous:
         report.update(baseline=baseline, gained_scopes=gained, regressions=regressions)
     print(json.dumps(report, indent=2))
-    return bool(regressions)
+    return bool(regressions or (args.corpus != "ruff" and pycdc_only))
 
 
 if __name__ == "__main__":
