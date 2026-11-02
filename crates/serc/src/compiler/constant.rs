@@ -4596,44 +4596,49 @@ pub(super) fn is_literal_constant(expression: &Expr) -> bool {
     )
 }
 pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
-    let token: String = token
-        .chars()
-        .filter(|character| *character != '_')
-        .collect();
-    let (digits, radix) = if let Some(digits) = token
-        .strip_prefix("0x")
-        .or_else(|| token.strip_prefix("0X"))
-    {
-        (digits, 16)
-    } else if let Some(digits) = token
-        .strip_prefix("0o")
-        .or_else(|| token.strip_prefix("0O"))
-    {
-        (digits, 8)
-    } else if let Some(digits) = token
-        .strip_prefix("0b")
-        .or_else(|| token.strip_prefix("0B"))
-    {
-        (digits, 2)
-    } else {
-        (token.as_str(), 10)
-    };
+    match token.as_bytes() {
+        [b'0', b'x' | b'X', ..] => return power_of_two_digits(&token[2..], 4),
+        [b'0', b'o' | b'O', ..] => return power_of_two_digits(&token[2..], 3),
+        [b'0', b'b' | b'B', ..] => return power_of_two_digits(&token[2..], 1),
+        _ => {}
+    }
 
     let mut value = vec![0_u16];
-    for digit in digits.chars().filter_map(|digit| digit.to_digit(radix)) {
+    for digit in token.chars().filter_map(|digit| digit.to_digit(10)) {
         let mut carry = digit;
         for limb in &mut value {
-            let next = u32::from(*limb) * radix + carry;
+            let next = u32::from(*limb) * 10 + carry;
             *limb = (next & 0x7fff) as u16;
             carry = next >> 15;
         }
-        while carry != 0 {
-            value.push((carry & 0x7fff) as u16);
-            carry >>= 15;
+        if carry != 0 {
+            value.push(u16::try_from(carry).expect("decimal carry is at most nine"));
         }
     }
-    while value.len() > 1 && value.last() == Some(&0) {
-        value.pop();
+    value
+}
+
+/// Pack binary, octal, or hexadecimal digits into little-endian 15-bit marshal limbs.
+fn power_of_two_digits(digits: &str, bits_per_digit: u32) -> Vec<u16> {
+    let digits = digits.trim_start_matches(['0', '_']);
+    let mut value = Vec::new();
+    let mut buffer = 0;
+    let mut bits = 0;
+    for digit in digits
+        .chars()
+        .rev()
+        .filter_map(|digit| digit.to_digit(1 << bits_per_digit))
+    {
+        buffer |= digit << bits;
+        bits += bits_per_digit;
+        if bits >= 15 {
+            value.push((buffer & 0x7fff) as u16);
+            buffer >>= 15;
+            bits -= 15;
+        }
+    }
+    if buffer != 0 || value.is_empty() {
+        value.push(u16::try_from(buffer).expect("fewer than 15 bits remain"));
     }
     value
 }
@@ -4652,6 +4657,20 @@ mod tests {
         CodeObject, Constant, LocalsIdentity, MarshalMetadataIds, MarshalProvenance, MetadataId,
     };
     use crate::{CompileOptions, PythonVersion, compile_with_options};
+
+    #[test]
+    fn integer_literal_radices_agree_across_limb_boundaries() {
+        for value in [0, 1, 0x7fff, 0x8000, 1 << 63, u128::MAX] {
+            let expected = super::big_integer_digits(&value.to_string());
+            for token in [
+                format!("0B_00_{value:b}"),
+                format!("0o00_{value:o}"),
+                format!("0X00_{value:X}"),
+            ] {
+                assert_eq!(super::big_integer_digits(&token), expected, "{token}");
+            }
+        }
+    }
 
     #[test]
     fn emitted_names_preserve_order_across_index_creation() {
