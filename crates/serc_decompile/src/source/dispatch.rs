@@ -153,9 +153,12 @@ impl Body<'_, '_, '_> {
             }
             let normal = &ops[success..handler];
             let handled = &ops[tail.clone()];
-            if normal.len() == handled.len() && normal.iter().zip(handled).all(|(a, b)| {
-                a.jump.is_none() && (a.opcode, a.arg) == (b.opcode, b.arg)
-            }) {
+            if normal.len() == handled.len()
+                && normal
+                    .iter()
+                    .zip(handled)
+                    .all(|(a, b)| a.jump.is_none() && (a.opcode, a.arg) == (b.opcode, b.arg))
+            {
                 // CPython copied one straight-line continuation onto both
                 // exits. It executes after the active exception is restored.
                 join = success;

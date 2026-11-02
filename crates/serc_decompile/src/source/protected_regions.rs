@@ -20,9 +20,9 @@ pub(super) struct Protected {
     next: usize,
     clause: Clause,
     handler: Range<usize>,
-    // An early return may keep its value across POP_EXCEPT, then discard the
-    // iterator. Resume with the same expression stack after the exception pop.
-    return_tail: Option<Range<usize>>,
+    // Resume after POP_EXCEPT for a loop transfer. A computed return keeps
+    // its value across the pop and the following iterator cleanup.
+    handler_tail: Option<Range<usize>>,
 }
 
 fn groups(bc: &Bytecode) -> FxHashMap<usize, Vec<Handler>> {
@@ -130,7 +130,7 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
         _ => None,
     }
     .filter(|&i| i < start && flow.for_iter_depth(i) == Some(first.depth));
-    let mut return_tail = None;
+    let mut handler_tail = None;
     let handler = match ops.get(body..stop)? {
         [.., raise] if raise.name == "RAISE_VARARGS" => body..stop,
         [.., pop, jump]
@@ -139,10 +139,20 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
                     jump.name,
                     "JUMP_FORWARD" | "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
                 )
-                && flow
-                    .jump(stop - 1)
-                    .is_some_and(|to| to == next || Some(to) == for_header) =>
+                && let Some(to) = flow.jump(stop - 1) =>
         {
+            if to != next && Some(to) != for_header {
+                // The handler skips the rest of this iteration. Only a jump
+                // to the enclosing iterator at its saved depth is a continue.
+                if ops[to].name != "FOR_ITER"
+                    || to >= start
+                    || flow.jump(to).is_none_or(|exit| end >= exit)
+                    || flow.for_iter_depth(to) != Some(first.depth)
+                {
+                    return None;
+                }
+                handler_tail = Some(stop - 1..stop);
+            }
             body..stop - 2
         }
         [.., ret]
@@ -155,7 +165,7 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
             if computed && (pop == body || (ops[pop - 1].name, ops[pop - 1].arg) != ("SWAP", 2)) {
                 return None;
             }
-            return_tail = Some(pop + 1..stop);
+            handler_tail = Some(pop + 1..stop);
             body..pop - usize::from(computed)
         }
         _ => {
@@ -179,7 +189,7 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
             next,
             clause: Clause::Except(kind),
             handler,
-            return_tail,
+            handler_tail,
         },
     ))
 }
@@ -249,7 +259,7 @@ fn finally_region(
             deferred_return: normal.end..next,
         },
         handler: normal,
-        return_tail: None,
+        handler_tail: None,
     })
 }
 
@@ -356,7 +366,7 @@ impl Body<'_, '_, '_> {
             }
         };
         let handler = self.fragment(ops, entry.handler.start, entry.handler.end, level)?;
-        let handler = if let Some(tail) = &entry.return_tail {
+        let handler = if let Some(tail) = &entry.handler_tail {
             handler.resume(self, ops, tail.clone(), level)?
         } else {
             handler.suite()?

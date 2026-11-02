@@ -545,6 +545,30 @@ except TypeError:
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_handled_error_can_skip_the_rest_of_an_iteration() {
+    check_fixture(
+        r"def collect(obj, names, emit):
+    for name in names:
+        try:
+            value = getattr(obj, name)
+        except AttributeError:
+            continue
+        emit(value)
+    emit('done')
+",
+        r"class Item:
+    first = 1
+    last = 2
+result = []
+collect(Item(), ('first', 'missing', 'last'), result.append)
+collect(Item(), (), result.append)
+assert result == [1, 2, 'done', 'done']
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_guard_and_loop_exhaustion_can_return_the_same_constant() {
     check_fixture(
         r"def wake(waiters, emit):
