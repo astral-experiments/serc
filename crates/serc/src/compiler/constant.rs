@@ -4603,6 +4603,14 @@ pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
         _ => {}
     }
 
+    // Even with an underscore between every digit, a 32 KiB literal has at least
+    // 16K digits. At that size divide-and-conquer beats repeated word multiplication.
+    if token.len() >= 32 * 1024 {
+        let value = dashu_int::UBig::from_str_radix(token, 10)
+            .expect("the lexer validated this decimal integer literal");
+        return pack_integer_bytes(value.as_words().iter().flat_map(|word| word.to_le_bytes()));
+    }
+
     let mut words = SmallVec::<[u64; 2]>::new();
     // Both a 19-digit chunk and its multiplier fit in u64.
     for chunk in token.as_bytes().chunks(19) {
@@ -4622,7 +4630,11 @@ pub(super) fn big_integer_digits(token: &str) -> Vec<u16> {
         }
     }
 
-    let bytes = words.into_iter().flat_map(u64::to_le_bytes);
+    pack_integer_bytes(words.into_iter().flat_map(u64::to_le_bytes))
+}
+
+/// Pack little-endian bytes from full-width words into canonical 15-bit marshal limbs.
+fn pack_integer_bytes(bytes: impl Iterator<Item = u8>) -> Vec<u16> {
     let mut value = pack_integer_digits(bytes.map(u32::from), 8);
     // The high word may contribute whole zero marshal limbs.
     value.truncate(significant_digits(&value).len().max(1));
@@ -4699,6 +4711,16 @@ mod tests {
                 assert_eq!(super::big_integer_digits(&token), expected, "{token}");
             }
         }
+    }
+
+    #[test]
+    fn decimal_grouping_preserves_digits_across_the_conversion_threshold() {
+        let separated = format!("{}7", "9_".repeat(16_384));
+        let compact = separated.replace('_', "");
+        assert_eq!(
+            super::big_integer_digits(&separated),
+            super::big_integer_digits(&compact)
+        );
     }
 
     #[test]

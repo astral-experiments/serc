@@ -17,6 +17,7 @@ doctest = false
 workspace = true
 
 [dependencies]
+dashu-int = { workspace = true }
 encoding_rs = { workspace = true }
 hashbrown = { workspace = true }
 ruff_index = { workspace = true }
