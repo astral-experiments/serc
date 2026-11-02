@@ -29,9 +29,7 @@ impl Body<'_, '_, '_> {
     }
 
     pub(super) fn alias_definition(&mut self, name: &str, def: &Definition) -> Result<(), String> {
-        if name != self.m.text(self.m.code(def.id)?.name)? {
-            return Err("type alias binding differs from code name".into());
-        }
+        let name = self.declaration_name(self.m.text(self.m.code(def.id)?.name)?, name)?;
         let rhs = self.lazy_value(def.id, false)?;
         let params = def.generic_suffix();
         self.line(&format!("type {name}{params} = {rhs}"))

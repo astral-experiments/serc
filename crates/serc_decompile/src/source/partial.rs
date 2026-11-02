@@ -54,6 +54,7 @@ pub(crate) fn partial(m: &Module<'_>, candidate: Option<Candidate>) -> Result<St
         emitted: false,
         partial: true,
         definitions: Vec::new(),
+        private_class: None,
     };
     let mut candidate = if let Some(candidate) = candidate {
         candidate

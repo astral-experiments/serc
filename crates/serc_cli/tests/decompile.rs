@@ -272,6 +272,56 @@ fn template_interpolations_retain_expression_text() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn formatted_displays_remain_interpolations() {
+    check_fixture(
+        "def show(x):\n    return f\"{ {'a': x}!r}\", f\"nested { {f'{ {x} }'} } end\"\n",
+        "result = show(42)",
+    );
+    check_fixture(
+        "def fields(xs):\n    return {f':{x}' for x in xs}, {f'{x}': f'{x!r}' for x in xs}\n",
+        "result = fields(['a', 2])",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_conditional_arms_share_the_outer_jump() {
+    check_fixture(
+        "def limits(high, low, call):\n    if high is None:\n        if low is None:\n            hi = call(1)\n        else:\n            lo = low\n            hi = call(4) * lo\n    else:\n        hi = high\n    return hi + call(2)\n",
+        "log = []\ndef observed(x): log.append(x); return x\nresult = [limits(h, l, observed) for h, l in [(None, None), (None, 3), (8, None), (8, 3)]], log",
+    );
+    check_fixture(
+        "def validate(hi, lo, bound):\n    if not hi >= lo >= bound():\n        raise ValueError(lo)\n    return hi, lo\n",
+        "calls = []\ndef bound(): calls.append(1); return 0\nvalues = []\nfor h, l in [(4, 3), (1, 2), (2, -1)]:\n    try: values.append(validate(h, l, bound))\n    except ValueError as e: values.append(e.args)\nresult = values, calls",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn optimized_generator_calls_keep_short_circuiting_and_shadowing() {
+    check_fixture(
+        "def both(xs, log):\n    a = all(log(x) for x in xs)\n    b = any(log(x) for x in xs)\n    return a, b\ndef first(xs): return any(x for x in xs)\n",
+        "seen = []\ndef observe(x): seen.append(x); return x\nresult = [both([1, 0, 2], observe), first([]), seen.copy()]\nall = any = tuple\nresult += [both([0, 2], observe), first([3, 4]), seen.copy()]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn private_declarations_keep_their_unmangled_names() {
+    check_output(
+        "class _Outer:\n    def __method(self, x):\n        def __local(): return x\n        return __local\n    class __Inner:\n        def __method(self): return 7\n    type __Alias = int\n",
+        "f = _Outer()._Outer__method(42)\ninner = _Outer._Outer__Inner\nalias = _Outer._Outer__Alias\nresult = f(), f.__qualname__, inner.__qualname__, inner()._Inner__method(), alias.__name__, alias.__value__",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert!(source.contains("def __method("), "{source}");
+            assert!(source.contains("class __Inner"), "{source}");
+            assert!(source.contains("type __Alias ="), "{source}");
+        },
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn corpus_operand_layouts() {
     check_fixture(
         "import os\nimport sys as alias\nx: int = 3\ny: str\nclass C:\n    n: int = 42\n    def read(self, k: int) -> int:\n        return self.n + k\n",
@@ -874,6 +924,10 @@ else:
     async def repeated(*, y):
         return y + 2
 fake_marker = '# __serc_definition_id__ 7'
+label: str = 'αβγ'
+class Labels:
+    label: str = 'αβγ'
+    size: int = 3
 def annotated(x: int): return x
 if before:
     lost = '{big}'
@@ -903,6 +957,15 @@ def unfinished():
         action()
         return '{big}'
     except Exception: return kept
+def guarded(flag, events):
+    if flag:
+        normal = 1
+        try: events.append('guarded')
+        except KeyError: pass
+        events.append('tail')
+    else:
+        events.append('other')
+    return events
 ",
         big = "x".repeat(200_000)
     );
@@ -962,6 +1025,10 @@ scope = runpy.run_path(sys.argv[1])
 assert scope['after'](5) == 12
 assert 'repeated' not in scope and 'inner' not in scope
 assert scope['fake_marker'] == '# __serc_definition_id__ 7'
+annotations = scope['__annotate__'](1) if '__annotate__' in scope else scope['__annotations__']
+assert annotations['label'] is str and scope['label'] == 'αβγ'
+assert scope['Labels'].__annotations__ == dict(label=str, size=int)
+assert scope['Labels'].label == 'αβγ' and scope['Labels'].size == 3
 events = []
 def fail(): raise KeyError
 for flag, action in [(True, fail), (False, lambda: None)]:
@@ -974,7 +1041,13 @@ try: get()
 except NameError: pass
 else: raise AssertionError('the omitted assignment initialized the cell')
 put(42)
-assert get() == 42",
+assert get() == 42
+events = []
+scope['guarded'](False, events)
+assert 'guarded' not in events and 'tail' not in events
+events.clear()
+scope['guarded'](True, events)
+assert 'other' not in events",
             ])
             .arg(&recovered)
             .output()

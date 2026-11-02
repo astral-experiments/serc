@@ -1,4 +1,5 @@
 mod annotations;
+mod builtin_calls;
 mod classes;
 mod comparisons;
 mod comprehensions;
@@ -46,6 +47,7 @@ struct Recovery<'m> {
     emitted: bool,
     partial: bool,
     definitions: Vec<Id>,
+    private_class: Option<Id>,
 }
 
 pub(super) struct Candidate {
@@ -68,6 +70,7 @@ pub(super) fn recover(
         emitted: false,
         partial: false,
         definitions: Vec::new(),
+        private_class: None,
     };
     let text = scope(m, m.root, 0, false, &mut work)?;
     if mode != synthetic::Mode::Ordinary && !work.emitted {
@@ -103,9 +106,15 @@ fn scope<'m>(
     class: bool,
     work: &mut Recovery<'m>,
 ) -> Result<String, String> {
-    stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
+    let enclosing = work.private_class;
+    if class {
+        work.private_class = Some(m.code(id)?.name);
+    }
+    let result = stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
         recover_scope(m, id, depth, class, work)
-    })
+    });
+    work.private_class = enclosing;
+    result
 }
 
 fn recover_scope<'m>(
@@ -151,6 +160,7 @@ fn recover_scope<'m>(
         code,
         stack: Vec::new(),
         lines: String::new(),
+        partial_prefix: 0,
         flow,
         loop_edges: None,
         class,
@@ -231,11 +241,23 @@ enum Value {
     Member(String),
 }
 
+impl Value {
+    fn expression_text(self) -> Option<String> {
+        match self {
+            Self::Expr(value) => Some(value),
+            Self::Formatted(field) => Some(format!("f\"{field}\"")),
+            _ => None,
+        }
+    }
+}
+
 struct Body<'m, 'data, 'work> {
     m: &'m Module<'data>,
     code: &'m Code,
     stack: Vec<Value>,
     lines: String,
+    // End of the last complete statement while recovering a partial region.
+    partial_prefix: usize,
     stubs: synthetic::Stubs<'m>,
     omitted_cell_stores: rustc_hash::FxHashSet<usize>,
     flow: crate::flow::Graph,
@@ -306,10 +328,10 @@ impl Body<'_, '_, '_> {
 
     fn expr(&mut self) -> Result<String, String> {
         match self.pop()? {
-            Value::Expr(value) => Ok(value),
-            Value::Formatted(field) => Ok(format!("f\"{field}\"")),
             Value::Function(def) => self.lambda(&def),
-            _ => Err("expected expression".into()),
+            value => value
+                .expression_text()
+                .ok_or_else(|| "expected expression".into()),
         }
     }
 

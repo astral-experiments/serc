@@ -20,7 +20,7 @@ impl Fragment {
     pub(super) fn expression(mut self) -> Result<String, String> {
         if self.lines.is_empty()
             && self.stack.len() == 1
-            && let Some(Value::Expr(value)) = self.stack.pop()
+            && let Some(value) = self.stack.pop().and_then(Value::expression_text)
         {
             Ok(value)
         } else {
@@ -28,7 +28,7 @@ impl Fragment {
         }
     }
     pub(super) fn key_value(mut self) -> Result<(String, String), String> {
-        let Some(Value::Expr(value)) = self.stack.pop() else {
+        let Some(value) = self.stack.pop().and_then(Value::expression_text) else {
             return Err("missing comprehension value".into());
         };
         Ok((self.expression()?, value))
@@ -37,7 +37,10 @@ impl Fragment {
     pub(super) fn pending_return(mut self) -> Result<(String, bool), String> {
         match self.stack.pop() {
             None => Ok((self.lines, false)),
-            Some(Value::Expr(value)) if self.stack.is_empty() => {
+            Some(value) if self.stack.is_empty() => {
+                let value = value
+                    .expression_text()
+                    .ok_or("unsupported protected stack outcome")?;
                 writeln!(self.lines, "return {value}").unwrap();
                 Ok((self.lines, true))
             }
@@ -74,9 +77,11 @@ impl Body<'_, '_, '_> {
     ) -> Result<Fragment, String> {
         let outer_stack = std::mem::replace(&mut self.stack, stack);
         let outer_lines = std::mem::take(&mut self.lines);
+        let outer_prefix = std::mem::take(&mut self.partial_prefix);
         let outer_loop = self.loop_edges;
         let result = self.region(ops, start, end, level + 1);
         self.loop_edges = outer_loop;
+        self.partial_prefix = outer_prefix;
         let fragment = Fragment {
             lines: std::mem::replace(&mut self.lines, outer_lines),
             stack: std::mem::replace(&mut self.stack, outer_stack),
@@ -122,22 +127,25 @@ impl Body<'_, '_, '_> {
             && start < end
             && self.stack.is_empty()
             && self.flow.unprotected_suite(start..end);
-        let mut prefix = self.lines.len();
         let mut i = start;
         while i < end {
             if partial && self.stack.is_empty() {
-                prefix = self.lines.len();
+                self.partial_prefix = self.lines.len();
             }
             let op = ops[i];
             let next = match self.region_step(ops, i, end, level) {
                 Ok(next) => next,
                 Err(reason) if partial => {
-                    self.lines.truncate(prefix);
+                    self.lines.truncate(self.partial_prefix);
                     self.stack.clear();
-                    let next = self
-                        .resume_after(ops, i)?
-                        .filter(|&next| next <= end)
-                        .unwrap_or(end);
+                    let next = match self.resume_after(ops, i)? {
+                        Some(next) if next <= end => next,
+                        _ if end == ops.len() => end,
+                        // The caller will emit the following protected suite.
+                        // Stopping at its boundary is unsafe when an omitted
+                        // branch can jump across that suite.
+                        _ => return Err(format!("byte {} ({}): {reason}", op.offset, op.name)),
+                    };
                     self.gap(&reason, &ops[i..next], next == ops.len())?;
                     next
                 }
@@ -146,10 +154,12 @@ impl Body<'_, '_, '_> {
             if next <= i || next > end {
                 return Err(format!("branch escapes region at byte {}", op.offset));
             }
-            if partial && self.stack.is_empty() && self.lines.len() > prefix {
-                self.charge(self.lines.len() - prefix)?;
-                if let Err(error) = ruff_python_parser::parse_module(&self.lines[prefix..]) {
-                    self.lines.truncate(prefix);
+            if partial && self.stack.is_empty() && self.lines.len() > self.partial_prefix {
+                self.charge(self.lines.len() - self.partial_prefix)?;
+                if let Err(error) =
+                    ruff_python_parser::parse_module(&self.lines[self.partial_prefix..])
+                {
+                    self.lines.truncate(self.partial_prefix);
                     self.gap(
                         &format!("invalid reconstructed statement: {error}"),
                         &ops[i..next],
@@ -206,6 +216,18 @@ impl Body<'_, '_, '_> {
                 Ok(i + 2)
             }
             "LOAD_LOCALS" if self.class && self.class_parameters(&ops[i..end])? => Ok(i + 3),
+            "COPY"
+                if op.arg == 1
+                    && let [constant, compare, branch, ..] = &ops[i + 1..end]
+                    && constant.name == "LOAD_COMMON_CONSTANT"
+                    && (compare.name, compare.arg) == ("IS_OP", 0)
+                    && branch.name == "POP_JUMP_IF_FALSE"
+                    && let Some(all) = super::builtin_calls::truth_builtin(constant.arg)
+                    && let Some(fallback) =
+                        self.optimized_truth_generator(&ops[..end], i + 3, all)? =>
+            {
+                Ok(fallback)
+            }
             "COPY"
                 if self.class
                     && op.arg == 1

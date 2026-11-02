@@ -360,6 +360,7 @@ impl Body<'_, '_, '_> {
         def: &Definition,
         bases: &[String],
     ) -> Result<(), String> {
+        let name = self.declaration_name(self.m.text(self.m.code(def.id)?.name)?, name)?;
         let body = scope(self.m, def.id, self.depth + 1, true, self.work)?;
         for decorator in def.decorators.iter().rev() {
             self.line(&format!("@{decorator}"))?;
@@ -380,9 +381,7 @@ impl Body<'_, '_, '_> {
             let expr = self.lambda(def)?;
             return self.line(&format!("{name} = {expr}"));
         }
-        if self.m.text(code.name)? != name {
-            return Err("function binding differs from code name".into());
-        }
+        let name = self.declaration_name(self.m.text(code.name)?, name)?;
         let params = def.parameters(self.m, code)?;
         let body = scope(self.m, def.id, self.depth + 1, false, self.work)?;
         for decorator in def.decorators.iter().rev() {
@@ -404,6 +403,34 @@ impl Body<'_, '_, '_> {
             self.work.definitions.push(def.id);
         }
         Ok(())
+    }
+
+    /// A private declaration keeps its original spelling in the code object.
+    /// Its store operand uses the enclosing class, even inside a nested function.
+    pub(super) fn declaration_name<'a>(
+        &self,
+        declared: &'a str,
+        binding: &str,
+    ) -> Result<&'a str, String> {
+        let declared = identifier(declared)?;
+        if binding == declared {
+            return Ok(declared);
+        }
+        if declared.starts_with("__")
+            && !declared.ends_with("__")
+            && let Some(id) = self.work.private_class
+        {
+            let class = self.m.text(id)?.trim_start_matches('_');
+            if !class.is_empty()
+                && binding
+                    .strip_prefix('_')
+                    .and_then(|name| name.strip_prefix(class))
+                    == Some(declared)
+            {
+                return Ok(declared);
+            }
+        }
+        Err("declaration binding differs from code name".into())
     }
 
     pub(super) fn lambda(&mut self, def: &Definition) -> Result<String, String> {
@@ -522,6 +549,7 @@ impl<'m, 'data> Body<'m, 'data, '_> {
                 code,
                 stack: Vec::new(),
                 lines: String::new(),
+                partial_prefix: 0,
                 flow,
                 loop_edges: None,
                 class: false,

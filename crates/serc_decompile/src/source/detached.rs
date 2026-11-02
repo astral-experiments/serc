@@ -14,7 +14,7 @@ use super::{
 const MARK: &str = "# __serc_definition_id__ ";
 const LIMIT: &str = "\n# serc: detached function recovery limit reached\n";
 
-/// CPython's annotation evaluator raises the intrinsic NotImplementedError
+/// CPython's annotation evaluator raises the intrinsic `NotImplementedError`
 /// for unsupported formats. An authored function with this name loads the
 /// exception class through its ordinary name lookup.
 pub(super) fn annotation_helper(bc: &Bytecode) -> bool {

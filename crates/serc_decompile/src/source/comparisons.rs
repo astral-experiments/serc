@@ -42,7 +42,7 @@ fn guard(ops: &[Instruction], link: usize) -> Option<(usize, bool)> {
     (ops.get(at)?.name == "POP_JUMP_IF_FALSE").then_some((at, copied))
 }
 
-fn same_instructions(left: &[Instruction], right: &[Instruction]) -> bool {
+pub(super) fn same_instructions(left: &[Instruction], right: &[Instruction]) -> bool {
     left.len() == right.len()
         && left
             .iter()
@@ -163,49 +163,49 @@ impl Body<'_, '_, '_> {
         let last = (operand..cleanup)
             .find(|&i| {
                 operator(ops[i], self.m.version).is_some()
-                    && ops
-                        .get(i + 1)
-                        .is_some_and(|op| op.name == "POP_JUMP_IF_FALSE")
+                    && ops.get(i + 1).is_some_and(|op| {
+                        matches!(op.name, "POP_JUMP_IF_FALSE" | "POP_JUMP_IF_TRUE")
+                    })
             })
             .ok_or("missing final comparison branch")?;
         self.finish_comparison(ops, operand, last, &mut chain, level)?;
         let branch = last + 1;
         let target = self.flow.target(branch)?;
         let mut suite = after_branch(ops, branch);
+        if suite < end && ops[suite].name == "JUMP_FORWARD" {
+            suite = self.flow.target(suite)?;
+        }
+        let fallthrough_true = ops[branch].name == "POP_JUMP_IF_FALSE";
+        // A negated chain jumps over its body on success. Its final false
+        // path must reach the same suite as an earlier failed comparison.
+        let failure = if fallthrough_true { target } else { suite };
         let discarded = cleanup + 1;
         if target >= end
+            || suite >= end
             || discarded >= end
-            || !(target == discarded
-                || self.flow.jump(discarded) == Some(target)
+            || !(failure == discarded
+                || self.flow.jump(discarded) == Some(failure)
                 || same_instructions(
                     &ops[discarded..self.flow.block(discarded).ops.end.min(end)],
-                    &ops[target..self.flow.block(target).ops.end.min(end)],
+                    &ops[failure..self.flow.block(failure).ops.end.min(end)],
                 ))
         {
             return Err("comparison failures have different destinations".into());
         }
-        if suite < end && ops[suite].name == "JUMP_FORWARD" {
-            suite = self.flow.target(suite)?;
-        }
+        let predicate = Predicate {
+            value: chain,
+            fallthrough_true,
+            branch,
+            suite,
+            target,
+        };
         if suite < cleanup && matches!(ops[cleanup - 1].name, "RETURN_CONST" | "RETURN_VALUE") {
             let body = self.fragment(ops, suite, cleanup, level)?.suite()?;
-            self.block(&format!("if {chain}:"), &body)?;
+            self.block(&format!("if {}:", predicate.test(true)), &body)?;
             return Ok(target);
         }
         let suite_end = if suite < cleanup { cleanup } else { target };
-        self.conditional_suites(
-            ops,
-            &Predicate {
-                value: chain,
-                fallthrough_true: true,
-                branch,
-                suite,
-                target,
-            },
-            suite_end,
-            end,
-            level,
-        )
+        self.conditional_suites(ops, &predicate, suite_end, end, level)
     }
 
     fn finish_comparison(
