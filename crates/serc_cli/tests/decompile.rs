@@ -916,6 +916,15 @@ def unfinished():
         action()
         return '{big}'
     except Exception: return kept
+def guarded(flag, events):
+    if flag:
+        normal = 1
+        try: events.append('guarded')
+        except KeyError: pass
+        events.append('tail')
+    else:
+        events.append('other')
+    return events
 ",
         big = "x".repeat(200_000)
     );
@@ -991,7 +1000,13 @@ try: get()
 except NameError: pass
 else: raise AssertionError('the omitted assignment initialized the cell')
 put(42)
-assert get() == 42",
+assert get() == 42
+events = []
+scope['guarded'](False, events)
+assert 'guarded' not in events and 'tail' not in events
+events.clear()
+scope['guarded'](True, events)
+assert 'other' not in events",
             ])
             .arg(&recovered)
             .output()

@@ -135,10 +135,14 @@ impl Body<'_, '_, '_> {
                 Err(reason) if partial => {
                     self.lines.truncate(self.partial_prefix);
                     self.stack.clear();
-                    let next = self
-                        .resume_after(ops, i)?
-                        .filter(|&next| next <= end)
-                        .unwrap_or(end);
+                    let next = match self.resume_after(ops, i)? {
+                        Some(next) if next <= end => next,
+                        _ if end == ops.len() => end,
+                        // The caller will emit the following protected suite.
+                        // Stopping at its boundary is unsafe when an omitted
+                        // branch can jump across that suite.
+                        _ => return Err(format!("byte {} ({}): {reason}", op.offset, op.name)),
+                    };
                     self.gap(&reason, &ops[i..next], next == ops.len())?;
                     next
                 }
