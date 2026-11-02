@@ -12,6 +12,7 @@ mod regions;
 mod strings;
 mod suspension;
 mod type_params;
+mod value_patterns;
 use definitions::{Definition, Import};
 
 use ruff_python_ast::str::TripleQuotes;

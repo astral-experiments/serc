@@ -19,7 +19,7 @@ fn target(ops: &[Instruction], i: usize, end: usize) -> Result<usize, String> {
         .ok_or_else(|| "invalid match exit".into())
 }
 
-fn case(out: &mut String, pattern: &str, suite: &str) {
+pub(super) fn case(out: &mut String, pattern: &str, suite: &str) {
     writeln!(out, "case {pattern}:").unwrap();
     for line in suite.lines() {
         writeln!(out, "    {line}").unwrap();

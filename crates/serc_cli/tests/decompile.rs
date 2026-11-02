@@ -624,3 +624,33 @@ def mixed(a, b, c):
         "result = chain(3, 2, 1), chain(1, 2, 2), branch(3, 2, 1), branch(1, 2, 3), mixed(1, [0], [0]), events",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn value_patterns_and_guards() {
+    check_fixture(
+        r#"events = []
+class Kind:
+    key = 17
+def test(value):
+    events.append(value)
+    return value
+def classify(value):
+    match test(value):
+        case Kind.key if test(True): return "key"
+        case False: return "false"
+        case None: return "none"
+        case other: return other
+def group(value):
+    match value:
+        case 0 | 1: return "small"
+        case 3 | None | 9: return "other"
+def bind(value):
+    match value:
+        case 0 as zero: return zero
+        case 3 as three if three: return three
+        case rest: return rest
+"#,
+        "result = [classify(x) for x in [17, 0, False, None, 'z']], [bind(x) for x in [0, 3, 4]], [group(x) for x in [0, 1, 3, None, 9, 2]], events",
+    );
+}
