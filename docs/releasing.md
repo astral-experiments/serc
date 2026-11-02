@@ -24,17 +24,13 @@ The settings below are managed outside this repository. Configure them before
 publishing with this workflow; a dry run does not verify publishing credentials
 or deployment protection rules.
 
-1. Apply the same release protection as ty through
+1. Restrict the `release` environment to `main` and protect release tags with
+   `rulesets/tags-require-release.json` in
    [`astral-sh/github-policies`](https://github.com/astral-sh/github-policies/blob/main/releases/README.md).
-   Add Serc to `environments/release-gate.json`, the `release-environment-gate`
-   entry in `environments/release.json`, and
-   `rulesets/tags-require-release.json`. Grant the `release-environment-gate`
-   GitHub App access to Serc before applying the policy. Both environments must
-   permit only `main`. The `release-gate` environment requires a reviewer from
-   Astral's `full-time` team, prevents self-review, and disallows administrator
-   bypass. Its approval unlocks the `release` environment's custom deployment
-   rule for the remaining publishing jobs. Keep the `release` environment name:
-   the registry trusted publishers are bound to it.
+   PyPI and crates.io bind their trusted publishers to this environment. If the
+   environment still uses the `release-environment-gate` GitHub App, its policy
+   must be updated separately because it expects a successful `release-gate`
+   job.
 2. Add these secrets to the `release` environment for the same R2 bucket used by
    ty. Obtain the values from the service administrator; GitHub does not reveal
    existing secret values:
@@ -105,9 +101,6 @@ and check the wheels, source distribution, standalone archives, installers,
 release manifest, and Cargo packages without publishing. To publish, enter the
 version from the merged release PR. The workflow checks that the tag matches the
 packages being released and builds from the selected commit.
-
-Publishing requires another full-time Astral employee to approve the
-`release-gate` job.
 
 After the build checks pass, the workflow publishes to PyPI and crates.io and
 creates the GitHub release with its manifest, checksums, and provenance
