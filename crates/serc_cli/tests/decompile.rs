@@ -584,3 +584,22 @@ class Child[T: int](Base[T], metaclass=type):
         "result = Child().method(), repr(Child.__orig_bases__), repr(Child.__annotations__)",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn parallel_assignments_evaluate_before_storing() {
+    check_fixture(
+        r"events = []
+def log(x):
+    events.append(x)
+    return x
+a, b, c = log(1), log(2), log(3)
+a, a = b, c
+def rotate(x, y, z):
+    x, y, z = log(z), log(x), log(y)
+    x, y = y, x
+    return x, y, z
+",
+        "result = a, rotate(4, 5, 6), events",
+    );
+}

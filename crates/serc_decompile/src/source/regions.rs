@@ -198,6 +198,14 @@ impl Body<'_, '_, '_> {
                     self.pop()?;
                     Ok(i + 2)
                 }
+                "SWAP" if matches!(op.arg, 2 | 3) && matches!(ops[i + 1..end].first().map(|op| op.name),
+                    Some("STORE_NAME" | "STORE_FAST" | "STORE_FAST_STORE_FAST" | "STORE_GLOBAL" | "STORE_DEREF" | "UNPACK_SEQUENCE" | "UNPACK_EX")) => {
+                    self.parallel_assignment(ops, i + 1, end, op.arg as usize, false)
+                }
+                "STORE_FAST" | "STORE_FAST_STORE_FAST"
+                    if super::operands::local_store_run(&ops[i..end], self.stack.len()) && self.stack.iter().all(|v| matches!(v, Value::Expr(_))) => {
+                    self.parallel_assignment(ops, i, end, self.stack.len(), true)
+                }
                 "KW_NAMES" if i + 1 < end && ops[i + 1].name == "CALL" => {
                     self.constant(op.arg)?;
                     let keys = self.expr()?;
