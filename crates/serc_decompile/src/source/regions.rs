@@ -29,6 +29,22 @@ pub(super) struct Fragment {
 }
 
 impl Fragment {
+    pub(super) fn resume(
+        self,
+        body: &mut Body<'_, '_, '_>,
+        ops: &[Instruction],
+        tail: std::ops::Range<usize>,
+        level: usize,
+    ) -> Result<String, String> {
+        let mut lines = self.lines;
+        lines.push_str(
+            &body
+                .seeded(ops, tail.start, tail.end, level, self.stack)?
+                .suite()?,
+        );
+        Ok(lines)
+    }
+
     pub(super) fn operands(self) -> Result<Vec<Value>, String> {
         if !self.lines.is_empty() {
             return Err("statement in assignment target".into());

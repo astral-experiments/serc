@@ -159,6 +159,13 @@ impl Graph {
         self.block(i).height.is_some()
     }
 
+    /// `FOR_ITER` pushes one item on fallthrough. A loop without a backedge
+    /// can share its header block with the instructions that build the iterator.
+    pub(super) fn for_iter_depth(&self, header: usize) -> Option<usize> {
+        let body = self.block(header).fallthrough?;
+        self.blocks[body].height?.checked_sub(1)
+    }
+
     pub(super) fn jump(&self, i: usize) -> Option<usize> {
         let b = &self.blocks[*self.owner.get(i)?];
         (b.ops.end == i + 1)

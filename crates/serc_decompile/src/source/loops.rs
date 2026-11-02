@@ -135,7 +135,7 @@ impl Body<'_, '_, '_> {
             ops[iter].opcode,
             ops[iter].arg,
         );
-        if self.flow.block(header).height != Some(slots) {
+        if self.flow.for_iter_depth(header) != Some(slots) {
             return None;
         }
         let computed = match ops[i].name {

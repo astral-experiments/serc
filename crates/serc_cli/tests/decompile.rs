@@ -501,6 +501,50 @@ fn a_terminal_module_guard_keeps_the_raise_in_the_else() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn handlers_at_the_end_of_a_for_loop_can_advance_or_return() {
+    check_fixture(
+        r"def visit(items, trigger, effect):
+    for item in items:
+        try:
+            if trigger(item):
+                raise ValueError
+        except ValueError:
+            effect(item)
+
+def first(items, compute):
+    for item in items:
+        try:
+            raise ValueError(item)
+        except ValueError:
+            return compute(item)
+
+def constant(items):
+    for item in items:
+        try:
+            raise ValueError
+        except ValueError:
+            return 7
+",
+        r"import sys
+result = []
+visit(range(4), lambda n: n % 2, result.append)
+def compute(item):
+    result.append(sys.exception().args)
+    return item + 10
+for items in ([], [3, 4]):
+    result.append((first(items, compute), constant(items)))
+def fail(_):
+    raise TypeError
+try:
+    visit([0], fail, result.append)
+except TypeError:
+    result.append('propagated')
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_guard_and_loop_exhaustion_can_return_the_same_constant() {
     check_fixture(
         r"def wake(waiters, emit):
