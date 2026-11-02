@@ -103,20 +103,20 @@ gap, including gaps in detached bodies. Each block appears once per code object.
 A header gives its starting byte offset, fallthrough and jump targets, and any
 exception handler with its unwind depth and `lasti` flag. Instruction lines show
 the byte offset, opcode, and numeric argument. Offsets are local to the code
-object. The listing includes the whole block when recovery stops mid-block, and
-can include earlier blocks for context when an incomplete suite is discarded. A
-lost class or anonymous function referenced by the skipped instructions can have
-its own listing. The appendix has a separate 16 MiB output budget. Reaching it
-leaves a truncation comment in the output.
+object. A logical instruction starts at its first `EXTENDED_ARG` prefix, if
+present, and includes its inline caches. The listing includes the whole block
+when recovery stops mid-block, and can include earlier blocks for context when
+an incomplete suite is discarded. A lost class or anonymous function referenced
+by the skipped instructions can have its own listing. The appendix has a
+separate 16 MiB output budget. Reaching it leaves a truncation comment in the
+output.
 
-A function can have a complete-looking body even when the candidate omits an
-exception path. For each named function without an explicit gap, serc compares
-the original exception table to the candidate recompiled at levels 0, 1, and
-2. If all three tables differ, a comment on the function header identifies
-the mismatch and the appendix shows the original blocks for that function.
-The candidate remains executable. For example, the 3.14.5 reconstruction of
-`asyncio.Queue.get` carries this warning on its `async def` line. An unchanged
-exception table alone does not establish that a function was verified.
+A function can have a complete-looking body that omits an exception path. If its
+candidate recompiles with a different exception table at all three optimization
+levels, serc warns on its definition and lists the original blocks. The body
+remains executable. On CPython 3.14.5, this labels both `asyncio.Queue.get` and
+`Queue.put`. Their listings contain all 101 and 96 original instructions,
+respectively. Functions with an explicit gap already have a listing.
 
 Use `serc decompile --strict FILE.pyc` to require whole-module verification. In
 strict mode a refusal writes the reason to stderr and leaves stdout empty.
@@ -175,13 +175,13 @@ The checker never executes corpus code.
 
 | CPython   | Compilable modules | Strictly verified | Coverage | Verified code objects / total | Modules with dead suites / live guards |
 | --------- | -----------------: | ----------------: | -------: | ----------------------------: | -------------------------------------: |
-| 3.12.14   |              2,190 |             1,819 |    83.1% |                7,754 / 11,063 |                                 42 / 1 |
-| 3.13.15   |              2,209 |             1,821 |    82.4% |                7,924 / 11,562 |                                 42 / 1 |
-| 3.14.5    |              2,246 |             1,834 |    81.7% |                9,769 / 14,082 |                                 49 / 5 |
-| 3.15.0rc2 |              2,266 |             1,852 |    81.7% |                9,781 / 14,114 |                                 52 / 8 |
+| 3.12.14   |              2,190 |             1,828 |    83.5% |                7,800 / 11,063 |                                 44 / 1 |
+| 3.13.15   |              2,209 |             1,831 |    82.9% |                7,982 / 11,562 |                                 44 / 1 |
+| 3.14.5    |              2,246 |             1,845 |    82.1% |                9,825 / 14,082 |                                 51 / 5 |
+| 3.15.0rc2 |              2,266 |             1,864 |    82.3% |                9,843 / 14,114 |                                 54 / 8 |
 
 The code-object count includes each module and its nested code. Only objects
-from strictly verified modules count here. On 3.14, 190 of the 412 refusals
+from strictly verified modules count here. On 3.14, 197 of the 401 refusals
 produced a candidate that failed verification. The most frequent differences
 were instructions, exception tables, and constants. Remaining recovery gaps
 include nested exception cleanup, overlapping branches and loops, and patterns
@@ -208,10 +208,10 @@ packages in subdirectories are outside this sample.
 
 | CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
 | --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
-| 3.12.14   |     164 |                         164 / 51 |                          19 / 3 |                           5,456 / 97 / 8,040 |
-| 3.13.15   |     153 |                        153 / 153 |                          21 / 1 |                            4,849 / 1 / 7,720 |
-| 3.14.5    |     154 |                          154 / 0 |                          22 / 0 |                            5,110 / 0 / 8,064 |
-| 3.15.0rc2 |     152 |                          152 / 0 |                          19 / 0 |                            5,214 / 0 / 8,259 |
+| 3.12.14   |     164 |                         164 / 51 |                          21 / 3 |                           5,643 / 97 / 8,040 |
+| 3.13.15   |     153 |                        153 / 153 |                          23 / 1 |                            4,949 / 1 / 7,720 |
+| 3.14.5    |     154 |                          154 / 0 |                          23 / 0 |                            5,245 / 0 / 8,064 |
+| 3.15.0rc2 |     152 |                          152 / 0 |                          20 / 0 |                            5,346 / 0 / 8,259 |
 
 A compilable file can contain placeholders. The last column pairs code objects
 by qualified name and occurrence and compares executable fields, including
@@ -220,8 +220,8 @@ independent CPython comparisons omit source locations and marshal reference
 identity. The serc verifier additionally checks reference sharing. This pycdc
 revision rejected the 3.14 and 3.15 cache magic values.
 
-Across the four runs, 112 of the 623 outputs also include detached definitions.
-Their 822 commented entries are available for inspection and contribute no
+Across the four runs, 96 of the 623 outputs also include detached definitions.
+Their 733 commented entries are available for inspection and contribute no
 executable code objects to the comparison.
 
 ```console
@@ -232,5 +232,26 @@ Pass `--corpus stdlib-packages` to compare the installed packages and their
 submodules. The script selects package directories from the interpreter's
 `sys.stdlib_module_names` and compiles their Python files without importing
 them. This excludes third-party distributions in `site-packages`. The JSON
-report breaks out executable matches and detached definitions by package. Pass
-`--corpus ruff` to compare the two decompilers on the pinned fixtures.
+report breaks out executable matches and detached definitions by package.
+
+| CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
+| --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
+| 3.12.14   |     519 |                        519 / 257 |                        255 / 25 |                       8,842 / 1,076 / 11,772 |
+| 3.13.15   |     477 |                        477 / 404 |                        217 / 14 |                          8,206 / 14 / 11,740 |
+| 3.14.5    |     498 |                          498 / 0 |                         231 / 0 |                           9,101 / 0 / 12,586 |
+| 3.15.0rc2 |     539 |                          539 / 0 |                         242 / 0 |                           9,692 / 0 / 13,544 |
+
+On 3.14.5, the largest gaps by number of unmatched code objects are in `idlelib`
+(488), `asyncio` (453), and `_pyrepl` (289). A mismatch counts once per code
+object, so a single lost method can also cause its enclosing class and module to
+miss.
+
+The Ruff sample (`--corpus ruff`) uses the same revision and fixture directories
+as the strict check.
+
+| CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
+| --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
+| 3.12.14   |   2,190 |                    2,190 / 1,569 |                     1,829 / 754 |                       9,728 / 3,194 / 11,063 |
+| 3.13.15   |   2,209 |                    2,209 / 2,040 |                     1,832 / 337 |                         9,844 / 337 / 11,562 |
+| 3.14.5    |   2,246 |                        2,246 / 0 |                       1,846 / 0 |                          12,210 / 0 / 14,082 |
+| 3.15.0rc2 |   2,266 |                        2,266 / 0 |                       1,865 / 0 |                          12,229 / 0 / 14,114 |

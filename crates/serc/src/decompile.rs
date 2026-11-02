@@ -55,6 +55,41 @@ mod tests {
     }
 
     #[test]
+    fn exception_warnings_require_a_mismatch_at_every_optimization_level() {
+        let cache = |source: &str| {
+            crate::compile(source, "handlers.py")
+                .unwrap()
+                .to_timestamp_pyc(0, 0)
+        };
+        let original = "def f():\n    try: work()\n    except KeyError: raise\n    return 1\n";
+        let input = cache(original);
+        // A different return value still prevents whole-module verification.
+        let same_table = cache(&original.replace("return 1", "return 2"));
+        let different_table = cache("def f():\n    work()\n    return 2\n");
+        for matching_level in [None, Some(crate::OptimizationLevel::Two)] {
+            let output = serc_decompile::decompile_pyc_with_mode(
+                &input,
+                DecompileMode::BestEffort,
+                |_, _, _, level| {
+                    Some(if Some(level) == matching_level {
+                        same_table.clone()
+                    } else {
+                        different_table.clone()
+                    })
+                },
+            )
+            .unwrap();
+            assert!(output.verification_error.is_some());
+            assert_eq!(
+                output
+                    .source
+                    .contains("def f():  # serc: exception table differs"),
+                matching_level.is_none(),
+            );
+        }
+    }
+
+    #[test]
     fn verification_rejects_a_cache_for_another_target() {
         let original = crate::compile("pass\n", "module.py")
             .unwrap()

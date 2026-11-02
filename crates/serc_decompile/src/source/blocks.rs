@@ -5,11 +5,12 @@ use std::ops::Range;
 
 use rustc_hash::FxHashSet;
 
-use super::{Bytecode, Id, MAX_WORK, Module, Object, comment};
+use super::{Bytecode, Id, Module, Object, comment};
 use crate::flow::Graph;
 
 pub(super) const MARK: &str = "# __serc_unplaced__ ";
-const TRUNCATED: &str = "# serc: unplaced block listing truncated at the output limit\n";
+const MAX_LISTING: usize = 16 << 20;
+const TRUNCATED: &str = "# serc: block listing truncated at the output limit\n";
 
 pub(super) struct Gap {
     pub(super) scope: Id,
@@ -64,12 +65,12 @@ pub(super) fn append(
             pending.entry(gap.scope).or_default().push(gap.ops);
         }
     }
-    let warned: FxHashSet<_> = warned.into_iter().collect();
     for &id in &warned {
         pending.entry(id).or_default().push(0..usize::MAX);
     }
+    let warned: FxHashSet<_> = warned.into_iter().collect();
     let mut seen = FxHashSet::default();
-    let end = source.len() + MAX_WORK;
+    let end = source.len() + MAX_LISTING;
     let mut listing = Listing { source, end };
     while let Some((id, mut ranges)) = pending.pop_first() {
         if !seen.insert(id) {

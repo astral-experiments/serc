@@ -1,5 +1,7 @@
 //! Match a retained definition to its recompiled exception table before
 //! attaching a warning. The original cache does not record its optimize level.
+use std::collections::BTreeMap;
+
 use ruff_python_ast::statement_visitor::{StatementVisitor, walk_stmt};
 use ruff_python_ast::token::TokenKind;
 use ruff_python_ast::{Stmt, token::Tokens};
@@ -19,10 +21,10 @@ fn children<'a>(
     m: &'a Module<'_>,
     id: Id,
     budget: &mut usize,
-) -> Option<FxHashMap<&'a str, Vec<Id>>> {
+) -> Option<BTreeMap<&'a str, Vec<Id>>> {
     let constants = m.tuple(m.code(id).ok()?.constants).ok()?;
     *budget = budget.checked_sub(1 + constants.len())?;
-    let mut groups = FxHashMap::<_, Vec<_>>::default();
+    let mut groups = BTreeMap::<_, Vec<_>>::new();
     for &child in constants {
         if let Object::Code(code) = &m.objects[child] {
             let name = m.text(code.qualname).ok()?;
