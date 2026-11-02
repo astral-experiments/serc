@@ -1,8 +1,8 @@
 # Decompilation
 
-`serc decompile FILE.pyc` reconstructs Python source without executing the
-cache or looking for the original source file. The default build provides
-the compiler. Enable the optional feature when building from the workspace.
+`serc decompile FILE.pyc` reconstructs Python source without executing the cache
+or looking for the original source file. The default build provides the
+compiler. Enable the optional feature when building from the workspace.
 
 ```console
 cargo build --locked -p serc-cli --features decompile
@@ -54,27 +54,27 @@ Exception recovery handles selected typed and bare handlers, multi-item and
 consecutive synchronous context managers, and handlers whose `try: pass` body
 CPython optimized away. A generator or coroutine can suspend inside a context
 manager. Recovery follows the manager's exception-table entries across an
-`await` and distinguishes `with` from `async with` at each entry and exit.
-Match recovery handles value and singleton patterns,
-alternatives, guards, captures, and selected sequence, mapping, and class
-patterns. Nested or overlapping cases can still exceed these recognizers.
+`await` and distinguishes `with` from `async with` at each entry and exit. Match
+recovery handles value and singleton patterns, alternatives, guards, captures,
+and selected sequence, mapping, and class patterns. Nested or overlapping cases
+can still exceed these recognizers.
 
 ## Verification
 
-The decompiler first tries recompiling the entire result with serc on the input target
-at optimization levels 0, 1, and 2. A successful result reproduces each nested
-code object's instructions, exception table, stack size, signature, flags,
-names, local layout, and constants, including reference sharing.
+The decompiler first tries recompiling the entire result with serc on the input
+target at optimization levels 0, 1, and 2. A successful result reproduces each
+nested code object's instructions, exception table, stack size, signature,
+flags, names, local layout, and constants, including reference sharing.
 
 By default, if exact verification fails, serc emits best-effort source with a
 `# serc: best-effort decompilation` header. When a nested body is unsupported,
-an ellipsis, a comment naming the scope, and an instruction excerpt identify
-the missing code. Recovery continues in the enclosing scope. A best-effort
-result can differ in behavior from the input. Invalid cache headers, marshal
-data, and undecodable instruction streams still produce an error.
+an ellipsis, a comment naming the scope, and an instruction excerpt identify the
+missing code. Recovery continues in the enclosing scope. A best-effort result
+can differ in behavior from the input. Invalid cache headers, marshal data, and
+undecodable instruction streams still produce an error.
 
-Use `serc decompile --strict FILE.pyc` to require whole-module verification.
-In strict mode a refusal writes the reason to stderr and leaves stdout empty.
+Use `serc decompile --strict FILE.pyc` to require whole-module verification. In
+strict mode a refusal writes the reason to stderr and leaves stdout empty.
 Library callers can use `serc::decompile_pyc_with_mode` to inspect
 `verification_error` or select `DecompileMode::Strict`.
 
@@ -100,9 +100,9 @@ The marker identifies the entire dead suite. A suite can contain a `yield` to
 preserve a generator function or reference a name captured by a closure.
 
 CPython can also keep a guard constant while retaining the guarded statement.
-For example, on 3.14 and 3.15, compiling `if not __debug__: yield arg` with
-`-O` can leave `False` in the constant table and an unconditional yield in
-the instruction stream. In that case serc can emit an always-true guard.
+For example, on 3.14 and 3.15, compiling `if not __debug__: yield arg` with `-O`
+can leave `False` in the constant table and an unconditional yield in the
+instruction stream. In that case serc can emit an always-true guard.
 
 ```console
 $ serc decompile optimized.pyc
@@ -124,21 +124,19 @@ that target's denominator. For every cache serc accepts, CPython independently
 recompiles the output and compares executable fields recursively. The checker
 never executes corpus code.
 
-| CPython   | Compilable modules | Verified modules | Coverage | Verified code objects / total |
-| --------- | -----------------: | ---------------: | -------: | ----------------------------: |
-| 3.12.14   |              2,190 |            1,754 |    80.1% |                7,366 / 11,063 |
-| 3.13.15   |              2,209 |            1,748 |    79.1% |                7,535 / 11,562 |
-| 3.14.5    |              2,246 |            1,752 |    78.0% |                9,170 / 14,082 |
-| 3.15.0rc2 |              2,266 |            1,766 |    77.9% |                9,153 / 14,114 |
+| CPython   | Compilable modules | Strictly verified | Coverage | Verified code objects / total | Modules with dead suites / live guards |
+| --------- | -----------------: | ----------------: | -------: | ----------------------------: | -------------------------------------: |
+| 3.12.14   |              2,190 |             1,814 |    82.8% |                7,725 / 11,063 |                                 41 / 1 |
+| 3.13.15   |              2,209 |             1,815 |    82.2% |                7,884 / 11,562 |                                 41 / 1 |
+| 3.14.5    |              2,246 |             1,828 |    81.4% |                9,721 / 14,082 |                                 48 / 5 |
+| 3.15.0rc2 |              2,266 |             1,846 |    81.5% |                9,733 / 14,114 |                                 51 / 8 |
 
 The code-object count includes each module and its nested code. Only objects
-from completely verified modules count as successes. All four runs had zero
-incorrect outputs, crashes, and timeouts. On 3.14, among the 494 refusals, 227
-produced a source candidate that failed verification. The most frequent
-differences were instructions, constants, and exception tables. Remaining source
-recovery gaps include nested exception cleanup, overlapping branches and loops,
-and patterns that combine different kinds of captures. These counts record only
-the first refusal in each module.
+from strictly verified modules count here. On 3.14, 187 of the 418 refusals
+produced a candidate that failed verification. The most frequent differences
+were instructions, exception tables, and constants. Remaining recovery gaps
+include nested exception cleanup, overlapping branches and loops, and patterns
+that combine different kinds of captures. Each module reports its first refusal.
 
 Run the check with each pinned CPython. It prints JSON counts, first refusal
 reasons and the filenames of any verification failures. To compare two builds,
@@ -149,4 +147,30 @@ coverage increased.
 
 ```console
 /path/to/python3.14 -I -B scripts/check_decompile_corpus.py target/debug/serc
+```
+
+## Best-effort comparison with pycdc
+
+The comparison compiles the top-level `.py` files from each pinned CPython
+installation, runs both decompilers on the same caches, and recompiles their
+output with that CPython. The sample below used macOS arm64 installations and
+pycdc commit `b4289760970dbc399684f1e155ec6d1ea1cc787e`. Standard-library
+packages in subdirectories are outside this sample.
+
+| CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
+| --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
+| 3.12.14   |     164 |                         164 / 51 |                          17 / 3 |                           4,888 / 97 / 8,040 |
+| 3.13.15   |     153 |                        153 / 153 |                          17 / 1 |                            4,309 / 1 / 7,720 |
+| 3.14.5    |     154 |                          154 / 0 |                          18 / 0 |                            4,531 / 0 / 8,064 |
+| 3.15.0rc2 |     152 |                          152 / 0 |                          16 / 0 |                            4,616 / 0 / 8,259 |
+
+A compilable file can contain placeholders. The last column pairs code objects
+by qualified name and occurrence and compares executable fields, including
+nested code. This counts intact functions in a partially recovered module. These
+independent CPython comparisons omit source locations and marshal reference
+identity. The serc verifier additionally checks reference sharing. This pycdc
+revision rejected the 3.14 and 3.15 cache magic values.
+
+```console
+/path/to/python3.14 -I -B scripts/compare_decompile_quality.py target/debug/serc /path/to/pycdc
 ```

@@ -31,10 +31,10 @@ ROOTS = [
 ]
 # Baseline complete modules recovered from this Ruff revision.
 MINIMUM_VERIFIED = {
-    "3.12.14": 1754,
-    "3.13.15": 1748,
-    "3.14.5": 1752,
-    "3.15.0rc2": 1766,
+    "3.12.14": 1814,
+    "3.13.15": 1815,
+    "3.14.5": 1828,
+    "3.15.0rc2": 1846,
 }
 FIELDS = (
     "co_name",
@@ -92,7 +92,10 @@ def strict_command(binary):
 def check_cache(binary, cache, filename, code):
     try:
         run = subprocess.run(
-            [*strict_command(binary), cache], capture_output=True, timeout=30, check=False
+            [*strict_command(binary), cache],
+            capture_output=True,
+            timeout=30,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         return "error", "decompiler timed out"
