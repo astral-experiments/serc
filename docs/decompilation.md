@@ -69,6 +69,13 @@ compares the cleanup on the normal path with the exceptional copy, including
 the destinations of jumps within each copy. This recovers the cleanup in
 `asyncio.sleep` and `asyncio.Event.wait` across all four targets.
 
+For a chain of `except` clauses, the false edge of each type check identifies
+the next clause. Successful handlers can return, raise, or jump back to a
+shared continuation. In `asyncio.selector_events`, this separates transient
+socket errors from exceptions the callback must re-raise or pass to the future.
+The reconstructed `_sock_recv`, `_sock_recv_into`, and `_sock_accept` methods
+match on all four targets.
+
 CPython can build long dictionary displays one pair at a time. Recognizing those
 insertions lets recovery continue past the configuration dictionary in 3.14.5's
 `turtle.py`, where 182 of 250 code objects then match. In `codecs.py`, the

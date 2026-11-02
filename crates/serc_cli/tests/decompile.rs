@@ -1034,6 +1034,53 @@ assert result == ['cleanup', 42, 'cleanup', 'cancelled',
 
 #[cfg(feature = "decompile")]
 #[test]
+fn ordered_exception_clauses_keep_the_success_path() {
+    check_fixture(
+        r"def receive(read, events):
+    try:
+        data = read()
+    except (BlockingIOError, InterruptedError):
+        return
+    except (SystemExit, KeyboardInterrupt):
+        raise
+    except BaseException as exc:
+        events.append(type(exc).__name__)
+    else:
+        events.append(data)
+",
+        r"result = []
+def fail(exc):
+    def read(): raise exc
+    return read
+receive(lambda: 42, result)
+for exc in (BlockingIOError(), InterruptedError(), SystemExit(), KeyboardInterrupt(), ValueError()):
+    try: receive(fail(exc), result)
+    except (SystemExit, KeyboardInterrupt): result.append('raised')
+assert result == [42, 'raised', 'raised', 'ValueError']",
+    );
+    check_fixture(
+        r"def run(work, events):
+    try:
+        value = work()
+    except KeyError as exc:
+        events.append(str(exc))
+    except:
+        return 7
+    else:
+        events.append(value)
+    events.append('continued')
+    return 9
+",
+        r"result = []
+def missing(): raise KeyError(1)
+def other(): raise ValueError
+for task in (lambda: 42, missing, other): result.append(run(task, result))
+assert result == [42, 'continued', 9, '1', 'continued', 9, 7]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn mismatched_exception_tables_mark_only_the_affected_function() {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original.py");

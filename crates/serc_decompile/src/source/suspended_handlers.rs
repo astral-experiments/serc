@@ -48,16 +48,7 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
     if end > dispatch {
         return None;
     }
-    let unwind = flow.handler(dispatch)?;
-    let cleanup = index(unwind.target)?;
-    if !unwind.lasti
-        || unwind.depth != first.depth + 1
-        || !matches!(ops.get(cleanup..cleanup + 3)?, [copy, pop, raise]
-            if (copy.name, copy.arg) == ("COPY", 3) && pop.name == "POP_EXCEPT" && (raise.name, raise.arg) == ("RERAISE", 1))
-    {
-        return None;
-    }
-
+    let (unwind, cleanup) = super::dispatch::unwind(ops, flow, dispatch, first.depth + 1)?;
     if unwind.start == ops[dispatch].offset
         && unwind.end == ops[cleanup].offset
         && let Some(finally) = finally_region(ops, flow, end, dispatch, cleanup)
@@ -67,14 +58,8 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
     let (kind, body, stop) = if ops.get(dispatch + 1)?.name == "POP_TOP" {
         (None, dispatch + 2, cleanup)
     } else {
-        let jump = flow.block(dispatch + 1).ops.end.checked_sub(1)?;
-        let check = jump.checked_sub(1)?;
-        let failed = flow.jump(jump)?;
-        let pop = jump + 1 + usize::from(ops.get(jump + 1)?.name == "NOT_TAKEN");
-        if check <= dispatch + 1
-            || ops[check].name != "CHECK_EXC_MATCH"
-            || ops[jump].name != "POP_JUMP_IF_FALSE"
-            || ops.get(pop)?.name != "POP_TOP"
+        let (check, pop, failed) = super::dispatch::typed_handler(flow, ops, dispatch + 1)?;
+        if ops[pop].name != "POP_TOP"
             || failed + 1 != cleanup
             || (ops[failed].name, ops[failed].arg) != ("RERAISE", 0)
         {

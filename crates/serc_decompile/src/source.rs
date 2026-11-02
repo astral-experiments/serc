@@ -7,6 +7,7 @@ mod comprehensions;
 mod conditionals;
 mod definitions;
 mod detached;
+mod dispatch;
 mod elided_tries;
 mod exceptions;
 mod layout;
