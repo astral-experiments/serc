@@ -15,9 +15,9 @@ target/debug/serc decompile __pycache__/example.cpython-314.pyc
 decoder. Its `read` feature adds cache parsing and instruction line numbers.
 `serc_decompile` uses those decoded instructions for stack analysis,
 control-flow recovery, source reconstruction, and verification. The public
-`serc::decompile_pyc` entry point supplies serc's compiler for verification. The
-CLI calls that same entry point. Compiler-only builds omit the recovery crate
-and the reader.
+`serc::decompile_pyc` and `serc::decompile_pyc_with_mode` entry points supply
+serc's compiler for verification. The CLI selects the mode through the same
+API. Compiler-only builds omit the recovery crate and the reader.
 
 The reader recognizes timestamp, checked-hash and unchecked-hash headers for the
 four pinned targets. It uses a bounded marshal arena so nested code and shared
@@ -69,16 +69,18 @@ flags, names, local layout, and constants, including reference sharing.
 By default, if exact verification fails, serc emits best-effort source with a
 `# serc: best-effort decompilation` header. When a nested body is unsupported,
 an ellipsis, a comment naming the scope, and an instruction excerpt identify the
-missing code. Recovery continues in the enclosing scope. A best-effort result
-can differ in behavior from the input. Invalid cache headers, marshal data, and
-undecodable instruction streams still produce an error.
+missing code. Recovery continues at a statement boundary once the evaluation
+stack is empty and the skipped paths rejoin, or in the enclosing scope. A
+best-effort result can differ in behavior from the input. Invalid cache
+headers, marshal data, and undecodable instruction streams still produce an
+error.
 
 Use `serc decompile --strict FILE.pyc` to require whole-module verification. In
 strict mode a refusal writes the reason to stderr and leaves stdout empty.
 Library callers can use `serc::decompile_pyc_with_mode` to inspect
 `verification_error` or select `DecompileMode::Strict`.
 
-The output supplies one spelling that produces those executable fields.
+Verified output supplies one spelling that produces those executable fields.
 Comments, original formatting, location tables, and code removed by CPython
 optimization generally cannot be recovered. Traceback line numbers can change.
 The decompiler preserves class line numbers when they appear as executable
@@ -97,7 +99,10 @@ answer = 1
 ```
 
 The marker identifies the entire dead suite. A suite can contain a `yield` to
-preserve a generator function or reference a name captured by a closure.
+preserve a generator function or an assignment to bind a closure cell. For
+example, a nested `nonlocal x` can outlive the outer function's erased
+annotation `x: int`. A marked dead assignment binds the name while leaving the
+cell empty at runtime.
 
 CPython can also keep a guard constant while retaining the guarded statement.
 For example, on 3.14 and 3.15, compiling `if not __debug__: yield arg` with `-O`

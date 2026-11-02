@@ -100,10 +100,11 @@ from a `.pyc` on a supported target. The cache file's magic selects the target.
 cargo run --locked -p serc-cli --features decompile -- decompile __pycache__/hello.cpython-314.pyc
 ```
 
-The command prints a module only after its reconstructed source passes
-verification. If any nested scope fails, the command exits with status 2 and
-writes the reason to stderr. See the
-[coverage and limitations](docs/decompilation.md).
+The command first tries to verify the entire module by recompiling it. If that
+fails, it prints best-effort source with a warning and marks gaps with an
+ellipsis and a bytecode excerpt. Use `serc decompile --strict FILE.pyc` to
+require verification. A strict refusal leaves stdout empty and exits with
+status 2. See the [coverage and limitations](docs/decompilation.md).
 
 ### Python version
 

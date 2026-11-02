@@ -1,4 +1,4 @@
-//! Verified source recovery using serc's compiler.
+//! Recover Python source and verify it with serc's compiler.
 pub use serc_decompile::{DecompileError, DecompileMode, DecompileOutput};
 
 use crate::{CompileOptions, compile_with_options};

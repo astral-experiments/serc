@@ -84,17 +84,18 @@ source as fresh.
 
 ## Decompilation
 
-Enable the `decompile` Cargo feature to recover a complete module from cache
-bytes. The library selects the target from the cache magic and performs no file
-I/O.
+Enable the `decompile` Cargo feature to recover Python source from cache bytes.
+The library selects the target from the cache magic and performs no file I/O.
 
 ```rust
 let cache = serc::compile("answer = 42\n", "module.py")?.to_timestamp_pyc(0, 0);
 let source = serc::decompile_pyc(&cache)?;
 ```
 
-`DecompileError` distinguishes reading the cache, reconstructing its scopes and
-verifying the source. See the [coverage report](../../docs/decompilation.md).
+If verification fails, the returned source carries a best-effort warning. Use
+`decompile_pyc_with_mode` to inspect the `verification_error` field, or select
+`DecompileMode::Strict` to require an executable-field match for every nested
+scope. See the [coverage report](../../docs/decompilation.md).
 
 ## CPython corpus comparison
 
