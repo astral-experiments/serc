@@ -130,6 +130,7 @@ impl Body<'_, '_, '_> {
         let mut i = start;
         while i < end {
             if partial && self.stack.is_empty() {
+                self.partial_start = i;
                 self.partial_prefix = self.lines.len();
             }
             let op = ops[i];
@@ -146,7 +147,7 @@ impl Body<'_, '_, '_> {
                         // branch can jump across that suite.
                         _ => return Err(format!("byte {} ({}): {reason}", op.offset, op.name)),
                     };
-                    self.gap(&reason, &ops[i..next], next == ops.len())?;
+                    self.gap(&reason, ops, self.partial_start..next, next == ops.len())?;
                     next
                 }
                 Err(reason) => return Err(format!("byte {} ({}): {reason}", op.offset, op.name)),
@@ -162,7 +163,8 @@ impl Body<'_, '_, '_> {
                     self.lines.truncate(self.partial_prefix);
                     self.gap(
                         &format!("invalid reconstructed statement: {error}"),
-                        &ops[i..next],
+                        ops,
+                        self.partial_start..next,
                         false,
                     )?;
                 }
@@ -291,21 +293,10 @@ impl Body<'_, '_, '_> {
                 self.pop()?;
                 Ok(i + 2)
             }
-            "SWAP"
-                if matches!(op.arg, 2 | 3)
-                    && matches!(
-                        ops[i + 1..end].first().map(|op| op.name),
-                        Some(
-                            "STORE_NAME"
-                                | "STORE_FAST"
-                                | "STORE_FAST_STORE_FAST"
-                                | "STORE_GLOBAL"
-                                | "STORE_DEREF"
-                                | "UNPACK_SEQUENCE"
-                                | "UNPACK_EX"
-                        )
-                    ) =>
-            {
+            // Reversing two or three operands prepares a parallel store. The
+            // target decoder also recognizes expressions computing a receiver
+            // or subscript before its store consumes the first RHS value.
+            "SWAP" if matches!(op.arg, 2 | 3) => {
                 self.parallel_assignment(ops, i + 1, end, op.arg as usize, false)
             }
             "STORE_FAST" | "STORE_FAST_STORE_FAST"

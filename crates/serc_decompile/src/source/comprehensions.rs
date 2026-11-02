@@ -1,7 +1,9 @@
 //! Recover comprehension clauses from synchronous and asynchronous iterator loops.
 use std::fmt::Write as _;
 
-use super::{Body, Instruction, Value};
+use serc_bytecode::instructions::Handler;
+
+use super::{Body, Bytecode, Instruction, Value};
 
 pub(super) fn is_collection_insert(op: &Instruction) -> bool {
     op.arg > 1
@@ -9,6 +11,43 @@ pub(super) fn is_collection_insert(op: &Instruction) -> bool {
             op.name,
             "LIST_APPEND" | "SET_ADD" | "MAP_ADD" | "LIST_EXTEND" | "SET_UPDATE" | "DICT_UPDATE"
         )
+}
+
+/// Split leading comprehension restores from user handlers. A restore after
+/// the last return starts the out-of-line cleanup, even when a later try has
+/// its own handler after it. Inline restores are jumped over on success.
+pub(super) fn protection(bc: &Bytecode) -> Result<(&[Handler], usize), String> {
+    let mut handlers = bc.handlers.as_slice();
+    let len = bc.ops.len();
+    if handlers.is_empty()
+        || !bc.ops.iter().any(|op| op.name == "LOAD_FAST_AND_CLEAR")
+        || !bc.ops.iter().any(is_collection_insert)
+    {
+        return Ok((handlers, len));
+    }
+    let mut first = len;
+    let mut after_return = len;
+    while let Some((entry, rest)) = handlers.split_first() {
+        let target = bc
+            .ops
+            .binary_search_by_key(&entry.target, |op| op.offset)
+            .map_err(|_| "invalid comprehension handler")?;
+        if !matches!(&bc.ops[target..], [swap, pop, ..] if (swap.name, swap.arg) == ("SWAP", 2) && pop.name == "POP_TOP")
+        {
+            break;
+        }
+        first = first.min(target);
+        if target > 0 && matches!(bc.ops[target - 1].name, "RETURN_VALUE" | "RETURN_CONST") {
+            after_return = after_return.min(target);
+        }
+        handlers = rest;
+    }
+    let end = if handlers.is_empty() && after_return == len {
+        first
+    } else {
+        after_return
+    };
+    Ok((handlers, end))
 }
 
 struct Iteration {

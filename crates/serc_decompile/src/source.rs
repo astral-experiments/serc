@@ -1,4 +1,5 @@
 mod annotations;
+mod blocks;
 mod builtin_calls;
 mod classes;
 mod comparisons;
@@ -20,6 +21,7 @@ mod suspension;
 pub(super) mod synthetic;
 mod type_params;
 mod value_patterns;
+mod warnings;
 use definitions::{Definition, Import};
 
 use ruff_python_ast::str::TripleQuotes;
@@ -51,8 +53,19 @@ struct Recovery<'m> {
 }
 
 pub(super) struct Candidate {
-    pub source: String,
-    pub definitions: Vec<Id>,
+    source: String,
+    definitions: Vec<Id>,
+    unplaced: Vec<blocks::Gap>,
+}
+
+impl Candidate {
+    pub(super) fn new(source: String, definitions: Vec<Id>) -> Self {
+        Self {
+            source,
+            definitions,
+            unplaced: Vec::new(),
+        }
+    }
 }
 
 pub(super) fn recover(
@@ -158,9 +171,11 @@ fn recover_scope<'m>(
         omitted_cell_stores: rustc_hash::FxHashSet::default(),
         m,
         code,
+        id,
         stack: Vec::new(),
         lines: String::new(),
         partial_prefix: 0,
+        partial_start: 0,
         flow,
         loop_edges: None,
         class,
@@ -171,28 +186,13 @@ fn recover_scope<'m>(
     body.declarations(&bc.ops)?;
     let result = if body.suspended() {
         body.suspension_scope(&bc)
-    } else if bc.ops.iter().any(|op| op.name == "LOAD_FAST_AND_CLEAR")
-        && bc.ops.iter().any(comprehensions::is_collection_insert)
-    {
-        // Nested comprehensions can place the inner unwind code before the
-        // outer handler. The normal path ends at the first cleanup after a return.
-        let mut handlers = bc
-            .handlers
-            .iter()
-            .filter_map(|h| bc.ops.binary_search_by_key(&h.target, |op| op.offset).ok());
-        let first = handlers.next().unwrap_or(bc.ops.len());
-        let stop = handlers
-            .filter(|&i| {
-                i > 0
-                    && matches!(bc.ops[i - 1].name, "RETURN_VALUE" | "RETURN_CONST")
-                    && (bc.ops[i].name, bc.ops[i].arg) == ("SWAP", 2)
-            })
-            .fold(first, usize::min);
-        body.region(&bc.ops, 0, stop, 0)
-    } else if bc.handlers.is_empty() {
-        body.region(&bc.ops, 0, bc.ops.len(), 0)
     } else {
-        body.protected(&bc)
+        let (handlers, end) = comprehensions::protection(&bc)?;
+        if handlers.is_empty() {
+            body.region(&bc.ops, 0, end, 0)
+        } else {
+            body.protected(&bc, handlers, end)
+        }
     }
     .and_then(|()| {
         if body.stack.is_empty() {
@@ -254,10 +254,13 @@ impl Value {
 struct Body<'m, 'data, 'work> {
     m: &'m Module<'data>,
     code: &'m Code,
+    id: Id,
     stack: Vec<Value>,
     lines: String,
     // End of the last complete statement while recovering a partial region.
     partial_prefix: usize,
+    // First instruction of the statement at that checkpoint.
+    partial_start: usize,
     stubs: synthetic::Stubs<'m>,
     omitted_cell_stores: rustc_hash::FxHashSet<usize>,
     flow: crate::flow::Graph,

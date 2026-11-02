@@ -50,13 +50,19 @@ pub(super) fn manager_entry(ops: &[Instruction], asynchronous: bool) -> Result<u
 }
 
 impl Body<'_, '_, '_> {
-    pub(super) fn protected(&mut self, bc: &Bytecode) -> Result<(), String> {
-        let entry = bc.handlers[0];
+    pub(super) fn protected(
+        &mut self,
+        bc: &Bytecode,
+        handlers: &[Handler],
+        limit: usize,
+    ) -> Result<(), String> {
+        let entry = handlers[0];
         let ops = &bc.ops;
         let index = |offset| boundary(ops, offset);
         let start = index(entry.start)?;
         let end = index(entry.end)?;
         let handler = index(entry.target)?;
+        let normal_end = handler.min(limit);
         if ops[start].name == "PUSH_EXC_INFO" && !self.flow.reachable(start) {
             return self.elided_tries(bc, start);
         }
@@ -70,12 +76,12 @@ impl Body<'_, '_, '_> {
             .get(handler + 1)
             .is_some_and(|op| op.name == "WITH_EXCEPT_START")
         {
-            return self.with_statement(bc);
+            return self.with_statement(bc, handlers, limit);
         }
         if entry.depth > 0 && !entry.lasti {
             // A protected condition inside a loop keeps the iterator on the
             // stack. Its exceptional cleanup is out of line.
-            return self.region(ops, 0, handler, 0);
+            return self.region(ops, 0, normal_end, 0);
         }
         if entry.depth != 0 || entry.lasti {
             return Err(format!("unsupported handler depth at byte {}", entry.start));
@@ -167,7 +173,7 @@ impl Body<'_, '_, '_> {
                 let alternate = self.fragment(ops, end, join, 0)?.suite()?;
                 self.block("else:", &alternate)?;
             }
-            return self.region(ops, join, handler, 0);
+            return self.region(ops, join, normal_end, 0);
         }
         if ops.get(handler + 1).is_some_and(|op| op.name == "POP_TOP") {
             let stop = ops[handler + 2..]
@@ -177,7 +183,7 @@ impl Body<'_, '_, '_> {
                 .ok_or("missing bare exception cleanup")?;
             let suite = self.fragment(ops, handler + 2, stop, 0)?.suite()?;
             self.block("except:", &suite)?;
-            return self.region(ops, end, handler, 0);
+            return self.region(ops, end, normal_end, 0);
         }
         let last = ops[handler + 1..]
             .iter()
@@ -199,7 +205,7 @@ impl Body<'_, '_, '_> {
             }
             Ok(())
         } else {
-            self.region(ops, next, handler, 0)
+            self.region(ops, next, normal_end, 0)
         }
     }
 
@@ -278,6 +284,24 @@ impl Body<'_, '_, '_> {
             let pop = (binding + 1..next)
                 .find(|&i| ops[i].name == "POP_EXCEPT")
                 .ok_or("missing exception cleanup")?;
+            // A computed return is already on the stack when the handler
+            // restores the active exception. The SWAP moves it past that
+            // exception so RETURN_VALUE can consume it after POP_EXCEPT.
+            if pop > binding + 1
+                && (ops[pop - 1].name, ops[pop - 1].arg) == ("SWAP", 2)
+                && pop + 2 == next
+                && ops[pop + 1].name == "RETURN_VALUE"
+            {
+                let (suite, returns) = self
+                    .fragment(ops, binding + 1, pop - 1, 0)?
+                    .pending_return()?;
+                if !returns {
+                    return Err("missing exception return value".into());
+                }
+                self.block(&format!("except {kind}:"), &suite)?;
+                cursor = next;
+                continue;
+            }
             let suite = self.fragment(ops, binding + 1, pop, 0)?.suite()?;
             self.block(&format!("except {kind}:"), &suite)?;
             if !matches!(ops[next - 1].name, "RETURN_CONST" | "RETURN_VALUE") {
@@ -293,8 +317,10 @@ impl Body<'_, '_, '_> {
             continuation = Some(tail);
             cursor = next;
         }
-        for line in continuation.ok_or("missing exception handler")?.lines() {
-            self.line(line)?;
+        if let Some(continuation) = continuation {
+            for line in continuation.lines() {
+                self.line(line)?;
+            }
         }
         Ok(())
     }
@@ -367,12 +393,16 @@ impl Body<'_, '_, '_> {
         ))
     }
 
-    fn with_statement(&mut self, bc: &Bytecode) -> Result<(), String> {
+    fn with_statement(
+        &mut self,
+        bc: &Bytecode,
+        handlers: &[Handler],
+        mut normal_end: usize,
+    ) -> Result<(), String> {
         let ops = &bc.ops;
-        let mut ranges = bc.handlers.iter().peekable();
+        let mut ranges = handlers.iter().peekable();
         let mut cursor = 0;
-        let mut normal_end = ops.len();
-        let depth = bc.handlers[0].depth;
+        let depth = handlers[0].depth;
         while cursor < normal_end {
             // Skip ranges that resume outer protection during the previous
             // group's cleanup. Only a subsequent independent manager at the

@@ -73,8 +73,12 @@ pub fn decompile_pyc_with_mode(
             verification_error: None,
         }),
         Err(error) if mode == DecompileMode::BestEffort => {
-            let result = source::partial(&module, fallback)
-                .map_err(|reason| DecompileError::Reconstruct(module.version, reason))?;
+            let code = module.code(module.root).map_err(DecompileError::Read)?;
+            let filename = module.text(code.filename).map_err(DecompileError::Read)?;
+            let result = source::partial(&module, fallback, |source, level| {
+                compile(source, filename, module.version, level)
+            })
+            .map_err(|reason| DecompileError::Reconstruct(module.version, reason))?;
             let note = source::comment(&error.to_string());
             Ok(DecompileOutput {
                 source: format!("# serc: best-effort decompilation\n\n# {note}\n{result}"),
@@ -147,10 +151,10 @@ fn verified(
                                 && let Some(slot) = fallback.as_deref_mut()
                                 && slot.is_none()
                             {
-                                *slot = Some(source::Candidate {
-                                    source: source.clone(),
-                                    definitions: definitions.clone(),
-                                });
+                                *slot = Some(source::Candidate::new(
+                                    source.clone(),
+                                    definitions.clone(),
+                                ));
                             }
                             mismatch.get_or_insert(reason);
                         }

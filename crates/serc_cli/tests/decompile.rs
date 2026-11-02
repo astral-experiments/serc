@@ -721,6 +721,24 @@ def rotate(x, y, z):
 ",
         "result = a, rotate(4, 5, 6), events",
     );
+    check_fixture(
+        "def fill(box, target, key, value):\n    box.a, box.b, box.c = value(1), value(2), value(3)\n    target()[key()], target().a = value(4), value(5)\n",
+        r"class Box(dict): pass
+box = Box()
+events = []
+def target():
+    events.append('target')
+    return box
+def key():
+    events.append('key')
+    return 6
+def value(x):
+    events.append(x)
+    return x
+fill(box, target, key, value)
+result = box.a, box.b, box.c, box[6], events
+assert result == (5, 2, 3, 4, [1, 2, 3, 4, 5, 'target', 'key', 'target'])",
+    );
 }
 
 #[cfg(feature = "decompile")]
@@ -899,6 +917,83 @@ Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12)
 
 #[cfg(feature = "decompile")]
 #[test]
+fn comprehensions_inside_returning_exception_handlers() {
+    check_fixture(
+        "def exports(module):\n    try:\n        return list(module.__all__)\n    except AttributeError:\n        return [n for n in dir(module) if n[0] != '_']\n",
+        "class Explicit: __all__ = ('_keep',)\nclass Implicit: visible = 1\nresult = exports(Explicit), exports(Implicit)\nassert result == (['_keep'], ['visible'])",
+    );
+    check_fixture(
+        "def values(items, work):\n    before = [x + 1 for x in items]\n    try: work()\n    except KeyError: before.append(5)\n    return before\n",
+        "def fail(): raise KeyError\nresult = values([1], fail), values([3], lambda: None)\nassert result == ([2,5],[4])",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn mismatched_exception_tables_mark_only_the_affected_function() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("original.py");
+    let cache = temp.path().join("module.pyc");
+    let recovered = temp.path().join("recovered.py");
+    fs_err::write(
+        &original,
+        r"def keep(fn): return fn
+@keep
+async def reader(work, events):
+    try: await work()
+    except KeyError:
+        events.append('lost')
+        raise
+    return 7
+first = reader
+def reader(x): return x + 1
+",
+    )
+    .unwrap();
+    for version in common::PYTHON_VERSIONS {
+        let built = common::python_command(version)
+            .args(["-c", "import py_compile, sys; py_compile.compile(sys.argv[1], sys.argv[2], doraise=True)"])
+            .arg(&original).arg(&cache).output().unwrap();
+        assert!(built.status.success(), "{built:?}");
+        let output = Command::new(env!("CARGO_BIN_EXE_serc"))
+            .arg("decompile")
+            .arg(&cache)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let source = String::from_utf8(output.stdout).unwrap();
+        let header =
+            "async def reader(work, events):  # serc: exception table differs after recompilation";
+        assert!(source.contains(header), "{source}");
+        assert_eq!(
+            source
+                .matches("# serc: exception table differs after recompilation")
+                .count(),
+            1
+        );
+        assert_eq!(
+            source
+                .matches("# serc: original blocks (exception table differs) in reader ")
+                .count(),
+            1
+        );
+        fs_err::write(&recovered, source).unwrap();
+        let checked = common::python_command(version).args(["-c", r"import asyncio, dis, marshal, re, runpy, sys, types
+with open(sys.argv[1], 'rb') as f:
+    f.read(16)
+    original = next(c for c in marshal.load(f).co_consts if isinstance(c, types.CodeType) and c.co_name == 'reader')
+text = open(sys.argv[2], encoding='utf8').read().split('# serc: original blocks (exception table differs) in reader ')[1]
+assert [(int(m[1]),m[2]) for m in re.finditer(r'^# +(\d+)  (\w+) ', text, re.M)] == [(op.offset,op.opname) for op in dis.get_instructions(original)]
+scope = runpy.run_path(sys.argv[2])
+async def ok(): return None
+assert asyncio.run(scope['first'](ok, [])) == 7 and scope['reader'](3) == 4
+"]).arg(&cache).arg(&recovered).output().unwrap();
+        assert!(checked.status.success(), "{checked:?}");
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original.py");
@@ -923,6 +1018,15 @@ if before:
 else:
     async def repeated(*, y):
         return y + 2
+if before:
+    lost = '{big}'
+    class Lost:
+        try:
+            if before: value = before + 4
+        except NameError: value = 0
+    hidden = lambda z: z + 3
+    def incomplete(): return '{big}'
+fake_gap = '# __serc_unplaced__ 0 1 2 # serc: unrecovered literal'
 fake_marker = '# __serc_definition_id__ 7'
 label: str = 'αβγ'
 class Labels:
@@ -985,6 +1089,10 @@ def guarded(flag, events):
         assert!(text.starts_with("# serc: best-effort decompilation\n"));
         assert!(text.contains("def large():\n    ...  # serc: unrecovered remainder of large"));
         assert!(text.contains("def after(x):"));
+        assert!(!text.contains("# serc: unplaced blocks in after ("));
+        assert!(!text.contains("# serc: unplaced blocks in Labels ("));
+        assert!(text.contains("# serc: detached function incomplete ("));
+        assert!(text.contains("# serc: unplaced blocks in incomplete ("));
         assert!(text.contains("# serc: unrecovered statement in <module>"));
         assert_eq!(
             text.matches("# serc: unrecovered statement in protected")
@@ -1020,8 +1128,33 @@ def guarded(flag, events):
         let checked = common::python_command(version)
             .args([
                 "-c",
-                r"import runpy, sys
+                r"import dis, marshal, re, runpy, sys, types
 scope = runpy.run_path(sys.argv[1])
+assert scope['fake_gap'] == '# __serc_unplaced__ 0 1 2 # serc: unrecovered literal'
+# Compare these lost scopes independently against the compiling interpreter.
+with open(sys.argv[2], 'rb') as cache:
+    cache.read(16)
+    module = marshal.load(cache)
+sections = {}
+for section in open(sys.argv[1], encoding='utf8').read().split('\n# serc: unplaced blocks in ')[1:]:
+    name, _, _ = section.partition(' (original line ')
+    sections.setdefault(name, []).append(section)
+for name in ['Lost', '<lambda>']:
+    code, = (c for c in module.co_consts if isinstance(c, types.CodeType) and c.co_name == name)
+    section, = sections[name]
+    lines = section.splitlines()
+    rows = [(int(row.split()[1]), row.split()[2]) for row in lines if re.match(r'^# +[0-9]+  ', row)]
+    ops = list(dis.get_instructions(code))
+    assert rows == [(op.offset, op.opname) for op in ops], (rows, ops)
+    if name == 'Lost':
+        assert len(rows) > 12
+        blocks = {int(row.split()[2]): row for row in lines if row.startswith('# block ')}
+        for entry in dis.Bytecode(code).exception_entries:
+            assert f'  except {entry.target} (depth {entry.depth}, lasti {str(entry.lasti).lower()})' in blocks[entry.start]
+        for i, op in enumerate(ops):
+            if op.opname.startswith('POP_JUMP'):
+                header = blocks[max(b for b in blocks if b <= op.offset)]
+                assert f'  jump {op.argval}' in header and f'  fallthrough {ops[i+1].offset}' in header
 assert scope['after'](5) == 12
 assert 'repeated' not in scope and 'inner' not in scope
 assert scope['fake_marker'] == '# __serc_definition_id__ 7'
@@ -1050,6 +1183,7 @@ scope['guarded'](True, events)
 assert 'other' not in events",
             ])
             .arg(&recovered)
+            .arg(&cache)
             .output()
             .unwrap();
         assert!(checked.status.success(), "{checked:?}");
