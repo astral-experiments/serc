@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import importlib.util
+import io
 import json
 import marshal
 import re
@@ -12,6 +13,7 @@ import struct
 import subprocess
 import sys
 import tempfile
+import tokenize
 import types
 import warnings
 from collections import Counter
@@ -98,7 +100,14 @@ def check_cache(binary, cache, filename, code):
         return "error", f"invalid source: {exc}"
     if fingerprint(code) != fingerprint(recovered):
         return "error", "different executable fields after recompilation"
-    return "verified", None
+    marker = "# serc: synthetic dead code"
+    marked = 0
+    if marker.encode() in run.stdout:
+        marked = sum(
+            token.type == tokenize.COMMENT and token.string == marker
+            for token in tokenize.tokenize(io.BytesIO(run.stdout).readline)
+        )
+    return "verified", marked
 
 
 def measure(binary, inputs, baseline=None):
@@ -140,6 +149,8 @@ def measure(binary, inputs, baseline=None):
                         errors[filename] = f"baseline: {problem}"
                 continue
             counts["verified_modules"] += 1
+            counts["synthetic_modules"] += bool(detail)
+            counts["synthetic_suites"] += detail
             counts["verified_code_objects"] += objects
     return dict(counts), refusals, errors, regressions
 
@@ -191,7 +202,9 @@ def main():
     with warnings.catch_warnings():
         warnings.simplefilter("ignore", SyntaxWarning)
         counts, refusals, errors, regressions = measure(
-            args.serc.resolve(), inputs, args.compare_with and args.compare_with.resolve()
+            args.serc.resolve(),
+            inputs,
+            args.compare_with and args.compare_with.resolve(),
         )
     result = {
         "python": version,

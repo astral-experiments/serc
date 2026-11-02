@@ -76,7 +76,8 @@ fields, serc can emit a dead suite with an inline marker. For example,
 `if False: hidden()` and `if False: hidden` can produce the same cache. With a
 subsequent assignment to `answer`, serc emits the following source.
 
-```python
+```console
+$ serc decompile example.pyc
 if False: hidden  # serc: synthetic dead code
 answer = 1
 ```
