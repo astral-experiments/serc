@@ -4,6 +4,25 @@ use std::fmt::Write as _;
 
 use super::{Body, Instruction, Object, Value};
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) struct ConstantReturn(&'static str, u32);
+
+pub(super) fn constant_return(ops: &[Instruction], end: usize) -> Option<(usize, ConstantReturn)> {
+    let op = ops.get(end.checked_sub(1)?)?;
+    match op.name {
+        "RETURN_CONST" => Some((end - 1, ConstantReturn(op.name, op.arg))),
+        "RETURN_VALUE" => {
+            let load = ops.get(end.checked_sub(2)?)?;
+            matches!(
+                load.name,
+                "LOAD_CONST" | "LOAD_SMALL_INT" | "LOAD_COMMON_CONSTANT"
+            )
+            .then_some((end - 2, ConstantReturn(load.name, load.arg)))
+        }
+        _ => None,
+    }
+}
+
 pub(super) struct Fragment {
     lines: String,
     pub(super) stack: Vec<Value>,
@@ -184,7 +203,7 @@ impl Body<'_, '_, '_> {
         if let Some(handler) = self.handlers.remove(&i) {
             // The protected fragment re-enters this same instruction. Leave other
             // entries available, including nested tries in the exception suite.
-            let result = self.suspended_handler(ops, i, end, level, &handler);
+            let result = self.protected_region(ops, i, end, level, &handler);
             self.handlers.insert(i, handler);
             if let Some(next) = result? {
                 return Ok(next);

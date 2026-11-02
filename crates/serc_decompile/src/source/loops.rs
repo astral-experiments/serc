@@ -1,4 +1,5 @@
 use super::conditionals::Predicate;
+use super::regions::{ConstantReturn, constant_return};
 use super::{Body, Instruction};
 
 #[derive(Clone, Copy)]
@@ -7,25 +8,6 @@ pub(super) struct Loop {
     after: Option<usize>,
     // CPython may copy the continuation's constant return into a break arm.
     copied_return: Option<ConstantReturn>,
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-struct ConstantReturn(&'static str, u32);
-
-fn constant_return(ops: &[Instruction], end: usize) -> Option<(usize, ConstantReturn)> {
-    let op = ops.get(end.checked_sub(1)?)?;
-    match op.name {
-        "RETURN_CONST" => Some((end - 1, ConstantReturn(op.name, op.arg))),
-        "RETURN_VALUE" => {
-            let load = ops.get(end.checked_sub(2)?)?;
-            matches!(
-                load.name,
-                "LOAD_CONST" | "LOAD_SMALL_INT" | "LOAD_COMMON_CONSTANT"
-            )
-            .then_some((end - 2, ConstantReturn(load.name, load.arg)))
-        }
-        _ => None,
-    }
 }
 
 impl Body<'_, '_, '_> {
@@ -185,13 +167,23 @@ impl Body<'_, '_, '_> {
             // its complete operand sequence before removing the copy.
             let mut before = i;
             let mut copy = tail - 1;
-            while copy > start
-                && before > 0
-                && ops[before - 1].opcode == ops[copy - 1].opcode
-                && ops[before - 1].arg == ops[copy - 1].arg
-            {
+            let mut inputs = 1usize;
+            while inputs > 0 {
+                if before == 0 || copy <= start {
+                    return Err("incomplete copied loop condition".into());
+                }
                 before -= 1;
                 copy -= 1;
+                let op = ops[before];
+                if op.opcode != ops[copy].opcode || op.arg != ops[copy].arg {
+                    return Err("distinct copied loop condition".into());
+                }
+                let (pops, pushes) =
+                    serc_bytecode::target::stack_counts_for(self.m.version, op.opcode, op.arg);
+                inputs = inputs
+                    .checked_sub(pushes)
+                    .ok_or("shared operand in copied loop condition")?
+                    + pops;
             }
             copy
         } else {

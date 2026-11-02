@@ -1061,6 +1061,55 @@ assert result == ['cleanup', 42, 'cleanup', 'cancelled',
 
 #[cfg(feature = "decompile")]
 #[test]
+fn guarded_tries_keep_handlers_in_their_original_branches() {
+    check_fixture(
+        r"def hooks(first, second):
+    if first:
+        try:
+            first()
+        except ValueError:
+            pass
+    if second:
+        try:
+            second()
+        except ValueError:
+            pass
+",
+        r"result = []
+def fail():
+    result.append(1)
+    raise ValueError
+def other(): raise KeyError
+hooks(fail, lambda: result.append(2))
+hooks(None, fail)
+try: hooks(other, lambda: result.append('skipped'))
+except KeyError: result.append(3)
+assert result == [1, 2, 1, 3]",
+    );
+    check_fixture(
+        r"def read(hook, ready, work, finish):
+    try:
+        if hook:
+            hook()
+        while ready():
+            work()
+        return ready()
+    finally:
+        finish()
+",
+        r"result = []
+def work(): result.append('work')
+def done(): result.append('finished')
+def fail(): raise ValueError
+assert read(None, lambda: not result, work, done) is False
+try: read(fail, lambda: True, work, done)
+except ValueError: result.append('raised')
+assert result == ['work', 'finished', 'finished', 'raised']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn ordered_exception_clauses_keep_the_success_path() {
     check_fixture(
         r"def receive(read, events):

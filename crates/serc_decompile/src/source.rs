@@ -16,9 +16,9 @@ mod operands;
 mod partial;
 pub(super) use partial::{comment, partial};
 mod patterns;
+mod protected_regions;
 mod regions;
 mod strings;
-mod suspended_handlers;
 mod suspension;
 pub(super) mod synthetic;
 mod type_params;
@@ -180,7 +180,7 @@ fn recover_scope<'m>(
         partial_start: 0,
         flow,
         loop_edges: None,
-        handlers: suspended_handlers::Handlers::default(),
+        handlers: protected_regions::Handlers::default(),
         terminal_returns: 0..0,
         class,
         annotations: Vec::new(),
@@ -272,7 +272,7 @@ struct Body<'m, 'data, 'work> {
     omitted_cell_stores: rustc_hash::FxHashSet<usize>,
     flow: crate::flow::Graph,
     loop_edges: Option<loops::Loop>,
-    handlers: suspended_handlers::Handlers,
+    handlers: protected_regions::Handlers,
     terminal_returns: std::ops::Range<usize>,
     depth: usize,
     class: bool,

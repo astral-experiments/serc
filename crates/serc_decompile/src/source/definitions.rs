@@ -555,7 +555,7 @@ impl<'m, 'data> Body<'m, 'data, '_> {
                 partial_start: 0,
                 flow,
                 loop_edges: None,
-                handlers: super::suspended_handlers::Handlers::default(),
+                handlers: super::protected_regions::Handlers::default(),
                 terminal_returns: 0..0,
                 class: false,
                 annotations: Vec::new(),

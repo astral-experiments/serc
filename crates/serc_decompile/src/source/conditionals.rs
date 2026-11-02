@@ -271,17 +271,18 @@ impl Body<'_, '_, '_> {
             // successor when the input has two distinct terminal blocks.
             if self.terminal_returns.contains(&target) {
                 let width = self.flow.block(target).ops.len();
-                let stop = fallthrough_end
-                    .checked_sub(width)
-                    .filter(|&n| {
-                        n > start
-                            && self.none_return(&ops[n..fallthrough_end])
-                            && self.flow.block(n).ops.start < n
-                    })
-                    .unwrap_or(fallthrough_end);
-                let suite = self.fragment(ops, start, stop, level)?.suite()?;
-                self.block(&format!("if {test}:"), &suite)?;
-                return Ok(end);
+                let copy = fallthrough_end.checked_sub(width).filter(|&n| {
+                    n > start
+                        && self.none_return(&ops[n..fallthrough_end])
+                        && self.flow.block(n).ops.start < n
+                });
+                if copy.is_some() || self.terminal_returns.len() > width {
+                    let suite = self
+                        .fragment(ops, start, copy.unwrap_or(fallthrough_end), level)?
+                        .suite()?;
+                    self.block(&format!("if {test}:"), &suite)?;
+                    return Ok(end);
+                }
             }
         }
         let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;

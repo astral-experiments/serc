@@ -71,6 +71,13 @@ compares the cleanup on the normal path with the exceptional copy, including
 the destinations of jumps within each copy. This recovers the cleanup in
 `asyncio.sleep` and `asyncio.Event.wait` across all four targets.
 
+In ordinary functions, a conditional can skip an entire protected suite. The
+decompiler places each recognized handler at its protected entry and follows
+normal successors to find the end of the function body. This recovers both
+guarded callbacks in 3.14.5's `_pyrepl.Reader.run_hooks`. Its `readline` method
+also keeps the polling loop and computed return inside the `try` that restores
+the reader.
+
 For a chain of `except` clauses, the false edge of each type check identifies
 the next clause. Successful handlers can return, raise, or jump back to a
 shared continuation. In `asyncio.selector_events`, this separates transient

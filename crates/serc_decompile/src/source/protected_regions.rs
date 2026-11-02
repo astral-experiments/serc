@@ -1,5 +1,5 @@
-//! User exception handlers in suspended scopes. Exception targets are out of
-//! line, even when the corresponding try is inside a loop or another handler.
+//! Recover protected suites at their instruction boundaries, including tries
+//! inside loops and conditional arms, and suspended suites split across a yield.
 use std::ops::Range;
 
 use rustc_hash::{FxHashMap, FxHashSet};
@@ -22,7 +22,7 @@ pub(super) struct Protected {
     handler: Range<usize>,
 }
 
-pub(super) fn regions(bc: &Bytecode, flow: &Graph) -> Handlers {
+fn groups(bc: &Bytecode) -> FxHashMap<usize, Vec<Handler>> {
     let mut groups = FxHashMap::<_, Vec<_>>::default();
     for entry in &bc.handlers {
         if !entry.lasti {
@@ -30,9 +30,51 @@ pub(super) fn regions(bc: &Bytecode, flow: &Graph) -> Handlers {
         }
     }
     groups
+}
+
+pub(super) fn suspended(bc: &Bytecode, flow: &Graph) -> Handlers {
+    groups(bc)
         .into_values()
         .filter_map(|entries| region(&bc.ops, flow, &entries))
         .collect()
+}
+
+/// Use region recovery for ordinary scopes when a branch encloses the first
+/// try, or there are multiple protected entries. Every user handler must have
+/// a known placement before the normal traversal can skip its out-of-line code.
+pub(super) fn guarded(bc: &Bytecode, flow: &Graph) -> Option<Handlers> {
+    let first = bc.handlers.first()?;
+    if first.lasti {
+        return None;
+    }
+    let groups = groups(bc);
+    let split = groups.get(&first.target)?.len() > 1;
+    if groups.len() == 1
+        && !split
+        && !bc
+            .ops
+            .iter()
+            .take_while(|op| op.offset < first.start)
+            .any(|op| op.jump.is_some_and(|target| target > first.start))
+    {
+        return None;
+    }
+    let mut result = Handlers::default();
+    let mut unwinds = FxHashSet::default();
+    for entries in groups.into_values() {
+        let dispatch = bc
+            .ops
+            .binary_search_by_key(&entries[0].target, |op| op.offset)
+            .ok()?;
+        let h = flow.handler(dispatch)?;
+        let (start, suite) = region(&bc.ops, flow, &entries)?;
+        unwinds.insert((h.target, h.depth));
+        result.insert(start, suite);
+    }
+    bc.handlers
+        .iter()
+        .all(|h| !h.lasti || unwinds.contains(&(h.target, h.depth)))
+        .then_some(result)
 }
 
 fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usize, Protected)> {
@@ -89,7 +131,19 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
         {
             body..stop - 2
         }
-        _ => return None,
+        _ => {
+            // A handler can fall through to the same constant return as the
+            // successful try. CPython copies it instead of jumping backwards.
+            let (load, value) = super::regions::constant_return(ops, stop)?;
+            let width = stop - load;
+            if load <= body
+                || ops[load - 1].name != "POP_EXCEPT"
+                || super::regions::constant_return(ops, next + width) != Some((next, value))
+            {
+                return None;
+            }
+            body..load - 1
+        }
     };
     Some((
         start,
@@ -188,6 +242,27 @@ fn protected_end(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Opti
             }
             continue;
         }
+        // A monitoring marker or a loop latch can sit outside the exception
+        // table between two parts of the same try. For the latch, require the
+        // preceding test to exit to the resumed span and the backedge to land
+        // inside this protection.
+        if at == end + 1
+            && end > 0
+            && flow.handler(end).is_none()
+            && ops[end - 1].name.starts_with("POP_JUMP_IF_")
+            && (ops[end].name == "NOT_TAKEN"
+                || (ops[end].name == "JUMP_BACKWARD"
+                    && flow.jump(end - 1) == Some(at)
+                    && flow
+                        .jump(end)
+                        .and_then(|i| flow.handler(i))
+                        .is_some_and(|h| {
+                            h.target == first.target && h.depth == first.depth && !h.lasti
+                        })))
+        {
+            end = index(entry.end)?;
+            continue;
+        }
         let throw = flow.handler(end)?;
         let cleanup = index(throw.target)?;
         if at != end + 1
@@ -211,7 +286,7 @@ fn protected_end(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Opti
 }
 
 impl Body<'_, '_, '_> {
-    pub(super) fn suspended_handler(
+    pub(super) fn protected_region(
         &mut self,
         ops: &[Instruction],
         start: usize,
