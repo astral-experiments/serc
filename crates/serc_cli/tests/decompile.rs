@@ -1046,6 +1046,42 @@ result = [scenario(*args) for args in [(0,0), (1,0), (1,1), (3,3), ('between',3)
 
 #[cfg(feature = "decompile")]
 #[test]
+fn suppressed_return_expressions_resume_after_the_manager() {
+    check_fixture(
+        r"def parse(first, second, probe):
+    with first:
+        return probe(1)
+    with second:
+        return probe(2)
+
+def fallback(first, second, probe):
+    with first, second:
+        return probe(1)
+    return probe(2)
+",
+        r"from contextlib import nullcontext, suppress
+def scenario(run, outer, inner, failures):
+    calls = []
+    def probe(n):
+        calls.append(n)
+        if n in failures:
+            raise ValueError(n)
+        return n
+    try:
+        value = run(outer, inner, probe)
+    except ValueError as exc:
+        value = exc.args
+    return value, calls
+result = [scenario(run, outer(), inner(), fail)
+          for run in (parse, fallback)
+          for outer in (nullcontext, lambda: suppress(ValueError))
+          for inner in (nullcontext, lambda: suppress(ValueError))
+          for fail in ((), (1,), (1, 2))]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn forward_joins_and_loop_exits() {
     check_fixture(
         "def first(xs, emit):\n    for x in xs:\n        emit(x)\n        break\n    else:\n        emit(0)\n    emit(9)\n",

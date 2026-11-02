@@ -74,7 +74,7 @@ impl Body<'_, '_, '_> {
         if handlers.len() == bc.handlers.len()
             && let Some(regions) = super::protected_regions::guarded(bc, &self.flow)
         {
-            let end = self.flow.normal_end();
+            let end = self.flow.normal_end(0);
             self.handlers = regions;
             if self.depth > 0 && !self.class {
                 self.index_terminal_returns(&bc.ops[..end], None);
@@ -384,11 +384,12 @@ impl Body<'_, '_, '_> {
         &mut self,
         bc: &Bytecode,
         handlers: &[Handler],
-        mut normal_end: usize,
+        limit: usize,
     ) -> Result<(), String> {
         let ops = &bc.ops;
         let mut ranges = handlers.iter().peekable();
         let mut cursor = 0;
+        let mut normal_end = limit;
         let depth = handlers[0].depth;
         while cursor < normal_end {
             // Skip ranges that resume outer protection during the previous
@@ -404,14 +405,62 @@ impl Body<'_, '_, '_> {
             {
                 break;
             }
-            let Some(next) =
+            if let Some(next) =
                 self.manager_group(ops, cursor, entry, &mut ranges, &mut normal_end)?
-            else {
-                return Ok(());
-            };
-            cursor = next;
+            {
+                cursor = next;
+            } else {
+                // A return expression can raise before the return takes effect.
+                // Suppression by the outermost manager resumes after the with.
+                let next = self.after_with_suppression(ops, entry)?;
+                if next <= cursor || next >= limit {
+                    return Err("unsupported continuation after with".into());
+                }
+                self.charge(ops.len())?;
+                normal_end = self.flow.normal_end(next).min(limit);
+                if self.none_return(&ops[next..normal_end]) {
+                    return Ok(());
+                }
+                cursor = next;
+            }
         }
         self.region(ops, cursor, normal_end, 0)
+    }
+
+    fn after_with_suppression(
+        &self,
+        ops: &[Instruction],
+        entry: &Handler,
+    ) -> Result<usize, String> {
+        let handler = boundary(ops, entry.target)?;
+        let branch = self.flow.block(handler).ops.end - 1;
+        if ops[branch].name != "POP_JUMP_IF_TRUE" {
+            return Err("unsupported with suppression test".into());
+        }
+        let target = self.flow.target(branch)?;
+        let [pop, restore, rest @ ..] = &ops[target..] else {
+            return Err("missing with suppression cleanup".into());
+        };
+        // The cleanup discards the active exception, restores the previous one,
+        // and pops the saved instruction offset and manager protocol operands.
+        let pops = rest
+            .iter()
+            .take(4)
+            .take_while(|op| op.name == "POP_TOP")
+            .count();
+        if pop.name != "POP_TOP"
+            || restore.name != "POP_EXCEPT"
+            || self.flow.block(target).height != Some(2 + pops)
+            || !(2..=3).contains(&pops)
+        {
+            return Err("unsupported with suppression cleanup".into());
+        }
+        let next = target + 2 + pops;
+        if ops.get(next).is_some_and(|op| op.name == "JUMP_FORWARD") {
+            self.flow.target(next)
+        } else {
+            Ok(next)
+        }
     }
 
     /// Recover one with statement, including adjacent items in its header.

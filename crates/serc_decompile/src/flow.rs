@@ -137,12 +137,12 @@ impl Graph {
             .map(|&id| self.blocks[id].ops.end - 1)
     }
 
-    /// The last instruction reachable from scope entry using normal edges.
+    /// End of the instructions reachable from `start` using normal edges.
     /// Handlers interleaved with the body do not extend this boundary merely
     /// because they can return or reraise.
-    pub(super) fn normal_end(&self) -> usize {
+    pub(super) fn normal_end(&self, start: usize) -> usize {
         let mut seen = vec![false; self.blocks.len()];
-        let mut pending = vec![0];
+        let mut pending = vec![self.owner[start]];
         let mut end = 0;
         while let Some(id) = pending.pop() {
             if std::mem::replace(&mut seen[id], true) {

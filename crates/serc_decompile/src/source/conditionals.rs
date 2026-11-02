@@ -47,7 +47,7 @@ impl Body<'_, '_, '_> {
         self.terminal_returns = start..ops.len();
     }
 
-    fn none_return(&self, ops: &[Instruction]) -> bool {
+    pub(super) fn none_return(&self, ops: &[Instruction]) -> bool {
         let load = match ops {
             [ret] if ret.name == "RETURN_CONST" => ret,
             // On targets with RETURN_CONST, a separate load and return
