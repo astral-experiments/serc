@@ -39,7 +39,9 @@ def measure(command, cache, filename, original, counts):
     if run.returncode:
         counts["nonzero_exits"] += 1
     if not run.stdout.strip():
-        return
+        counts["empty_outputs"] += 1
+        if run.returncode:
+            return
     try:
         recovered = compile(run.stdout, filename, "exec", dont_inherit=True, optimize=0)
     except (ValueError, SyntaxError, RecursionError):
