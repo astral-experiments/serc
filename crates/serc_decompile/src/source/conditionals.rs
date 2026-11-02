@@ -2,8 +2,8 @@ use super::regions::Fragment;
 use super::{Body, Instruction};
 
 pub(super) struct Predicate {
-    value: String,
-    fallthrough_true: bool,
+    pub(super) value: String,
+    pub(super) fallthrough_true: bool,
     pub(super) branch: usize,
     pub(super) suite: usize,
     pub(super) target: usize,
@@ -106,11 +106,23 @@ impl Body<'_, '_, '_> {
     ) -> Result<usize, String> {
         let value = self.expr()?;
         let predicate = self.predicate(ops, i, value, end, level)?;
+        let fallthrough_end = predicate.target;
+        self.conditional_suites(ops, &predicate, fallthrough_end, end, level)
+    }
+
+    pub(super) fn conditional_suites(
+        &mut self,
+        ops: &[Instruction],
+        predicate: &Predicate,
+        fallthrough_end: usize,
+        end: usize,
+        level: usize,
+    ) -> Result<usize, String> {
         let (i, start, target) = (predicate.branch, predicate.suite, predicate.target);
-        if target <= i || target > end {
+        if target <= i || target > end || fallthrough_end < start || fallthrough_end > target {
             return Err("unsupported conditional destination".into());
         }
-        let tail = target - 1;
+        let tail = fallthrough_end - 1;
         if start < tail
             && ops[tail].name == "RAISE_VARARGS"
             && ops[tail].arg == 1
@@ -144,16 +156,16 @@ impl Body<'_, '_, '_> {
                 .is_some_and(|after| after.iter().any(|op| op.offset == handler.end))
             && target < end
         {
-            return self.finally_break(ops, &predicate, handler, level, end);
+            return self.finally_break(ops, predicate, handler, level, end);
         }
         let test = predicate.test(true);
         if self.loop_transfer(ops, tail).is_some() {
-            let suite = self.fragment(ops, start, target, level)?.suite()?;
+            let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
             self.block(&format!("if {test}:"), &suite)?;
             return Ok(target);
         }
         if ops[tail].name == "JUMP_BACKWARD" {
-            return self.while_loop(ops, &predicate, &test, end, level);
+            return self.while_loop(ops, predicate, &test, end, level);
         }
         if self.flow.join(i) == Some(target) {
             // Both paths reach the taken target. Only the fallthrough path
@@ -161,7 +173,7 @@ impl Body<'_, '_, '_> {
             let stop = if self.flow.jump(tail) == Some(target) && ops[tail].name == "JUMP_FORWARD" {
                 tail
             } else {
-                target
+                fallthrough_end
             };
             let suite = self.fragment(ops, start, stop, level)?.suite()?;
             self.block(&format!("if {test}:"), &suite)?;
@@ -188,7 +200,7 @@ impl Body<'_, '_, '_> {
             }
             return Ok(join);
         }
-        let suite = self.fragment(ops, start, target, level)?.suite()?;
+        let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
         if matches!(ops[tail].name, "RETURN_CONST" | "RETURN_VALUE")
             && end > target
             && matches!(ops[end - 1].name, "RETURN_CONST" | "RETURN_VALUE")

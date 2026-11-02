@@ -185,6 +185,7 @@ impl Body<'_, '_, '_> {
                     self.annotation_site()?;
                     Ok(i + 2)
                 }
+                "SWAP" if super::comparisons::is_link(&ops[i..end]) => self.comparison_chain(ops, i, end, level),
                 "SWAP"
                     if op.arg == 2
                         && i + 1 < end
@@ -197,6 +198,14 @@ impl Body<'_, '_, '_> {
                     // A dotted import walks the package before binding its final member.
                     self.pop()?;
                     Ok(i + 2)
+                }
+                "SWAP" if matches!(op.arg, 2 | 3) && matches!(ops[i + 1..end].first().map(|op| op.name),
+                    Some("STORE_NAME" | "STORE_FAST" | "STORE_FAST_STORE_FAST" | "STORE_GLOBAL" | "STORE_DEREF" | "UNPACK_SEQUENCE" | "UNPACK_EX")) => {
+                    self.parallel_assignment(ops, i + 1, end, op.arg as usize, false)
+                }
+                "STORE_FAST" | "STORE_FAST_STORE_FAST"
+                    if super::operands::local_store_run(&ops[i..end], self.stack.len()) && self.stack.iter().all(|v| matches!(v, Value::Expr(_))) => {
+                    self.parallel_assignment(ops, i, end, self.stack.len(), true)
                 }
                 "KW_NAMES" if i + 1 < end && ops[i + 1].name == "CALL" => {
                     self.constant(op.arg)?;
@@ -264,6 +273,7 @@ impl Body<'_, '_, '_> {
                 "COPY" if let Some(count) = super::operands::augmented_load(&ops[i..end]) => {
                     self.augmented_store(ops, i + count, count, end, level)
                 }
+                "COPY" if super::value_patterns::header(&ops[..end], i, self.m.version).is_some() => self.value_cases(ops, i, end, level),
                 "COPY" if op.arg == 1 => self.boolean(ops, i, end, level),
                 "GET_ITER" if ops.get(i + 1).is_some_and(|next| next.name == "FOR_ITER") => {
                     self.for_loop(ops, i + 1, end, level)

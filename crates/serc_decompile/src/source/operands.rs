@@ -34,6 +34,28 @@ pub(super) fn augmented_load(ops: &[Instruction]) -> Option<usize> {
     }
 }
 
+/// The optimizer can reverse fast-local stores and eliminate the preceding
+/// SWAP. A fused load belongs to the next expression, after the last store.
+pub(super) fn local_store_run(ops: &[Instruction], count: usize) -> bool {
+    if !(2..=3).contains(&count) {
+        return false;
+    }
+    let mut left = count;
+    for op in ops {
+        let stores = match op.name {
+            "STORE_FAST" => 1,
+            "STORE_FAST_STORE_FAST" => 2,
+            "STORE_FAST_LOAD_FAST" => return left == 1,
+            _ => return false,
+        };
+        if stores >= left {
+            return stores == left;
+        }
+        left -= stores;
+    }
+    false
+}
+
 pub(super) struct Binding {
     pub(super) target: String,
     pub(super) next: usize,
@@ -185,10 +207,44 @@ impl Body<'_, '_, '_> {
         start: usize,
         end: usize,
     ) -> Result<Binding, String> {
+        self.bindings(ops, start, end, 1, false)
+    }
+
+    pub(super) fn parallel_assignment(
+        &mut self,
+        ops: &[Instruction],
+        start: usize,
+        end: usize,
+        count: usize,
+        reversed: bool,
+    ) -> Result<usize, String> {
+        let rhs = self.args(u32::try_from(count).map_err(|_| "invalid assignment arity")?)?;
+        let binding = self.bindings(ops, start, end, count, reversed)?;
+        self.line(&format!("{} = ({})", binding.target, rhs.join(", ")))?;
+        self.stack.extend(binding.seed);
+        Ok(binding.next)
+    }
+
+    fn bindings(
+        &mut self,
+        ops: &[Instruction],
+        start: usize,
+        end: usize,
+        count: usize,
+        reversed: bool,
+    ) -> Result<Binding, String> {
         let mut next = start;
         let mut pending = None;
-        let mut target = String::new();
-        self.write_target(&ops[..end], &mut next, &mut pending, &mut target, 0)?;
+        let mut targets = Vec::new();
+        for _ in 0..count {
+            let mut target = String::new();
+            self.write_target(&ops[..end], &mut next, &mut pending, &mut target, 0)?;
+            targets.push(target);
+        }
+        if reversed {
+            targets.reverse();
+        }
+        let target = targets.join(", ");
         let seed = match pending {
             Some(("LOAD_FAST", index)) => {
                 vec![Value::Expr(self.name(self.code.locals, index)?.to_owned())]

@@ -584,3 +584,73 @@ class Child[T: int](Base[T], metaclass=type):
         "result = Child().method(), repr(Child.__orig_bases__), repr(Child.__annotations__)",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn parallel_assignments_evaluate_before_storing() {
+    check_fixture(
+        r"events = []
+def log(x):
+    events.append(x)
+    return x
+a, b, c = log(1), log(2), log(3)
+a, a = b, c
+def rotate(x, y, z):
+    x, y, z = log(z), log(x), log(y)
+    x, y = y, x
+    return x, y, z
+",
+        "result = a, rotate(4, 5, 6), events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn comparison_chains_short_circuit() {
+    check_fixture(
+        r"events = []
+def log(value):
+    events.append(value)
+    return value
+def chain(a, b, c):
+    return log(a) < log(b) <= log(c)
+def branch(a, b, c):
+    if log(a) < log(b) < log(c):
+        return a
+    return c
+def mixed(a, b, c):
+    return [a is b is not c, a not in c == b]
+",
+        "result = chain(3, 2, 1), chain(1, 2, 2), branch(3, 2, 1), branch(1, 2, 3), mixed(1, [0], [0]), events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn value_patterns_and_guards() {
+    check_fixture(
+        r#"events = []
+class Kind:
+    key = 17
+def test(value):
+    events.append(value)
+    return value
+def classify(value):
+    match test(value):
+        case Kind.key if test(True): return "key"
+        case False: return "false"
+        case None: return "none"
+        case other: return other
+def group(value):
+    match value:
+        case 0 | 1: return "small"
+        case 3 | None | 9: return "other"
+def bind(value):
+    match value:
+        case 0 as zero: return zero
+        case 3 as three if three: return three
+        case rest: return rest
+"#,
+        "result = [classify(x) for x in [17, 0, False, None, 'z']], [bind(x) for x in [0, 3, 4]], [group(x) for x in [0, 1, 3, None, 9, 2]], events",
+    );
+}
