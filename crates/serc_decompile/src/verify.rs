@@ -1,8 +1,14 @@
 //! A candidate must reproduce the executable fields of every nested code
 //! object. Source positions describe the lost original spelling.
-use crate::marshal::reader::{Module, Object};
+use serc_bytecode::marshal::reader::{Module, Object};
 
 pub(super) fn compare(original: &Module<'_>, recovered: &Module<'_>) -> Result<(), String> {
+    if original.version != recovered.version {
+        return Err(format!(
+            "compiler returned a cache for Python {}",
+            recovered.version
+        ));
+    }
     let mut pending = vec![(original.root, recovered.root, original.root, "module")];
     let mut seen = rustc_hash::FxHashSet::default();
     let mut aliases_a = rustc_hash::FxHashMap::default();

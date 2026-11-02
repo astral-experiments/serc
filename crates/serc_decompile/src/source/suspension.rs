@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use super::{Body, Bytecode, Instruction, Value};
-use crate::target::code_flags;
+use serc_bytecode::target::code_flags;
 
 fn find(ops: &[Instruction], start: usize, end: usize, name: &str) -> Result<usize, String> {
     ops.get(start..end)

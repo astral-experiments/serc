@@ -1416,11 +1416,12 @@ dependencies = [
  "ruff_source_file",
  "ruff_text_size",
  "rustc-hash",
+ "serc_bytecode",
+ "serc_decompile",
  "serc_fixtures",
  "serde",
  "serde_json",
  "sha2",
- "siphasher",
  "smallvec",
  "stacker",
  "tempfile",
@@ -1452,6 +1453,29 @@ dependencies = [
  "mimalloc",
  "serc",
  "serc_fixtures",
+]
+
+[[package]]
+name = "serc_bytecode"
+version = "0.1.9"
+dependencies = [
+ "rustc-hash",
+ "siphasher",
+ "stacker",
+]
+
+[[package]]
+name = "serc_decompile"
+version = "0.1.9"
+dependencies = [
+ "ruff_python_ast",
+ "ruff_python_codegen",
+ "ruff_python_literal",
+ "ruff_python_parser",
+ "ruff_source_file",
+ "rustc-hash",
+ "serc_bytecode",
+ "stacker",
 ]
 
 [[package]]

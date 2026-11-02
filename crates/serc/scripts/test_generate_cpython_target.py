@@ -143,6 +143,7 @@ class NumericAuthorityTest(unittest.TestCase):
                 path.write_text("")
             with (
                 mock.patch.object(generator, "CRATE_ROOT", root),
+                mock.patch.object(generator, "BYTECODE_ROOT", root / "serc_bytecode"),
                 mock.patch.object(
                     generator,
                     "parse_opcodes_from_generated_names",

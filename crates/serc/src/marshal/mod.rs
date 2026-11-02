@@ -1,13 +1,11 @@
 mod graph;
 mod key;
 mod plan;
-#[cfg(feature = "decompile")]
-pub(crate) mod reader;
-mod v4;
-mod v5;
-mod v6;
+use serc_bytecode::marshal::{v4, v5, v6};
 mod writer;
 
+#[cfg(all(test, feature = "decompile"))]
+mod reader_tests;
 #[cfg(test)]
 mod tests;
 

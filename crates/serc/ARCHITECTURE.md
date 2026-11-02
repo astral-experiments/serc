@@ -18,7 +18,7 @@ source -> decoding/normalization -> Ruff AST -> scope planning/lowering
 | Scope planning, AST lowering, constants/names/locals, logical stack depth | [compiler](src/compiler/)                                                    |
 | Finished code-object fields and marshal provenance                        | [code_object.rs](src/code_object.rs)                                         |
 | Control flow, instruction layout, line and exception tables               | [assembler](src/assembler/)                                                  |
-| CPython numeric metadata and target identity                              | [target](src/target/)                                                        |
+| CPython numeric metadata and target identity                              | [serc_bytecode](../serc_bytecode/)                                           |
 | Object identity, reference planning, binary encoding                      | [marshal](src/marshal/)                                                      |
 
 Keep target numbers in generated metadata, control-flow rewrites in the
@@ -113,11 +113,12 @@ retained code object with `CompiledModule::marshal`.
 
 ## Target metadata and changes
 
-[Generated target modules](src/target/) supply wire opcodes, cache widths,
-flags, operands, stack effects, and release provenance;
-[generated marshal modules](src/marshal/) supply wire tags. Do not hand-edit
-them or duplicate their numeric constants in lowering and assembly. Typed
-internal state and provenance carry information that is absent from bytecode.
+[Generated target modules](../serc_bytecode/src/target/) supply wire opcodes,
+cache widths, flags, operands, stack effects, and release provenance. The
+[generated marshal modules](../serc_bytecode/src/marshal/) supply wire tags. Do
+not hand-edit them or duplicate their numeric constants in lowering and
+assembly. Typed internal state and provenance carry information that is absent
+from bytecode.
 
 Generation verifies an exact CPython checkout, but generated tables do not
 replace auditing its compiler and serialization semantics. Follow

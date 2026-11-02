@@ -5,7 +5,7 @@ use crate::target::{Opcode, opcodes};
 /// the instruction's entry point; only the opcode and its caches contribute
 /// to the base of a relative jump.
 #[derive(Clone, Copy, Debug)]
-pub(super) struct Instruction {
+pub struct Instruction {
     pub offset: usize,
     pub opcode: Opcode,
     pub name: &'static str,
@@ -14,7 +14,7 @@ pub(super) struct Instruction {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(super) struct Handler {
+pub struct Handler {
     pub start: usize,
     pub end: usize,
     pub target: usize,
@@ -22,17 +22,13 @@ pub(super) struct Handler {
     pub lasti: bool,
 }
 
-pub(super) struct Bytecode {
+pub struct Bytecode {
     pub ops: Vec<Instruction>,
     pub handlers: Vec<Handler>,
 }
 
 impl Bytecode {
-    pub(super) fn decode(
-        version: PythonVersion,
-        bytes: &[u8],
-        exceptions: &[u8],
-    ) -> Result<Self, String> {
+    pub fn decode(version: PythonVersion, bytes: &[u8], exceptions: &[u8]) -> Result<Self, String> {
         let mut ops = Vec::new();
         let mut cursor = 0;
         while cursor < bytes.len() {
