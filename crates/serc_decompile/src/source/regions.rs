@@ -181,6 +181,15 @@ impl Body<'_, '_, '_> {
         end: usize,
         level: usize,
     ) -> Result<usize, String> {
+        if let Some(handler) = self.handlers.remove(&i) {
+            // The protected fragment re-enters this same instruction. Leave other
+            // entries available, including nested tries in the exception suite.
+            let result = self.suspended_handler(ops, i, end, level, &handler);
+            self.handlers.insert(i, handler);
+            if let Some(next) = result? {
+                return Ok(next);
+            }
+        }
         let op = ops[i];
         match op.name {
             // CPython builds a constant set display by updating an empty

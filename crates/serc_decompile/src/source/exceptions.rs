@@ -50,6 +50,21 @@ pub(super) fn manager_entry(ops: &[Instruction], asynchronous: bool) -> Result<u
 }
 
 impl Body<'_, '_, '_> {
+    pub(super) fn try_block(&mut self, suite: &str, inline: bool) -> Result<(), String> {
+        // A one-line try suite can omit the tracing NOP before its first
+        // protected instruction. The formatted candidate also tries a block.
+        if inline && suite.lines().count() == 1
+            && ruff_python_parser::parse_module(suite).is_ok_and(|parsed| {
+                matches!(parsed.suite().as_slice(), [stmt] if !ruff_python_ast::helpers::is_compound_statement(stmt))
+            })
+        {
+            self.line(&format!("try: {}", suite.trim_end()))?;
+        } else {
+            self.block("try:", suite)?;
+        }
+        Ok(())
+    }
+
     pub(super) fn protected(
         &mut self,
         bc: &Bytecode,
@@ -88,17 +103,7 @@ impl Body<'_, '_, '_> {
         }
         self.region(ops, 0, start, 0)?;
         let (suite, returns) = self.fragment(ops, start, end, 0)?.pending_return()?;
-        // A one-line try suite can omit the tracing NOP before its first
-        // protected instruction. The formatted candidate also tries a block.
-        if start > 0 && ops[start - 1].name != "NOP" && suite.lines().count() == 1
-            && ruff_python_parser::parse_module(&suite).is_ok_and(|parsed| {
-                matches!(parsed.suite().as_slice(), [stmt] if !ruff_python_ast::helpers::is_compound_statement(stmt))
-            })
-        {
-            self.line(&format!("try: {}", suite.trim_end()))?;
-        } else {
-            self.block("try:", &suite)?;
-        }
+        self.try_block(&suite, start > 0 && ops[start - 1].name != "NOP")?;
         let star = ops
             .get(handler + 1)
             .is_some_and(|op| op.name == "BUILD_LIST");
