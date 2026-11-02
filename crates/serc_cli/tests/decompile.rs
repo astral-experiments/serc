@@ -20,7 +20,7 @@ fn command_requires_feature() {
 
 #[cfg(feature = "decompile")]
 #[test]
-fn complete_modules_only() {
+fn strict_mode_requires_complete_modules() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("original.py");
     let cache = temp.path().join("module.pyc");
@@ -41,6 +41,7 @@ fn complete_modules_only() {
                 fs_err::remove_file(&source).unwrap();
                 let recovered = Command::new(env!("CARGO_BIN_EXE_serc"))
                     .arg("decompile")
+                    .arg("--strict")
                     .arg(&cache)
                     .output()
                     .unwrap();
@@ -792,12 +793,61 @@ Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12)
         assert!(built.status.success(), "{built:?}");
         let output = Command::new(env!("CARGO_BIN_EXE_serc"))
             .arg("decompile")
+            .arg("--strict")
             .arg(&cache)
             .output()
             .unwrap();
         assert!(!output.status.success(), "{version}");
         assert!(output.stdout.is_empty());
     }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("original.py");
+    let cache = temp.path().join("module.pyc");
+    let recovered = temp.path().join("recovered.py");
+    let source = format!(
+        "before = 7\ndef large():\n    return '{}'\ndef after(x):\n    return x + before\n",
+        "x".repeat(200_000)
+    );
+    fs_err::write(&original, source).unwrap();
+    for version in common::PYTHON_VERSIONS {
+        let built = common::python_command(version)
+            .args(["-c", "import py_compile, sys; py_compile.compile(sys.argv[1], sys.argv[2], doraise=True)"])
+            .arg(&original).arg(&cache).output().unwrap();
+        assert!(built.status.success(), "{built:?}");
+        let output = Command::new(env!("CARGO_BIN_EXE_serc"))
+            .arg("decompile")
+            .arg(&cache)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.starts_with("# serc: best-effort decompilation\n"));
+        assert!(text.contains("def large():\n    ...  # serc: unrecovered remainder of large"));
+        assert!(text.contains("def after(x):"));
+        fs_err::write(&recovered, text).unwrap();
+        let checked = common::python_command(version)
+            .args([
+                "-c",
+                "import runpy, sys; assert runpy.run_path(sys.argv[1])['after'](5) == 12",
+            ])
+            .arg(&recovered)
+            .output()
+            .unwrap();
+        assert!(checked.status.success(), "{checked:?}");
+    }
+    fs_err::write(&cache, b"not a cache").unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_serc"))
+        .arg("decompile")
+        .arg(&cache)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
 }
 
 #[cfg(feature = "decompile")]

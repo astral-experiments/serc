@@ -45,6 +45,9 @@ enum Command {
     /// Recover Python source from a CPython cache file.
     #[cfg(feature = "decompile")]
     Decompile {
+        /// Require all executable fields to match when recompiled.
+        #[arg(long)]
+        strict: bool,
         #[arg(value_name = "FILE.pyc", value_hint = ValueHint::FilePath)]
         path: PathBuf,
     },
@@ -149,16 +152,27 @@ fn run(cli: Cli) -> Result<ExitCode, String> {
     match cli.command {
         Command::Compile(command) => compile_command(command),
         #[cfg(feature = "decompile")]
-        Command::Decompile { path } => {
+        Command::Decompile { path, strict } => {
             let mut bytes = Vec::new();
             fs_err::File::open(&path)
                 .and_then(|file| file.take((64 << 20) + 1).read_to_end(&mut bytes))
                 .map_err(|error| format!("{}: {error}", path.display()))?;
-            let source = serc::decompile_pyc(&bytes)
+            let mode = if strict {
+                serc::DecompileMode::Strict
+            } else {
+                serc::DecompileMode::BestEffort
+            };
+            let output = serc::decompile_pyc_with_mode(&bytes, mode)
                 .map_err(|error| format!("{}: {error}", path.display()))?;
+            if output.verification_error.is_some() {
+                eprintln!(
+                    "serc: {}: best-effort decompilation; see diagnostics in source",
+                    path.display()
+                );
+            }
             io::stdout()
                 .lock()
-                .write_all(source.as_bytes())
+                .write_all(output.source.as_bytes())
                 .map_err(|error| error.to_string())?;
             Ok(ExitCode::SUCCESS)
         }

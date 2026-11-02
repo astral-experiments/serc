@@ -34,7 +34,9 @@ use code_object::{CodeFilename, CodeObject};
 use compiler::Compiler;
 pub use config::{CompileOptions, NativeBuildProfile};
 #[cfg(feature = "decompile")]
-pub use decompile::{DecompileError, decompile_pyc};
+pub use decompile::{
+    DecompileError, DecompileMode, DecompileOutput, decompile_pyc, decompile_pyc_with_mode,
+};
 pub use initial_intern_state::InitialInternState;
 use ruff_text_size::{Ranged, TextRange, TextSize};
 pub use serc_bytecode::{

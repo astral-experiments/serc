@@ -1,7 +1,7 @@
 # Decompilation
 
-`serc decompile FILE.pyc` reconstructs a whole Python module without executing
-the cache or looking for the original source file. The default build provides
+`serc decompile FILE.pyc` reconstructs Python source without executing the
+cache or looking for the original source file. The default build provides
 the compiler. Enable the optional feature when building from the workspace.
 
 ```console
@@ -61,11 +61,22 @@ patterns. Nested or overlapping cases can still exceed these recognizers.
 
 ## Verification
 
-The decompiler tries recompiling the entire result with serc on the input target
+The decompiler first tries recompiling the entire result with serc on the input target
 at optimization levels 0, 1, and 2. A successful result reproduces each nested
 code object's instructions, exception table, stack size, signature, flags,
-names, local layout, and constants, including reference sharing. On failure the
-CLI reports the reason on stderr and emits no source.
+names, local layout, and constants, including reference sharing.
+
+By default, if exact verification fails, serc emits best-effort source with a
+`# serc: best-effort decompilation` header. When a nested body is unsupported,
+an ellipsis, a comment naming the scope, and an instruction excerpt identify
+the missing code. Recovery continues in the enclosing scope. A best-effort
+result can differ in behavior from the input. Invalid cache headers, marshal
+data, and undecodable instruction streams still produce an error.
+
+Use `serc decompile --strict FILE.pyc` to require whole-module verification.
+In strict mode a refusal writes the reason to stderr and leaves stdout empty.
+Library callers can use `serc::decompile_pyc_with_mode` to inspect
+`verification_error` or select `DecompileMode::Strict`.
 
 The output supplies one spelling that produces those executable fields.
 Comments, original formatting, location tables, and code removed by CPython
@@ -101,8 +112,8 @@ def stream(arg):
 ```
 
 Here the marker applies only to the condition. The `yield` still runs. Both
-markers appear by default in CLI and library output, and the marked source
-must pass whole-module verification.
+markers appear by default in CLI and library output. The verifier checks the
+marked spelling before accepting a whole-module match.
 
 ## Ruff corpus
 

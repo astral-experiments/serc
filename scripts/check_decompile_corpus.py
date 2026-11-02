@@ -17,6 +17,7 @@ import tokenize
 import types
 import warnings
 from collections import Counter
+from functools import cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -81,10 +82,17 @@ def object_count(code):
     )
 
 
+@cache
+def strict_command(binary):
+    # Earlier stack layers always used strict mode.
+    help_text = subprocess.check_output([binary, "decompile", "--help"], timeout=30)
+    return [binary, "decompile", *(["--strict"] if b"--strict" in help_text else [])]
+
+
 def check_cache(binary, cache, filename, code):
     try:
         run = subprocess.run(
-            [binary, "decompile", cache], capture_output=True, timeout=30, check=False
+            [*strict_command(binary), cache], capture_output=True, timeout=30, check=False
         )
     except subprocess.TimeoutExpired:
         return "error", "decompiler timed out"

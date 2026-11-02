@@ -1,16 +1,23 @@
 //! Verified source recovery using serc's compiler.
-pub use serc_decompile::DecompileError;
+pub use serc_decompile::{DecompileError, DecompileMode, DecompileOutput};
 
 use crate::{CompileOptions, compile_with_options};
 
-/// Recover an entire module as Python source without executing its bytecode.
-/// The cache magic selects one of serc's pinned targets. Each nested scope
-/// must reproduce its executable fields when recompiled. Dead suites synthesized
-/// to reproduce metadata carry the comment `# serc: synthetic dead code`.
-/// Synthetic conditions around live statements carry `# serc: synthetic live guard`.
+/// Reconstruct Python source from a cache without executing it. Output that
+/// could not be verified carries a best-effort warning.
 pub fn decompile_pyc(bytes: &[u8]) -> Result<String, DecompileError> {
-    serc_decompile::decompile_pyc(
+    Ok(decompile_pyc_with_mode(bytes, DecompileMode::BestEffort)?.source)
+}
+
+/// Recover source with structured verification status. Select
+/// [`DecompileMode::Strict`] to require an exact executable-field match.
+pub fn decompile_pyc_with_mode(
+    bytes: &[u8],
+    mode: DecompileMode,
+) -> Result<DecompileOutput, DecompileError> {
+    serc_decompile::decompile_pyc_with_mode(
         bytes,
+        mode,
         |source, filename, python_version, optimization_level| {
             let options = CompileOptions {
                 python_version,
@@ -36,7 +43,11 @@ mod tests {
             .to_timestamp_pyc(0, 0);
         let mut candidate = original.clone();
         candidate[..4].copy_from_slice(&PythonVersion::Py315.target().magic_number);
-        let result = serc_decompile::decompile_pyc(&original, |_, _, _, _| Some(candidate.clone()));
+        let result = serc_decompile::decompile_pyc_with_mode(
+            &original,
+            DecompileMode::Strict,
+            |_, _, _, _| Some(candidate.clone()),
+        );
         assert!(
             matches!(result, Err(DecompileError::Verify(PythonVersion::Py314, reason)) if reason.contains("3.15"))
         );

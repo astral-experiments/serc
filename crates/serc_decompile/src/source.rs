@@ -9,6 +9,8 @@ mod exceptions;
 mod layout;
 mod loops;
 mod operands;
+mod partial;
+pub(super) use partial::{comment, partial};
 mod patterns;
 mod regions;
 mod strings;
@@ -41,6 +43,7 @@ struct Recovery<'m> {
     synthetic: Option<&'m synthetic::Hints>,
     mode: synthetic::Mode,
     emitted: bool,
+    partial: bool,
 }
 
 pub(super) fn recover(
@@ -56,6 +59,7 @@ pub(super) fn recover(
         synthetic,
         mode,
         emitted: false,
+        partial: false,
     };
     let text = scope(m, m.root, 0, false, &mut work)?;
     if mode != synthetic::Mode::Ordinary && !work.emitted {
@@ -146,7 +150,7 @@ fn recover_scope<'m>(
         work,
     };
     body.declarations(&bc.ops)?;
-    if body.suspended() {
+    let result = if body.suspended() {
         body.suspension_scope(&bc)
     } else if bc.ops.iter().any(|op| op.name == "LOAD_FAST_AND_CLEAR")
         && bc.ops.iter().any(comprehensions::is_collection_insert)
@@ -171,9 +175,18 @@ fn recover_scope<'m>(
     } else {
         body.protected(&bc)
     }
-    .map_err(|e| format!("{name}: {e}"))?;
-    if !body.stack.is_empty() {
-        return Err(format!("{name}: unused stack values at end"));
+    .and_then(|()| {
+        if body.stack.is_empty() {
+            Ok(())
+        } else {
+            Err("unused stack values at end".into())
+        }
+    });
+    if let Err(reason) = result {
+        if body.work.partial {
+            return body.partial_scope(name, &reason, &bc);
+        }
+        return Err(format!("{name}: {reason}"));
     }
     body.emit_stub(None)?;
     if let Some(guard) = live_guard {
