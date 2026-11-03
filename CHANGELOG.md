@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.1.11
+
+Released on 2026-11-03.
+
+### Other changes
+
+- Publish standalone archives and installers to GitHub Releases with Serc's
+  repository token (astral-experiments/serc#2378,
+  https://github.com/astral-experiments/serc/pull/2378).
+
 ## 0.1.10
 
 Released on 2026-11-02.
