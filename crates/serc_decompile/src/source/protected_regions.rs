@@ -15,6 +15,7 @@ enum Clause {
         kind: Option<Range<usize>>,
         binding: usize,
         success: Range<usize>,
+        following: Vec<super::dispatch::Arm>,
     },
     Finally {
         deferred_return: Range<usize>,
@@ -95,7 +96,7 @@ fn groups(bc: &Bytecode) -> Vec<Vec<Handler>> {
     ordered
 }
 
-pub(super) fn suspended(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Handlers {
+pub(super) fn collect(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Handlers {
     let mut result = Handlers::default();
     for entries in groups(bc) {
         if let Some((start, suite)) = region(&bc.ops, owner, &entries, &result) {
@@ -107,7 +108,7 @@ pub(super) fn suspended(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Handlers {
 
 /// If a coroutine only raises, there is no return instruction to delimit
 /// its body. Include continuations reachable solely through an except clause.
-pub(super) fn returnless_end(bc: &Bytecode, flow: &Graph, handlers: &Handlers) -> Option<usize> {
+pub(super) fn returnless_end(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<usize> {
     let mut starts = vec![0];
     for group in groups(bc) {
         let entry = group.first()?;
@@ -115,13 +116,18 @@ pub(super) fn returnless_end(bc: &Bytecode, flow: &Graph, handlers: &Handlers) -
             .ops
             .binary_search_by_key(&entry.start, |op| op.offset)
             .ok()?;
-        let suite = handlers.get(&start)?;
+        // An await that never reaches a return still has its delegated
+        // throw handler. The normal SEND edge already visits its resumption.
+        if group.len() == 1 && owner.delegated_cleanup(&bc.ops, start).is_some() {
+            continue;
+        }
+        let suite = owner.handlers.get(&start)?;
         if bc.ops.get(suite.end)?.offset == entry.target && suite.next > suite.end {
             bc.ops.get(suite.next)?;
             starts.push(suite.next);
         }
     }
-    Some(flow.normal_end(starts))
+    Some(owner.flow.normal_end(starts))
 }
 
 /// Use region recovery for ordinary scopes when a branch encloses the first
@@ -178,9 +184,12 @@ pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handle
             let guarded_return = bc.ops[suite.handler.clone()]
                 .windows(2)
                 .any(|ops| (ops[0].name, ops[0].arg) == ("SWAP", 2) && ops[1].name == "POP_EXCEPT");
-            let exceptional_finally =
-                matches!(suite.clause, Clause::Finally { .. }) && suite.handler.start > dispatch;
-            if !guarded_return && !exceptional_finally {
+            let exceptional_finally = matches!(suite.clause, Clause::Finally { .. })
+                && (suite.handler.start > dispatch
+                    || break_marker(&bc.ops, flow, start..suite.end));
+            let multiple =
+                matches!(&suite.clause, Clause::Except { following, .. } if !following.is_empty());
+            if !guarded_return && !exceptional_finally && !multiple {
                 return None;
             }
         }
@@ -228,12 +237,15 @@ fn region(
     {
         return Some((start, finally));
     }
+    let mut following = Vec::new();
     let (kind, binding, stop) = if ops.get(dispatch + 1)?.name == "POP_TOP" {
         (None, dispatch + 1, cleanup)
     } else {
         let (check, pop, failed) = super::dispatch::typed_handler(flow, ops, dispatch + 1)?;
         if failed + 1 != cleanup || (ops[failed].name, ops[failed].arg) != ("RERAISE", 0) {
-            return None;
+            // Further matches that only raise have no normal continuation
+            // to reconcile with the first arm or the successful try.
+            following = owner.raising_arms(ops, failed, cleanup)?;
         }
         let stop = if ops[pop].name == "POP_TOP" {
             failed
@@ -367,6 +379,7 @@ fn region(
                 kind,
                 binding,
                 success,
+                following,
             },
             try_exits: None,
             handler_exits,
@@ -469,8 +482,9 @@ fn finally_region(
             handler_tail: None,
         });
     }
-    let deferred = ops[end].name == "NOP";
-    let start = end + usize::from(deferred);
+    let marker = ops[end].name == "NOP";
+    let deferred = marker && !break_marker(ops, flow, suite);
+    let start = end + usize::from(marker);
     let normal = start..owner.finally_copy_end(ops, start..dispatch, copy.clone(), terminal)?;
     // A return of a constant can leave a tracing NOP at its original site,
     // with the constant materialized only after the normal cleanup.
@@ -501,6 +515,15 @@ fn finally_region(
         handler_exits: None,
         handler_tail: None,
     })
+}
+
+/// A break can jump to a tracing NOP before the finalizer. Its operand
+/// stack is empty there and execution continues after cleanup.
+fn break_marker(ops: &[Instruction], flow: &Graph, suite: Range<usize>) -> bool {
+    ops[suite.end].name == "NOP"
+        && flow.incoming(suite.end).any(|i| {
+            suite.contains(&i) && ops[i].name == "JUMP_FORWARD" && flow.jump(i) == Some(suite.end)
+        })
 }
 
 fn protected_end(
@@ -556,6 +579,25 @@ fn protected_end(
             }
             continue;
         }
+        // Once TO_BOOL succeeded, newer targets leave both the conditional
+        // jump and its latch outside the try. The taken edge reaches the
+        // protected break marker, the other returns to this same suite.
+        if matches!(ops.get(end..at), Some([test, marker, back])
+             if test.name.starts_with("POP_JUMP_IF_") && marker.name == "NOT_TAKEN" && back.name == "JUMP_BACKWARD")
+            && flow.jump(end) == Some(at)
+            && flow
+                .jump(at - 1)
+                .and_then(|head| flow.handler(head))
+                .is_some_and(|h| {
+                    (h.target, h.depth, h.lasti) == (first.target, first.depth, first.lasti)
+                })
+            && flow
+                .blocks_covering(end..at)
+                .all(|b| flow.handler(b.ops.start).is_none())
+        {
+            end = index(entry.end)?;
+            continue;
+        }
         // A monitoring marker or a loop latch can sit outside the exception
         // table between two parts of the same try. For the latch, require the
         // preceding test to exit to the resumed span and the backedge to land
@@ -600,6 +642,34 @@ fn protected_end(
 }
 
 impl Body<'_, '_, '_> {
+    /// A nested try can own the rest of a manager's body. On an exception
+    /// its final unwind must transfer control to this manager's exit.
+    pub(super) fn managed_child_end(
+        &self,
+        ops: &[Instruction],
+        mut start: usize,
+        manager: Handler,
+    ) -> Option<usize> {
+        while ops.get(start)?.name == "NOP" {
+            start += 1;
+        }
+        let child = self.handlers.get(&start)?;
+        let entry = self.flow.handler(start)?;
+        let dispatch = ops
+            .binary_search_by_key(&entry.target, |op| op.offset)
+            .ok()?;
+        let (_, unwind) = super::dispatch::unwind(ops, &self.flow, dispatch, entry.depth + 1)?;
+        let parent = self.flow.handler(unwind)?;
+        (!entry.lasti
+            && entry.depth == manager.depth
+            && child.next > start
+            && parent.start == ops[unwind].offset
+            && parent.end == ops.get(unwind + 3)?.offset
+            && (parent.target, parent.depth, parent.lasti)
+                == (manager.target, manager.depth, manager.lasti))
+            .then_some(child.next)
+    }
+
     fn protected_fragment(
         &mut self,
         ops: &[Instruction],
@@ -628,7 +698,8 @@ impl Body<'_, '_, '_> {
             .protected_fragment(ops, start..entry.end, level, entry.try_exits)?
             .pending_return()?;
         let mut next = entry.next;
-        if returns {
+        let carried = returns && next == limit && matches!(entry.clause, Clause::Finally { .. });
+        if returns && !carried {
             if next >= limit || ops[next].name != "RETURN_VALUE" {
                 return Err("unsupported return through suspended handler".into());
             }
@@ -669,16 +740,25 @@ impl Body<'_, '_, '_> {
         };
         self.try_block(&suite, start > 0 && ops[start - 1].name != "NOP")?;
         self.block(&header, &handler)?;
-        if let Clause::Except { success, .. } = &entry.clause
-            && !success.is_empty()
+        if let Clause::Except {
+            success, following, ..
+        } = &entry.clause
         {
-            let suite = self
-                .fragment(ops, success.start, success.end, level)?
-                .suite()?;
-            self.block("else:", &suite)?;
+            for arm in following {
+                self.emit_arm(ops, arm, level, false)?;
+            }
+            if !success.is_empty() {
+                let suite = self
+                    .fragment(ops, success.start, success.end, level)?
+                    .suite()?;
+                self.block("else:", &suite)?;
+            }
         }
         if terminal_unwind.is_some() && entry.next > entry.end && (level > 0 || next < limit) {
             self.line("return")?;
+        }
+        if carried {
+            self.stack.push(super::Value::PendingReturn);
         }
         Ok(Some(next))
     }

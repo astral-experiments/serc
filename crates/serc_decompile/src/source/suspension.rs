@@ -55,7 +55,7 @@ impl Body<'_, '_, '_> {
     pub(super) fn suspension_scope(&mut self, bc: &Bytecode) -> Result<(), String> {
         let ops = &bc.ops;
         if ops.iter().any(|op| op.name == "WITH_EXCEPT_START") {
-            self.handlers = super::protected_regions::suspended(bc, self);
+            self.handlers = super::protected_regions::collect(bc, self);
             if !self.handlers.is_empty() {
                 let end = self.flow.normal_end([0]);
                 return self.region(ops, 0, end, 0);
@@ -74,14 +74,12 @@ impl Body<'_, '_, '_> {
         {
             ops.len() - 2
         } else {
-            self.handlers = super::protected_regions::suspended(bc, self);
+            self.handlers = super::protected_regions::collect(bc, self);
             ops.iter()
                 .rposition(|op| matches!(op.name, "RETURN_VALUE" | "RETURN_CONST"))
                 // A copied return in a break arm can precede the loop latch.
                 .map(|last| (last + 1).max(self.flow.normal_end([0])))
-                .or_else(|| {
-                    super::protected_regions::returnless_end(bc, &self.flow, &self.handlers)
-                })
+                .or_else(|| super::protected_regions::returnless_end(bc, self))
                 .ok_or("unsupported returnless suspension scope")?
         };
         if self.depth > 0 && !self.class {

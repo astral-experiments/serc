@@ -3136,6 +3136,114 @@ result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is 
 
 #[cfg(feature = "decompile")]
 #[test]
+fn finalizers_protect_loop_predicates_and_pending_managed_returns() {
+    check_fixture(
+        r"def run(step, ready, cleanup):
+    try:
+        while True:
+            step()
+            if ready():
+                break
+    finally:
+        cleanup()
+
+async def acquire(lock, work, cleanup):
+    async with lock:
+        try:
+            return await work()
+        finally:
+            cleanup()
+",
+        r"import asyncio, sys
+result = []
+for failure in ('step', 'ready', 'cleanup', None):
+    calls = iter([False, True])
+    def record(label):
+        result.append((label, type(sys.exception()).__name__))
+        if label == failure: raise LookupError(label)
+    def ready():
+        record('ready')
+        return next(calls)
+    try: run(lambda: record('step'), ready, lambda: record('cleanup'))
+    except LookupError as exc: result.append(exc.args)
+class Lock:
+    async def __aenter__(self): pass
+    async def __aexit__(self, kind, value, tb):
+        result.append(('exit', kind.__name__ if kind else None))
+        return suppress
+async def work():
+    if fail: raise ValueError('work')
+    return 42
+def cleanup():
+    result.append(('cleanup', type(sys.exception()).__name__))
+    if replace: raise KeyError('cleanup')
+for fail in (False, True):
+    for replace in (False, True):
+        for suppress in (False, True):
+            try: result.append(asyncio.run(acquire(Lock(), work, cleanup)))
+            except Exception as exc: result.append(exc.args)
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn managed_await_preserves_ordered_handlers_and_suppression() {
+    check_fixture(
+        r"async def run(lock, wait, clean, emit):
+    with lock:
+        emit('start')
+        try:
+            await wait()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            await clean()
+            raise
+    emit('after')
+
+async def forever(read, emit):
+    while True:
+        emit(await read())
+",
+        r"import asyncio, sys
+result = []
+async def scenario(error, replace, suppress):
+    def emit(value): result.append((value, type(sys.exception()).__name__))
+    class Lock:
+        def __enter__(self): emit('enter')
+        def __exit__(self, *exc):
+            emit('exit')
+            return suppress
+    async def wait():
+        await asyncio.sleep(0)
+        if error: raise error
+    async def clean():
+        emit('clean')
+        await asyncio.sleep(0)
+        if replace: raise LookupError()
+    try: await run(Lock(), wait, clean, emit)
+    except BaseException as exc: emit(type(exc).__name__)
+for error in (None, SystemExit(), ValueError(), asyncio.CancelledError()):
+    for replace in (True, False):
+        for suppress in (True, False):
+            asyncio.run(scenario(error, replace, suppress))
+async def consume():
+    values = iter([1, 2, 3])
+    async def read():
+        await asyncio.sleep(0)
+        v = next(values)
+        if v == 3: raise LookupError()
+        return v
+    try: await forever(read, result.append)
+    except LookupError: result.append('done')
+asyncio.run(consume())
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn managers_inside_try_keep_the_exception_and_success_paths() {
     check_fixture(
         r"async def run(manager, work, emit):

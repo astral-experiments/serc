@@ -60,6 +60,7 @@ impl Body<'_, '_, '_> {
             .get(handler + 1)
             .is_some_and(|op| op.name == "WITH_EXCEPT_START")
         {
+            self.handlers = super::protected_regions::collect(bc, self);
             return self.with_statement(bc, handlers, limit);
         }
         if entry.depth > 0 && !entry.lasti {
@@ -95,7 +96,7 @@ impl Body<'_, '_, '_> {
             && !returns
             && let Some(dispatch) = self.exception_dispatch(bc, handler, start, end, limit)
         {
-            return self.emit_dispatch(ops, dispatch, try_source_start);
+            return self.emit_dispatch(ops, &dispatch, try_source_start);
         }
         let match_kind = if star {
             "CHECK_EG_MATCH"

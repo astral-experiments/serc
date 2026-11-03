@@ -74,8 +74,21 @@ impl Body<'_, '_, '_> {
         }
         let block = self.flow.block(nop + 1);
         let header = block.ops.start;
-        let branch = block.ops.end - 1;
-        if header < nop || branch + 1 >= end {
+        // A protected predicate can end just before its conditional jump.
+        // The table boundary splits the block without changing normal flow.
+        let branch = if block.ops.end < end
+            && ops[block.ops.end].name.starts_with("POP_JUMP_IF_")
+            && self.flow.fallthrough(block) == Some(block.ops.end)
+            && self.flow.entered_from(block.ops.end, block.ops.clone())
+        {
+            block.ops.end
+        } else {
+            block.ops.end - 1
+        };
+        if header < nop
+            || (header > nop && self.handlers.contains_key(&header))
+            || branch + 1 >= end
+        {
             return Ok(None);
         }
         let fall = branch + 1 + usize::from(ops[branch + 1].name == "NOT_TAKEN");

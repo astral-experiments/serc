@@ -14,7 +14,7 @@ pub(super) struct Dispatch {
     retry: bool,
 }
 
-struct Arm {
+pub(super) struct Arm {
     kind: Option<Range<usize>>,
     binding: usize,
     body: Range<usize>,
@@ -194,39 +194,7 @@ impl Body<'_, '_, '_> {
             }
             Some(after..self.flow.normal_end([after]).min(end).min(limit))
         };
-        let mut cursor = handler + 1;
-        let mut arms = Vec::new();
-        let mut join = None;
-        while cursor < cleanup && ops[cursor].name != "RERAISE" {
-            let (kind, binding, next) = if ops[cursor].name == "POP_TOP" {
-                (None, cursor, cleanup)
-            } else {
-                let (check, binding, next) = typed_handler(&self.flow, ops, cursor)?;
-                if next >= cleanup {
-                    return None;
-                }
-                (Some(cursor..check), binding, next)
-            };
-            let (body, exit) = self.handler_body(ops, binding, next)?;
-            if let Exit::Jump(dest) = exit
-                && join.replace(dest).is_some_and(|old| old != dest)
-            {
-                return None;
-            }
-            arms.push(Arm {
-                kind,
-                binding,
-                body,
-                exit,
-            });
-            cursor = next;
-        }
-        if arms.is_empty()
-            || !(cursor == cleanup
-                || (cursor + 1 == cleanup && (ops[cursor].name, ops[cursor].arg) == ("RERAISE", 0)))
-        {
-            return None;
-        }
+        let (mut arms, join) = self.handler_arms(ops, handler + 1, cleanup)?;
         // A retrying handler jumps to the NOP at the try header. Older
         // targets take that backedge through a jump after the unwind.
         let retry_header = match (&handled_tail, join) {
@@ -324,6 +292,59 @@ impl Body<'_, '_, '_> {
         })
     }
 
+    fn handler_arms(
+        &self,
+        ops: &[Instruction],
+        mut cursor: usize,
+        cleanup: usize,
+    ) -> Option<(Vec<Arm>, Option<usize>)> {
+        let mut arms = Vec::new();
+        let mut join = None;
+        while cursor < cleanup && ops[cursor].name != "RERAISE" {
+            let (kind, binding, next) = if ops[cursor].name == "POP_TOP" {
+                (None, cursor, cleanup)
+            } else {
+                let (check, binding, next) = typed_handler(&self.flow, ops, cursor)?;
+                if next >= cleanup {
+                    return None;
+                }
+                (Some(cursor..check), binding, next)
+            };
+            let (body, exit) = self.handler_body(ops, binding, next)?;
+            if let Exit::Jump(dest) = exit
+                && join.replace(dest).is_some_and(|old| old != dest)
+            {
+                return None;
+            }
+            arms.push(Arm {
+                kind,
+                binding,
+                body,
+                exit,
+            });
+            cursor = next;
+        }
+        if arms.is_empty()
+            || !(cursor == cleanup
+                || (cursor + 1 == cleanup && (ops[cursor].name, ops[cursor].arg) == ("RERAISE", 0)))
+        {
+            return None;
+        }
+        Some((arms, join))
+    }
+
+    pub(super) fn raising_arms(
+        &self,
+        ops: &[Instruction],
+        start: usize,
+        cleanup: usize,
+    ) -> Option<Vec<Arm>> {
+        let (arms, _) = self.handler_arms(ops, start, cleanup)?;
+        arms.iter()
+            .all(|arm| matches!(arm.exit, Exit::Raise))
+            .then_some(arms)
+    }
+
     /// Locate `POP_EXCEPT` and the first instruction after normal binding cleanup.
     pub(super) fn handler_pop(
         ops: &[Instruction],
@@ -414,35 +435,47 @@ impl Body<'_, '_, '_> {
         Ok(header)
     }
 
+    pub(super) fn emit_arm(
+        &mut self,
+        ops: &[Instruction],
+        arm: &Arm,
+        level: usize,
+        keep_return: bool,
+    ) -> Result<(), String> {
+        let header = self.except_header(ops, arm.kind.clone(), arm.binding, level)?;
+        let fragment = self.fragment(ops, arm.body.start, arm.body.end, level)?;
+        let mut suite = if matches!(arm.exit, Exit::ReturnValue) {
+            let (suite, returns) = fragment.pending_return()?;
+            if !returns {
+                return Err("missing exception return value".into());
+            }
+            suite
+        } else {
+            fragment.suite()?
+        };
+        if let Exit::Return(tail) = &arm.exit {
+            let tail = self.fragment(ops, tail.start, tail.end, level)?.suite()?;
+            if keep_return || suite.is_empty() || tail != "return None\n" {
+                suite.push_str(&tail);
+            }
+        }
+        self.block(&header, &suite)?;
+        Ok(())
+    }
+
     pub(super) fn emit_dispatch(
         &mut self,
         ops: &[Instruction],
-        dispatch: Dispatch,
+        dispatch: &Dispatch,
         try_source_start: usize,
     ) -> Result<(), String> {
-        for arm in dispatch.arms {
-            let header = self.except_header(ops, arm.kind, arm.binding, 0)?;
-            let fragment = self.fragment(ops, arm.body.start, arm.body.end, 0)?;
-            let mut suite = if matches!(arm.exit, Exit::ReturnValue) {
-                let (suite, returns) = fragment.pending_return()?;
-                if !returns {
-                    return Err("missing exception return value".into());
-                }
-                suite
-            } else {
-                fragment.suite()?
-            };
-            if let Exit::Return(tail) = arm.exit {
-                let tail = self.fragment(ops, tail.start, tail.end, 0)?.suite()?;
-                if dispatch.retry
-                    || !dispatch.continuation.is_empty()
-                    || suite.is_empty()
-                    || tail != "return None\n"
-                {
-                    suite.push_str(&tail);
-                }
-            }
-            self.block(&header, &suite)?;
+        for arm in &dispatch.arms {
+            self.emit_arm(
+                ops,
+                arm,
+                0,
+                dispatch.retry || !dispatch.continuation.is_empty(),
+            )?;
         }
         if !dispatch.success.is_empty() {
             let suite = self

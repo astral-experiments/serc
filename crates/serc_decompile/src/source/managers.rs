@@ -410,6 +410,20 @@ impl Body<'_, '_, '_> {
         };
         // An early return splits the protected body around its normal
         // __exit__ call. The next arm is still inside the same manager.
+        while let Some(next) = self.managed_child_end(ops, end, entry) {
+            if next > *normal_end {
+                return Err("nested try escapes manager body".into());
+            }
+            end = if let Some(resume) = self.flow.handler(next)
+                && resume.start == ops[next].offset
+                && (resume.target, resume.depth, resume.lasti)
+                    == (entry.target, entry.depth, entry.lasti)
+            {
+                body_end(ops, &self.flow, resume)?
+            } else {
+                next
+            };
+        }
         let mut exits = Vec::new();
         if let [(asynchronous, _)] = managers.as_slice() {
             while let Some((exit, next)) =

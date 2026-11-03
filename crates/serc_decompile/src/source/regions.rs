@@ -74,6 +74,7 @@ impl Fragment {
     pub(super) fn pending_return(mut self) -> Result<(String, bool), String> {
         match self.stack.pop() {
             None => Ok((self.lines, false)),
+            Some(Value::PendingReturn) if self.stack.is_empty() => Ok((self.lines, true)),
             Some(value) if self.stack.is_empty() => {
                 let value = value
                     .expression_text()

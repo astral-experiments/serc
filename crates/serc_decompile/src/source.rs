@@ -248,6 +248,9 @@ enum Value {
     Slice(String),
     InPlace(String, &'static str, String),
     Null,
+    // A nested try emitted the return at its evaluation site. Its value
+    // is still on the bytecode stack until enclosing cleanups complete.
+    PendingReturn,
     Code(Id),
     Function(Definition),
     BuildClass,
