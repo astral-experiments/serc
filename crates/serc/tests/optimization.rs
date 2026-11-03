@@ -18652,6 +18652,21 @@ def run(data, items, consume, flag):
 }
 
 #[test]
+fn final_else_keeps_a_shared_value_discard_before_its_implicit_return() {
+    for expression in ["first() if enabled else second()", "enabled and first()"] {
+        let source = format!(
+            "def sample(mode, enabled):
+    if mode is None:
+        update()
+    else:
+        {expression}
+"
+        );
+        assert_matches_cpython(&source, "final_else_discard.py", &LEVELS);
+    }
+}
+
+#[test]
 fn terminal_else_preserves_nested_conditional_exits_before_removed_assertions() {
     for (index, leaf) in ["assert marker", "pass", "marker = first"]
         .into_iter()
