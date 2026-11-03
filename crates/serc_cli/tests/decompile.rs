@@ -1585,6 +1585,52 @@ class Last: pass
 
 #[cfg(feature = "decompile")]
 #[test]
+fn an_empty_try_keeps_its_finally_definitions_and_continuation() {
+    check_fixture(
+        r"def run(emit):
+    try:
+        pass
+    finally:
+        def inner():
+            return 'inner'
+        emit(inner())
+    emit('after')
+",
+        r"result = []
+run(result.append)
+assert result == ['inner', 'after']
+def fail(value):
+    result.append(value)
+    raise ValueError
+try:
+    run(fail)
+except ValueError:
+    pass
+assert result == ['inner', 'after', 'inner']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn an_elided_exception_group_keeps_its_type_expression_in_the_handler() {
+    check_fixture(
+        r"def run(kind, record):
+    try:
+        pass
+    except* kind():
+        pass
+    record('after')
+",
+        r"result = []
+def kind():
+    raise AssertionError('evaluated handler type')
+run(kind, result.append)
+assert result == ['after']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn handlers_survive_an_elided_try_suite() {
     check_fixture(
         r"events = []

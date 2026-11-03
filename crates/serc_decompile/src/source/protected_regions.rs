@@ -229,25 +229,15 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
     ))
 }
 
-/// Match the normal copy to the exceptional one, up to its final reraise.
-/// CPython can borrow a local on the normal path but load it owned on unwind.
-fn finally_region(
+/// CPython may borrow locals on the normal path and own them on unwind.
+pub(super) fn same_finally_suite(
     ops: &[Instruction],
     flow: &Graph,
-    end: usize,
-    dispatch: usize,
-    cleanup: usize,
-) -> Option<Protected> {
-    let reraise = cleanup.checked_sub(1)?;
-    let exceptional = dispatch + 1..reraise;
-    if exceptional.is_empty() || (ops[reraise].name, ops[reraise].arg) != ("RERAISE", 0) {
-        return None;
-    }
-    let deferred = ops[end].name == "NOP";
-    let start = end + usize::from(deferred);
-    let normal = start..start + exceptional.len();
-    if normal.end > dispatch
-        || !normal.clone().zip(exceptional.clone()).all(|(a, b)| {
+    normal: Range<usize>,
+    exceptional: Range<usize>,
+) -> bool {
+    normal.len() == exceptional.len()
+        && normal.clone().zip(exceptional.clone()).all(|(a, b)| {
             let load = |op: Instruction| match op.name {
                 "LOAD_FAST_BORROW" => "LOAD_FAST",
                 "LOAD_FAST_BORROW_LOAD_FAST_BORROW" => "LOAD_FAST_LOAD_FAST",
@@ -267,7 +257,25 @@ fn finally_region(
                 ops[a].arg == ops[b].arg
             }
         })
-    {
+}
+
+/// Match the normal copy to the exceptional one, up to its final reraise.
+fn finally_region(
+    ops: &[Instruction],
+    flow: &Graph,
+    end: usize,
+    dispatch: usize,
+    cleanup: usize,
+) -> Option<Protected> {
+    let reraise = cleanup.checked_sub(1)?;
+    let exceptional = dispatch + 1..reraise;
+    if exceptional.is_empty() || (ops[reraise].name, ops[reraise].arg) != ("RERAISE", 0) {
+        return None;
+    }
+    let deferred = ops[end].name == "NOP";
+    let start = end + usize::from(deferred);
+    let normal = start..start + exceptional.len();
+    if normal.end > dispatch || !same_finally_suite(ops, flow, normal.clone(), exceptional) {
         return None;
     }
     // A return of a constant can leave a tracing NOP at its original site,

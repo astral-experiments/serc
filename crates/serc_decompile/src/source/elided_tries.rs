@@ -1,6 +1,7 @@
 //! A try suite containing only `pass` can lose its protected interval entirely.
 //! The exceptional copy remains out of line with its own lasti cleanup entries.
-use super::{Body, Bytecode, Instruction};
+use super::{Body, Bytecode, Instruction, protected_regions::same_finally_suite};
+use serc_bytecode::target::operands::BinaryIntrinsic;
 
 impl Body<'_, '_, '_> {
     pub(super) fn elided_tries(&mut self, bc: &Bytecode, normal_end: usize) -> Result<(), String> {
@@ -37,8 +38,23 @@ impl Body<'_, '_, '_> {
                 .ok_or("missing elided try location")?;
             self.region(ops, cursor, marker, 0)?;
             self.block("try:", "")?;
-            self.elided_handlers(ops, start + 1, cleanup)?;
             cursor = marker + 1;
+            // With an empty try, a finally suite is still copied onto both
+            // paths. Its exceptional copy ends by reraising the exception.
+            let copy = start + 1..cleanup - 1;
+            let after = cursor + copy.len();
+            if (ops[cleanup - 1].name, ops[cleanup - 1].arg) == ("RERAISE", 0)
+                && handler.end == ops[cleanup].offset
+                && !copy.is_empty()
+                && after <= normal_end
+                && same_finally_suite(ops, &self.flow, cursor..after, copy)
+            {
+                let suite = self.fragment(ops, cursor, after, 0)?.suite()?;
+                self.block("finally:", &suite)?;
+                cursor = after;
+            } else {
+                self.elided_handlers(ops, start + 1, cleanup)?;
+            }
             start = cleanup + 3;
         }
         self.region(ops, cursor, normal_end, 0)
@@ -50,6 +66,11 @@ impl Body<'_, '_, '_> {
         mut at: usize,
         cleanup: usize,
     ) -> Result<(), String> {
+        if matches!(ops.get(at..cleanup), Some([list, copy, ..]) if
+            (list.name, list.arg) == ("BUILD_LIST", 0) && (copy.name, copy.arg) == ("COPY", 2))
+        {
+            return self.elided_group_handler(ops, at + 2, cleanup);
+        }
         while at < cleanup {
             if (ops[at].name, ops[at].arg) == ("RERAISE", 0) {
                 return Ok(());
@@ -91,5 +112,55 @@ impl Body<'_, '_, '_> {
             at = next;
         }
         Ok(())
+    }
+
+    fn elided_group_handler(
+        &mut self,
+        ops: &[Instruction],
+        type_start: usize,
+        cleanup: usize,
+    ) -> Result<(), String> {
+        let matched = (type_start..cleanup)
+            .find(|&i| ops[i].name == "CHECK_EG_MATCH")
+            .ok_or("missing elided exception group match")?;
+        let branch = matched + 2;
+        if !matches!(ops.get(matched + 1..cleanup), Some([copy, jump, ..]) if
+            (copy.name, copy.arg) == ("COPY", 1) && jump.name == "POP_JUMP_IF_NONE")
+        {
+            return Err("unsupported elided exception group test".into());
+        }
+        let taken = self.flow.target(branch)?;
+        let fall = branch + 1 + usize::from(ops[branch + 1].name == "NOT_TAKEN");
+        // With a single empty clause, both paths discard the subgroup and
+        // append the remainder before the same PREP_RERAISE_STAR. A handler
+        // body or another type test cannot be skipped on either path.
+        let merge = |mut i: usize| {
+            if i >= cleanup || ops[i].name != "POP_TOP" {
+                return None;
+            }
+            i += 1;
+            let mut appended = false;
+            while i < cleanup {
+                match (ops[i].name, ops[i].arg) {
+                    ("LIST_APPEND", 1) if !appended => {
+                        appended = true;
+                        i += 1;
+                    }
+                    ("JUMP_FORWARD", _) => i = self.flow.jump(i).filter(|&next| next > i)?,
+                    ("CALL_INTRINSIC_2", arg)
+                        if appended && arg == BinaryIntrinsic::PREP_RERAISE_STAR.argument() =>
+                    {
+                        return Some(i);
+                    }
+                    _ => return None,
+                }
+            }
+            None
+        };
+        if merge(taken).is_none_or(|join| merge(fall) != Some(join)) {
+            return Err("unsupported elided exception group suite".into());
+        }
+        let kind = self.fragment(ops, type_start, matched, 0)?.expression()?;
+        self.block(&format!("except* {kind}:"), "")
     }
 }
