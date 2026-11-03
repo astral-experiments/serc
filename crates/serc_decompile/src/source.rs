@@ -198,7 +198,7 @@ fn recover_scope<'m>(
     let result = if body.suspended() {
         body.suspension_scope(&bc)
     } else {
-        let (handlers, end) = comprehensions::protection(&bc)?;
+        let (handlers, end) = comprehensions::protection(&bc, &bc.handlers)?;
         if handlers.is_empty() {
             body.region(&bc.ops, 0, end, 0)
         } else {

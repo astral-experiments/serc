@@ -72,7 +72,8 @@ impl Body<'_, '_, '_> {
         limit: usize,
     ) -> Result<(), String> {
         if handlers.len() == bc.handlers.len()
-            && let Some((regions, end)) = super::protected_regions::guarded(bc, &self.flow)
+            && let Some((regions, end)) =
+                super::protected_regions::guarded(bc, &self.flow, |ops| self.none_return(ops))
         {
             self.handlers = regions;
             if self.depth > 0 && !self.class {
@@ -132,7 +133,7 @@ impl Body<'_, '_, '_> {
         }
         if !star
             && !returns
-            && let Some(dispatch) = self.exception_dispatch(ops, handler, end, limit)
+            && let Some(dispatch) = self.exception_dispatch(bc, handler, end, limit)
         {
             return self.emit_dispatch(ops, dispatch);
         }
@@ -266,6 +267,12 @@ impl Body<'_, '_, '_> {
             let kind = self.fragment(ops, cursor, check, 0)?.expression()?;
             if binding >= next || ops[binding].name != "POP_TOP" {
                 return Err("unsupported returning exception binding".into());
+            }
+            if let Some(end) = self.raising_handler_end(ops, check, binding) {
+                let suite = self.fragment(ops, binding + 1, end, 0)?.suite()?;
+                self.block(&format!("except {kind}:"), &suite)?;
+                cursor = next;
+                continue;
             }
             let pop = (binding + 1..next)
                 .find(|&i| ops[i].name == "POP_EXCEPT")

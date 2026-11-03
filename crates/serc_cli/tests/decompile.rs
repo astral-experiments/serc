@@ -512,6 +512,94 @@ assert result == [1, 1, 'b', ('b',), 'b', 2, ('c',), 3, ('d',), ('d',)]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_raising_try_keeps_the_continuation_after_name_cleanup() {
+    check_fixture(
+        r"try:
+    raise KeyError('key')
+except KeyError as exc:
+    message = exc.args[0]
+
+def keys(items):
+    return [key for key in items]
+
+def recover(error, observe):
+    try:
+        raise error
+    except ValueError as caught:
+        observe(caught.args)
+    return observe('after')
+",
+        r"import sys
+result = []
+def observe(value):
+    result.append((value, type(sys.exception()).__name__))
+    return 'done'
+assert message == 'key' and keys(['a']) == ['a'] and 'exc' not in globals()
+assert recover(ValueError('v'), observe) == 'done'
+try:
+    recover(KeyError('k'), observe)
+except KeyError as err:
+    assert err.args == ('k',)
+else:
+    raise AssertionError('lost unmatched exception')
+assert result == [(('v',), 'ValueError'), ('after', 'NoneType')]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_returning_try_preserves_the_raising_handler() {
+    check_fixture(
+        r"def lookup(operation, key):
+    try:
+        return operation(key)
+    except LookupError:
+        raise ValueError(key)
+",
+        r"def operation(key):
+    if key < 0:
+        raise KeyError(key)
+    if key == 0:
+        raise TypeError(key)
+    return key + 1
+result = []
+for key in [-1, 0, 1]:
+    try:
+        result.append(lookup(operation, key))
+    except ValueError as exc:
+        assert isinstance(exc.__context__, KeyError)
+        result.append('replaced')
+    except TypeError:
+        result.append('propagated')
+assert result == ['replaced', 'propagated', 2]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_terminal_try_guard_can_skip_the_protected_call() {
+    check_fixture(
+        r"def guarded(check, action):
+    try:
+        if check():
+            action()
+    except LookupError:
+        pass
+",
+        r"result = []
+def fail():
+    raise KeyError()
+def action():
+    result.append('called')
+    fail()
+for check in [lambda: False, fail, lambda: True]:
+    assert guarded(check, action) is None
+assert result == ['called']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn distinct_and_shared_constant_returns_keep_their_constant_order() {
     check_fixture(
         r"def early(ready, emit):

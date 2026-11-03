@@ -16,8 +16,10 @@ pub(super) fn is_collection_insert(op: &Instruction) -> bool {
 /// Split leading comprehension restores from user handlers. A restore after
 /// the last return starts the out-of-line cleanup, even when a later try has
 /// its own handler after it. Inline restores are jumped over on success.
-pub(super) fn protection(bc: &Bytecode) -> Result<(&[Handler], usize), String> {
-    let mut handlers = bc.handlers.as_slice();
+pub(super) fn protection<'a>(
+    bc: &Bytecode,
+    mut handlers: &'a [Handler],
+) -> Result<(&'a [Handler], usize), String> {
     let len = bc.ops.len();
     if handlers.is_empty()
         || !bc.ops.iter().any(|op| op.name == "LOAD_FAST_AND_CLEAR")

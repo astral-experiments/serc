@@ -95,15 +95,32 @@ impl Body<'_, '_, '_> {
 
     pub(super) fn exception_dispatch(
         &self,
-        ops: &[Instruction],
+        bc: &super::Bytecode,
         handler: usize,
         success: usize,
         limit: usize,
     ) -> Option<Dispatch> {
+        let ops = &bc.ops;
         let (_, cleanup) = unwind(ops, &self.flow, handler, 1)?;
-        if cleanup + 3 != limit {
-            return None;
-        }
+        let after = cleanup + 3;
+        // When the try always raises, only a matching handler can reach the
+        // code after its unwind. Bound handlers clear the exception name first.
+        let handled_tail = if after == limit {
+            None
+        } else {
+            if after >= limit || success != handler || ops[handler - 1].name != "RAISE_VARARGS" {
+                return None;
+            }
+            let rest = bc
+                .handlers
+                .partition_point(|entry| entry.start < ops[after].offset);
+            let (remaining, end) =
+                super::comprehensions::protection(bc, &bc.handlers[rest..]).ok()?;
+            if !remaining.is_empty() {
+                return None;
+            }
+            Some(after..self.flow.normal_end([after]).min(end).min(limit))
+        };
         let mut cursor = handler + 1;
         let mut arms = Vec::new();
         let mut join = None;
@@ -119,7 +136,8 @@ impl Body<'_, '_, '_> {
             };
             let (body, exit) = self.handler_body(ops, binding, next)?;
             if let Exit::Jump(dest) = exit
-                && (!(success..handler).contains(&dest)
+                && ((!(success..handler).contains(&dest)
+                    && handled_tail.as_ref().is_none_or(|tail| dest != tail.start))
                     || join.replace(dest).is_some_and(|old| old != dest))
             {
                 return None;
@@ -137,6 +155,13 @@ impl Body<'_, '_, '_> {
                 || (cursor + 1 == cleanup && (ops[cursor].name, ops[cursor].arg) == ("RERAISE", 0)))
         {
             return None;
+        }
+        if let Some(tail) = handled_tail {
+            return (join == Some(tail.start)).then_some(Dispatch {
+                arms,
+                success: success..success,
+                continuation: tail,
+            });
         }
         if let [arm] = arms.as_slice()
             && matches!(arm.exit, Exit::Raise)

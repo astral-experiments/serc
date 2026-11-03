@@ -45,14 +45,19 @@ pub(super) fn suspended(bc: &Bytecode, flow: &Graph) -> Handlers {
 /// Use region recovery for ordinary scopes when a branch encloses the first
 /// try, or there are multiple protected entries. Every user handler must have
 /// a known placement before the normal traversal can skip its out-of-line code.
-pub(super) fn guarded(bc: &Bytecode, flow: &Graph) -> Option<(Handlers, usize)> {
+pub(super) fn guarded(
+    bc: &Bytecode,
+    flow: &Graph,
+    none_return: impl Fn(&[Instruction]) -> bool,
+) -> Option<(Handlers, usize)> {
     let first = bc.handlers.first()?;
     if first.lasti {
         return None;
     }
     let groups = groups(bc);
     let split = groups.get(&first.target)?.len() > 1;
-    let unguarded = groups.len() == 1
+    let single_dispatch = groups.len() == 1;
+    let unguarded = single_dispatch
         && !split
         && !bc
             .ops
@@ -68,11 +73,27 @@ pub(super) fn guarded(bc: &Bytecode, flow: &Graph) -> Option<(Handlers, usize)> 
             .binary_search_by_key(&entries[0].target, |op| op.offset)
             .ok()?;
         let h = flow.handler(dispatch)?;
-        let (start, suite) = region(&bc.ops, flow, &entries)?;
+        let (start, mut suite) = region(&bc.ops, flow, &entries)?;
         if suite.end == dispatch && suite.next > dispatch {
             // The try returned. Only the handled exception reaches this
             // continuation, so an ordinary walk from offset zero misses it.
             starts.push(suite.next);
+        } else if single_dispatch
+            && first.depth == 0
+            && suite.next == suite.end
+            && let Some((second, _)) = super::regions::constant_return(&bc.ops, dispatch)
+            && suite.end < second
+            && none_return(&bc.ops[suite.end..second])
+            && none_return(&bc.ops[second..dispatch])
+            && flow.unprotected_suite(suite.end..dispatch)
+            && flow
+                .incoming(second)
+                .any(|i| (start..suite.end).contains(&i))
+            && flow.normal_end([0]) == dispatch
+        {
+            // The final guard has two copies of the implicit return outside
+            // the protected suite. Its successful paths both leave the scope.
+            suite.next = dispatch;
         } else if unguarded {
             return None;
         }
