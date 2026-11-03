@@ -171,20 +171,20 @@ pub(super) fn partial(m: &Module<'_>, candidate: &Module<'_>, source: &str) -> O
         .iter()
         .rposition(|(line, wanted)| line == wanted)
         .map_or(0, |i| i + 1);
-    // The AST generator separates a class header from its first method with
-    // a blank line. Removing that separator can keep the next class on its
-    // original line. Use tokens so newlines inside strings remain untouched.
+    // Remove standalone blank lines between suites only when needed to
+    // preserve a class's line. Newlines inside strings belong to the token.
     let blanks: Vec<_> = parsed
         .tokens()
-        .windows(3)
+        .windows(2)
         .filter(|t| {
-            t[0].kind() == TokenKind::Colon
-                && t[1].kind() == TokenKind::Newline
-                && t[2].kind() == TokenKind::NonLogicalNewline
-                && t[1].end() == t[2].start()
-                && &source[t[2].range()] == "\n"
+            matches!(
+                t[0].kind(),
+                TokenKind::Newline | TokenKind::NonLogicalNewline
+            ) && t[1].kind() == TokenKind::NonLogicalNewline
+                && t[0].end() == t[1].start()
+                && &source[t[1].range()] == "\n"
         })
-        .map(|t| t[2].start().to_usize())
+        .map(|t| t[1].start().to_usize())
         .collect();
     let mut blanks = blanks.as_slice();
     let mut result = String::new();

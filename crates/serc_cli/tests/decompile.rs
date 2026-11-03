@@ -166,6 +166,57 @@ fn branches_preserve_call_order() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_terminal_arm_can_jump_over_its_alternate() {
+    check_fixture(
+        r"def check(first, read, other, done):
+    if first:
+        value = read()
+        if value is not None and value:
+            raise ValueError(value)
+    elif other():
+        raise LookupError()
+    done()
+
+def handled(read, recover, emit):
+    try:
+        read()
+    except ValueError as error:
+        if error.args:
+            return recover(error)
+        emit('empty')
+    emit('after')
+
+def quit(clean, code):
+    try:
+        clean()
+    except:
+        pass
+    raise SystemExit(code)
+",
+        r"import sys
+result = []
+def record(value):
+    result.append(value)
+    return value
+for first in (False, True):
+    for value in (None, 0, 2):
+        for other in (False, True):
+            try: check(first, lambda: record(value), lambda: record(other), lambda: record('done'))
+            except Exception as exc: result.append((type(exc).__name__, exc.args))
+for err in (None, ValueError(), ValueError('bound')):
+    def read():
+        if err is not None: raise err
+    def recover(value):
+        result.append(sys.exception() is value)
+        return value.args
+    result.append(handled(read, recover, record))
+    try: quit(read, 9)
+    except SystemExit as exc: result.append((exc.code, exc.__context__ is None))",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn mixed_guards_short_circuit_before_entering_a_generator() {
     check_fixture(
         r"def choose(first, second, items, visit, emit):

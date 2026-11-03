@@ -294,14 +294,35 @@ impl Body<'_, '_, '_> {
     // CPython can thread a nested arm directly to the enclosing join.
     // Falling off this fragment runs the caller's jump to the same place.
     fn local_join(&self, ops: &[Instruction], destination: usize, end: usize) -> usize {
-        if destination > end
-            && ops.get(end).is_some_and(|op| op.name == "JUMP_FORWARD")
-            && self.flow.jump(end) == Some(destination)
+        if self.arm_exit == Some((end, destination))
+            || (destination > end
+                && ops.get(end).is_some_and(|op| op.name == "JUMP_FORWARD")
+                && self.flow.jump(end) == Some(destination))
         {
             end
         } else {
             destination
         }
+    }
+
+    /// If one arm ends in a raise or return, its nested guards can skip the
+    /// other arm without leaving a JUMP_FORWARD at the end of the first.
+    fn threaded_arm_join(&self, first: std::ops::Range<usize>, limit: usize) -> Option<usize> {
+        let mut join = None;
+        for block in self.flow.blocks_in(first.clone()) {
+            if self.flow.fallthrough(block) == Some(first.end) {
+                return None;
+            }
+            if let Some(target) = self.flow.jump(block.ops.end - 1)
+                && !first.contains(&target)
+            {
+                if target <= first.end || target > limit || join.is_some_and(|old| old != target) {
+                    return None;
+                }
+                join = Some(target);
+            }
+        }
+        join
     }
 
     pub(super) fn conditional_suites(
@@ -456,6 +477,26 @@ impl Body<'_, '_, '_> {
                     self.block(&format!("if {test}:"), &suite)?;
                     return Ok(end);
                 }
+            }
+        }
+        if fallthrough_end == target
+            && target < end
+            && self.stack.is_empty()
+            && matches!(
+                ops[tail].name,
+                "RAISE_VARARGS" | "RETURN_VALUE" | "RETURN_CONST"
+            )
+        {
+            self.charge(fallthrough_end - start)?;
+            if let Some(join) = self.threaded_arm_join(start..fallthrough_end, end) {
+                let enclosing = self.arm_exit.replace((fallthrough_end, join));
+                let suite = self.fragment(ops, start, fallthrough_end, level);
+                self.arm_exit = enclosing;
+                let suite = suite?.suite()?;
+                let other = self.fragment(ops, target, join, level)?.suite()?;
+                self.block(&format!("if {test}:"), &suite)?;
+                self.block("else:", &other)?;
+                return Ok(join);
             }
         }
         let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;

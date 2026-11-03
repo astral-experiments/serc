@@ -159,7 +159,12 @@ impl Body<'_, '_, '_> {
         if ops.get(handler + 1).is_some_and(|op| op.name == "POP_TOP") {
             let (_, cleanup) = super::dispatch::unwind(ops, &self.flow, handler, entry.depth + 1)
                 .ok_or("missing bare exception cleanup")?;
-            let stop = if ops[cleanup - 1].name == "RAISE_VARARGS" {
+            let stop = if ops[cleanup - 1].name == "RAISE_VARARGS"
+                && self
+                    .flow
+                    .handler(cleanup - 1)
+                    .is_some_and(|h| h.target == ops[cleanup].offset && h.lasti)
+            {
                 cleanup
             } else {
                 (handler + 2..cleanup)

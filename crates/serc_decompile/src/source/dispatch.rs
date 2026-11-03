@@ -99,6 +99,39 @@ impl Body<'_, '_, '_> {
             .then_some(*store)
     }
 
+    /// A value returned from an except suite stays on the stack while CPython
+    /// restores the active exception and clears the optional binding.
+    pub(super) fn handler_value_return(
+        &self,
+        ops: &[Instruction],
+        swap: usize,
+        end: usize,
+    ) -> Option<usize> {
+        let pop = swap + 1;
+        if self.stack.len() != 1 || ops[swap].arg != 2 || ops.get(pop)?.name != "POP_EXCEPT" {
+            return None;
+        }
+        let (outer, _) = unwind(ops, &self.flow, swap, 1)?;
+        let mut ret = pop + 1;
+        if ops.get(ret)?.name != "RETURN_VALUE" {
+            let h = self.flow.handler(swap.checked_sub(1)?)?;
+            let cleanup = ops.binary_search_by_key(&h.target, |op| op.offset).ok()?;
+            self.cleared_name(ops, cleanup)?;
+            if !h.lasti
+                || h.depth != outer.depth
+                || self.flow.handler(cleanup)?.target != outer.target
+                || !super::comparisons::same_instructions(
+                    ops.get(ret..ret + 3)?,
+                    &ops[cleanup..cleanup + 3],
+                )
+            {
+                return None;
+            }
+            ret += 3;
+        }
+        (ret < end && ops[ret].name == "RETURN_VALUE").then_some(ret)
+    }
+
     /// After dropping the iterator a return also restores the active exception
     /// and, for a bound handler, clears its name exactly as on unwind.
     pub(super) fn handler_constant_return(

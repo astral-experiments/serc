@@ -153,7 +153,16 @@ pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handle
             suite.try_exits = Some(copies);
             suite.next = dispatch;
         } else if unguarded && suite.handler_exits.is_none() {
-            return None;
+            // The linear handler walk ends at the first POP_EXCEPT. A
+            // computed return inside a conditional leaves another live arm.
+            let guarded_return = bc.ops[suite.handler.clone()]
+                .windows(2)
+                .any(|ops| (ops[0].name, ops[0].arg) == ("SWAP", 2) && ops[1].name == "POP_EXCEPT");
+            let exceptional_finally =
+                matches!(suite.clause, Clause::Finally { .. }) && suite.handler.start > dispatch;
+            if !guarded_return && !exceptional_finally {
+                return None;
+            }
         }
         if let Clause::Except { binding, .. } = suite.clause
             && bc.ops[binding].name != "POP_TOP"

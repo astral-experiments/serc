@@ -335,6 +335,7 @@ impl Body<'_, '_, '_> {
                 Ok(self.flow.block(i).ops.end)
             }
             "SWAP" | "POP_TOP" if let Some(next) = self.iterator_return(ops, i, end) => Ok(next),
+            "SWAP" if let Some(ret) = self.handler_value_return(ops, i, end) => Ok(ret),
             "SWAP" if super::comparisons::is_link(&ops[i..end]) => {
                 self.comparison_chain(ops, i, end, level, operand_start)
             }
