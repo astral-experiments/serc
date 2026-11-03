@@ -35,6 +35,37 @@ fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
 }
 
 #[test]
+fn nested_else_while_break_keeps_its_condition_location() {
+    let source = r"def scan(outer, ready, value):
+    if outer:
+        if ready:
+            pass
+        else:
+            while value:
+                consume(value)
+                break
+    else:
+        replace(value)
+    finish(value)
+
+def nested(outer, active, ready, value):
+    if outer:
+        if active:
+            if ready:
+                consume(value)
+            else:
+                while value:
+                    if done(value):
+                        break
+                    value = advance(value)
+        else:
+            replace(value)
+    finish(value)
+";
+    assert_matches_cpython(source, "nested_while_exit.py", &LEVELS);
+}
+
+#[test]
 fn nested_finally_guard_inherits_the_preceding_calls_handler() {
     let source = r"def run(group):
     try:
