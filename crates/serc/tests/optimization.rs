@@ -15,6 +15,17 @@ use serc::{
 };
 
 #[test]
+fn closure_cells_sort_by_their_mangled_names() {
+    let source = r"class Middle:
+    def factory(self):
+        __value = 1
+        _Zulu = 2
+        return lambda: (__value, _Zulu)
+";
+    assert_matches_cpython(source, "closure_cells.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
