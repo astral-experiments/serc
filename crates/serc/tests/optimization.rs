@@ -15,6 +15,23 @@ use serc::{
 };
 
 #[test]
+fn nested_guard_threads_through_the_join_after_a_raise() {
+    let source = r"def scan(items, first, second, value):
+    while items:
+        if first:
+            if second:
+                if not value:
+                    break
+            else:
+                raise ValueError(value)
+        elif not value:
+            pass
+        value = 1
+";
+    assert_matches_cpython(source, "raising_guard_join.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
