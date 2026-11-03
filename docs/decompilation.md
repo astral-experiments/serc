@@ -33,7 +33,10 @@ shared successors to combine short-circuit tests. When CPython gives several
 edges separate copies of a function's implicit `None` return, recovery can place
 a guard at function exit without introducing a shared return block. Loop
 recovery distinguishes exhaustion from explicit breaks, including when CPython
-copied the return after the loop into a break arm. A branch can also leave a
+copies a shared return into a break arm. In Ruff's `for_else_no_false_positive`
+fixture, the break arm discards the iterator and returns a local. The exhaustion
+path runs a second loop before returning the same local. Recovering the break
+keeps `result.items()` from being evaluated twice. A branch can also leave a
 loop by falling through after its last backward jump. More complex cyclic graphs
 and exception layouts can still be refused.
 
@@ -333,7 +336,7 @@ module to miss.
 
 An independent CFG check recompiled the 235 best-effort package modules on
 3.14.5 at all three optimization levels. It paired uniquely named functions
-whose recovered body had no marked gap. Of 2,771 such functions with a
+whose recovered body had no marked gap. Of 2,774 such functions with a
 conditional branch and no exception table, 20 had different normal edges at
 every level. Of 934 functions with an exception table in the original or a
 candidate, 144 had different normal edges and 199 had a different exception

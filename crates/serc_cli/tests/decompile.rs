@@ -512,6 +512,34 @@ assert result == [1, 1, 'b', ('b',), 'b', 2, ('c',), 3, ('d',), ('d',)]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_copied_local_return_skips_the_for_else_suite() {
+    check_fixture(
+        r"def visit(source, emit):
+    for key, value in source.items():
+        if value > 0:
+            break
+    else:
+        for key in source.keys():
+            emit(key)
+    return source
+",
+        r"result = []
+class Source(dict):
+    def items(self):
+        result.append('items')
+        return super().items()
+    def keys(self):
+        result.append('keys')
+        return super().keys()
+for values in [[], [('a', 1)], [('a', 0), ('b', 1)], [('a', 0), ('b', -1)]]:
+    obj = Source(values)
+    assert visit(obj, result.append) is obj
+assert result == ['items', 'keys', 'items', 'items', 'items', 'keys', 'a', 'b']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn an_early_return_cleans_up_the_iterator_after_evaluating_its_value() {
     check_fixture(
         r"def ready(items, accept):
