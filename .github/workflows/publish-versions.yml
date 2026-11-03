@@ -37,8 +37,8 @@ jobs:
         id: token
         uses: astral-sh/github-actions/simple-token-service@eb81cf4d13127c3f9539f621c17e4c65327636c8
         with:
-          exchange-url: ${{ secrets.RELEASES_STS_API_URL }}/exchange
-          audience: ${{ secrets.RELEASES_STS_API_URL }}
+          exchange-url: ${{ secrets.ASTRAL_SH_RELEASES_STS_API_URL }}/exchange
+          audience: ${{ secrets.ASTRAL_SH_RELEASES_STS_API_URL }}
           repository: astral-sh/versions
           permissions: |
             contents: write

@@ -52,10 +52,15 @@ or deployment protection rules.
    `astral.sh/serc/VERSION/install.{sh,ps1}`, must redirect to
    `https://releases.astral.sh/github/serc/releases/download/VERSION/serc-installer.{sh,ps1}`.
 
-3. Serc's GitHub release job uses its built-in `GITHUB_TOKEN` with
-   `contents: write` to tag the commit that produced the artifacts.
-4. Configure `RELEASES_STS_API_URL` in the `release` environment with the
-   release broker's base URL and grant `astral-releases-bot` access to
+3. Grant `astral-experiments-releases-bot` access to Serc and configure
+   `RELEASES_STS_API_URL` in the `release` environment with the
+   experiments releases broker's base URL. Serc's
+   `.github/secure-token-service-release.json` permits `release.yml` on `main`
+   to request `contents: write` and `workflows: write`. The latter allows
+   tagging the selected commit even if `main` advances across workflow
+   changes while artifacts are building.
+4. Set `ASTRAL_SH_RELEASES_STS_API_URL` in the `release` environment to the
+   `astral-sh` releases broker's base URL. Grant `astral-releases-bot` access to
    [`astral-sh/versions`](https://github.com/astral-sh/versions/blob/main/.github/secure-token-service-release.json)
    to publish version metadata. Its policy must identify Serc by repository ID
    `1385584662`, owner ID `330068706`, and its immutable OIDC subject. It
