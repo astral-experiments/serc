@@ -35576,7 +35576,7 @@ impl<'source> Compiler<'source> {
                 // CFG pass resolves sole donors and keeps shared loop/branch exits unlocated.
                 // A loop's initial false jump and footer fallthrough are distinct predecessors.
                 if (self.context.python_version <= crate::PythonVersion::Py313
-                    && self.assembler.at_jump_target())
+                    && self.assembler.at_handler_cleanup_jump_target(body_start, body_end))
                     || handler_cleanup_from_original_join
                     || copied_while_break_return
                     || named_while_at_enclosing_loop_tail
