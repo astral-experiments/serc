@@ -13619,6 +13619,29 @@ def collect_direct(items, active, fallback):
 }
 
 #[test]
+fn copied_handler_backedges_leave_the_enclosing_loop_body_try() {
+    let source = r"def scan(items, active):
+    for item in items:
+        try:
+            try:
+                visit(item)
+            except ValueError:
+                if active:
+                    recover()
+                else:
+                    yield item
+        except KeyError:
+            pass
+";
+    assert_matches_cpython_versions(
+        source,
+        "handler_backedge_unwind.py",
+        &LEVELS,
+        &[PythonVersion::Py314, PythonVersion::Py315],
+    );
+}
+
+#[test]
 fn copied_loop_handler_cleanup_uses_each_conditional_predecessor() {
     for header in ["for item in items:", "while active:"] {
         let source = format!(
