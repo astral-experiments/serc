@@ -3136,6 +3136,73 @@ result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is 
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_nested_try_else_rejoins_the_outer_exception_handler() {
+    check_fixture(
+        r"def probe(work, record):
+    try:
+        work(0)
+    except KeyError:
+        record('caught')
+        try:
+            work(1)
+        except LookupError:
+            pass
+        else:
+            work(2)
+        record('joined')
+        raise TypeError() from None
+    return 7
+",
+        r"import sys
+result = []
+for outcomes in ([], [KeyError], [KeyError, IndexError], [KeyError, ValueError], [KeyError, None, IndexError]):
+    def record(tag):
+        exc = sys.exception()
+        result.append((tag, type(exc).__name__))
+    def work(i):
+        record(i)
+        if i < len(outcomes) and outcomes[i]: raise outcomes[i]()
+    try: result.append(probe(work, record))
+    except Exception as exc: result.append((type(exc).__name__, type(exc.__context__).__name__))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn guarded_handler_exits_restore_a_bound_exception_in_each_dispatch_arm() {
+    check_fixture(
+        r"def handle(work, record, notify):
+    try:
+        work()
+    except BlockingIOError:
+        pass
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        record(exc)
+        if notify:
+            record(exc)
+    else:
+        record(None)
+",
+        r"import sys
+result = []
+def record(exc):
+    result.append((getattr(exc, 'args', ()), exc is sys.exception()))
+for kind in (None, BlockingIOError, KeyboardInterrupt, ValueError):
+    def work():
+        if kind: raise kind('work')
+    for notify in (False, True):
+        try: handle(work, record, notify)
+        except KeyboardInterrupt: result.append('interrupted')
+        record(None)
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn nested_except_returns_restore_the_active_exceptions_in_order() {
     for fallback in ["False", "read(2)"] {
         let source = format!(

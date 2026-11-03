@@ -45,13 +45,18 @@ pub(super) struct Protected {
 /// enter any copy at its first instruction, including past the lifted suite.
 #[derive(Clone, Copy)]
 pub(super) struct ExitCopies {
-    first: usize,
+    pub(super) first: usize,
     end: usize,
     width: usize,
 }
 
 impl ExitCopies {
-    fn suffix(ops: &[Instruction], flow: &Graph, body: Range<usize>, width: usize) -> Option<Self> {
+    pub(super) fn suffix(
+        ops: &[Instruction],
+        flow: &Graph,
+        body: Range<usize>,
+        width: usize,
+    ) -> Option<Self> {
         let mut first = body.end.checked_sub(width)?;
         if first < body.start {
             return None;
@@ -271,6 +276,7 @@ fn region(
     // that edge comes from POP_EXCEPT in the handler. Include RETURN_VALUE
     // in the try suite before resuming at the jump target.
     let after_cleanup = cleanup + 3;
+    let mut success = end..end;
     let (end, mut next) = match ops.get(end..dispatch)? {
         [swap, pop, ret]
             if (swap.name, swap.arg) == ("SWAP", 2)
@@ -284,7 +290,14 @@ fn region(
             // The value was evaluated with that exception still active.
             (dispatch, dispatch)
         }
-        [jump] if jump.name == "JUMP_FORWARD" && flow.jump(end) == Some(after_cleanup) => {
+        [.., jump]
+            if jump.name == "JUMP_FORWARD"
+                && flow.jump(dispatch - 1) == Some(after_cleanup)
+                && (end + 1 == dispatch || flow.block(end).ops == (end..dispatch)) =>
+        {
+            // A straight-line else runs outside the inner protection. Both
+            // the successful try and a handled exception skip the unwind.
+            success = end..dispatch - 1;
             (end, after_cleanup)
         }
         [ret]
@@ -306,7 +319,6 @@ fn region(
         _ => None,
     }
     .filter(|&i| i < start && flow.for_iter_depth(i) == Some(first.depth));
-    let mut success = next..next;
     let mut handler_tail = None;
     let mut handler_exits = None;
     let handler = match ops.get(body..stop)? {
@@ -634,7 +646,7 @@ impl Body<'_, '_, '_> {
             .then_some(child.next)
     }
 
-    fn protected_fragment(
+    pub(super) fn protected_fragment(
         &mut self,
         ops: &[Instruction],
         body: Range<usize>,
