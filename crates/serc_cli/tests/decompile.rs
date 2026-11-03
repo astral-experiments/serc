@@ -556,6 +556,43 @@ assert all(nested(x, y) is None for x in (True, False) for y in (True, False))",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_copied_binary_return_preserves_the_live_left_operand() {
+    check_fixture(
+        "def add(left, guard):\n    return left() + (4 if guard() else 0)\n",
+        r"result = []
+def left():
+    result.append('left')
+    return 8
+def guard(value):
+    result.append('guard')
+    return value
+assert add(left, lambda: guard(False)) == 8
+assert add(left, lambda: guard(True)) == 12
+assert result == ['left', 'guard'] * 2",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_guards_keep_their_implicit_return_blocks() {
+    check_fixture(
+        r"def rotate(default, exists, emit):
+    if default:
+        if exists:
+            emit('default')
+    else:
+        emit('custom')
+",
+        r"result = []
+for default in (False, True):
+    for exists in (False, True):
+        rotate(default, exists, result.append)
+assert result == ['custom', 'custom', 'default']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_copied_local_return_skips_the_for_else_suite() {
     check_fixture(
         r"def visit(source, emit):

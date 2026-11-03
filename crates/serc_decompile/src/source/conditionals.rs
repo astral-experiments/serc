@@ -250,6 +250,26 @@ impl Body<'_, '_, '_> {
             return self.finally_break(ops, predicate, handler, level, end);
         }
         let test = predicate.test(true);
+        // A binary expression's left operand is already on the stack. When
+        // CPython copies the final operation and return into both arms, join
+        // the right operands so the left operand still runs before the test.
+        if !self.stack.is_empty()
+            && fallthrough_end >= start + 3
+            && end >= target + 3
+            && ops[end - 2].name == "BINARY_OP"
+            && ops[end - 1].name == "RETURN_VALUE"
+            && super::comparisons::same_instructions(
+                &ops[fallthrough_end - 2..fallthrough_end],
+                &ops[end - 2..end],
+            )
+        {
+            let yes = self
+                .fragment(ops, start, fallthrough_end - 2, level)?
+                .expression()?;
+            let no = self.fragment(ops, target, end - 2, level)?.expression()?;
+            self.push(format!("({yes} if {test} else {no})"))?;
+            return Ok(end - 2);
+        }
         if self.loop_transfer(ops, tail).is_some() {
             let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
             self.block(&format!("if {test}:"), &suite)?;
@@ -415,7 +435,22 @@ impl Body<'_, '_, '_> {
                     if !right.is_empty() {
                         self.block("else:", &right)?;
                     }
-                    self.line(&format!("return {a}"))?;
+                    // A nested guard can target a block containing only its
+                    // implicit None return. An explicit return after the outer
+                    // else would merge that exit with its sibling.
+                    let implicit = end == ops.len()
+                        && level == 0
+                        && a == "None"
+                        && self.none_return(&ops[self.flow.block(tail).ops.clone()])
+                        && super::regions::constant_return(ops, end).is_some_and(|(at, _)| {
+                            at > target
+                                && self.instruction_lines(ops).is_ok_and(|lines| {
+                                    lines[at].is_some() && lines[at] == lines[at - 1]
+                                })
+                        });
+                    if !implicit {
+                        self.line(&format!("return {a}"))?;
+                    }
                     return Ok(end);
                 }
                 // A bare constant return exits the function. The remaining
