@@ -2148,6 +2148,17 @@ impl Assembler {
         self.at_jump_target_matching(is_unconditional_jump)
     }
 
+    /// The handler's private range boundaries cannot receive jumps. Only a label emitted
+    /// by the handler body can make its cleanup a jump target.
+    pub(crate) fn at_handler_cleanup_jump_target(
+        &self,
+        body_start: Label,
+        body_end: Label,
+    ) -> bool {
+        trailing_labels(self.linear_items()).any(|label| label != body_start && label != body_end)
+            && self.at_jump_target()
+    }
+
     fn at_jump_target_matching(&self, matches_opcode: impl Fn(Opcode) -> bool) -> bool {
         let items = self.linear_items();
         let trailing = items
@@ -8463,10 +8474,11 @@ impl Assembler {
         if self.python_version != crate::PythonVersion::Py313 {
             return;
         }
+        // The compiler marks this boundary once, beside the POP_BLOCK it just lowered.
         let index = self
             .linear_items()
             .iter()
-            .position(|item| *item == Item::Label(boundary))
+            .rposition(|item| *item == Item::Label(boundary))
             .expect("normal POP_BLOCK boundary is emitted");
         let materialized = self.linear_items()[index + 1..]
             .iter()
