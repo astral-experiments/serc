@@ -93,6 +93,42 @@ mod tests {
     }
 
     #[test]
+    fn load_packing_keeps_handler_flow_but_fails_strict_verification() {
+        let source = "def guard(a, b, c, d, e, f):\n    try:\n        use(a, b, c,\n            d, e, f)\n    except OSError:\n        raise\n";
+        for python_version in [
+            PythonVersion::Py313,
+            PythonVersion::Py314,
+            PythonVersion::Py315,
+        ] {
+            let options = CompileOptions {
+                python_version,
+                ..CompileOptions::default()
+            };
+            let cache = compile_with_options(source, "packing.py", &options)
+                .unwrap()
+                .to_timestamp_pyc(0, 0);
+            let output = decompile_pyc_with_mode(&cache, DecompileMode::BestEffort).unwrap();
+            assert!(
+                output.source.contains("use(a, b, c, d, e, f)"),
+                "{}",
+                output.source
+            );
+            assert!(output.verification_error.is_some());
+            assert!(output.source.contains("# strict verification:"));
+            assert!(
+                !output.source.contains("see original blocks"),
+                "{}",
+                output.source
+            );
+            assert!(!output.source.contains("# serc: original blocks"));
+            assert!(matches!(
+                decompile_pyc_with_mode(&cache, DecompileMode::Strict),
+                Err(DecompileError::Verify(..))
+            ));
+        }
+    }
+
+    #[test]
     fn normal_flow_warnings_require_different_edges_at_every_level() {
         let original = "def route(a, b):\n    if a and b: work()\n    return a + 1\n";
         let cache = |source: &str| {
