@@ -73,6 +73,34 @@ fn reraising_cleanup_leaves_one_iterator_discard_predecessor() {
 }
 
 #[test]
+fn post_finally_call_guards_keep_slots_across_a_removed_jump() {
+    for condition in [
+        "str(value).startswith('a')",
+        "obj.check(value, other, flag=isinstance(extra, Kind))",
+        "obj.check(other)",
+    ] {
+        let source = format!(
+            "async def run(obj, value, other, extra, ready):
+    try:
+        work()
+    finally:
+        if ready:
+            finish()
+    if not {condition}:
+        return value
+    return False
+"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "post_finally_call.py",
+            &LEVELS,
+            &[PythonVersion::Py314],
+        );
+    }
+}
+
+#[test]
 fn post_try_fusion_survives_the_removed_fallthrough_jump() {
     let source = r"import checks
 
