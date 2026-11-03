@@ -22933,6 +22933,19 @@ fn elided_non_ascii_identifier_preserves_discarded_builders() {
 }
 
 #[test]
+fn conditional_match_exit_uses_the_original_final_tuple_store() {
+    for (targets, values) in [
+        ("first, last", "get(), (value,)"),
+        ("first, middle, last", "get(), (value,), get()"),
+    ] {
+        let source = format!(
+            "def sample(value, flag):\n    match value:\n        case Color.red:\n            if flag:\n                {targets} = {values}\n    return process(first, last)\n"
+        );
+        assert_matches_cpython(&source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
 fn swapped_tuple_stores_keep_the_original_loop_backedge_column() {
     // High local indexes keep the two stores separate through superinstruction fusion.
     let mut extra = String::new();
