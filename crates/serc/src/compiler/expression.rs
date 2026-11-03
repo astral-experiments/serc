@@ -4410,8 +4410,10 @@ impl Compiler<'_> {
                     hidden_owner_slots +=
                         folded_constant_owner_slots(default, self.context.python_version);
                 }
-                let operand_folds =
-                    self.record_folded_collection_operands(positional_defaults.iter().copied())?;
+                let operand_folds = self.record_folded_collection_operands(
+                    positional_defaults.iter().copied(),
+                    Some(&defaults),
+                )?;
                 self.assembler
                     .set_location(self.source_location(lambda.range));
                 self.emit_deferred_constant(Constant::Tuple(defaults))?;
@@ -7586,7 +7588,8 @@ impl Compiler<'_> {
                     .map(|element| self.source_aware_fold_constant(element))
                     .collect::<Option<Vec<_>>>()
             {
-                let operand_folds = self.record_folded_collection_operands(elements.iter())?;
+                let operand_folds =
+                    self.record_folded_collection_operands(elements.iter(), Some(&constants))?;
                 for element in elements {
                     self.emit_folded_tuple_not_nops(element)?;
                 }
@@ -7616,7 +7619,8 @@ impl Compiler<'_> {
                     .map(|element| self.source_aware_fold_constant(element))
                     .collect::<Option<Vec<_>>>()
             {
-                let operand_folds = self.record_folded_collection_operands(elements.iter())?;
+                let operand_folds =
+                    self.record_folded_collection_operands(elements.iter(), Some(&constants))?;
                 for element in elements {
                     self.emit_folded_tuple_not_nops(element)?;
                 }
@@ -7704,8 +7708,10 @@ impl Compiler<'_> {
                 .map(|element| self.source_aware_fold_constant(element))
                 .collect::<Option<Vec<_>>>()
         {
-            let operand_folds =
-                self.record_folded_collection_operands(elements[..unpacking_start].iter())?;
+            let operand_folds = self.record_folded_collection_operands(
+                elements[..unpacking_start].iter(),
+                Some(&constants),
+            )?;
             for element in &elements[..unpacking_start] {
                 self.emit_folded_tuple_not_nops(element)?;
             }
@@ -7787,7 +7793,8 @@ impl Compiler<'_> {
                         .map(|element| self.source_aware_fold_constant(element))
                         .collect::<Option<Vec<_>>>()
                 {
-                    let operand_folds = self.record_folded_collection_operands(list.elts.iter())?;
+                    let operand_folds =
+                        self.record_folded_collection_operands(list.elts.iter(), Some(&constants))?;
                     for element in &list.elts {
                         self.emit_folded_tuple_not_nops(element)?;
                     }
@@ -7827,7 +7834,8 @@ impl Compiler<'_> {
                         .iter()
                         .all(|element| self.source_aware_fold_constant(element).is_some()) =>
             {
-                let operand_folds = self.record_folded_collection_operands(set.elts.iter())?;
+                let operand_folds =
+                    self.record_folded_collection_operands(set.elts.iter(), None)?;
                 let constants = set
                     .elts
                     .iter()
