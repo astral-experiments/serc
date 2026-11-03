@@ -3,6 +3,39 @@
 //! and the handler's saved exception from the loop's own stack slots.
 use super::{Body, ExitCopies, FxHashSet, Graph, Instruction, Range};
 
+/// A handled exception retries the entire try, while success breaks out of
+/// the loop. Older targets put the retry jump just after the dispatcher.
+pub(super) fn retry_break(
+    ops: &[Instruction],
+    flow: &Graph,
+    suite: Range<usize>,
+    dest: usize,
+    after_cleanup: usize,
+) -> Option<usize> {
+    let header = if dest == after_cleanup && ops[dest].name == "JUMP_BACKWARD" {
+        flow.jump(dest)?
+    } else {
+        dest
+    };
+    if header >= suite.start || !ops[header..suite.start].iter().all(|op| op.name == "NOP") {
+        return None;
+    }
+    let end = suite.end;
+    if flow.blocks_covering(suite.clone()).any(|b| {
+        [flow.jump(b.ops.end - 1), flow.fallthrough(b)]
+            .into_iter()
+            .flatten()
+            .any(|to| !(suite.start..=end).contains(&to))
+    }) {
+        return None;
+    }
+    match ops[end].name {
+        "NOP" => Some(end + 1),
+        "JUMP_FORWARD" => flow.jump(end).filter(|&to| to >= after_cleanup && to > end),
+        _ => None,
+    }
+}
+
 /// The last guard of a try may skip to another copy of the while latch.
 pub(super) fn copied_latch(
     ops: &[Instruction],

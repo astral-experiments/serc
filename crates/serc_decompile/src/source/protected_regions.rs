@@ -33,6 +33,7 @@ enum Clause {
         success: Range<usize>,
         following: Vec<super::dispatch::Arm>,
         finalizer: Option<Range<usize>>,
+        retry: bool,
     },
     Finally {
         deferred_return: Range<usize>,
@@ -449,6 +450,7 @@ fn region(
             arm.fall_out_of_parent();
         }
     }
+    let mut retry = false;
     let mut handler_tail = None;
     let mut handler_exits = None;
     let handler = match ops.get(body..stop)? {
@@ -491,7 +493,15 @@ fn region(
                 && to < start
                 && flow.jump(next) == Some(to)
                 && flow.block(to).height == Some(first.depth);
-            if to != next
+            if following.is_empty()
+                && next == end
+                && success.is_empty()
+                && let Some(after_break) =
+                    loop_exits::retry_break(ops, flow, start..end, to, after_cleanup)
+            {
+                retry = true;
+                next = after_break;
+            } else if to != next
                 && Some(to) != for_header
                 && !shared_latch
                 && parent.is_none_or(|parent| parent.exit(owner, ops, to).is_none())
@@ -606,6 +616,7 @@ fn region(
                 success,
                 following,
                 finalizer: None,
+                retry,
             },
             try_exits,
             handler_exits,
@@ -876,6 +887,11 @@ impl Body<'_, '_, '_> {
         } else {
             handler.suite()?
         };
+        let retry = matches!(entry.clause, Clause::Except { retry: true, .. });
+        let try_start = self.lines.len();
+        if retry {
+            suite.push_str("break\n");
+        }
         self.try_block(&suite, start > 0 && ops[start - 1].name != "NOP")?;
         self.block(&header, &handler)?;
         if let Clause::Except {
@@ -900,6 +916,10 @@ impl Body<'_, '_, '_> {
                     .suite()?;
                 self.block("finally:", &suite)?;
             }
+        }
+        if retry {
+            let body = self.lines.split_off(try_start);
+            self.block("while True:", &body)?;
         }
         if terminal_unwind.is_some() && entry.next > entry.end && (level > 0 || next < limit) {
             self.line("return")?;

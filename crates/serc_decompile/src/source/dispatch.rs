@@ -299,6 +299,74 @@ impl Body<'_, '_, '_> {
                 });
             }
         }
+        // CPython can copy the same continuation after POP_EXCEPT and the
+        // binding cleanup of one or more arms. Restore its execution with
+        // the caller's exception active, including on the successful try.
+        let copied_tail = |tail: &Range<usize>| {
+            if tail.is_empty()
+                || super::regions::constant_return(ops, tail.end)
+                    .is_some_and(|(load, _)| load == tail.start)
+                || ops[tail.clone()].iter().any(|op| op.jump.is_some())
+                || self
+                    .flow
+                    .blocks_covering(tail.clone())
+                    .any(|b| self.flow.handler(b.ops.start).is_some())
+            {
+                return None;
+            }
+            // The whole successful exit can have a different physical width
+            // when CPython borrows or packs neighboring local loads.
+            [
+                handler.checked_sub(tail.len()),
+                Some(join.unwrap_or(success)),
+            ]
+            .into_iter()
+            .flatten()
+            .find(|&at| {
+                at >= success
+                    && at < handler
+                    && self
+                        .flow
+                        .blocks_covering(at..handler)
+                        .all(|b| self.flow.handler(b.ops.start).is_none())
+                    && self.finally_copy_end(
+                        ops,
+                        at..handler,
+                        tail.clone(),
+                        super::finalizers::CopyExit::Fallthrough,
+                    ) == Some(handler)
+            })
+        };
+        if let Some(at) = arms.iter().find_map(|arm| match &arm.exit {
+            Exit::Return(tail) => copied_tail(tail),
+            _ => None,
+        }) && join.is_none_or(|join| join == at)
+        {
+            for arm in &mut arms {
+                if let Exit::Return(tail) = &arm.exit
+                    && copied_tail(tail) == Some(at)
+                {
+                    arm.exit = Exit::Jump(at);
+                }
+            }
+            // An explicit return after the last statement creates its own
+            // block on newer targets and can prevent copying this exit.
+            let end = super::regions::constant_return(ops, handler)
+                .filter(|(load, _)| {
+                    *load > at
+                        && self.none_return(&ops[*load..handler])
+                        && self.instruction_lines(ops).is_ok_and(|lines| {
+                            lines[*load].is_some() && lines[*load] == lines[*load - 1]
+                        })
+                })
+                .map_or(handler, |(load, _)| load);
+            return Some(Dispatch {
+                arms,
+                success: success..at,
+                continuation: at..end,
+                retry: false,
+            });
+        }
         let mut join = join.unwrap_or(handler);
         let mut continuation = join..handler;
         if let [arm] = arms.as_mut_slice() {

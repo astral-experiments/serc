@@ -2674,6 +2674,42 @@ assert result == [1, 2, 42]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn shared_straight_line_code_runs_after_the_exception_is_restored() {
+    check_fixture(
+        r"def handle(work, record, finish):
+    try:
+        work()
+    except TypeError:
+        raise
+    except LookupError as error:
+        record(error)
+    return finish()
+",
+        r"import sys
+result = []
+def run(failure):
+    def work():
+        if failure:
+            raise failure
+    def record(error):
+        assert sys.exception() is error
+        result.append(type(error).__name__)
+    def finish():
+        result.append(type(sys.exception()).__name__)
+        return 42
+    return handle(work, record, finish)
+try:
+    raise ValueError()
+except ValueError:
+    assert run(None) == run(KeyError()) == 42
+    try: run(TypeError())
+    except TypeError: result.append('raised')
+assert result == ['ValueError', 'KeyError', 'ValueError', 'raised']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn cancellation_reaches_the_handler_after_either_finalizer_copy() {
     check_fixture(
         r"async def acquire(wait, release, wake):
@@ -2757,6 +2793,40 @@ assert asyncio.run(run(value, None)) is value
 assert events == [('clear', None), ('close', key), ('clear', key),
                   ('close', key), ('clear', value), ('clear', value)]
 result = [name for name, error in events]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn an_out_of_line_handler_retries_until_the_await_succeeds() {
+    check_fixture(
+        r"async def run(acquire, events):
+    error = None
+    while True:
+        try:
+            await acquire()
+            break
+        except LookupError as exc:
+            error = exc
+    events.append(error)
+    return True
+",
+        r"import asyncio
+result = []
+async def exercise(errors):
+    async def acquire():
+        await asyncio.sleep(0)
+        error = next(errors)
+        if error is not None:
+            raise error
+    return await run(acquire, result)
+first, last = KeyError(), IndexError()
+assert asyncio.run(exercise(iter([first, last, None]))) is True
+assert asyncio.run(exercise(iter([None]))) is True
+try: asyncio.run(exercise(iter([ValueError()])))
+except ValueError: pass
+assert result == [last, None]
+result = [type(error).__name__ for error in result]",
     );
 }
 
