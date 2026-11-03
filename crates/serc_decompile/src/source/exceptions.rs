@@ -3,7 +3,7 @@
 use super::conditionals::Predicate;
 use super::{Body, Bytecode, Instruction, Value};
 use serc_bytecode::instructions::Handler;
-use serc_bytecode::target::operands::SpecialMethod;
+use serc_bytecode::target::operands::{SpecialMethod, UnaryIntrinsic};
 
 fn boundary(ops: &[Instruction], offset: usize) -> Result<usize, String> {
     ops.binary_search_by_key(&offset, |op| op.offset)
@@ -19,7 +19,7 @@ fn is_manager_handler(ops: &[Instruction], entry: &Handler) -> Result<bool, Stri
 }
 
 /// Locate the implicit manager protocol immediately before a protected binding.
-pub(super) fn manager_entry(ops: &[Instruction], asynchronous: bool) -> Result<usize, String> {
+fn manager_entry(ops: &[Instruction], asynchronous: bool) -> Result<usize, String> {
     let (before_with, enter_method, exit_method) = if asynchronous {
         (
             "BEFORE_ASYNC_WITH",
@@ -368,7 +368,7 @@ impl Body<'_, '_, '_> {
         Ok(next)
     }
 
-    pub(super) fn manager_item(
+    fn manager_item(
         &mut self,
         manager: String,
         ops: &[Instruction],
@@ -386,17 +386,17 @@ impl Body<'_, '_, '_> {
         ))
     }
 
-    fn with_statement(
+    pub(super) fn with_statement(
         &mut self,
         bc: &Bytecode,
         handlers: &[Handler],
         limit: usize,
     ) -> Result<(), String> {
         let ops = &bc.ops;
-        let mut ranges = handlers.iter().peekable();
+        let mut ranges = handlers.iter();
         let mut cursor = 0;
-        let mut normal_end = limit;
-        let depth = handlers[0].depth;
+        let mut normal_end = self.flow.normal_end([0]).min(limit);
+        let mut depth = None;
         while cursor < normal_end {
             // Skip ranges that resume outer protection during the previous
             // group's cleanup. Only a subsequent independent manager at the
@@ -404,11 +404,24 @@ impl Body<'_, '_, '_> {
             let Some(entry) = ranges.find(|range| range.start >= ops[cursor].offset) else {
                 break;
             };
-            if entry.depth != depth
-                || !entry.lasti
-                || boundary(ops, entry.start)? >= normal_end
-                || !is_manager_handler(ops, entry)?
-            {
+            if boundary(ops, entry.start)? >= normal_end {
+                break;
+            }
+            if !entry.lasti || !is_manager_handler(ops, entry)? {
+                let target = boundary(ops, entry.target)?;
+                if self.suspended()
+                    && (ops[target].name == "CLEANUP_THROW"
+                        || (ops[target].name, ops[target].arg)
+                            == (
+                                "CALL_INTRINSIC_1",
+                                UnaryIntrinsic::STOPITERATION_ERROR.argument(),
+                            ))
+                {
+                    continue;
+                }
+                break;
+            }
+            if *depth.get_or_insert(entry.depth) != entry.depth {
                 break;
             }
             if let Some(next) =
@@ -439,7 +452,15 @@ impl Body<'_, '_, '_> {
         entry: &Handler,
     ) -> Result<usize, String> {
         let handler = boundary(ops, entry.target)?;
-        let branch = self.flow.block(handler).ops.end - 1;
+        let test = if ops
+            .get(handler + 2)
+            .is_some_and(|op| op.name == "GET_AWAITABLE")
+        {
+            self.manager_await_end(ops, handler + 2)?
+        } else {
+            handler
+        };
+        let branch = self.flow.block(test).ops.end - 1;
         if ops[branch].name != "POP_JUMP_IF_TRUE" {
             return Err("unsupported with suppression test".into());
         }
@@ -469,6 +490,20 @@ impl Body<'_, '_, '_> {
         }
     }
 
+    fn manager_await_end(&self, ops: &[Instruction], at: usize) -> Result<usize, String> {
+        if ops
+            .get(at)
+            .is_none_or(|op| (op.name, op.arg) != ("GET_AWAITABLE", 2))
+        {
+            return Err("missing awaited manager exit".into());
+        }
+        let send = at + 2 + usize::from(ops.get(at + 1).is_some_and(|op| op.name == "PUSH_NULL"));
+        self.flow
+            .jump(send)
+            .filter(|&end| ops[send].name == "SEND" && end > send && ops[end].name == "END_SEND")
+            .ok_or_else(|| "unsupported awaited manager exit".into())
+    }
+
     /// Recover one with statement, including adjacent items in its header.
     /// Return the normal continuation, or None for a return through the managers.
     fn manager_group<'a>(
@@ -476,21 +511,52 @@ impl Body<'_, '_, '_> {
         ops: &[Instruction],
         cursor: usize,
         mut entry: &'a Handler,
-        ranges: &mut std::iter::Peekable<std::slice::Iter<'a, Handler>>,
+        ranges: &mut std::slice::Iter<'a, Handler>,
         normal_end: &mut usize,
     ) -> Result<Option<usize>, String> {
+        let awaited = |entry: &Handler| -> Result<bool, String> {
+            let handler = boundary(ops, entry.target)?;
+            Ok(ops
+                .get(handler + 2)
+                .is_some_and(|op| (op.name, op.arg) == ("GET_AWAITABLE", 2)))
+        };
+        let asynchronous = awaited(entry)?;
         let mut managers = Vec::new();
         let mut previous_body = None;
         let mut seed = Vec::new();
         let (start, end) = loop {
             let start = boundary(ops, entry.start)?;
-            let end = boundary(ops, entry.end)?;
+            // A delegated yield briefly transfers protection to CLEANUP_THROW.
+            // Its resume belongs to the same manager at the same stack depth.
+            let mut end_offset = entry.end;
+            while let [suspend, resume, ..] = ranges.as_slice()
+                && suspend.start == end_offset
+                && suspend.end == resume.start
+                && (resume.target, resume.depth, resume.lasti)
+                    == (entry.target, entry.depth, entry.lasti)
+                && ops[boundary(ops, suspend.start)?].name == "YIELD_VALUE"
+                && ops[boundary(ops, suspend.target)?].name == "CLEANUP_THROW"
+            {
+                end_offset = resume.end;
+                ranges.nth(1);
+            }
+            let end = boundary(ops, end_offset)?;
             let handler = boundary(ops, entry.target)?;
             *normal_end = (*normal_end).min(handler);
             if start >= end || end > *normal_end {
                 return Err("unsupported manager layout".into());
             }
-            let enter = manager_entry(&ops[..start], false)?;
+            let before = previous_body.unwrap_or(cursor);
+            let protocol_end = if asynchronous {
+                before
+                    + ops[before..start]
+                        .iter()
+                        .rposition(|op| (op.name, op.arg) == ("GET_AWAITABLE", 1))
+                        .ok_or("missing awaited manager entry")?
+            } else {
+                start
+            };
+            let enter = before + manager_entry(&ops[before..protocol_end], asynchronous)?;
             let manager = if let Some(previous) = previous_body {
                 self.seeded(ops, previous, enter, 0, std::mem::take(&mut seed))?
                     .expression()?
@@ -504,11 +570,12 @@ impl Body<'_, '_, '_> {
 
             // Each additional item starts where the enclosing protected range
             // ends. The enclosing handler resumes protection during inner cleanup.
-            if let Some(&inner) = ranges.peek()
-                && inner.start == entry.end
+            if let Some(inner) = ranges.as_slice().first()
+                && inner.start == end_offset
                 && inner.depth > entry.depth
                 && inner.lasti
                 && is_manager_handler(ops, inner)?
+                && awaited(inner)? == asynchronous
             {
                 ranges.next();
                 previous_body = Some(body_start);
@@ -518,7 +585,8 @@ impl Body<'_, '_, '_> {
             }
         };
         let (body, returns) = self.seeded(ops, start, end, 0, seed)?.pending_return()?;
-        self.block(&format!("with {}:", managers.join(", ")), &body)?;
+        let header = if asynchronous { "async with" } else { "with" };
+        self.block(&format!("{header} {}:", managers.join(", ")), &body)?;
 
         let mut next = end;
         for _ in &managers {
@@ -527,6 +595,11 @@ impl Body<'_, '_, '_> {
                 .position(|op| op.name == "CALL")
                 .map(|n| next + n)
                 .ok_or("unsupported manager exit")?;
+            let exit = if asynchronous {
+                self.manager_await_end(ops, exit + 1)?
+            } else {
+                exit
+            };
             if exit + 1 >= *normal_end || ops[exit + 1].name != "POP_TOP" {
                 return Err("unsupported manager result".into());
             }

@@ -1516,6 +1516,56 @@ fn unpacking_comprehensions_use_the_target_iteration_order() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn nested_managers_suspend_and_resume_after_suppression() {
+    check_fixture(
+        r"def paused(first, second):
+    with first as a, second as b:
+        yield a, b
+    yield 'after'
+
+async def run(first, second, read):
+    async with first as a, second as b:
+        return await read(a, b)
+    return 'suppressed'
+",
+        r"import asyncio
+from contextlib import contextmanager, asynccontextmanager
+log = []
+@contextmanager
+def manager(name, suppress):
+    log.append(('enter', name))
+    try:
+        yield name
+    except ValueError:
+        log.append(('caught', name))
+        if not suppress: raise
+    finally:
+        log.append(('exit', name))
+@asynccontextmanager
+async def delayed(name, suppress):
+    await asyncio.sleep(0)
+    with manager(name, suppress) as value:
+        yield value
+    await asyncio.sleep(0)
+for outer, inner in [(True, False), (False, True), (False, False)]:
+    it = paused(manager('a', outer), manager('b', inner))
+    log.append(next(it))
+    try: log.append(it.throw(ValueError()))
+    except ValueError: log.append('raised')
+    it.close()
+    for fail in [False, True]:
+        async def read(a, b):
+            await asyncio.sleep(0)
+            if fail: raise ValueError()
+            return a, b
+        try: log.append(asyncio.run(run(delayed('a', outer), delayed('b', inner), read)))
+        except ValueError: log.append('raised')
+result = log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn consecutive_managers_keep_separate_exception_paths() {
     check_fixture(
         "def run(manager, emit):\n    with manager(1) as a, manager(2) as b:\n        emit(a, b)\n    emit('between')\n    with manager(3) as c:\n        emit(c)\n    emit('done')\n    return 17\n",
