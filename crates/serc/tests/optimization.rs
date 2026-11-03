@@ -23937,6 +23937,23 @@ for name, flag, expected in (
 }
 
 #[test]
+fn a_managed_iterator_preserves_pass_lines_in_its_body_and_after_its_exit() {
+    let source = r"def run(items, manager, skip):
+    try:
+        with manager:
+            for item in items:
+                if skip:
+                    continue
+                pass
+                inspect(item)
+            pass
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "managed_iterator_pass.py", &LEVELS);
+}
+
+#[test]
 fn protected_with_assertion_join_pass_has_no_exception_owner() {
     const SOURCE: &str = concat!(
         "def f(flag, manager):\n    try:\n        with manager:\n            if flag:\n                assert flag\n            else:\n                assert not flag\n            pass\n        work()\n    except Fault:\n        recover()\n",
