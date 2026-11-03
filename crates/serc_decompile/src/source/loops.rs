@@ -31,7 +31,8 @@ fn local_return(ops: &[Instruction], end: usize) -> Option<usize> {
 
 impl Body<'_, '_, '_> {
     /// 3.14+ retains the first constant loop test even after folding it.
-    /// A leading loop can therefore distinguish `while 1` from `while True`.
+    /// A loop can still supply the first constant after a call or assignment
+    /// that needed only names and locals.
     fn constant_loop(
         &mut self,
         ops: &[Instruction],
@@ -39,9 +40,21 @@ impl Body<'_, '_, '_> {
         suite: &str,
     ) -> Result<(), String> {
         if self.m.version >= super::PythonVersion::Py314
-            && ops[..marker]
-                .iter()
-                .all(|op| matches!(op.name, "COPY_FREE_VARS" | "MAKE_CELL" | "RESUME"))
+            && ops[..marker].iter().all(|op| {
+                matches!(
+                    op.name,
+                    "COPY_FREE_VARS"
+                        | "MAKE_CELL"
+                        | "RESUME"
+                        | "LOAD_GLOBAL"
+                        | "LOAD_ATTR"
+                        | "LOAD_FAST"
+                        | "LOAD_FAST_BORROW"
+                        | "PUSH_NULL"
+                        | "CALL"
+                        | "STORE_FAST"
+                )
+            })
             && let Some(&id) = self.m.tuple(self.code.constants)?.first()
             && let super::Object::Int(value) = self.m.objects[id]
             && value != 0
@@ -304,7 +317,8 @@ impl Body<'_, '_, '_> {
             if protected
                 || (start != header
                     && !self.flow.entered_from(start, nop..after)
-                    && !self.delegation_rejoins_loop(ops, start, nop..after))
+                    && !self.delegation_rejoins_loop(ops, start, nop..after)
+                    && !self.handler_rejoins_loop(ops, start, nop..after))
                 || self.flow.jump(last).is_some_and(|to| {
                     !((nop..after).contains(&to)
                         || (to == after
@@ -530,6 +544,20 @@ impl Body<'_, '_, '_> {
         if let Some(after) = active.after
             && after > exhausted
         {
+            // CPython can leave the exhaustion location on a tracing NOP
+            // outside the protected range. A break jumps over this marker.
+            if after == exhausted + 1
+                && ops[exhausted].name == "NOP"
+                && ops[active.header].name == "FOR_ITER"
+                && self.active_try.is_some()
+                && self.flow.handler(exhausted).is_none()
+                && let Some(cleanup) = self.flow.jump(active.header)
+                && self.instruction_lines.as_deref().is_ok_and(|lines| {
+                    lines[cleanup].is_some() && lines[cleanup] == lines[exhausted]
+                })
+            {
+                return Ok(after);
+            }
             let suite = self.fragment(ops, exhausted, after, level)?.suite()?;
             self.block("else:", &suite)?;
             Ok(after)

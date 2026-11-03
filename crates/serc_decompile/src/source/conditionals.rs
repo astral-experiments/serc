@@ -623,9 +623,10 @@ impl Body<'_, '_, '_> {
             && let guard = self.flow.block(start).ops.end - 1
             && ops[guard].name.starts_with("POP_JUMP_IF_")
             && self.flow.jump(guard) == Some(last.ops.start)
-            && self.instruction_lines.as_deref().is_ok_and(|lines| {
-                lines[guard].is_some() && lines[guard] == lines[last.ops.start]
-            })
+            && self
+                .instruction_lines
+                .as_deref()
+                .is_ok_and(|lines| lines[guard].is_some() && lines[guard] == lines[last.ops.start])
             && self.flow.blocks_in(start..target).all(|block| {
                 [
                     self.flow.jump(block.ops.end - 1),

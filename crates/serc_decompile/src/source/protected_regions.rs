@@ -383,6 +383,18 @@ fn region(
     let body = binding + 1;
     let bound = ops[binding].name != "POP_TOP";
     let end = guarded_return_end(ops, flow, start..end, dispatch, first.depth).unwrap_or(end);
+    // The iterator's successful cleanup can leave a tracing NOP between the
+    // end of protection and the join shared by the break and the handler.
+    let end = if ops[end].name == "NOP"
+        && flow.jump(stop - 1) == Some(end + 1)
+        && flow.incoming(end + 1).any(|i| {
+            (start..end).contains(&i)
+                && loop_exits::break_over_cleanup(ops, flow, i, first) == Some(end + 1)
+        }) {
+        end + 1
+    } else {
+        end
+    };
     // An inline handler rejoins just past its unwind. When the try returns,
     // that edge comes from POP_EXCEPT in the handler. Include RETURN_VALUE
     // in the try suite before resuming at the jump target.
@@ -415,14 +427,19 @@ fn region(
         // An out-of-line handler can jump backwards past a try-else. Only
         // normal completion of the protected suite enters that else, which
         // may itself contain another placed try.
-        _ if matches!(ops[stop - 1].name, "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT")
-            && let Some(join) = flow.jump(stop - 1)
+        _ if matches!(
+            ops[stop - 1].name,
+            "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
+        ) && let Some(join) = flow.jump(stop - 1)
             && (end + 1..dispatch).contains(&join)
             && flow.block(join).height == Some(first.depth)
-            && Body::handler_pop(ops, binding, stop).is_some_and(|(pop, after)| body <= pop && after == stop - 1)
+            && Body::handler_pop(ops, binding, stop)
+                .is_some_and(|(pop, after)| body <= pop && after == stop - 1)
             && flow.blocks_in(end..join).all(|block| {
                 [flow.jump(block.ops.end - 1), flow.fallthrough(block)]
-                    .into_iter().flatten().all(|to| (end..=join).contains(&to))
+                    .into_iter()
+                    .flatten()
+                    .all(|to| (end..=join).contains(&to))
             })
             && following_join.is_none_or(|to| to == join) =>
         {
@@ -722,6 +739,10 @@ fn protected_end(
             }
             continue;
         }
+        if end + 1 == at && loop_exits::break_over_cleanup(ops, flow, end, first).is_some() {
+            end = index(entry.end)?;
+            continue;
+        }
         if end < at
             && (iterator_return_block(ops, flow, end..at, first.depth)
                 || (first.depth == 0
@@ -834,6 +855,35 @@ impl Body<'_, '_, '_> {
                     && start < suite.next
                     && suite.next <= body.end
             })
+    }
+
+    /// A handler placed inside the loop may live after the latch and jump
+    /// back into the loop after restoring the saved exception.
+    pub(super) fn handler_rejoins_loop(
+        &self,
+        ops: &[Instruction],
+        target: usize,
+        body: Range<usize>,
+    ) -> bool {
+        self.flow.incoming(target).all(|source| {
+            body.contains(&source)
+                || (matches!(
+                    ops[source].name,
+                    "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
+                ) && self.flow.jump(source) == Some(target)
+                    && self.handlers.iter().any(|(&start, suite)| {
+                        let Clause::Except { binding, .. } = suite.clause else {
+                            return false;
+                        };
+                        body.contains(&start)
+                            && start < suite.end
+                            && suite.end <= target
+                            && suite.next == target
+                            && suite.handler.end <= source
+                            && Self::handler_pop(ops, binding, source + 1)
+                                == Some((suite.handler.end, source))
+                    }))
+        })
     }
 
     /// A nested try can own the rest of a manager's body. On an exception

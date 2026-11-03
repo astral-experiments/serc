@@ -3,6 +3,46 @@
 //! and the handler's saved exception from the loop's own stack slots.
 use super::{Body, ExitCopies, FxHashSet, Graph, Instruction, Range};
 
+/// A break can discard the iterator under protection, then jump outside the
+/// table. Check the iterator's own exhaustion path and its protected latch
+/// before including that jump in the try.
+pub(super) fn break_over_cleanup(
+    ops: &[Instruction],
+    flow: &Graph,
+    jump: usize,
+    protection: super::Handler,
+) -> Option<usize> {
+    if ops.get(jump)?.name != "JUMP_FORWARD" || flow.handler(jump).is_some() {
+        return None;
+    }
+    let target = flow.jump(jump)?;
+    let mut cleanup = target.checked_sub(1)?;
+    if ops[cleanup].name == "NOP" {
+        cleanup = cleanup.checked_sub(1)?;
+    }
+    if matches!(ops[cleanup].name, "POP_TOP" | "POP_ITER") {
+        cleanup = cleanup.checked_sub(1)?;
+    }
+    let latch = cleanup.checked_sub(1)?;
+    let header = flow.jump(latch)?;
+    let slots = flow.for_iter_depth(header)?.checked_sub(protection.depth)?;
+    let pop = jump.checked_sub(slots)?;
+    (ops[cleanup].name == "END_FOR"
+        && ops[latch].name == "JUMP_BACKWARD"
+        && header < pop
+        && ops[header].name == "FOR_ITER"
+        && flow.jump(header) == Some(cleanup)
+        && (1..=2).contains(&slots)
+        && ops[pop..jump].iter().all(|op| op.name == "POP_TOP")
+        && [header, pop, latch].into_iter().all(|i| {
+            flow.handler(i).is_some_and(|h| {
+                (h.target, h.depth, h.lasti) == (protection.target, protection.depth, false)
+            })
+        })
+        && flow.block(jump).height == Some(protection.depth))
+    .then_some(target)
+}
+
 /// A handled exception retries the entire try, while success breaks out of
 /// the loop. Older targets put the retry jump just after the dispatcher.
 pub(super) fn retry_break(

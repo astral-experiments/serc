@@ -4742,6 +4742,52 @@ result = seen",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn out_of_line_handlers_rejoin_their_loop_and_iterator_breaks_skip_exhaustion() {
+    check_fixture(
+        r"def worker(take, store, record, items):
+    while True:
+        try:
+            task = take()
+        except EOFError:
+            return
+        if task is None:
+            break
+        try:
+            store(task)
+        except KeyError:
+            pass
+        record('iteration')
+    try:
+        for item in items:
+            if not item:
+                break
+            store(item)
+    except KeyError:
+        pass
+    record('done')
+",
+        r"import sys
+events = []
+def store(value):
+    events.append(value)
+    if value == 'missing': raise KeyError
+def record(value):
+    assert sys.exception() is None
+    events.append(value)
+def take():
+    value = next(tasks)
+    if value == 'eof': raise EOFError
+    return value
+for inputs, items in [(['a', 'missing', None], [1, 0, 2]), ([None], ['missing', 3]), ([None], []), (['eof'], [4])]:
+    tasks = iter(inputs)
+    worker(take, store, record, items)
+assert events == ['a', 'iteration', 'missing', 'iteration', 1, 'done', 'missing', 'done', 'done']
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn iterator_breaks_rejoin_an_outer_latch_or_a_shared_return() {
     check_fixture(
         r"def first(groups, emit):
