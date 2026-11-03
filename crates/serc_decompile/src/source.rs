@@ -56,6 +56,7 @@ struct Recovery<'m> {
     mode: synthetic::Mode,
     emitted: bool,
     partial: bool,
+    tail_builtin_alias: Option<String>,
     definitions: Vec<Id>,
     private_class: Option<Id>,
 }
@@ -90,6 +91,7 @@ pub(super) fn recover(
         mode,
         emitted: false,
         partial: false,
+        tail_builtin_alias: None,
         definitions: Vec::new(),
         private_class: None,
     };

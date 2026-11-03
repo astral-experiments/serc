@@ -150,10 +150,12 @@ nested code object's instructions, exception table, stack size, signature,
 flags, names, local layout, and constants, including reference sharing.
 
 By default, if exact verification fails, serc emits best-effort source with a
-`# serc: best-effort decompilation` header. When a nested body is unsupported,
-an ellipsis and a comment naming the scope identify the missing code. Recovery
-continues at a statement boundary once the evaluation stack is empty and the
-skipped paths rejoin, or in the enclosing scope. A best-effort result can differ
+`# serc: best-effort decompilation` header. A function that reaches an
+unrecovered tail raises `NotImplementedError` with the message
+`serc: unrecovered function tail`. Earlier returns still take effect.
+Module and class gaps use a marked ellipsis, as do missing statements within
+a function where the skipped paths rejoin with an empty evaluation stack.
+A comment at each gap names the affected scope. A best-effort result can differ
 in behavior from the input. Invalid cache headers, marshal data, and undecodable
 instruction streams still produce an error.
 

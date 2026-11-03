@@ -662,7 +662,37 @@ impl Body<'_, '_, '_> {
             self.block("else:", &right)?;
             return Ok(end);
         }
-        let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
+        let suite = match self
+            .fragment(ops, start, fallthrough_end, level)
+            .and_then(Fragment::suite)
+        {
+            Ok(suite) => suite,
+            Err(reason)
+                if self.work.partial
+                    && level == 0
+                    && self.depth > 0
+                    && !self.class
+                    && self.stack.is_empty()
+                    && fallthrough_end == target
+                    && target < end
+                    && self.flow.block(start).ops.end == target
+                    && self.flow.block(start).height == Some(0)
+                    && self.flow.handler(start).is_none()
+                    && matches!(
+                        ops[tail].name,
+                        "RETURN_CONST" | "RETURN_VALUE" | "RAISE_VARARGS"
+                    ) =>
+            {
+                // This edge leaves the function. The other edge can still
+                // run, so keep the missing tail inside the failed arm.
+                let prefix = self.lines.len();
+                self.gap(&reason, ops, start..target, true)?;
+                let missing = self.lines.split_off(prefix);
+                self.block(&format!("if {test}:"), &missing)?;
+                return Ok(target);
+            }
+            Err(error) => return Err(error),
+        };
         if self.implicit_reraise(ops, tail)
             && target < end
             && !self.flow.incoming(target).any(|from| {
@@ -689,7 +719,26 @@ impl Body<'_, '_, '_> {
             // nested guard. Its other edge still enters the shared tail.
             && !self.flow.incoming(target).any(|from| (start..fallthrough_end).contains(&from) || self.handler_jumps_from(ops, start..fallthrough_end, from, target))
         {
-            let other = self.fragment(ops, target, end, level)?.suite()?;
+            let other = match self
+                .fragment(ops, target, end, level)
+                .and_then(Fragment::suite)
+            {
+                Ok(other) => other,
+                // A missing alternate must not erase the first arm's proven
+                // return. Resume on the only edge that still needs source.
+                Err(_)
+                    if self.work.partial
+                        && self.stack.is_empty()
+                        && self.flow.block(start).ops.end == fallthrough_end
+                        && suite.lines().last().is_some_and(|line| {
+                            line == "return" || line.starts_with("return ")
+                        }) =>
+                {
+                    self.block(&format!("if {test}:"), &suite)?;
+                    return Ok(target);
+                }
+                Err(error) => return Err(error),
+            };
             let split_return = |s: &str| -> Option<(String, String)> {
                 let (before, last) = s
                     .trim_end_matches('\n')

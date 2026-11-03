@@ -3523,10 +3523,30 @@ if before:
     lost = '{big}'
 else:
     wrongly_hoisted()
-def large():
+def large(stop=False, NotImplementedError=None):
+    if stop:
+        return 'early'
+    return '{big}'
+def one_arm(flag, work):
+    if flag:
+        return '{big}'
+    return work()
+def lazy():
+    yield '{big}'
+async def async_lazy():
+    yield '{big}'
+async def delayed():
+    return '{big}'
+_serc_builtins = 'global'
+def shadow(observe):
+    def existing(): return _serc_builtins
+    observe(existing)
     return '{big}'
 def after(x):
     return x + before
+class PartialClass:
+    kept = before
+    missing = '{big}'
 if before:
     lost = '{big}'
     def repeated(x, /):
@@ -3615,7 +3635,7 @@ def guarded(flag, events):
                 "# serc: module normal control flow differs after recompilation (see original blocks)"
             )
         );
-        assert!(text.contains("def large():\n    ...  # serc: unrecovered remainder of large"));
+        assert!(text.contains("NotImplementedError('serc: unrecovered function tail')  # serc: unrecovered remainder of large"));
         assert!(text.contains("def after(x):"));
         assert!(!text.contains("# serc: unplaced blocks in after ("));
         assert!(!text.contains("# serc: unplaced blocks in Labels ("));
@@ -3691,6 +3711,31 @@ for name in ['<module>', 'Lost', '<lambda>']:
                 header = blocks[max(b for b in blocks if b <= op.offset)]
                 assert f'  jump {op.argval}' in header and f'  fallthrough {ops[i+1].offset}' in header
 assert scope['after'](5) == 12
+assert scope['PartialClass'].kept == 7
+assert scope['large'](True) == 'early'
+import asyncio, inspect
+def missing(call):
+    try: call()
+    except NotImplementedError as err: assert err.args == ('serc: unrecovered function tail',)
+    else: raise AssertionError('missing tail returned')
+missing(scope['large'])
+ran = []
+assert scope['one_arm'](False, lambda: ran.append('good') or 11) == 11
+missing(lambda: scope['one_arm'](True, lambda: ran.append('wrong')))
+assert ran == ['good']
+callbacks = []
+missing(lambda: scope['shadow'](callbacks.append))
+assert callbacks[0]() == 'global'
+stream = scope['lazy']()
+assert inspect.isgenerator(stream)
+missing(lambda: next(stream))
+async_stream = scope['async_lazy']()
+assert inspect.isasyncgen(async_stream)
+async def advance(): return await anext(async_stream)
+missing(lambda: asyncio.run(advance()))
+coroutine = scope['delayed']()
+assert inspect.iscoroutine(coroutine)
+missing(lambda: asyncio.run(coroutine))
 assert 'repeated' not in scope and 'inner' not in scope
 assert scope['fake_marker'] == '# __serc_definition_id__ 7'
 annotations = scope['__annotate__'](1) if '__annotate__' in scope else scope['__annotations__']
@@ -3703,7 +3748,7 @@ for flag, action in [(True, fail), (False, lambda: None)]:
     assert scope['protected'](flag, action, events) == 7
 assert events == ['caught', 'after', 'after']
 events.clear()
-scope['outer'](events)
+missing(lambda: scope['outer'](events))
 get, put = events[0]
 try: get()
 except NameError: pass

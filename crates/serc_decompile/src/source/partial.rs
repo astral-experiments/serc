@@ -2,8 +2,9 @@
 use std::ops::Range;
 
 use ruff_text_size::Ranged;
+use rustc_hash::FxHashSet;
 use serc_bytecode::marshal::reader::read;
-use serc_bytecode::target::code_flags::CO_NEWLOCALS;
+use serc_bytecode::target::code_flags::{CO_ASYNC_GENERATOR, CO_GENERATOR, CO_NEWLOCALS};
 use serc_bytecode::{OptimizationLevel, PythonVersion};
 
 use super::{
@@ -70,6 +71,7 @@ pub(crate) fn partial(
         mode: synthetic::Mode::Ordinary,
         emitted: false,
         partial: true,
+        tail_builtin_alias: None,
         definitions: Vec::new(),
         private_class: None,
     };
@@ -85,7 +87,7 @@ pub(crate) fn partial(
     let unformatted = candidate.source.len();
     candidate
         .source
-        .insert_str(0, &format!("{HEADER}\n# {}\n", comment(reason)));
+        .insert_str(0, &format!("{HEADER}#\n# {}\n", comment(reason)));
     let mut first = compile(&candidate.source, OptimizationLevel::Zero);
     if align_classes
         && let Some(other) = first.as_deref().and_then(|bytes| read(bytes).ok())
@@ -97,10 +99,13 @@ pub(crate) fn partial(
     let formatting_bytes = candidate.source.len().saturating_sub(unformatted);
     let warned = super::warnings::annotate(m, &mut candidate, first, compile);
     let mut result = detached::append(m, candidate, &mut work, &warned, formatting_bytes)?;
-    if let Some(difference) = warned.get(&m.root) {
-        // The blank header line reserves the module diagnostic's location.
-        result.insert_str(HEADER.len(), &difference.module_note());
-    }
+    // A comment reserves the diagnostic line even when class alignment
+    // removes blank lines. Replacing it preserves every later line number.
+    let note = warned
+        .get(&m.root)
+        .map(|d| d.module_note())
+        .unwrap_or_default();
+    result.replace_range(HEADER.len()..=HEADER.len(), &note);
     Ok(result)
 }
 
@@ -164,14 +169,35 @@ impl Body<'_, '_, '_> {
         } else {
             "statement in"
         };
+        let statement = if remainder && self.depth > 0 && !self.class {
+            // The original may shadow the exception or the builtins module.
+            // Introduce the import only on the path that reaches the gap.
+            let alias = self
+                .work
+                .tail_builtin_alias
+                .get_or_insert_with(|| tail_builtin_alias(self.m));
+            let import = format!("import builtins as {alias}");
+            let raise =
+                format!("raise {alias}.NotImplementedError('serc: unrecovered function tail')");
+            self.line(&import)?;
+            raise
+        } else {
+            "...".into()
+        };
         self.line(&format!(
-            "...  {}{} {} {} # serc: unrecovered {extent} {name}: {}",
+            "{statement}  {}{} {} {} # serc: unrecovered {extent} {name}: {}",
             super::blocks::MARK,
             self.id,
             range.start,
             range.end,
             comment(reason)
-        ))
+        ))?;
+        if remainder && self.code.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0 {
+            // If the missing tail contained the only yield, calling the
+            // function must still create an iterator before it can raise.
+            self.line("if False: yield  # serc: synthetic dead code")?;
+        }
+        Ok(())
     }
 
     fn remember_cell_stores(&mut self, ops: &[super::Instruction]) -> Result<(), String> {
@@ -183,6 +209,27 @@ impl Body<'_, '_, '_> {
         );
         Ok(())
     }
+}
+
+/// The local import must not capture a name used by a nested definition.
+fn tail_builtin_alias(m: &Module<'_>) -> String {
+    let base = "_serc_builtins";
+    let occupied: FxHashSet<_> = m
+        .objects
+        .iter()
+        .filter_map(|obj| match obj {
+            Object::Text { bytes, .. } if bytes.starts_with(base.as_bytes()) => Some(*bytes),
+            _ => None,
+        })
+        .collect();
+    let mut name = base.to_owned();
+    for n in 1.. {
+        if !occupied.contains(name.as_bytes()) {
+            break;
+        }
+        name = format!("{base}_{n}");
+    }
+    name
 }
 
 /// A failed handler can leave a dangling `try` after complete definitions.
