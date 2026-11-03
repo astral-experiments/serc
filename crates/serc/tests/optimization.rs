@@ -923,6 +923,12 @@ fn returning_from_an_async_iterator_keeps_its_slot_under_three_managers() {
 }
 
 #[test]
+fn pass_before_a_protected_loop_tail_test_keeps_its_line() {
+    let source = "def scan(ready, value):\n    try:\n        while True:\n            if ready:\n                pass\n                if value:\n                    consume(value)\n    finally:\n        finish()\n";
+    assert_matches_cpython(source, "loop_tail_test.py", &LEVELS);
+}
+
+#[test]
 fn guarded_cleanup_keeps_the_outer_iterators_discard_unlocated() {
     let source = r"def scan(items, manager, active):
     with manager:
