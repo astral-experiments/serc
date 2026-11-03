@@ -1,6 +1,6 @@
 //! A try suite containing only `pass` can lose its protected interval entirely.
 //! The exceptional copy remains out of line with its own lasti cleanup entries.
-use super::{Body, Bytecode, Instruction, protected_regions::same_finally_suite};
+use super::{Body, Bytecode, Instruction, finalizers};
 use serc_bytecode::target::operands::BinaryIntrinsic;
 
 impl Body<'_, '_, '_> {
@@ -42,12 +42,10 @@ impl Body<'_, '_, '_> {
             // With an empty try, a finally suite is still copied onto both
             // paths. Its exceptional copy ends by reraising the exception.
             let copy = start + 1..cleanup - 1;
-            let after = cursor + copy.len();
             if (ops[cleanup - 1].name, ops[cleanup - 1].arg) == ("RERAISE", 0)
-                && handler.end == ops[cleanup].offset
+                && finalizers::owns_cleanup(ops, &self.flow, start..cleanup, handler)
                 && !copy.is_empty()
-                && after <= normal_end
-                && same_finally_suite(ops, &self.flow, cursor..after, copy)
+                && let Some(after) = finalizers::copy_end(ops, &self.flow, cursor..normal_end, copy)
             {
                 let suite = self.fragment(ops, cursor, after, 0)?.suite()?;
                 self.block("finally:", &suite)?;

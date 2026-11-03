@@ -197,11 +197,15 @@ impl Body<'_, '_, '_> {
             return self.region(ops, join, normal_end, 0);
         }
         if ops.get(handler + 1).is_some_and(|op| op.name == "POP_TOP") {
-            let stop = ops[handler + 2..]
-                .iter()
-                .position(|op| op.name == "POP_EXCEPT")
-                .map(|n| handler + 2 + n)
+            let (_, cleanup) = super::dispatch::unwind(ops, &self.flow, handler, entry.depth + 1)
                 .ok_or("missing bare exception cleanup")?;
+            let stop = if ops[cleanup - 1].name == "RAISE_VARARGS" {
+                cleanup
+            } else {
+                (handler + 2..cleanup)
+                    .find(|&i| ops[i].name == "POP_EXCEPT")
+                    .ok_or("missing bare exception exit")?
+            };
             let suite = self.fragment(ops, handler + 2, stop, 0)?.suite()?;
             self.block("except:", &suite)?;
             return self.region(ops, end, normal_end, 0);

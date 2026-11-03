@@ -10,6 +10,7 @@ mod detached;
 mod dispatch;
 mod elided_tries;
 mod exceptions;
+mod finalizers;
 mod layout;
 mod loops;
 mod operands;

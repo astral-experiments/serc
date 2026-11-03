@@ -190,7 +190,7 @@ fn region(
     }
     let (unwind, cleanup) = super::dispatch::unwind(ops, flow, dispatch, first.depth + 1)?;
     if unwind.start == ops[dispatch].offset
-        && unwind.end == ops[cleanup].offset
+        && super::finalizers::owns_cleanup(ops, flow, dispatch..cleanup, unwind)
         && let Some(finally) = finally_region(ops, flow, start..end, dispatch, cleanup)
     {
         return Some((start, finally));
@@ -359,36 +359,6 @@ fn guarded_return_end(
     }
 }
 
-/// CPython may borrow locals on the normal path and own them on unwind.
-pub(super) fn same_finally_suite(
-    ops: &[Instruction],
-    flow: &Graph,
-    normal: Range<usize>,
-    exceptional: Range<usize>,
-) -> bool {
-    normal.len() == exceptional.len()
-        && normal.clone().zip(exceptional.clone()).all(|(a, b)| {
-            let load = |op: Instruction| match op.name {
-                "LOAD_FAST_BORROW" => "LOAD_FAST",
-                "LOAD_FAST_BORROW_LOAD_FAST_BORROW" => "LOAD_FAST_LOAD_FAST",
-                name => name,
-            };
-            if load(ops[a]) != load(ops[b]) {
-                return false;
-            }
-            if ops[a].jump.is_some() {
-                // Every copied jump must reach the same point within its copy,
-                // including the fallthrough immediately following the cleanup.
-                matches!((flow.jump(a), flow.jump(b)), (Some(x), Some(y))
-                if (normal.start..=normal.end).contains(&x)
-                && (exceptional.start..=exceptional.end).contains(&y)
-                && x - normal.start == y - exceptional.start)
-            } else {
-                ops[a].arg == ops[b].arg
-            }
-        })
-}
-
 /// Match the normal copy to the exceptional one, up to its final reraise.
 fn finally_region(
     ops: &[Instruction],
@@ -430,10 +400,7 @@ fn finally_region(
     }
     let deferred = ops[end].name == "NOP";
     let start = end + usize::from(deferred);
-    let normal = start..start + exceptional.len();
-    if normal.end > dispatch || !same_finally_suite(ops, flow, normal.clone(), exceptional) {
-        return None;
-    }
+    let normal = start..super::finalizers::copy_end(ops, flow, start..dispatch, exceptional)?;
     // A return of a constant can leave a tracing NOP at its original site,
     // with the constant materialized only after the normal cleanup.
     let mut next = normal.end;

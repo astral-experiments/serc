@@ -2136,6 +2136,50 @@ fn comprehensions_inside_returning_exception_handlers() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn cleanup_copies_restore_locals_on_close_and_reraise() {
+    check_fixture(
+        r"def save(box, fail):
+    try:
+        saved = box[:]
+        del box[:]
+        yield
+    finally:
+        if fail:
+            box[:] = saved
+        else:
+            box.append(saved)
+        box.append(42)
+
+def prepare(read, restore):
+    try:
+        read()
+    except:
+        restore()
+        raise
+",
+        r"import sys
+result = []
+for fail in (True, False):
+    for close in (True, False):
+        box = [1, 2]
+        it = save(box, fail)
+        next(it)
+        if close:
+            it.close()
+        else:
+            try: it.throw(ValueError('thrown'))
+            except ValueError as exc: result.append(exc.args)
+        result.append(box)
+def fail(): raise KeyboardInterrupt('read')
+def restore(): result.append(sys.exception().args)
+try: prepare(fail, restore)
+except KeyboardInterrupt as exc: result.append(exc.args)
+prepare(lambda: result.append('read'), restore)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn nested_finalizers_run_under_the_right_active_exception() {
     check_fixture(
         r"async def unwind(wait, failure, emit):
