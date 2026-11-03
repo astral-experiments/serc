@@ -3136,6 +3136,101 @@ result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is 
 
 #[cfg(feature = "decompile")]
 #[test]
+fn separate_bound_handler_arms_reach_their_own_cleanup() {
+    check_fixture(
+        r"def send(work, first, record):
+    try:
+        work()
+    except BlockingIOError:
+        pass
+    except OSError as exc:
+        if first:
+            msg = str(exc)
+            record(msg)
+        else:
+            record(exc.args)
+    except KeyboardInterrupt:
+        raise
+    else:
+        record('sent')
+",
+        r"import sys
+result = []
+for kind in (None, OSError, BlockingIOError, KeyboardInterrupt):
+    for first in (True, False):
+        def work():
+            if kind: raise kind('failed')
+        def record(value):
+            result.append((value, type(sys.exception()).__name__))
+        try: send(work, first, record)
+        except KeyboardInterrupt: result.append('interrupted')
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn cleanup_handlers_and_folded_breaks_rejoin_their_own_loop() {
+    check_fixture(
+        r"def drain(items, run, errors):
+    while items:
+        task = items.pop()
+        try:
+            run(task)
+        except ValueError as exc:
+            errors.append(exc.args)
+    if errors:
+        return errors[0]
+
+def run_all(items, state):
+    for i, item in enumerate(items):
+        if state:
+            break
+        item(state)
+    return state
+",
+        r"result = []
+def work(task):
+    result.append(task)
+    if task % 2: raise ValueError(task)
+result.append(drain([1, 2, 3], work, []))
+for state in ([], [7]):
+    out = run_all([lambda s: s.append(1), lambda s: s.append(2)], state)
+    result.append((out is state, list(out)))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_raise_after_a_handled_return_runs_with_the_caller_exception() {
+    check_fixture(
+        r"async def advance(read, failure):
+    try:
+        return read()
+    except StopIteration:
+        pass
+    raise failure()
+",
+        r"import asyncio, sys
+result = []
+async def check(items):
+    try:
+        raise LookupError('caller')
+    except LookupError:
+        def failure():
+            result.append(sys.exception().args)
+            return StopAsyncIteration()
+        try: result.append(await advance(iter(items).__next__, failure))
+        except StopAsyncIteration as error: result.append(error.__context__.args)
+asyncio.run(check([1]))
+asyncio.run(check([]))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn exception_groups_offer_the_remainder_to_each_handler() {
     check_fixture(
         r"def dispatch(work, observe, fail):

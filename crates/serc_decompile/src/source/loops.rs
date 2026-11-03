@@ -44,13 +44,12 @@ impl Body<'_, '_, '_> {
             // The entire arm discards exactly this iterator before reading
             // the same local as the continuation. A return from a nested
             // iterator would have additional slots to unwind.
+            let cleanup = block.ops.start + usize::from(ops[block.ops.start].name == "NOT_TAKEN");
             if block.ops.end != end
-                || at - block.ops.start != slots
+                || at.checked_sub(cleanup) != Some(slots)
                 || block.height != Some(slots)
                 || self.flow.handler(at).is_some()
-                || ops[block.ops.start..at]
-                    .iter()
-                    .any(|op| op.name != "POP_TOP")
+                || ops[cleanup..at].iter().any(|op| op.name != "POP_TOP")
             {
                 return None;
             }

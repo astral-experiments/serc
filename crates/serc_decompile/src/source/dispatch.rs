@@ -330,7 +330,7 @@ impl Body<'_, '_, '_> {
                 && super::regions::constant_return(ops, tail.end)
                     .is_some_and(|(load, _)| load == tail.start)
             {
-                ExitCopies::suffix(ops, &self.flow, body.start..tail.end, tail.end - body.end)
+                ExitCopies::handler(ops, &self.flow, body.clone(), tail.end)
             } else {
                 None
             };

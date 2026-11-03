@@ -75,11 +75,14 @@ impl Body<'_, '_, '_> {
             ops.len() - 2
         } else {
             self.handlers = super::protected_regions::collect(bc, self);
+            let handled_end = super::protected_regions::handled_end(bc, self);
             ops.iter()
                 .rposition(|op| matches!(op.name, "RETURN_VALUE" | "RETURN_CONST"))
                 // A copied return in a break arm can precede the loop latch.
-                .map(|last| (last + 1).max(self.flow.normal_end([0])))
-                .or_else(|| super::protected_regions::returnless_end(bc, self))
+                .map(|last| {
+                    (last + 1).max(handled_end.unwrap_or_else(|| self.flow.normal_end([0])))
+                })
+                .or(handled_end)
                 .ok_or("unsupported returnless suspension scope")?
         };
         if self.depth > 0 && !self.class {

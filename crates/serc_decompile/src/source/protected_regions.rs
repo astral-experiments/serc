@@ -58,7 +58,7 @@ impl ExitCopies {
         width: usize,
     ) -> Option<Self> {
         let mut first = body.end.checked_sub(width)?;
-        if first < body.start {
+        if width == 0 || first < body.start {
             return None;
         }
         let exit = &ops[first..body.end];
@@ -81,6 +81,49 @@ impl ExitCopies {
             end: body.end,
             width,
         })
+    }
+
+    pub(super) fn handler(
+        ops: &[Instruction],
+        flow: &Graph,
+        body: Range<usize>,
+        end: usize,
+    ) -> Option<Self> {
+        let width = end.checked_sub(body.end)?;
+        Self::suffix(ops, flow, body.start..end, width).or_else(|| {
+            let block = flow.block(body.end);
+            (ops[body.end].name == "POP_EXCEPT"
+                && block.ops == (body.end..end)
+                && block.height == Some(1)
+                && flow.handler(body.end).is_none())
+            .then_some(Self {
+                first: body.end,
+                end,
+                width,
+            })
+        })
+    }
+
+    /// The first arm of a terminal if/else can end with a separate copy of
+    /// the final handler cleanup, with the second arm's statements in between.
+    pub(super) fn before_arm(
+        self,
+        ops: &[Instruction],
+        flow: &Graph,
+        target: usize,
+        end: usize,
+    ) -> Option<usize> {
+        let copy = target.checked_sub(self.width)?;
+        (end == self.first
+            && flow.block(copy).ops == (copy..target)
+            && flow.handler(copy).is_none()
+            && flow.block(copy).height == Some(1)
+            && ops[copy].name == "POP_EXCEPT"
+            && super::comparisons::same_instructions(
+                &ops[copy..target],
+                &ops[end..end + self.width],
+            ))
+        .then_some(copy)
     }
 
     pub(super) fn destination(self, target: usize) -> usize {
@@ -117,9 +160,9 @@ pub(super) fn collect(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Handlers {
     result
 }
 
-/// If a coroutine only raises, there is no return instruction to delimit
-/// its body. Include continuations reachable solely through an except clause.
-pub(super) fn returnless_end(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<usize> {
+/// Include normal continuations reachable solely through an except clause.
+/// A coroutine can also lack a return instruction to delimit its body.
+pub(super) fn handled_end(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<usize> {
     let mut starts = vec![0];
     for group in groups(bc) {
         let entry = group.first()?;
@@ -275,9 +318,27 @@ fn region(
     // An inline handler rejoins just past its unwind. When the try returns,
     // that edge comes from POP_EXCEPT in the handler. Include RETURN_VALUE
     // in the try suite before resuming at the jump target.
+    // A successful try returns immediately. An exception in the try can
+    // reach a separate raise *after* POP_EXCEPT, with the caller's exception
+    // restored. It must not run under the matching except.
+    let after_handler = if end + 1 == dispatch
+        && ops[end].name == "RETURN_VALUE"
+        && kind.is_some()
+        && following.is_empty()
+        && ops[stop - 1].name == "RAISE_VARARGS"
+        && let Some((pop, after)) = Body::handler_pop(ops, binding, stop)
+        && after < stop
+        && flow.block(pop).ops == (pop..stop)
+        && flow.handler(pop).is_none_or(|h| h.target != unwind.target)
+    {
+        Some((pop, after))
+    } else {
+        None
+    };
     let after_cleanup = cleanup + 3;
     let mut success = end..end;
     let (end, mut next) = match ops.get(end..dispatch)? {
+        _ if let Some((_, after)) = after_handler => (dispatch, after),
         [swap, pop, ret]
             if (swap.name, swap.arg) == ("SWAP", 2)
                 && pop.name == "POP_EXCEPT"
@@ -322,6 +383,7 @@ fn region(
     let mut handler_tail = None;
     let mut handler_exits = None;
     let handler = match ops.get(body..stop)? {
+        _ if let Some((pop, _)) = after_handler => body..pop,
         _ if let Some(child_end) =
             returning_handler_child(ops, flow, body..stop, unwind, inner) =>
         {
@@ -345,7 +407,13 @@ fn region(
                 && after == stop - 1
                 && let Some(to) = flow.jump(stop - 1) =>
         {
-            if to != next && Some(to) != for_header {
+            // A while loop's normal latch and handler can both jump straight
+            // to the header. Falling out of this try reaches the same latch.
+            let shared_latch = ops[next].name == "JUMP_BACKWARD"
+                && to < start
+                && flow.jump(next) == Some(to)
+                && flow.block(to).height == Some(first.depth);
+            if to != next && Some(to) != for_header && !shared_latch {
                 // The handler skips the rest of this iteration. Only a jump
                 // to the enclosing iterator at its saved depth is a continue.
                 if ops[to].name != "FOR_ITER"
