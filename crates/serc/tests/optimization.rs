@@ -1924,6 +1924,15 @@ fn nested_finalizer_keeps_shared_subscript_store() {
 }
 
 #[test]
+fn copied_discard_and_return_fold_the_immediate_constant_arm() {
+    for value in ["'ready'", "3", "None", "item"] {
+        let source =
+            format!("def select(flag, item):\n    {value} if flag else 'later'\n    return\n");
+        assert_matches_cpython(&source, "copied_constant_discard.py", &LEVELS);
+    }
+}
+
+#[test]
 fn finalizer_copies_named_cleanup_after_an_elif() {
     let source = "def sample(ready, flag, prior):
     try:
