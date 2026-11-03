@@ -103,12 +103,16 @@ impl Body<'_, '_, '_> {
         let ops = &bc.ops;
         let (_, cleanup) = unwind(ops, &self.flow, handler, 1)?;
         let after = cleanup + 3;
-        // When the try always raises, only a matching handler can reach the
-        // code after its unwind. Bound handlers clear the exception name first.
+        // When the try raises or returns, only a matching handler can reach
+        // the code after its unwind. A constant return lies just outside
+        // the protected interval. Bound handlers clear the exception name first.
         let handled_tail = if after == limit {
             None
         } else {
-            if after >= limit || success != handler || ops[handler - 1].name != "RAISE_VARARGS" {
+            let raises = success == handler && ops[handler - 1].name == "RAISE_VARARGS";
+            let returns = super::regions::constant_return(ops, handler)
+                .is_some_and(|(start, _)| start == success);
+            if after >= limit || !(raises || returns) {
                 return None;
             }
             let rest = bc
@@ -159,7 +163,7 @@ impl Body<'_, '_, '_> {
         if let Some(tail) = handled_tail {
             return (join == Some(tail.start)).then_some(Dispatch {
                 arms,
-                success: success..success,
+                success: success..handler,
                 continuation: tail,
             });
         }

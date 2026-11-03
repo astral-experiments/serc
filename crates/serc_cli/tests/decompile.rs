@@ -1631,6 +1631,31 @@ assert result == ['after']",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn only_the_handler_continues_after_a_successful_constant_return() {
+    check_fixture(
+        r"def bind(obj, record):
+    try:
+        obj.bound
+        return
+    except AttributeError:
+        obj.bound = True
+    record(obj)
+",
+        r"import sys
+result = []
+class Box: pass
+box = Box()
+def record(obj):
+    assert sys.exception() is None
+    result.append(obj.bound)
+bind(box, record)
+bind(box, record)
+assert result == [True]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn handlers_survive_an_elided_try_suite() {
     check_fixture(
         r"events = []
