@@ -785,6 +785,55 @@ assert result == [('TypeError', True), ('IndexError', False), ('NoneType', False
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_nested_try_preserves_the_enclosing_exception_binding() {
+    check_fixture(
+        r"def protect(read, report, recover):
+    try:
+        read()
+    except KeyboardInterrupt:
+        raise
+    except LookupError as err:
+        try:
+            report(err)
+        except KeyboardInterrupt:
+            raise
+        except OSError:
+            recover(err)
+
+def value(read, report, recover):
+    try:
+        read()
+    except LookupError as err:
+        try:
+            report(err)
+        except OSError:
+            return recover(err)
+",
+        r"import sys
+result = []
+def fail(exc):
+    def read(): raise exc
+    return read
+def report(err):
+    result.append(('report', err is sys.exception()))
+    raise OSError('report failed')
+def recover(err):
+    result.append(('recover', err.args, sys.exception().__context__ is err))
+protect(lambda: 1, report, recover)
+protect(fail(IndexError(1)), report, recover)
+protect(fail(KeyError(2)), lambda err: result.append(('handled', err is sys.exception())), recover)
+try: protect(fail(KeyboardInterrupt()), report, recover)
+except KeyboardInterrupt: result.append('propagated')
+assert result == [('report', True), ('recover', (1,), True), ('handled', True), 'propagated']
+def recovered(err): return (err.args, sys.exception().__context__ is err)
+assert value(fail(KeyError(3)), report, recovered) == ((3,), True)
+assert value(fail(KeyError(4)), lambda err: 10, recovered) is None
+assert sys.exception() is None",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn returning_arms_skip_later_protected_statements() {
     check_fixture(
         r"def process(read, record, proceed):

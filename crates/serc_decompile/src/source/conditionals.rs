@@ -656,7 +656,7 @@ impl Body<'_, '_, '_> {
                     // A nested guard can target a block containing only its
                     // implicit None return. An explicit return after the outer
                     // else would merge that exit with its sibling.
-                    let implicit = end == ops.len()
+                    let implicit = (end == ops.len() || end == self.terminal_returns.end)
                         && level == 0
                         && a == "None"
                         && self.none_return(&ops[self.flow.block(tail).ops.clone()])

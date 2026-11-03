@@ -7,14 +7,17 @@ use serc_bytecode::instructions::Handler;
 
 use super::{Body, Bytecode, Instruction};
 use crate::flow::Graph;
+mod bound_parent;
 mod finally;
 mod handler_rejoin;
 mod handler_returns;
 mod loop_exits;
 
+pub(super) use bound_parent::BoundParent;
 use finally::{break_marker, finally_region, returning_finally_loop};
 pub(super) use handler_rejoin::HandlerRejoin;
-use handler_returns::{enclosing_exception, nested_handler_return, returning_handler_child};
+pub(super) use handler_returns::returning_handler_child;
+use handler_returns::{enclosing_exception, nested_handler_return};
 
 pub(super) use loop_exits::iterator_return_block;
 use loop_exits::{guarded_return_end, iterator_success_latch};
@@ -267,7 +270,7 @@ pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handle
         {
             for bind in std::iter::once(*binding).chain(following.iter().map(|arm| arm.binding)) {
                 if bc.ops[bind].name != "POP_TOP" {
-                    let cleanup = flow.handler(bind + 1)?;
+                    let cleanup = owner.binding_unwind(&bc.ops, bind)?;
                     unwinds.insert((cleanup.target, cleanup.depth));
                 }
             }
@@ -323,7 +326,7 @@ fn region(
         if failed + 1 != cleanup || (ops[failed].name, ops[failed].arg) != ("RERAISE", 0) {
             // Any later matches that fall through must rejoin the same
             // iterator as the first arm. Check that after placing its else.
-            (following, following_join) = owner.following_arms(ops, failed, cleanup)?;
+            (following, following_join) = owner.following_arms(ops, failed, cleanup, inner)?;
         }
         let stop = if ops[pop].name == "POP_TOP" {
             failed
@@ -357,7 +360,12 @@ fn region(
     };
     let after_cleanup = cleanup + 3;
     let mut success = end..end;
+    let parent = (first.depth == 1)
+        .then(|| BoundParent::at_cleanup(owner, ops, cleanup))
+        .flatten()
+        .filter(|parent| parent.success(owner, ops, end..dispatch).is_some());
     let (end, mut next) = match ops.get(end..dispatch)? {
+        _ if parent.is_some() => (end, dispatch),
         _ if let Some((_, after)) = after_handler => (dispatch, after),
         [swap, pop, ret]
             if (swap.name, swap.arg) == ("SWAP", 2)
@@ -400,14 +408,29 @@ fn region(
         _ => None,
     }
     .filter(|&i| i < start && flow.for_iter_depth(i) == Some(first.depth));
+    let falls_off = owner.none_return(&ops[next..flow.block(next).ops.end]);
+    if falls_off {
+        for arm in &mut following {
+            arm.fall_out_of_parent();
+        }
+    }
     let mut handler_tail = None;
     let mut handler_exits = None;
     let handler = match ops.get(body..stop)? {
         _ if let Some((pop, _)) = after_handler => body..pop,
-        _ if let Some(child_end) =
-            returning_handler_child(ops, flow, body..stop, unwind, inner) =>
+        _ if let Some((child_end, tail)) =
+            returning_handler_child(ops, owner, body..stop, unwind, inner) =>
         {
+            handler_tail = tail.filter(|_| !falls_off);
             body..child_end
+        }
+        _ if !bound
+            && let Some((pop, ret)) =
+                parent.and_then(|parent| parent.handler_exit(owner, ops, stop))
+            && pop >= body =>
+        {
+            handler_tail = ret.map(|at| at..stop);
+            body..pop
         }
         _ if !bound
             && end == dispatch
@@ -433,7 +456,11 @@ fn region(
                 && to < start
                 && flow.jump(next) == Some(to)
                 && flow.block(to).height == Some(first.depth);
-            if to != next && Some(to) != for_header && !shared_latch {
+            if to != next
+                && Some(to) != for_header
+                && !shared_latch
+                && parent.is_none_or(|parent| parent.exit(owner, ops, to).is_none())
+            {
                 // The handler skips the rest of this iteration. Only a jump
                 // to the enclosing iterator at its saved depth is a continue.
                 if ops[to].name != "FOR_ITER"
@@ -524,6 +551,7 @@ fn region(
         next += 1;
     }
     if let Some(header) = following_join
+        && parent.is_none_or(|parent| parent.exit(owner, ops, header).is_none())
         && (ops[header].name != "FOR_ITER"
             || flow.for_iter_depth(header) != Some(first.depth)
             || ops[next].name != "JUMP_BACKWARD"
@@ -605,7 +633,13 @@ fn protected_end(
             continue;
         }
         if end < at
-            && iterator_return_block(ops, flow, end..at, first.depth)
+            && (iterator_return_block(ops, flow, end..at, first.depth)
+                || (first.depth == 0
+                    && flow.block(end).ops == (end..at)
+                    && flow.block(end).height == Some(0)
+                    && flow.handler(end).is_none()
+                    && super::regions::constant_return(ops, at)
+                        .is_some_and(|(load, _)| load == end)))
             && flow.incoming(at).any(|i| {
                 i < end
                     && flow.jump(i) == Some(at)
@@ -818,6 +852,18 @@ impl Body<'_, '_, '_> {
         }
         if carried {
             self.stack.push(super::Value::PendingReturn);
+        }
+        // An implicit None return inherits the protected statement's line.
+        // Spelling it after the try can merge distinct binding cleanups on 3.12.
+        if level == 0
+            && next > 0
+            && next < limit
+            && self.none_return(&ops[next..limit])
+            && self
+                .instruction_lines(ops)
+                .is_ok_and(|lines| lines[next].is_some() && lines[next] == lines[next - 1])
+        {
+            next = limit;
         }
         Ok(Some(next))
     }
