@@ -15,6 +15,12 @@ use serc::{
 };
 
 #[test]
+fn return_after_reordered_finalizer_stores_inherits_the_original_last_target() {
+    let source = "def f(a, b, c):\n    try:\n        return True\n    finally:\n        a, b, c = None, None, None\n";
+    assert_matches_cpython(source, "finalizer_store_locations.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
