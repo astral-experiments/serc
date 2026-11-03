@@ -275,14 +275,33 @@ impl Body<'_, '_, '_> {
     ) -> Result<usize, String> {
         let value = self.expr()?;
         let mut predicate = self.predicate(ops, i, value, end, level, header)?;
+        predicate.target = self.local_join(ops, predicate.target, end);
         if let Some(latch) = self.enclosing_continue_latch(ops, &predicate, end) {
             predicate.suite = predicate.target;
             predicate.target = end;
             predicate.fallthrough_true = !predicate.fallthrough_true;
             return self.while_loop(ops, &predicate, &latch, end, level);
         }
+        if self.guarded_iteration_tail(ops, &predicate, end) {
+            let suite = self.fragment(ops, predicate.target, end, level)?.suite()?;
+            self.block(&format!("if {}:", predicate.test(false)), &suite)?;
+            return Ok(end);
+        }
         let fallthrough_end = predicate.target;
         self.conditional_suites(ops, &predicate, fallthrough_end, end, level)
+    }
+
+    // CPython can thread a nested arm directly to the enclosing join.
+    // Falling off this fragment runs the caller's jump to the same place.
+    fn local_join(&self, ops: &[Instruction], destination: usize, end: usize) -> usize {
+        if destination > end
+            && ops.get(end).is_some_and(|op| op.name == "JUMP_FORWARD")
+            && self.flow.jump(end) == Some(destination)
+        {
+            end
+        } else {
+            destination
+        }
     }
 
     pub(super) fn conditional_suites(
@@ -385,17 +404,7 @@ impl Body<'_, '_, '_> {
         if ops[tail].name == "JUMP_FORWARD" {
             // With a returning or looping arm there may be no common forward
             // postdominator. The other arm still jumps over its alternate.
-            let destination = self.flow.target(tail)?;
-            // CPython can send both arms of a nested conditional directly
-            // to the enclosing join. The caller owns the jump at `end`.
-            let join = if destination > end
-                && ops.get(end).is_some_and(|op| op.name == "JUMP_FORWARD")
-                && self.flow.jump(end) == Some(destination)
-            {
-                end
-            } else {
-                destination
-            };
+            let join = self.local_join(ops, self.flow.target(tail)?, end);
             if join <= target || join > end {
                 return Err("unsupported conditional join".into());
             }

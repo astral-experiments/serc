@@ -204,6 +204,7 @@ fn region(
     };
     let body = binding + 1;
     let bound = ops[binding].name != "POP_TOP";
+    let end = guarded_return_end(ops, flow, start..end, dispatch, first.depth).unwrap_or(end);
     // An inline handler rejoins just past its unwind. When the try returns,
     // that edge comes from POP_EXCEPT in the handler. Include RETURN_VALUE
     // in the try suite before resuming at the jump target.
@@ -306,6 +307,50 @@ fn region(
             handler_tail,
         },
     ))
+}
+
+/// A guarded return evaluates its value under protection but returns it
+/// outside the table. In a for loop the same block first drops the iterator.
+/// The other arm skips the whole epilogue and continues after the try.
+fn guarded_return_end(
+    ops: &[Instruction],
+    flow: &Graph,
+    suite: Range<usize>,
+    dispatch: usize,
+    depth: usize,
+) -> Option<usize> {
+    let block = flow.block(suite.end);
+    let next = block.ops.end;
+    if block.ops.start != suite.end
+        || next >= dispatch
+        || flow.handler(suite.end).is_some()
+        || block.height != Some(depth + 1)
+        || !flow
+            .incoming(next)
+            .any(|i| suite.contains(&i) && ops[i].name.starts_with("POP_JUMP_IF_"))
+    {
+        return None;
+    }
+    let (ret, cleanup) = ops[block.ops.clone()].split_last()?;
+    if ret.name != "RETURN_VALUE" {
+        return None;
+    }
+    match cleanup {
+        [] if depth == 0 => Some(next),
+        [swap, pops @ ..]
+            if depth > 0
+                && swap.name == "SWAP"
+                && swap.arg as usize == depth + 1
+                && pops.len() == depth
+                && pops.iter().all(|op| op.name == "POP_TOP")
+                && flow.jump(next).is_some_and(|header| {
+                    ops[header].name == "FOR_ITER" && flow.for_iter_depth(header) == Some(depth)
+                }) =>
+        {
+            Some(next)
+        }
+        _ => None,
+    }
 }
 
 /// CPython may borrow locals on the normal path and own them on unwind.

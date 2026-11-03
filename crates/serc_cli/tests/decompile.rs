@@ -741,6 +741,108 @@ assert not hasattr(t, 'item')
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_handler_search_restores_the_exception_only_after_a_match() {
+    check_fixture(
+        r"def apply(update, matches, errors):
+    try:
+        update()
+    except OSError as why:
+        for e in errors:
+            if matches(e) and why.errno == e:
+                break
+        else:
+            raise
+",
+        r"import sys
+result = []
+error = OSError(2, 'missing')
+def fail():
+    raise error
+def matches(e):
+    assert sys.exception() is error
+    result.append(e)
+    return True
+apply(lambda: None, matches, [9])
+apply(fail, matches, [1, 2, 3])
+try:
+    apply(fail, matches, [4])
+except OSError as caught:
+    assert caught is error
+else:
+    assert False
+assert sys.exception() is None and result == [1, 2, 4]
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn guarded_returns_cross_only_their_own_iterator_cleanup() {
+    check_fixture(
+        r"def locate(names, lookup, fallback):
+    for name in names:
+        try:
+            if lookup(name):
+                return name
+        except LookupError:
+            pass
+    try:
+        if lookup(fallback):
+            return fallback
+    except LookupError:
+        raise ValueError(fallback)
+    raise RuntimeError
+",
+        r"result = []
+def lookup(name):
+    result.append(name)
+    if name is None:
+        raise KeyError
+    return name == 'hit'
+assert locate([None, 'skip', 'hit', 'unused'], lookup, 'unused') == 'hit'
+assert locate([], lookup, 'hit') == 'hit'
+for fallback, error in [(None, ValueError), ('absent', RuntimeError)]:
+    try:
+        locate([], lookup, fallback)
+    except error:
+        pass
+    else:
+        assert False
+assert result == [None, 'skip', 'hit', 'hit', None, 'absent']
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_nested_guard_can_jump_directly_to_the_following_try() {
+    check_fixture(
+        r"def apply(platform, follow, needed, set_mode):
+    if platform:
+        if follow:
+            if needed():
+                set_mode(1)
+        else:
+            set_mode(2)
+    try:
+        set_mode(3)
+    except ValueError:
+        pass
+",
+        r"result = []
+def set_mode(mode):
+    result.append(mode)
+    if mode == 3:
+        raise ValueError
+for platform, follow, needed in [(False, True, True), (True, False, False), (True, True, False), (True, True, True)]:
+    apply(platform, follow, lambda: needed, set_mode)
+assert result == [3, 2, 3, 3, 1, 3]
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn distinct_and_shared_constant_returns_keep_their_constant_order() {
     check_fixture(
         r"def early(ready, emit):
