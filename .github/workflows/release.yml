@@ -28,6 +28,22 @@ env:
   CARGO_DIST_CHECKSUM: "cd355dab0b4c02fb59038fef87655550021d07f45f1d82f947a34ef98560abb8"
 
 jobs:
+  release-gate:
+    # N.B. This name should not change, it is used for downstream checks.
+    name: release-gate
+    if: ${{ github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main' && inputs.tag != 'dry-run' }}
+    runs-on: ubuntu-24.04
+    # This environment requires a 2-factor approval, i.e., the workflow must be approved by another
+    # team member. GitHub fires approval events on every job that deploys to an environment, so we
+    # have a dedicated environment for this purpose instead of using the `release` environment.
+    # We use a GitHub App with a deployment protection rule webhook to ensure that the `release`
+    # environment is only approved when the `release-gate` job succeeds.
+    environment:
+      name: release-gate
+      deployment: true
+    steps:
+      - run: echo "Release approved"
+
   # Run 'dist plan' (or host) to determine what tasks we need to do
   plan:
     permissions:
@@ -210,13 +226,14 @@ jobs:
   # Determines if we should publish/announce
   host:
     needs:
+      - release-gate
       - check-crates
       - plan
       - custom-build-binaries
       - build-global-artifacts
       - generate-checksum-manifest
     # Require checksums for all built archives before publishing. Other build jobs may be skipped.
-    if: ${{ always() && !cancelled() && needs.check-crates.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.generate-checksum-manifest.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-build-binaries.result == 'skipped' || needs.custom-build-binaries.result == 'success') }}
+    if: ${{ always() && !cancelled() && needs.release-gate.result == 'success' && needs.check-crates.result == 'success' && needs.plan.result == 'success' && needs.plan.outputs.publishing == 'true' && needs.generate-checksum-manifest.result == 'success' && (needs.build-global-artifacts.result == 'skipped' || needs.build-global-artifacts.result == 'success') && (needs.custom-build-binaries.result == 'skipped' || needs.custom-build-binaries.result == 'success') }}
     permissions:
       "contents": "read"
     env:
@@ -269,6 +286,7 @@ jobs:
       - custom-build-binaries
       - plan
       - host
+      - release-gate
     if: ${{ !fromJson(needs.plan.outputs.val).announcement_is_prerelease || fromJson(needs.plan.outputs.val).publish_prereleases }}
     uses: ./.github/workflows/publish-pypi.yml
     with:
@@ -281,6 +299,7 @@ jobs:
   custom-publish-crates:
     needs:
       - host
+      - release-gate
       - custom-publish-pypi
     uses: ./.github/workflows/publish-crates.yml
     permissions:
@@ -293,11 +312,12 @@ jobs:
     needs:
       - plan
       - host
+      - release-gate
       - custom-publish-pypi
     # use "always() && ..." to allow us to wait for all publish jobs while
     # still allowing individual publish jobs to skip themselves (for prereleases).
     # "host" however must run to completion, no skipping allowed!
-    if: ${{ always() && !cancelled() && needs.host.result == 'success' && (needs.custom-publish-pypi.result == 'skipped' || needs.custom-publish-pypi.result == 'success') }}
+    if: ${{ always() && !cancelled() && needs.host.result == 'success' && needs.release-gate.result == 'success' && (needs.custom-publish-pypi.result == 'skipped' || needs.custom-publish-pypi.result == 'success') }}
     runs-on: ubuntu-24.04
     environment:
       name: release

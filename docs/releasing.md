@@ -24,13 +24,16 @@ The settings below are managed outside this repository. Configure them before
 publishing with this workflow; a dry run does not verify publishing credentials
 or deployment protection rules.
 
-1. Restrict the `release` environment to `main` and protect release tags with
-   `rulesets/tags-require-release.json` in
-   [`astral-sh/github-policies`](https://github.com/astral-sh/github-policies/blob/main/releases/README.md).
-   PyPI and crates.io bind their trusted publishers to this environment. If the
-   environment still uses the `release-environment-gate` GitHub App, its policy
-   must be updated separately because it expects a successful `release-gate`
-   job.
+1. Grant the `astral-experiments-release-gate` GitHub App access to Serc and
+   apply the
+   [release environment policies](https://github.com/astral-experiments/github-policies/tree/main/environments).
+   Both environments allow deployments only from `main` and disallow
+   administrator bypass. The `release-gate` environment requires approval from
+   `astral-experiments/astral-defaults` and prevents self-review. The App
+   approves deployments to `release` after the `release-gate` job succeeds in
+   the same workflow run. PyPI and crates.io bind their trusted publishers to
+   `release`. Keep the repository's release tag rule in place so tag creation
+   requires a successful deployment to `release`.
 2. Add these secrets to the `release` environment for the same R2 bucket used by
    ty. Obtain the values from the service administrator; GitHub does not reveal
    existing secret values:
@@ -104,11 +107,12 @@ release manifest, and Cargo packages without publishing. To publish, enter the
 version from the merged release PR. The workflow checks that the tag matches the
 packages being released and builds from the selected commit.
 
-After the build checks pass, the workflow publishes to PyPI and crates.io and
-creates the GitHub release with its manifest, checksums, and provenance
-attestations. It then mirrors standalone downloads and installers to R2 and
-updates the versions repository. A crates.io failure does not block the GitHub
-release.
+Have another member of `astral-experiments/astral-defaults` approve the
+`release-gate` job. After approval and successful build checks, the workflow
+publishes to PyPI and crates.io and creates the GitHub release with its
+manifest, checksums, and provenance attestations. It then mirrors standalone
+downloads and installers to R2 and updates the versions repository. A crates.io
+failure does not block the GitHub release.
 
 The crates publisher skips versions already on crates.io, allowing an
 interrupted release to resume. PyPI's publisher likewise checks existing files
