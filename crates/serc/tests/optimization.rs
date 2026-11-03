@@ -15,6 +15,20 @@ use serc::{
 };
 
 #[test]
+fn a_folded_branch_does_not_repeat_its_line_before_a_finalizer() {
+    let source = r"def pick():
+    try:
+        if True:
+            work()
+        else:
+            fallback()
+    finally:
+        finish()
+";
+    assert_matches_cpython(source, "folded_branch_finalizer.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
