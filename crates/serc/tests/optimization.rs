@@ -15,6 +15,43 @@ use serc::{
 };
 
 #[test]
+fn branched_handler_exits_share_a_local_attribute_return() {
+    let source = r"def lookup(obj, outer, inner):
+    try:
+        if outer:
+            if inner:
+                take()
+            else:
+                release()
+    except LookupError:
+        if inner:
+            recover()
+        else:
+            reset()
+    return obj.value
+";
+    assert_matches_cpython(source, "handler_attribute_return.py", &LEVELS);
+}
+
+#[test]
+fn nested_try_exits_share_a_local_attribute_return() {
+    let source = r"def fetch(obj, outer, inner):
+    try:
+        if outer:
+            if inner:
+                work()
+            else:
+                recover()
+        else:
+            finish()
+    except LookupError:
+        pass
+    return obj.value
+";
+    assert_matches_cpython(source, "nested_attribute_return.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
