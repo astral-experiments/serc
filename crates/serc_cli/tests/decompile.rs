@@ -2163,6 +2163,35 @@ def mixed(a, b, c):
 
 #[cfg(feature = "decompile")]
 #[test]
+fn successive_comparison_chains_skip_their_own_failure_blocks() {
+    check_fixture(
+        r"def valid(enabled, read, a, b):
+    if enabled and 0 <= read(a) <= 12 and 1 <= read(b) <= 31:
+        return read(42)
+    return None
+
+def either(read, a, b):
+    if 0 < read(a) < 5 or 7 < read(b) < 10:
+        return read(42)
+    return None
+",
+        r"result = []
+def read(value):
+    result.append(value)
+    return value
+assert valid(False, read, 4, 8) is None and result == []
+assert valid(True, read, -1, 8) is None and result == [-1]
+assert valid(True, read, 13, 8) is None and result[-1] == 13
+assert valid(True, read, 1, 32) is None and result[-2:] == [1, 32]
+assert valid(True, read, 1, 31) == 42 and result[-3:] == [1, 31, 42]
+assert either(read, 2, 0) == 42 and result[-2:] == [2, 42]
+assert either(read, 6, 9) == 42 and result[-3:] == [6, 9, 42]
+assert either(read, 0, 7) is None and result[-2:] == [0, 7]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn value_patterns_and_guards() {
     check_fixture(
         r#"events = []

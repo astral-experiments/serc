@@ -108,7 +108,13 @@ impl Body<'_, '_, '_> {
                 return Ok(join);
             }
 
-            return self.comparison_predicate(ops, header, operand, cleanup, chain, level);
+            let predicate =
+                self.comparison_predicate(ops, header, operand, cleanup, chain, level)?;
+            let predicate = self.extend_comparison(ops, first, predicate, level)?;
+            if let Some(cleanup) = predicate.comparison_cleanup {
+                return self.comparison_suites(ops, &predicate, cleanup, level);
+            }
+            return self.conditional_suites(ops, &predicate, predicate.target, ops.len(), level);
         }
     }
 
@@ -149,6 +155,49 @@ impl Body<'_, '_, '_> {
         Ok((tail, join))
     }
 
+    /// A chain used as one operand of an and/or predicate can jump over its
+    /// failure cleanup before the next test. Preserve that logical fallthrough.
+    pub(super) fn comparison_operand(
+        &mut self,
+        ops: &[Instruction],
+        start: usize,
+        end: usize,
+        level: usize,
+    ) -> Option<Predicate> {
+        let ops = ops.get(..end)?;
+        let branch = self.flow.block(start).ops.end.checked_sub(1)?;
+        if branch >= end || ops[branch].name != "POP_JUMP_IF_FALSE" {
+            return None;
+        }
+        let link = branch.checked_sub(3)?;
+        if link <= start || !is_link(&ops[link..]) || guard(ops, link)? != (branch, false) {
+            return None;
+        }
+        let cleanup = self.flow.jump(branch)?;
+        if cleanup <= branch || cleanup >= end || !self.flow.entered_from(cleanup, link..cleanup) {
+            return None;
+        }
+        let operands = self
+            .fragment(ops, start, link, level)
+            .ok()?
+            .operands()
+            .ok()?;
+        let [left, right]: [_; 2] = operands.try_into().ok()?;
+        let cmp = operator(ops[link + 2], self.m.version)?;
+        let chain = format!(
+            "({} {cmp} {}",
+            left.expression_text()?,
+            right.expression_text()?
+        );
+        let atom = self
+            .comparison_predicate(ops, None, after_branch(ops, branch), cleanup, chain, level)
+            .ok()?;
+        (atom.suite > cleanup
+            || (atom.suite < cleanup
+                && matches!(ops[cleanup - 1].name, "RETURN_VALUE" | "RETURN_CONST")))
+        .then_some(atom)
+    }
+
     fn comparison_predicate(
         &mut self,
         ops: &[Instruction],
@@ -157,7 +206,7 @@ impl Body<'_, '_, '_> {
         cleanup: usize,
         mut chain: String,
         level: usize,
-    ) -> Result<usize, String> {
+    ) -> Result<Predicate, String> {
         let end = ops.len();
         if ops[cleanup].name != "POP_TOP" {
             return Err("unsupported comparison predicate cleanup".into());
@@ -194,21 +243,32 @@ impl Body<'_, '_, '_> {
         {
             return Err("comparison failures have different destinations".into());
         }
-        let predicate = Predicate {
+        Ok(Predicate {
             header,
             value: chain,
             fallthrough_true,
             branch,
             suite,
             target,
-        };
+            comparison_cleanup: Some(cleanup),
+        })
+    }
+
+    pub(super) fn comparison_suites(
+        &mut self,
+        ops: &[Instruction],
+        predicate: &Predicate,
+        cleanup: usize,
+        level: usize,
+    ) -> Result<usize, String> {
+        let (suite, target) = (predicate.suite, predicate.target);
         if suite < cleanup && matches!(ops[cleanup - 1].name, "RETURN_CONST" | "RETURN_VALUE") {
             let body = self.fragment(ops, suite, cleanup, level)?.suite()?;
             self.block(&format!("if {}:", predicate.test(true)), &body)?;
             return Ok(target);
         }
         let suite_end = if suite < cleanup { cleanup } else { target };
-        self.conditional_suites(ops, &predicate, suite_end, end, level)
+        self.conditional_suites(ops, predicate, suite_end, ops.len(), level)
     }
 
     fn finish_comparison(
