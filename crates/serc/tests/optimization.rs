@@ -15959,6 +15959,17 @@ fn erased_match_cases_keep_unlocated_loop_exits() {
 }
 
 #[test]
+fn erased_loop_capture_keeps_the_stores_line_on_its_backedge() {
+    let source = r"def consume(items, ready):
+    while ready and items:
+        match items.pop():
+            case selected:
+                assert selected
+";
+    assert_matches_cpython(source, "erased_loop_capture.py", &LEVELS);
+}
+
+#[test]
 fn erased_match_cases_preserve_loop_backedges() {
     for body in [
         "assert item",
