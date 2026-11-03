@@ -279,6 +279,10 @@ impl Body<'_, '_, '_> {
     ) -> Result<usize, String> {
         let value = self.expr()?;
         let mut predicate = self.predicate(ops, i, value, end, level, header)?;
+        if self.conditional_break(ops, predicate.target, end) {
+            self.block(&format!("if {}:", predicate.test(false)), "break")?;
+            return Ok(predicate.suite);
+        }
         predicate.target = self.local_join(ops, predicate.target, end);
         if let Some(latch) = self.enclosing_continue_latch(ops, &predicate, end) {
             predicate.suite = predicate.target;

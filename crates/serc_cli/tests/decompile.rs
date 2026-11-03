@@ -595,6 +595,64 @@ assert result == (0, 'unused', [0])",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn unconditional_loops_follow_their_own_resumption_and_break_edges() {
+    check_fixture(
+        r"def parse(read, limit):
+    lines = []
+    while True:
+        line = read()
+        if len(line) > limit:
+            raise ValueError(line)
+        lines.append(line)
+        if len(lines) > limit:
+            raise OverflowError
+        if not line:
+            break
+    return lines
+
+def widths(first, more):
+    yield first
+    while True:
+        yield more()
+
+async def drain(read):
+    values = []
+    while True:
+        value = await read()
+        if not value:
+            break
+        values.append(value)
+    return values
+",
+        r"import asyncio
+result = []
+for lines, limit in [(['x', ''], 3), (['xxxx'], 2), (['x', 'y', ''], 2)]:
+    try: result.append(parse(iter(lines).__next__, limit))
+    except Exception as exc: result.append((type(exc).__name__, exc.args))
+for stop in ('close', 'throw', 'next'):
+    it = widths(4, iter([3, 2]).__next__)
+    result.append([next(it), next(it), next(it)])
+    try:
+        if stop == 'close': it.close()
+        elif stop == 'throw': it.throw(LookupError('thrown'))
+        else: next(it)
+    except Exception as exc: result.append((type(exc).__name__, exc.args))
+async def consume(values):
+    async def read():
+        await asyncio.sleep(0)
+        value = next(values)
+        if isinstance(value, Exception): raise value
+        return value
+    try: return await drain(read)
+    except ValueError as exc: return exc.args
+for values in ([1, 2, 0], [3, ValueError('failed')]):
+    result.append(asyncio.run(consume(iter(values))))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_constant_loop_reenters_after_exhausting_its_nested_iterator() {
     check_fixture(
         r"def search(read, match, visit):
