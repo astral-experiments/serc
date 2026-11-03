@@ -18055,6 +18055,33 @@ fn elided_terminal_boolean_preserves_shared_return_order() {
 }
 
 #[test]
+fn terminal_conditional_stores_keep_their_original_value_join() {
+    for (target, value) in [
+        (
+            "out",
+            "item if ready else build({} if item is None else item)",
+        ),
+        (
+            "owner.result",
+            "item if ready else 1 + (item if active else 2)",
+        ),
+        (
+            "out",
+            "(item if active else (2 if ready else 3)) if ready else item",
+        ),
+    ] {
+        let source =
+            format!("def run(owner, item, ready, active, build):\n    {target} = {value}\n");
+        assert_matches_cpython_versions(
+            &source,
+            "conditional_store.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+    }
+}
+
+#[test]
 fn terminal_conditional_name_assignments_preserve_join() {
     for scope in ["nonlocal", "local", "global", "attribute"] {
         for guard in ["compound", "simple", "none"] {
