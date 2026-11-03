@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare serc and pycdc, requiring serc to match every pycdc scope in the stdlib."""
+"""Compare executable scopes, including verified functions in invalid pycdc output."""
 
 from __future__ import annotations
 
@@ -21,27 +21,36 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import check_decompile_corpus as corpus
 from decompile_flow import function_matches, scopes
+from decompile_fragments import verified_fragments
 
 
-def measure(command, cache, filename, original, counts, *, check_flow=False):
+def measure(
+    command, cache, filename, original, counts, *, check_flow=False, salvage=False
+):
     try:
         run = subprocess.run(
             [*command, cache], capture_output=True, check=False, timeout=30
         )
     except subprocess.TimeoutExpired:
         counts["timeouts"] += 1
-        return set(), {}
+        return set(), {}, set()
     if run.returncode:
         counts["nonzero_exits"] += 1
     if not run.stdout.strip():
         counts["empty_outputs"] += 1
         if run.returncode:
-            return set(), {}
+            return set(), {}, set()
     try:
         recovered = compile(run.stdout, filename, "exec", dont_inherit=True, optimize=0)
     except (ValueError, SyntaxError, RecursionError):
         counts["invalid_source"] += 1
-        return set(), {}
+        fragments = (
+            verified_fragments(run.stdout, filename, original) if salvage else set()
+        )
+        if fragments:
+            counts["invalid_modules_with_verified_fragments"] += 1
+            counts["verified_fragment_code_objects"] += len(fragments)
+        return set(), {}, fragments
     counts["compilable_modules"] += 1
     if b"# serc: detached function " in run.stdout:
         sections = sum(
@@ -73,7 +82,7 @@ def measure(command, cache, filename, original, counts, *, check_flow=False):
         if check_flow
         else {}
     )
-    return matches, flow
+    return matches, flow, set()
 
 
 def main():
@@ -140,6 +149,7 @@ def main():
     flow_regressions = {}
     newly_unplaced = {}
     pycdc_only = {}
+    pycdc_fragment_only = {}
     gained = 0
     baseline = Counter()
     packages = defaultdict(lambda: defaultdict(Counter))
@@ -166,15 +176,24 @@ def main():
                 importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(code)
             )
             matched = {}
+            pycdc_fragments = set()
             for tool, command in commands.items():
                 result = Counter()
                 compare = previous is not None and tool == "serc"
-                matches, flow = measure(
-                    command, cache, filename, code, result, check_flow=compare
+                matches, flow, fragments = measure(
+                    command,
+                    cache,
+                    filename,
+                    code,
+                    result,
+                    check_flow=compare,
+                    salvage=tool == "pycdc",
                 )
+                if tool == "pycdc":
+                    pycdc_fragments = fragments
                 matched[tool] = matches
                 if compare:
-                    old, old_flow = measure(
+                    old, old_flow, _ = measure(
                         previous, cache, filename, code, baseline, check_flow=True
                     )
                     gained += len(matches - old)
@@ -190,6 +209,8 @@ def main():
                 totals[tool].update(result)
                 if package is not None:
                     package[tool].update(result)
+            if extra := pycdc_fragments - matched["serc"]:
+                pycdc_fragment_only[filename] = sorted(extra)
             if extra := matched["pycdc"] - matched["serc"]:
                 pycdc_only[filename] = sorted(extra)
     report = {
@@ -198,6 +219,7 @@ def main():
         "inputs": counts,
         **totals,
         "pycdc_only": pycdc_only,
+        "pycdc_fragment_only": pycdc_fragment_only,
     }
     if packages:
         report["packages"] = packages
@@ -211,7 +233,11 @@ def main():
         )
     print(json.dumps(report, indent=2))
     return bool(
-        regressions or (args.corpus != "ruff" and (pycdc_only or flow_regressions))
+        regressions
+        or (
+            args.corpus != "ruff"
+            and (pycdc_only or pycdc_fragment_only or flow_regressions)
+        )
     )
 
 

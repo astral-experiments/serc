@@ -31,10 +31,10 @@ ROOTS = [
 ]
 # Baseline complete modules recovered from this Ruff revision.
 MINIMUM_VERIFIED = {
-    "3.12.14": 1891,
-    "3.13.15": 1895,
-    "3.14.5": 1882,
-    "3.15.0rc2": 1902,
+    "3.12.14": 1894,
+    "3.13.15": 1898,
+    "3.14.5": 1886,
+    "3.15.0rc2": 1906,
 }
 FIELDS = (
     "co_name",

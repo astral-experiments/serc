@@ -180,6 +180,21 @@ fn embedded_operands_keep_their_grouping() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_short_circuit_operand_can_create_a_lambda() {
+    check_fixture(
+        "def select(convert, default):\n    return convert or (lambda node=default(): node)\n",
+        r"result = []
+def default():
+    result.append('default')
+    return 42
+assert select(str, default) is str
+assert select(None, default)() == 42
+assert result == ['default']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn identifiers_allow_unicode_continuation_characters() {
     check_fixture(
         "Q\u{307} = 1\nx\u{e0100} = 2\n",
