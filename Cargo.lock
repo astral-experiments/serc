@@ -1425,7 +1425,7 @@ dependencies = [
 
 [[package]]
 name = "serc"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "clap",
  "cpu-time",
@@ -1460,7 +1460,7 @@ dependencies = [
 
 [[package]]
 name = "serc-cli"
-version = "0.1.11"
+version = "0.1.12"
 dependencies = [
  "clap",
  "fs-err",
