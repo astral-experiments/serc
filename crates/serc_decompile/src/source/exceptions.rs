@@ -113,6 +113,7 @@ impl Body<'_, '_, '_> {
         }
         self.region(ops, 0, start, 0)?;
         let (suite, returns) = self.fragment(ops, start, end, 0)?.pending_return()?;
+        let try_source_start = self.lines.len();
         self.try_block(&suite, start > 0 && ops[start - 1].name != "NOP")?;
         let star = ops
             .get(handler + 1)
@@ -133,9 +134,9 @@ impl Body<'_, '_, '_> {
         }
         if !star
             && !returns
-            && let Some(dispatch) = self.exception_dispatch(bc, handler, end, limit)
+            && let Some(dispatch) = self.exception_dispatch(bc, handler, start, end, limit)
         {
-            return self.emit_dispatch(ops, dispatch);
+            return self.emit_dispatch(ops, dispatch, try_source_start);
         }
         let match_kind = if star {
             "CHECK_EG_MATCH"

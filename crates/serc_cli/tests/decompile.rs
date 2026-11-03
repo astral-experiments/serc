@@ -1631,6 +1631,34 @@ assert result == ['after']",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn an_exception_handler_can_retry_the_entire_try_suite() {
+    check_fixture(
+        r"def retry(work, handled):
+    while True:
+        try:
+            work()
+            break
+        except KeyboardInterrupt:
+            handled()
+",
+        r"import sys
+result = []
+attempts = iter((False, False, True))
+def work():
+    assert sys.exception() is None
+    result.append('attempt')
+    if not next(attempts):
+        raise KeyboardInterrupt
+def handled():
+    assert isinstance(sys.exception(), KeyboardInterrupt)
+    result.append('interrupt')
+retry(work, handled)
+assert result == ['attempt', 'interrupt', 'attempt', 'interrupt', 'attempt']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn only_the_handler_continues_after_a_successful_constant_return() {
     check_fixture(
         r"def bind(obj, record):
