@@ -2136,6 +2136,48 @@ fn comprehensions_inside_returning_exception_handlers() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn nested_finalizers_run_under_the_right_active_exception() {
+    check_fixture(
+        r"async def unwind(wait, failure, emit):
+    try:
+        await wait()
+    except ValueError as exc:
+        if exc.args:
+            emit('caught')
+    try:
+        if failure is not None:
+            try:
+                raise failure
+            finally:
+                emit('inner')
+    finally:
+        emit('outer')
+    return 42
+",
+        r"import asyncio, sys
+async def scenario(wait_error, failure, replace):
+    events = []
+    def emit(label):
+        active = sys.exception()
+        events.append((label, type(active).__name__, active.args if active else None))
+        if label == replace: raise RuntimeError(label)
+    async def wait():
+        await asyncio.sleep(0)
+        if wait_error is not None: raise wait_error
+    try:
+        value = await unwind(wait, failure, emit)
+    except Exception as exc:
+        value = type(exc).__name__, exc.args
+    return events, value
+result = [asyncio.run(scenario(wait_error, failure, replace))
+          for wait_error in [None, ValueError(), ValueError('caught'), TypeError('uncaught')]
+          for failure in [None, KeyError('failed')]
+          for replace in [None, 'inner', 'outer']]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn suspended_handlers_resume_and_reraise_in_loops() {
     check_fixture(
         r"async def consume(pending, wait, events):

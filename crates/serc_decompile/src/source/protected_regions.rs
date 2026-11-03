@@ -80,21 +80,27 @@ impl ExitCopies {
     }
 }
 
-fn groups(bc: &Bytecode) -> FxHashMap<usize, Vec<Handler>> {
+fn groups(bc: &Bytecode) -> Vec<Vec<Handler>> {
     let mut groups = FxHashMap::<_, Vec<_>>::default();
     for entry in &bc.handlers {
         if !entry.lasti {
             groups.entry(entry.target).or_default().push(*entry);
         }
     }
-    groups
+    // Recover inner suites before resolving their enclosing unwind edges.
+    let mut ordered: Vec<_> = groups.into_values().collect();
+    ordered.sort_unstable_by_key(|entries| std::cmp::Reverse(entries[0].start));
+    ordered
 }
 
 pub(super) fn suspended(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Handlers {
-    groups(bc)
-        .into_values()
-        .filter_map(|entries| region(&bc.ops, owner, &entries))
-        .collect()
+    let mut result = Handlers::default();
+    for entries in groups(bc) {
+        if let Some((start, suite)) = region(&bc.ops, owner, &entries, &result) {
+            result.insert(start, suite);
+        }
+    }
+    result
 }
 
 /// Use region recovery for ordinary scopes when a branch encloses the first
@@ -107,7 +113,7 @@ pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handle
         return None;
     }
     let groups = groups(bc);
-    let split = groups.get(&first.target)?.len() > 1;
+    let split = groups.last()?.len() > 1;
     let single_dispatch = groups.len() == 1;
     let unguarded = single_dispatch
         && !split
@@ -119,13 +125,13 @@ pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handle
     let mut result = Handlers::default();
     let mut unwinds = FxHashSet::default();
     let mut starts = vec![0];
-    for entries in groups.into_values() {
+    for entries in groups {
         let dispatch = bc
             .ops
             .binary_search_by_key(&entries[0].target, |op| op.offset)
             .ok()?;
         let h = flow.handler(dispatch)?;
-        let (start, mut suite) = region(&bc.ops, owner, &entries)?;
+        let (start, mut suite) = region(&bc.ops, owner, &entries, &result)?;
         if suite.end == dispatch && suite.next > dispatch {
             // The try returned. Only the handled exception reaches this
             // continuation, so an ordinary walk from offset zero misses it.
@@ -167,6 +173,7 @@ fn region(
     ops: &[Instruction],
     owner: &Body<'_, '_, '_>,
     entries: &[Handler],
+    inner: &Handlers,
 ) -> Option<(usize, Protected)> {
     let flow = &owner.flow;
     let index = |offset| ops.binary_search_by_key(&offset, |op| op.offset).ok();
@@ -177,14 +184,14 @@ fn region(
         return None;
     }
 
-    let end = protected_end(ops, flow, entries)?;
+    let end = protected_end(ops, flow, entries, inner)?;
     if end > dispatch {
         return None;
     }
     let (unwind, cleanup) = super::dispatch::unwind(ops, flow, dispatch, first.depth + 1)?;
     if unwind.start == ops[dispatch].offset
         && unwind.end == ops[cleanup].offset
-        && let Some(finally) = finally_region(ops, flow, end, dispatch, cleanup)
+        && let Some(finally) = finally_region(ops, flow, start..end, dispatch, cleanup)
     {
         return Some((start, finally));
     }
@@ -236,13 +243,12 @@ fn region(
     let mut handler_exits = None;
     let handler = match ops.get(body..stop)? {
         [.., raise] if raise.name == "RAISE_VARARGS" => body..stop,
-        [.., pop, jump]
-            if !bound
-                && pop.name == "POP_EXCEPT"
-                && matches!(
-                    jump.name,
-                    "JUMP_FORWARD" | "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
-                )
+        [.., jump]
+            if matches!(
+                jump.name,
+                "JUMP_FORWARD" | "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
+            ) && let Some((pop, after)) = owner.handler_pop(ops, binding, stop)
+                && after == stop - 1
                 && let Some(to) = flow.jump(stop - 1) =>
         {
             if to != next && Some(to) != for_header {
@@ -257,7 +263,7 @@ fn region(
                 }
                 handler_tail = Some(stop - 1..stop);
             }
-            body..stop - 2
+            body..pop
         }
         [.., ret]
             if !bound
@@ -387,7 +393,7 @@ pub(super) fn same_finally_suite(
 fn finally_region(
     ops: &[Instruction],
     flow: &Graph,
-    end: usize,
+    suite: Range<usize>,
     dispatch: usize,
     cleanup: usize,
 ) -> Option<Protected> {
@@ -395,6 +401,32 @@ fn finally_region(
     let exceptional = dispatch + 1..reraise;
     if exceptional.is_empty() || (ops[reraise].name, ops[reraise].arg) != ("RERAISE", 0) {
         return None;
+    }
+    let end = suite.end;
+    // If every normal path raises, CPython emits only the exceptional copy.
+    if ops[end - 1].name == "RAISE_VARARGS"
+        && flow.blocks_in(suite.clone()).all(|block| {
+            let last = block.ops.end - 1;
+            let jump = flow.jump(last);
+            let fallthrough = flow.fallthrough(block);
+            [jump, fallthrough]
+                .into_iter()
+                .flatten()
+                .all(|dest| suite.contains(&dest))
+                && (jump.is_some() || fallthrough.is_some() || ops[last].name == "RAISE_VARARGS")
+        })
+    {
+        return Some(Protected {
+            end,
+            next: end,
+            clause: Clause::Finally {
+                deferred_return: end..end,
+            },
+            handler: exceptional,
+            try_exits: None,
+            handler_exits: None,
+            handler_tail: None,
+        });
     }
     let deferred = ops[end].name == "NOP";
     let start = end + usize::from(deferred);
@@ -432,20 +464,51 @@ fn finally_region(
     })
 }
 
-fn protected_end(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<usize> {
+fn protected_end(
+    ops: &[Instruction],
+    flow: &Graph,
+    entries: &[Handler],
+    inner: &Handlers,
+) -> Option<usize> {
     let index = |offset| ops.binary_search_by_key(&offset, |op| op.offset).ok();
     let first = entries[0];
     // A delegated yield temporarily routes throws to CLEANUP_THROW. On success
     // it rejoins END_SEND. If it throws again, the user's handler gets control.
     let mut end = index(first.end)?;
-    let mut cleanups = FxHashSet::default();
+    let mut cleanups = FxHashMap::default();
     for entry in &entries[1..] {
         let at = index(entry.start)?;
         if (entry.depth, entry.lasti) != (first.depth, first.lasti) {
             return None;
         }
-        if ops[at].name == "CLEANUP_THROW" {
-            if index(entry.end)? != at + 1 || !cleanups.remove(&at) {
+        // The enclosing range can stop at a nested try and resume on its
+        // exceptional unwind. Only stitch a child whose cleanup the table
+        // routes back to this exact handler.
+        let mut child = end;
+        while child < at && matches!(ops[child].name, "NOP" | "NOT_TAKEN") {
+            child += 1;
+        }
+        if let Some(suite) = inner.get(&child)
+            && matches!(suite.clause, Clause::Finally { .. })
+            && let Some(h) = flow.handler(child)
+            && let Some((_, unwind)) =
+                super::dispatch::unwind(ops, flow, index(h.target)?, h.depth + 1)
+            && let Some(parent) = flow.handler(unwind)
+            && parent.start == ops[unwind].offset
+            && (parent.target, parent.depth, parent.lasti)
+                == (first.target, first.depth, first.lasti)
+            && index(parent.end)? == unwind + 3
+            && (at == unwind || at == suite.next)
+        {
+            cleanups.insert(unwind, unwind + 3);
+            end = suite.next;
+            if at == end {
+                end = index(entry.end)?;
+                continue;
+            }
+        }
+        if let Some(expected_end) = cleanups.remove(&at) {
+            if index(entry.end)? != expected_end {
                 return None;
             }
             continue;
@@ -488,7 +551,7 @@ fn protected_end(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Opti
         if !(at..end).contains(&resume) || ops[resume].name != "END_SEND" {
             return None;
         }
-        cleanups.insert(cleanup);
+        cleanups.insert(cleanup, cleanup + 1);
     }
     cleanups.is_empty().then_some(end)
 }
