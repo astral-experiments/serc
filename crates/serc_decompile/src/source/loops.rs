@@ -14,6 +14,8 @@ pub(super) struct WhileLatch {
 pub(super) struct Loop {
     header: usize,
     body_end: usize,
+    // Number of for statements whose iterators are live inside this loop.
+    iterators: usize,
     after: Option<usize>,
     // Index of the return operand CPython copied into a break arm.
     copied_return: Option<usize>,
@@ -62,7 +64,7 @@ impl Body<'_, '_, '_> {
         } else {
             let at = local_return(ops, end)?;
             let block = self.flow.block(at);
-            let slots = self.iterator_slots(ops, header)?;
+            let slots = self.iterator_slots(ops, header, 1)?;
             // The entire arm discards exactly this iterator before reading
             // the same local as the continuation. A return from a nested
             // iterator would have additional slots to unwind.
@@ -300,6 +302,7 @@ impl Body<'_, '_, '_> {
         let outer = self.loop_edges.replace(Loop {
             header: nop,
             body_end: latch,
+            iterators: self.loop_edges.map_or(0, |outer| outer.iterators),
             after: Some(after),
             copied_return,
         });
@@ -376,7 +379,7 @@ impl Body<'_, '_, '_> {
                 })
     }
 
-    fn iterator_slots(&self, ops: &[Instruction], header: usize) -> Option<usize> {
+    fn iterator_slots(&self, ops: &[Instruction], header: usize, count: usize) -> Option<usize> {
         let iter = header.checked_sub(1)?;
         if ops[header].name != "FOR_ITER" || ops[iter].name != "GET_ITER" {
             return None;
@@ -387,9 +390,10 @@ impl Body<'_, '_, '_> {
             ops[iter].arg,
         );
         let depth = self.flow.for_iter_depth(header)?;
+        let expected = slots * count;
         // A loop in an except clause also carries the saved exception.
-        (depth == slots
-            || (depth == slots + 1
+        (depth == expected
+            || (depth == expected + 1
                 && self
                     .flow
                     .handler(header)
@@ -397,26 +401,35 @@ impl Body<'_, '_, '_> {
         .then_some(slots)
     }
 
-    /// A return inside a for suite discards the iterator that the source
-    /// operand stack leaves implicit. A computed return value is moved
-    /// underneath it first. Only consume slots owned by this iterator.
+    /// A return discards each enclosing iterator, innermost first. For a
+    /// computed return CPython moves the value under each iterator in turn.
     pub(super) fn iterator_return(
         &self,
         ops: &[Instruction],
         i: usize,
         end: usize,
     ) -> Option<usize> {
-        let slots = self.iterator_slots(ops, self.loop_edges?.header)?;
+        let active = self.loop_edges?;
+        let slots = self.iterator_slots(ops, active.header, active.iterators)?;
         let computed = match ops[i].name {
             "SWAP" if ops[i].arg as usize == slots + 1 && self.stack.len() == 1 => true,
             "POP_TOP" if self.stack.is_empty() => false,
             _ => return None,
         };
-        let pop = i + usize::from(computed);
-        let next = pop + slots;
+        let width = usize::from(computed) + slots;
+        let next = i + active.iterators * width;
         let stop = self.flow.block(i).ops.end;
-        if next > stop || stop > end || ops[pop..next].iter().any(|op| op.name != "POP_TOP") {
+        if next > stop || stop > end {
             return None;
+        }
+        for discard in ops[i..next].chunks_exact(width) {
+            if computed && (discard[0].name, discard[0].arg as usize) != ("SWAP", slots + 1)
+                || discard[usize::from(computed)..]
+                    .iter()
+                    .any(|op| op.name != "POP_TOP")
+            {
+                return None;
+            }
         }
         if !computed && next == stop {
             return self.handler_constant_return(ops, i, next, end);
@@ -440,6 +453,8 @@ impl Body<'_, '_, '_> {
         let mut active = Loop {
             header,
             body_end: body.end,
+            iterators: self.loop_edges.map_or(0, |outer| outer.iterators)
+                + usize::from(ops[header].name == "FOR_ITER"),
             after: None,
             copied_return: None,
         };

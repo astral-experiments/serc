@@ -1139,6 +1139,42 @@ assert result == ['items', 'keys', 'items', 'items', 'items', 'keys', 'a', 'b']"
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_return_from_nested_iterators_evaluates_the_value_before_each_unwind() {
+    check_fixture(
+        r"def search(rows, read):
+    for row in rows:
+        for group in row:
+            for value in group:
+                if value:
+                    return read(value)
+    return 'empty'
+
+def contains(rows):
+    for row in rows:
+        for value in row:
+            if value:
+                return True
+    return False
+",
+        r"result = []
+class Stream:
+    def __init__(self, name, values):
+        self.name, self.values = name, values
+    def __iter__(self):
+        try: yield from self.values
+        finally: result.append(self.name)
+def read(value):
+    result.append(value)
+    return value
+assert search(Stream('rows', [Stream('groups', [Stream('values', [0, 7, 8])])]), read) == 7
+assert result == [7, 'values', 'groups', 'rows']
+assert search([[], [[]], [[0]]], read) == 'empty'
+assert contains([[0], [0, 3]]) and not contains([[0], []])",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn an_early_return_cleans_up_the_iterator_after_evaluating_its_value() {
     check_fixture(
         r"def ready(items, accept):
