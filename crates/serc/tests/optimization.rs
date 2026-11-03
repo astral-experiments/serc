@@ -923,6 +923,12 @@ fn returning_from_an_async_iterator_keeps_its_slot_under_three_managers() {
 }
 
 #[test]
+fn a_guard_can_locate_an_ownerless_try_exit_before_a_copied_return() {
+    let source = "def read(source):\n    try:\n        if source and source[0]:\n            try:\n                if valid(source):\n                    return 'yes'\n            except Exception as error:\n                warn(error)\n                reset()\n    except LookupError:\n        pass\n    return 'no'\n";
+    assert_matches_cpython(source, "guarded_try_return.py", &LEVELS);
+}
+
+#[test]
 fn guarded_cleanup_keeps_the_outer_iterators_discard_unlocated() {
     let source = r"def scan(items, manager, active):
     with manager:
