@@ -707,6 +707,26 @@ fn iterators_keep_an_unlocated_join_after_a_named_finalizer_handler() {
 }
 
 #[test]
+fn raising_while_else_preserves_the_break_on_a_copied_return() {
+    let source = r"def sample(ready, enabled):
+    try:
+        while ready():
+            try:
+                if enabled:
+                    step()
+                else:
+                    break
+            except ValueError:
+                pass
+        else:
+            raise LookupError
+    except TypeError:
+        pass
+";
+    assert_matches_cpython(source, "while_else_break_return.py", &LEVELS);
+}
+
+#[test]
 fn terminal_while_else_keeps_its_handler_break_position() {
     let source = r"def sample(active):
     if active:
