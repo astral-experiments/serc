@@ -3136,6 +3136,35 @@ result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is 
 
 #[cfg(feature = "decompile")]
 #[test]
+fn nested_except_returns_restore_the_active_exceptions_in_order() {
+    for fallback in ["False", "read(2)"] {
+        let source = format!(
+            "def lookup(read):\n    try:\n        return read(0)\n    except KeyError:\n        try:\n            return read(1)\n        except KeyError:\n            return {fallback}\n"
+        );
+        check_fixture(
+            &source,
+            r"import sys
+result = []
+def run(errors):
+    def read(i):
+        current = sys.exception()
+        result.append((i, current.args if current else ()))
+        if i < len(errors): raise errors[i](i)
+        return i
+    try: result.append(lookup(read))
+    except Exception as exc: result.append((type(exc).__name__, exc.args))
+for failures in ([], [KeyError], [ValueError], [KeyError, KeyError], [KeyError, ValueError], [KeyError, KeyError, RuntimeError]):
+    try: raise OSError('caller')
+    except OSError:
+        run(failures)
+        result.append(sys.exception().args)
+",
+        );
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn either_return_can_consume_the_iterator_after_a_protected_call() {
     check_fixture(
         r"def choose(items, select, build):

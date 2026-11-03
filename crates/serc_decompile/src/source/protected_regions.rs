@@ -8,8 +8,10 @@ use serc_bytecode::instructions::Handler;
 use super::{Body, Bytecode, Instruction};
 use crate::flow::Graph;
 mod finally;
+mod handler_returns;
 
 use finally::{break_marker, finally_region, returning_finally_loop};
+use handler_returns::{enclosing_exception, nested_handler_return, returning_handler_child};
 
 pub(super) type Handlers = FxHashMap<usize, Protected>;
 
@@ -270,6 +272,18 @@ fn region(
     // in the try suite before resuming at the jump target.
     let after_cleanup = cleanup + 3;
     let (end, mut next) = match ops.get(end..dispatch)? {
+        [swap, pop, ret]
+            if (swap.name, swap.arg) == ("SWAP", 2)
+                && pop.name == "POP_EXCEPT"
+                && ret.name == "RETURN_VALUE"
+                && first.depth == 1
+                && enclosing_exception(ops, flow, end, cleanup)
+                && flow.handler(end + 1).is_none() =>
+        {
+            // Returning the inner try's value also exits an enclosing except.
+            // The value was evaluated with that exception still active.
+            (dispatch, dispatch)
+        }
         [jump] if jump.name == "JUMP_FORWARD" && flow.jump(end) == Some(after_cleanup) => {
             (end, after_cleanup)
         }
@@ -296,6 +310,20 @@ fn region(
     let mut handler_tail = None;
     let mut handler_exits = None;
     let handler = match ops.get(body..stop)? {
+        _ if let Some(child_end) =
+            returning_handler_child(ops, flow, body..stop, unwind, inner) =>
+        {
+            body..child_end
+        }
+        _ if !bound
+            && end == dispatch
+            && first.depth == 1
+            && let Some((expression_end, tail)) =
+                nested_handler_return(ops, flow, body..stop, cleanup) =>
+        {
+            handler_tail = Some(tail..stop);
+            body..expression_end
+        }
         [.., raise] if raise.name == "RAISE_VARARGS" => body..stop,
         [.., jump]
             if matches!(
