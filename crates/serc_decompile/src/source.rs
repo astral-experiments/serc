@@ -13,6 +13,7 @@ mod exceptions;
 mod finalizers;
 mod layout;
 mod loops;
+mod managers;
 mod operands;
 mod paired;
 mod partial;

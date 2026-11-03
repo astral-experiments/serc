@@ -14,6 +14,7 @@ enum Clause {
     Except {
         kind: Option<Range<usize>>,
         binding: usize,
+        success: Range<usize>,
     },
     Finally {
         deferred_return: Range<usize>,
@@ -191,6 +192,9 @@ fn region(
     let (unwind, cleanup) = super::dispatch::unwind(ops, flow, dispatch, first.depth + 1)?;
     if unwind.start == ops[dispatch].offset
         && super::finalizers::owns_cleanup(ops, flow, dispatch..cleanup, unwind)
+        && ops[dispatch + 1].name != "POP_TOP"
+        && ops[dispatch + 1].name != "BUILD_LIST"
+        && super::dispatch::typed_handler(flow, ops, dispatch + 1).is_none()
         && let Some(finally) = finally_region(ops, flow, start..end, dispatch, cleanup)
     {
         return Some((start, finally));
@@ -216,7 +220,7 @@ fn region(
     // that edge comes from POP_EXCEPT in the handler. Include RETURN_VALUE
     // in the try suite before resuming at the jump target.
     let after_cleanup = cleanup + 3;
-    let (end, next) = match ops.get(end..dispatch)? {
+    let (end, mut next) = match ops.get(end..dispatch)? {
         [jump] if jump.name == "JUMP_FORWARD" && flow.jump(end) == Some(after_cleanup) => {
             (end, after_cleanup)
         }
@@ -239,6 +243,7 @@ fn region(
         _ => None,
     }
     .filter(|&i| i < start && flow.for_iter_depth(i) == Some(first.depth));
+    let mut success = next..next;
     let mut handler_tail = None;
     let mut handler_exits = None;
     let handler = match ops.get(body..stop)? {
@@ -293,9 +298,32 @@ fn region(
                         &ops[pop + 1..load],
                         &ops[stop..stop + clear],
                     ))
-                || super::regions::constant_return(ops, next + width) != Some((next, value))
             {
                 return None;
+            }
+            if super::regions::constant_return(ops, next + width) != Some((next, value)) {
+                let normal = flow.block(next);
+                let normal_return = super::regions::constant_return(ops, normal.ops.end);
+                // A suppressed with exception jumps back into the successful
+                // try path. Protection on that jump distinguishes an else
+                // suite from a statement after an explicitly returning handler.
+                if let Some((ret, normal_value)) = normal_return
+                    && normal_value == value
+                    && next < ret
+                    && normal.ops.end <= dispatch
+                    && flow.incoming(next).any(|source| {
+                        source > next
+                            && flow.jump(source) == Some(next)
+                            && flow
+                                .handler(source)
+                                .is_some_and(|h| h.target == first.target)
+                    })
+                {
+                    success = next..ret;
+                    next = ret;
+                } else {
+                    handler_tail = Some(load..stop);
+                }
             }
             handler_exits = ExitCopies::suffix(ops, flow, body..stop, stop - pop);
             body..handler_exits.map_or(pop, |copies| copies.first)
@@ -306,7 +334,11 @@ fn region(
         Protected {
             end,
             next,
-            clause: Clause::Except { kind, binding },
+            clause: Clause::Except {
+                kind,
+                binding,
+                success,
+            },
             try_exits: None,
             handler_exits,
             handler,
@@ -448,6 +480,10 @@ fn protected_end(
         if (entry.depth, entry.lasti) != (first.depth, first.lasti) {
             return None;
         }
+        if super::managers::bridges_try(ops, flow, end..at, first, &mut cleanups).is_some() {
+            end = index(entry.end)?;
+            continue;
+        }
         // The enclosing range can stop at a nested try and resume on its
         // exceptional unwind. Only stitch a child whose cleanup the table
         // routes back to this exact handler.
@@ -559,7 +595,7 @@ impl Body<'_, '_, '_> {
             next += 1;
         }
         let header = match &entry.clause {
-            Clause::Except { kind, binding } => {
+            Clause::Except { kind, binding, .. } => {
                 self.except_header(ops, kind.clone(), *binding, level)?
             }
             Clause::Finally { deferred_return } => {
@@ -582,6 +618,14 @@ impl Body<'_, '_, '_> {
         };
         self.try_block(&suite, start > 0 && ops[start - 1].name != "NOP")?;
         self.block(&header, &handler)?;
+        if let Clause::Except { success, .. } = &entry.clause
+            && !success.is_empty()
+        {
+            let suite = self
+                .fragment(ops, success.start, success.end, level)?
+                .suite()?;
+            self.block("else:", &suite)?;
+        }
         Ok(Some(next))
     }
 }

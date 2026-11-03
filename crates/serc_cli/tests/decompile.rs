@@ -2913,6 +2913,64 @@ result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is 
 
 #[cfg(feature = "decompile")]
 #[test]
+fn managers_inside_try_keep_the_exception_and_success_paths() {
+    check_fixture(
+        r"async def run(manager, work, emit):
+    try:
+        async with manager:
+            await work()
+    except ValueError:
+        emit('handled')
+    else:
+        emit('done')
+
+def rows(cm):
+    try:
+        with cm as values:
+            for value in values:
+                yield value
+    except ValueError as exc:
+        raise KeyError(*exc.args)
+",
+        r"import asyncio, sys
+from contextlib import asynccontextmanager, contextmanager
+result = []
+async def scenario(fail, suppress):
+    @asynccontextmanager
+    async def manager():
+        if fail == 'enter': raise ValueError('enter')
+        try: yield
+        except ValueError:
+            if not suppress: raise
+        finally:
+            await asyncio.sleep(0)
+            if fail == 'exit': raise ValueError('exit')
+    async def work():
+        await asyncio.sleep(0)
+        if fail == 'work': raise ValueError('work')
+    def emit(label):
+        active = sys.exception()
+        result.append((label, active.args if active else None))
+        if fail == 'done': raise ValueError(label)
+    try: await run(manager(), work, emit)
+    except ValueError as exc: result.append(('outside', exc.args))
+for fail in ['enter', 'work', 'exit', 'done', None]:
+    for suppress in [False, True]:
+        asyncio.run(scenario(fail, suppress))
+@contextmanager
+def values():
+    try: yield [1, 2]
+    finally: result.append(('closed', type(sys.exception()).__name__))
+it = rows(values())
+result.append(next(it))
+try: it.throw(ValueError('bad row'))
+except KeyError as exc: result.append(exc.args)
+result.extend(rows(values()))",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn managers_resume_after_await_and_preserve_exception_suppression() {
     check_fixture(
         "async def run(m, n, cb):\n    with m as v:\n        await cb(v)\n    async with n as w:\n        await cb(w)\n        await cb(3)\n    return 9\n",
