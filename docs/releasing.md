@@ -53,12 +53,12 @@ or deployment protection rules.
    `https://releases.astral.sh/github/serc/releases/download/VERSION/serc-installer.{sh,ps1}`.
 
 3. Grant `astral-experiments-releases-bot` access to Serc and configure
-   `RELEASES_STS_API_URL` in the `release` environment with the
-   experiments releases broker's base URL. Serc's
+   `RELEASES_STS_API_URL` in the `release` environment with the experiments
+   releases broker's base URL. Serc's
    `.github/secure-token-service-release.json` permits `release.yml` on `main`
    to request `contents: write` and `workflows: write`. The latter allows
-   tagging the selected commit even if `main` advances across workflow
-   changes while artifacts are building.
+   tagging the selected commit even if `main` advances across workflow changes
+   while artifacts are building.
 4. Set `ASTRAL_SH_RELEASES_STS_API_URL` in the `release` environment to the
    `astral-sh` releases broker's base URL. Grant `astral-releases-bot` access to
    [`astral-sh/versions`](https://github.com/astral-sh/versions/blob/main/.github/secure-token-service-release.json)
