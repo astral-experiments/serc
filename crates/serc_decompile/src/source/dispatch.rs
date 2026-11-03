@@ -207,6 +207,32 @@ impl Body<'_, '_, '_> {
         Some(load)
     }
 
+    /// One branch of an except suite may restore the saved exception and
+    /// return while its sibling raises. Every incoming edge must still carry
+    /// that handler's single saved exception.
+    pub(super) fn handler_branch_return(
+        &self,
+        ops: &[Instruction],
+        pop: usize,
+        end: usize,
+    ) -> Option<usize> {
+        let block = self.flow.block(pop);
+        if !self.stack.is_empty() || block.ops.start != pop || block.height != Some(1) {
+            return None;
+        }
+        let mut incoming = self.flow.incoming(pop);
+        let first = incoming.next()?;
+        let owner = self.flow.handler(first)?;
+        if !incoming.all(|i| {
+            self.flow.handler(i).is_some_and(|h| {
+                (h.target, h.depth, h.lasti) == (owner.target, owner.depth, owner.lasti)
+            })
+        }) {
+            return None;
+        }
+        self.handler_constant_return(ops, first, pop, end)
+    }
+
     pub(super) fn exception_dispatch(
         &self,
         bc: &super::Bytecode,

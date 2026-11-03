@@ -4672,6 +4672,101 @@ result = events, list(tasks(broken())), list(tasks([1, 2]))",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn conditional_handler_returns_and_finalizer_copies_restore_exception_state() {
+    check_fixture(
+        r"def send(write, value, parts):
+    try:
+        write(value)
+    except TypeError:
+        if parts is not None:
+            for part in parts:
+                write(part)
+        else:
+            raise ValueError(value)
+
+def check(bad, release):
+    try:
+        if bad:
+            raise LookupError
+    finally:
+        release()
+",
+        r"import sys
+events = []
+def write(value):
+    events.append((value, type(sys.exception()).__name__))
+    if value == 'bad': raise TypeError
+def release():
+    events.append(('close', type(sys.exception()).__name__))
+send(write, 'ok', None)
+send(write, 'bad', [1, 2])
+try: send(write, 'bad', None)
+except ValueError as exc: assert isinstance(exc.__context__, TypeError)
+else: raise AssertionError
+check(False, release)
+try: check(True, release)
+except LookupError: pass
+else: raise AssertionError
+assert events == [('ok', 'NoneType'), ('bad', 'NoneType'), (1, 'TypeError'), (2, 'TypeError'),
+                  ('bad', 'NoneType'), ('close', 'NoneType'), ('close', 'LookupError')]
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn pending_returns_cross_nested_finalizers_and_the_manager_exit() {
+    check_fixture(
+        r"def exchange(manager, work, record):
+    with manager as value:
+        record('open')
+        try:
+            record('start')
+            try:
+                work()
+            except LookupError as exc:
+                record(str(exc))
+                raise
+            finally:
+                record('detach')
+            return value, work()
+        except:
+            record('abort')
+            raise
+        finally:
+            record('close')
+",
+        r"import sys
+events = []
+def record(label): events.append((label, type(sys.exception()).__name__))
+class Manager:
+    def __enter__(self): return 'peer'
+    def __exit__(self, kind, exc, tb):
+        record('exit')
+        return kind is ValueError
+def work():
+    result = next(results)
+    if isinstance(result, Exception): raise result
+    return result
+results = iter([1, 2])
+assert exchange(Manager(), work, record) == ('peer', 2)
+assert events == [(x, 'NoneType') for x in ('open', 'start', 'detach', 'close', 'exit')]
+events.clear()
+results = iter([LookupError('lost')])
+try: exchange(Manager(), work, record)
+except LookupError: pass
+else: raise AssertionError
+assert events[2:] == [(x, 'LookupError') for x in ('lost', 'detach', 'abort', 'close', 'exit')]
+events.clear()
+results = iter([0, ValueError()])
+assert exchange(Manager(), work, record) is None
+assert events[2:] == [('detach', 'NoneType'), ('abort', 'ValueError'), ('close', 'ValueError'), ('exit', 'ValueError')]
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn nested_try_else_arms_rejoin_the_same_unprotected_continuation() {
     check_fixture(
         r"def dispatch(read, run, record):

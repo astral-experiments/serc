@@ -55,6 +55,43 @@ pub(super) struct Protected {
     handler_tail: Option<Range<usize>>,
 }
 
+impl Protected {
+    /// In a combined try/except/finally the first unwind enters the finalizer.
+    /// Its own unwind is the one that propagates to the enclosing suite.
+    fn unwind(&self, ops: &[Instruction], flow: &Graph, entry: Handler) -> Option<usize> {
+        let index = |offset| ops.binary_search_by_key(&offset, |op| op.offset).ok();
+        let (_, unwind) =
+            super::dispatch::unwind(ops, flow, index(entry.target)?, entry.depth + 1)?;
+        if let Clause::Except {
+            finalizer: Some(normal),
+            ..
+        } = &self.clause
+        {
+            let outer = flow.handler(unwind)?;
+            if outer.lasti
+                || outer.depth != entry.depth
+                || outer.start != ops[unwind].offset
+                || outer.end != ops.get(unwind + 3)?.offset
+                || normal.end != self.next
+            {
+                return None;
+            }
+            let (_, last) =
+                super::dispatch::unwind(ops, flow, index(outer.target)?, outer.depth + 1)?;
+            Some(last)
+        } else {
+            Some(unwind)
+        }
+    }
+
+    fn normal_finalizer(&self) -> Option<&Range<usize>> {
+        match &self.clause {
+            Clause::Finally { .. } => Some(&self.handler),
+            Clause::Except { finalizer, .. } => finalizer.as_ref(),
+        }
+    }
+}
+
 /// Consecutive copies of the same straight-line clause exit. A predicate can
 /// enter any copy at its first instruction, including past the lifted suite.
 #[derive(Clone, Copy)]
@@ -720,10 +757,9 @@ fn protected_end(
             child += 1;
         }
         if let Some(suite) = inner.get(&child)
-            && matches!(suite.clause, Clause::Finally { .. })
+            && let Some(normal) = suite.normal_finalizer()
             && let Some(h) = flow.handler(child)
-            && let Some((_, unwind)) =
-                super::dispatch::unwind(ops, flow, index(h.target)?, h.depth + 1)
+            && let Some(unwind) = suite.unwind(ops, flow, h)
             && let Some(parent) = flow.handler(unwind)
             && parent.start == ops[unwind].offset
             && (parent.target, parent.depth, parent.lasti)
@@ -731,11 +767,16 @@ fn protected_end(
             && index(parent.end)? == unwind + 3
             && (at == unwind
                 || at == suite.next
-                || (suite.handler == (at..index(entry.end)?) && suite.handler.end == suite.next))
+                || (normal.start == at
+                    && normal.end == suite.next
+                    && suite.next <= index(entry.end)?))
         {
             cleanups.insert(unwind, unwind + 3);
             end = suite.next;
-            if at == suite.handler.start && index(entry.end)? == end {
+            if at == normal.start && normal.end == end {
+                // Protection can resume on the normal finalizer copy and
+                // continue into further statements in the enclosing try.
+                end = index(entry.end)?;
                 continue;
             }
             if at == end {
@@ -839,10 +880,9 @@ impl Body<'_, '_, '_> {
         source: usize,
         target: usize,
     ) -> bool {
-        matches!(
-            ops[source].name,
-            "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
-        ) && self.flow.jump(source) == Some(target)
+        ops.get(source)
+            .is_some_and(|op| matches!(op.name, "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"))
+            && self.flow.jump(source) == Some(target)
             && self.handlers.iter().any(|(&start, suite)| {
                 let Clause::Except { binding, .. } = suite.clause else {
                     return false;
@@ -871,10 +911,7 @@ impl Body<'_, '_, '_> {
         }
         let child = self.handlers.get(&start)?;
         let entry = self.flow.handler(start)?;
-        let dispatch = ops
-            .binary_search_by_key(&entry.target, |op| op.offset)
-            .ok()?;
-        let (_, unwind) = super::dispatch::unwind(ops, &self.flow, dispatch, entry.depth + 1)?;
+        let unwind = child.unwind(ops, &self.flow, entry)?;
         let parent = self.flow.handler(unwind)?;
         (!entry.lasti
             && entry.depth == manager.depth
@@ -934,7 +971,14 @@ impl Body<'_, '_, '_> {
         let carried = returns
             && !consumes_return
             && next == limit
-            && matches!(entry.clause, Clause::Finally { .. });
+            && matches!(
+                entry.clause,
+                Clause::Finally { .. }
+                    | Clause::Except {
+                        finalizer: Some(_),
+                        ..
+                    }
+            );
         if returns && !carried && !consumes_return {
             if next >= limit || ops[next].name != "RETURN_VALUE" {
                 return Err("unsupported return through suspended handler".into());
