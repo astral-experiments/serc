@@ -166,6 +166,17 @@ fn nested_case_guards_keep_each_loop_exit() {
 }
 
 #[test]
+fn short_circuited_operands_keep_constants_reused_after_the_expression() {
+    let source = "def check(value):
+    assert value == (True or False)
+    record('middle', False)
+    result = False and lookup('unused')
+    return result, 'later', 'unused'
+";
+    assert_matches_cpython(source, "short_circuit_constants.py", &LEVELS);
+}
+
+#[test]
 fn threaded_boolean_value_keeps_intermediate_jump_lines() {
     let expression = r"(a
         or (b and (
