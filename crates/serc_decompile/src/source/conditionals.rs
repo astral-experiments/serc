@@ -324,7 +324,7 @@ impl Body<'_, '_, '_> {
         if av != bv || a == 0 {
             return false;
         }
-        self.instruction_lines(ops).is_ok_and(|lines| {
+        self.instruction_lines.as_deref().is_ok_and(|lines| {
             matches!((lines[a - 1], lines[a], lines[b]),
                 (Some(prev), Some(early), Some(late)) if prev < early && early < late)
         })
@@ -606,6 +606,48 @@ impl Body<'_, '_, '_> {
                 return Ok(join);
             }
         }
+        // The first arm of a terminal if/else can have its own copies of the
+        // implicit return. A bare None exit carrying its incoming guard's
+        // line belongs to that guard. Index it as the end of this arm so the
+        // nested test does not emit a return that merges the original exits.
+        if self.stack.is_empty()
+            && self.loop_edges.is_none()
+            && end == self.terminal_returns.end
+            && fallthrough_end == target
+            && start < tail
+            && target < end
+            && self.flow.handler(tail).is_none()
+            && let last = self.flow.block(tail)
+            && start < last.ops.start
+            && self.none_return(&ops[last.ops.clone()])
+            && self.instruction_lines.as_deref().is_ok_and(|lines| {
+                lines[last.ops.start].is_some()
+                    && self.flow.incoming(last.ops.start).any(|from| {
+                        (start..last.ops.start).contains(&from)
+                            && ops[from].name.starts_with("POP_JUMP_IF_")
+                            && lines[from] == lines[last.ops.start]
+                    })
+            })
+            && self.flow.blocks_in(start..target).all(|block| {
+                [
+                    self.flow.jump(block.ops.end - 1),
+                    self.flow.fallthrough(block),
+                ]
+                .into_iter()
+                .flatten()
+                .all(|to| (start..target).contains(&to))
+            })
+        {
+            let outer = self.terminal_returns.clone();
+            self.index_terminal_returns(&ops[..target], None);
+            let left = self.fragment(ops, start, target, level);
+            self.terminal_returns = outer;
+            let left = left?.suite()?;
+            let right = self.fragment(ops, target, end, level)?.suite()?;
+            self.block(&format!("if {test}:"), &left)?;
+            self.block("else:", &right)?;
+            return Ok(end);
+        }
         let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
         if self.implicit_reraise(ops, tail)
             && target < end
@@ -719,7 +761,7 @@ impl Body<'_, '_, '_> {
                         && self.none_return(&ops[self.flow.block(tail).ops.clone()])
                         && super::regions::constant_return(ops, end).is_some_and(|(at, _)| {
                             at > target
-                                && self.instruction_lines(ops).is_ok_and(|lines| {
+                                && self.instruction_lines.as_deref().is_ok_and(|lines| {
                                     lines[at].is_some() && lines[at] == lines[at - 1]
                                 })
                         });

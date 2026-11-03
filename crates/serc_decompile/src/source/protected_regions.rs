@@ -540,7 +540,7 @@ fn region(
                 // falling through before an else. Its POP_EXCEPT has its own
                 // source line, even when the handler did work before it.
                 if body < pop
-                    && owner.instruction_lines(ops).is_ok_and(|lines| {
+                    && owner.instruction_lines.as_deref().is_ok_and(|lines| {
                         lines[pop].is_none_or(|line| lines[body..pop].contains(&Some(line)))
                     })
                     && let Some(latch) = iterator_success_latch(owner, ops, start..next, to)
@@ -996,7 +996,8 @@ impl Body<'_, '_, '_> {
             && next < limit
             && self.none_return(&ops[next..limit])
             && self
-                .instruction_lines(ops)
+                .instruction_lines
+                .as_deref()
                 .is_ok_and(|lines| lines[next].is_some() && lines[next] == lines[next - 1])
         {
             next = limit;

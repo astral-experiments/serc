@@ -4524,6 +4524,113 @@ result = log",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn mixed_boolean_values_rejoin_at_the_next_operand_discard() {
+    check_fixture(
+        r"def choose(a, b, c, d):
+    selected = a() or b() and (c() and d() or a())
+    return selected
+
+def both(a, b, c):
+    selected = (a() or b()) and c()
+    return selected
+",
+        r"from itertools import product
+result = []
+class Flag:
+    def __init__(self, name, truth): self.name, self.truth = name, truth
+    def __bool__(self):
+        result.append(('test', self.name))
+        return self.truth
+    def __call__(self):
+        result.append(('call', self.name))
+        return self
+for truth in product([False, True], repeat=4):
+    flags = [Flag(n, v) for n, v in zip('abcd', truth)]
+    for selected in (choose(*flags), both(*flags[:3])):
+        assert any(selected is flag for flag in flags)
+        result.append(selected.name)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_terminal_guards_keep_their_separate_implicit_returns() {
+    check_fixture(
+        r"def notify(failed, enabled, cancelled, emit):
+    if failed:
+        if enabled():
+            emit('failed', explicit=True)
+    elif not cancelled():
+        emit('done')
+",
+        r"from itertools import product
+log = []
+def probe(value, label):
+    def read():
+        log.append(label)
+        return value
+    return read
+def emit(label, explicit=False): log.append((label, explicit))
+for failed, enabled, cancelled in product([False, True], repeat=3):
+    notify(failed, probe(enabled, 'enable'), probe(cancelled, 'cancel'), emit)
+result = log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn split_keyword_loads_preserve_the_following_handler_offsets() {
+    check_fixture(
+        r"def connect(lookup, sock, emit):
+    try:
+        cert = lookup()
+    except ValueError as exc:
+        emit(error=str(exc))
+        return
+    emit(cert=cert,
+         cipher=sock.cipher(), sock=sock)
+",
+        r"log = []
+class Socket:
+    def cipher(self):
+        log.append('cipher')
+        return 2
+def emit(**kw):
+    log.append(tuple(kw))
+def fail():
+    raise ValueError('closed')
+sock = Socket()
+connect(fail, sock, emit)
+connect(lambda: 1, sock, emit)
+result = log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_return_shared_by_match_cases_runs_after_their_assignments() {
+    check_fixture(
+        r"def parse(key, lookup, assign):
+    match key:
+        case 'Y' | 'y' | 'G':
+            assign('year')
+        case 'd':
+            assign('day')
+    return lookup[key]
+",
+        r"log = []
+class Lookup:
+    def __getitem__(self, key):
+        log.append(('lookup', key))
+        return key
+for key in ('Y', 'G', 'd', 'x'):
+    assert parse(key, Lookup(), log.append) == key
+result = log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn terminal_handlers_skip_the_success_continuation() {
     check_fixture(
         r"def handshake(start, report, ready):

@@ -278,7 +278,14 @@ impl Body<'_, '_, '_> {
     ) -> Result<usize, String> {
         let ops = &ops[..end];
         let subject = self.expr()?;
-        let mut cases = String::new();
+        let mut arms = Vec::new();
+        let last = self.flow.block(end - 1);
+        let shared = last.ops.clone();
+        let mut shared_return = last.height == Some(0)
+            && shared.end == end
+            && matches!(ops[end - 1].name, "RETURN_CONST" | "RETURN_VALUE")
+            && !matches!(ops[shared.start].name, "NOP" | "POP_TOP")
+            && ops[shared.clone()].iter().all(|op| op.jump.is_none());
         let mut at = first;
         let mut join = None;
         let mut saved = true;
@@ -376,19 +383,40 @@ impl Body<'_, '_, '_> {
             } else {
                 self.seeded(ops, body, stop, level, seed)?.suite()?
             };
-            case(&mut cases, &pattern, &suite);
+            // CPython may copy a return following the match into every
+            // successful arm. Require the same instructions, source lines,
+            // and protection as the unmatched path before placing it there.
+            if shared_return {
+                self.charge(shared.len())?;
+                shared_return = stop >= body + shared.len()
+                    && fallback.is_none()
+                    && self.instruction_lines.as_deref().is_ok_and(|lines| {
+                        let copy = stop - shared.len()..stop;
+                        lines[shared.start].is_some()
+                            && lines[copy.clone()] == lines[shared.clone()]
+                            && super::comparisons::same_instructions(
+                                &ops[copy.clone()],
+                                &ops[shared.clone()],
+                            )
+                            && copy
+                                .zip(shared.clone())
+                                .all(|(a, b)| self.flow.handler(a) == self.flow.handler(b))
+                    });
+            }
+            arms.push((pattern, suite));
             if let Some(range) = fallback {
                 let suite = self.fragment(ops, range.start, range.end, level)?.suite()?;
                 if !suite.is_empty() {
-                    case(&mut cases, "_", &suite);
+                    arms.push(("_".to_owned(), suite));
                 }
             }
             at = next;
         }
-        let after = join.unwrap_or(end);
+        let mut after = join.unwrap_or(end);
         if at > after {
             return Err("match overlaps its continuation".into());
         }
+        let mut fallback_case = None;
         if at < after {
             let mut pattern = "_".to_owned();
             let mut seed = Vec::new();
@@ -402,12 +430,35 @@ impl Body<'_, '_, '_> {
                 at = binding.next;
             }
             let fallback = self.seeded(ops, at, after, level, seed)?.suite()?;
-            if !fallback.is_empty() || saved {
-                if fallback.lines().count() == 1 && ops.get(at).is_some_and(|op| op.name != "NOP") {
-                    writeln!(cases, "case {pattern}: {}", fallback.trim_end()).unwrap();
-                } else {
-                    case(&mut cases, &pattern, &fallback);
+            if !saved
+                && shared_return
+                && join.is_none()
+                && at == shared.start
+                && fallback.lines().count() == 1
+                && fallback.starts_with("return ")
+                && arms.iter().all(|(_, suite)| {
+                    suite
+                        .strip_suffix(&fallback)
+                        .is_some_and(|prefix| prefix.is_empty() || prefix.ends_with('\n'))
+                })
+            {
+                for (_, suite) in &mut arms {
+                    suite.truncate(suite.len() - fallback.len());
                 }
+                after = at;
+            } else if !fallback.is_empty() || saved {
+                fallback_case = Some((pattern, fallback));
+            }
+        }
+        let mut cases = String::new();
+        for (pattern, suite) in arms {
+            case(&mut cases, &pattern, &suite);
+        }
+        if let Some((pattern, fallback)) = fallback_case {
+            if fallback.lines().count() == 1 && ops.get(at).is_some_and(|op| op.name != "NOP") {
+                writeln!(cases, "case {pattern}: {}", fallback.trim_end()).unwrap();
+            } else {
+                case(&mut cases, &pattern, &fallback);
             }
         }
         self.block(&format!("match {subject}:"), &cases)?;

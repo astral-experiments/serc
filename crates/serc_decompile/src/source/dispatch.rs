@@ -363,7 +363,7 @@ impl Body<'_, '_, '_> {
                 .filter(|(load, _)| {
                     *load > at
                         && self.none_return(&ops[*load..handler])
-                        && self.instruction_lines(ops).is_ok_and(|lines| {
+                        && self.instruction_lines.as_deref().is_ok_and(|lines| {
                             lines[*load].is_some() && lines[*load] == lines[*load - 1]
                         })
                 })

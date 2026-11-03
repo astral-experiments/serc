@@ -256,6 +256,10 @@ impl Body<'_, '_, '_> {
             return Ok(next);
         }
         match op.name {
+            "CALL_KW" => {
+                self.located_keyword_call(ops, i)?;
+                Ok(i + 1)
+            }
             "RERAISE" if self.implicit_reraise(ops, i) => Ok(i + 1),
             // CPython builds a constant set display by updating an empty
             // set from a frozenset constant. Its elements belong directly
@@ -503,12 +507,36 @@ impl Body<'_, '_, '_> {
         {
             return Err("unsupported short-circuit shape".into());
         }
+        // In (a and b) or c, a false a reaches the discard before c
+        // directly. The test of b jumps over c when b is true. Stop the
+        // inner operand before that test and let it consume the whole group.
+        let mut stop = target;
+        if ops.get(target).is_some_and(|op| op.name == "POP_TOP") {
+            let next_branch = target - 1 - usize::from(ops[target - 1].name == "NOT_TAKEN");
+            let opposite = if operator == "and" {
+                "POP_JUMP_IF_TRUE"
+            } else {
+                "POP_JUMP_IF_FALSE"
+            };
+            if next_branch > discard + 1
+                && ops[next_branch].name == opposite
+                && self
+                    .flow
+                    .jump(next_branch)
+                    .is_some_and(|to| target < to && to <= end)
+            {
+                let copy = next_branch - 1 - usize::from(ops[next_branch - 1].name == "TO_BOOL");
+                if copy > discard + 1 && (ops[copy].name, ops[copy].arg) == ("COPY", 1) {
+                    stop = copy;
+                }
+            }
+        }
         let lhs = self.expr()?;
         let operand = self
-            .fragment(ops, discard + 1, target, level)?
+            .fragment(ops, discard + 1, stop, level)?
             .single_operand()?;
         let rhs = self.render_expression(operand)?;
         self.push(format!("({lhs} {operator} {rhs})"))?;
-        Ok(target)
+        Ok(stop)
     }
 }

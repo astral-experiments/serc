@@ -24,7 +24,7 @@ impl Body<'_, '_, '_> {
             {
                 return Err("unsupported elided try cleanup".into());
             }
-            let lines = self.instruction_lines(ops)?;
+            let lines = self.instruction_lines.as_deref().map_err(Clone::clone)?;
             let clause_line = lines[start + 1..cleanup]
                 .iter()
                 .copied()
