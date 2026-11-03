@@ -347,6 +347,36 @@ fn protected_value_match_preserves_case_and_failure_exits() {
 }
 
 #[test]
+fn protected_match_fallthrough_locates_the_following_local_return() {
+    let value_case = r#"def choose(value, kind):
+    try:
+        match kind:
+            case "yes":
+                pass
+    except LookupError:
+        pass
+    return value
+"#;
+    let wildcard = r"def choose(value, kind, active):
+    try:
+        match kind:
+            case Choice.YES:
+                pass
+            case _:
+                if active:
+                    pass
+                else:
+                    from colors import red as value
+    except ValueError as error:
+        pass
+    return value
+";
+    for source in [value_case, wildcard] {
+        assert_matches_cpython(source, "match_fallthrough.py", &LEVELS);
+    }
+}
+
+#[test]
 fn protected_value_match_with_multiple_handlers_locates_its_failure() {
     let source = r"async def choose(item, flag):
     try:
