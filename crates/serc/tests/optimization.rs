@@ -777,6 +777,25 @@ fn local_fusion_keeps_retained_try_setup_unowned() {
 }
 
 #[test]
+fn a_copied_finalizer_call_keeps_the_coroutine_on_its_nested_guard() {
+    let source = r"async def run(active, value):
+    try:
+        work()
+    except ValueError:
+        return make(convert(value))
+    finally:
+        value.clean(value)
+        clean(value)
+        try:
+            if active:
+                pass
+        finally:
+            pass
+";
+    assert_matches_cpython_versions(source, "case.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
 fn method_call_before_finally_none_test_keeps_the_original_handler() {
     let managed = r"async def finish(manager, service, resource, ready):
     with manager:
