@@ -397,7 +397,18 @@ impl Body<'_, '_, '_> {
                             }))
                     {
                         self.block(&format!("if {test}:"), &suite)?;
-                        self.line(other.trim_end_matches('\n'))?;
+                        // A jump out of an else suite can survive as a tracing
+                        // NOP before the copied return. Keep the alternate
+                        // inside the conditional and its continuation outside.
+                        if !right.is_empty()
+                            && super::regions::constant_return(ops, end)
+                                .is_some_and(|(at, _)| at > target && ops[at - 1].name == "NOP")
+                        {
+                            self.block("else:", &right)?;
+                            self.line(&format!("return {b}"))?;
+                        } else {
+                            self.line(other.trim_end_matches('\n'))?;
+                        }
                         return Ok(end);
                     }
                     self.block(&format!("if {test}:"), &left)?;

@@ -533,12 +533,24 @@ def early_none(ready, emit):
         emit('first')
         return
     emit('last')
+
+def nested(x, y):
+    if x:
+        if y:
+            a = 4
+            return
+        else:
+            b = 2
+    else:
+        c = 3
+    return
 ",
         r"result = []
 for f in [early, common, early_none]:
     for ready in [True, False]:
         result.append(f(ready, result.append))
-assert result == ['first', 'done', 'last', 'done'] * 2 + ['first', None, 'last', None]",
+assert result == ['first', 'done', 'last', 'done'] * 2 + ['first', None, 'last', None]
+assert all(nested(x, y) is None for x in (True, False) for y in (True, False))",
     );
 }
 
