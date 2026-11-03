@@ -73,6 +73,20 @@ fn reraising_cleanup_leaves_one_iterator_discard_predecessor() {
 }
 
 #[test]
+fn async_iterator_restarts_before_an_inner_while_handler() {
+    let source = r"async def read(stream, key):
+    async for chunk in stream:
+        while key in chunk:
+            try:
+                if ready():
+                    consume(chunk)
+            except ValueError:
+                continue
+";
+    assert_matches_cpython(source, "async_iterator_while_handler.py", &LEVELS);
+}
+
+#[test]
 fn post_try_fusion_survives_the_removed_fallthrough_jump() {
     let source = r"import checks
 
