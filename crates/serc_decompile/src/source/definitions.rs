@@ -566,6 +566,7 @@ impl<'m, 'data> Body<'m, 'data, '_> {
                 clause_exits: None,
                 arm_exit: None,
                 finally_unwind: None,
+                manager_exits: Vec::new(),
                 terminal_returns: 0..0,
                 class: false,
                 annotations: Vec::new(),

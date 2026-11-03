@@ -89,11 +89,15 @@ impl Body<'_, '_, '_> {
             }
             _ => return false,
         };
-        match load.name {
+        self.none_constant(*load)
+    }
+
+    pub(super) fn none_constant(&self, op: Instruction) -> bool {
+        match op.name {
             "LOAD_CONST" | "RETURN_CONST" => self
-                .item(self.code.constants, load.arg)
+                .item(self.code.constants, op.arg)
                 .is_ok_and(|id| matches!(self.m.objects[id], super::Object::None)),
-            "LOAD_COMMON_CONSTANT" => load.arg == super::CommonConstant::NONE.argument(),
+            "LOAD_COMMON_CONSTANT" => op.arg == super::CommonConstant::NONE.argument(),
             _ => false,
         }
     }
@@ -306,7 +310,7 @@ impl Body<'_, '_, '_> {
     }
 
     /// If one arm ends in a raise or return, its nested guards can skip the
-    /// other arm without leaving a JUMP_FORWARD at the end of the first.
+    /// other arm without leaving a `JUMP_FORWARD` at the end of the first.
     fn threaded_arm_join(&self, first: std::ops::Range<usize>, limit: usize) -> Option<usize> {
         let mut join = None;
         for block in self.flow.blocks_in(first.clone()) {

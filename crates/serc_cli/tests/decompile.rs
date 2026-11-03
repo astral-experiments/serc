@@ -1617,6 +1617,69 @@ result = log",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn managers_follow_guards_loops_and_early_returns() {
+    check_fixture(
+        r"def guarded(active, lock, call):
+    if active:
+        with lock:
+            return call()
+    return 7
+
+def repeat(items, lock, call):
+    for item in items:
+        with lock:
+            call(item)
+    call('after')
+
+async def nested(outer, inner, call, emit):
+    with outer:
+        async with inner:
+            emit(await call())
+    emit('after')
+
+async def choose(lock, call, flag, emit):
+    async with lock:
+        if flag:
+            return await call()
+        emit('other')
+    emit('after')
+",
+        r"import asyncio
+result = []
+class Lock:
+    def __init__(self, name, suppress):
+        self.name, self.suppress = name, suppress
+    def __enter__(self): result.append(('enter', self.name))
+    def __exit__(self, kind, value, tb):
+        result.append(('exit', self.name, kind.__name__ if kind else None))
+        return self.suppress
+    async def __aenter__(self): return self.__enter__()
+    async def __aexit__(self, *exc): return self.__exit__(*exc)
+for fails in (False, True):
+    def call(*args):
+        result.append(('call', args))
+        if fails: raise ValueError()
+        return 42
+    async def read(): return call()
+    for outer in (False, True):
+        lock = Lock('outer', outer)
+        for inner in (False, True):
+            other = Lock('inner', inner)
+            try: result.append(asyncio.run(nested(lock, other, read, result.append)))
+            except ValueError: result.append('failed')
+        for flag in (False, True):
+            try: result.append(guarded(flag, lock, call))
+            except ValueError: result.append('failed')
+            try: result.append(asyncio.run(choose(lock, read, flag, result.append)))
+            except ValueError: result.append('failed')
+        try: repeat([1, 2], lock, call)
+        except ValueError: result.append('failed')
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn consecutive_managers_keep_separate_exception_paths() {
     check_fixture(
         "def run(manager, emit):\n    with manager(1) as a, manager(2) as b:\n        emit(a, b)\n    emit('between')\n    with manager(3) as c:\n        emit(c)\n    emit('done')\n    return 17\n",

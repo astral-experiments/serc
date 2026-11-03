@@ -281,7 +281,7 @@ fn region(
             if matches!(
                 jump.name,
                 "JUMP_FORWARD" | "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
-            ) && let Some((pop, after)) = owner.handler_pop(ops, binding, stop)
+            ) && let Some((pop, after)) = Body::handler_pop(ops, binding, stop)
                 && after == stop - 1
                 && let Some(to) = flow.jump(stop - 1) =>
         {

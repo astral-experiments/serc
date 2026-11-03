@@ -223,6 +223,16 @@ impl Body<'_, '_, '_> {
         level: usize,
         operand_start: Option<usize>,
     ) -> Result<usize, String> {
+        if let Ok(n) = self
+            .manager_exits
+            .binary_search_by_key(&i, |exit| exit.start)
+        {
+            let exit = &self.manager_exits[n];
+            if self.stack.len() != usize::from(exit.pending) || exit.ret >= end {
+                return Err("unsupported early return through with".into());
+            }
+            return Ok(exit.ret);
+        }
         if let Some(handler) = self.handlers.remove(&i) {
             // The protected fragment re-enters this same instruction. Leave other
             // entries available, including nested tries in the exception suite.

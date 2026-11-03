@@ -4,7 +4,7 @@ use std::ops::Range;
 
 use serc_bytecode::instructions::Handler;
 
-use super::{Body, Instruction, Object};
+use super::{Body, Instruction};
 use crate::flow::Graph;
 
 pub(super) struct Dispatch {
@@ -84,15 +84,8 @@ impl Body<'_, '_, '_> {
             return None;
         };
         let name = store.name.strip_prefix("STORE_")?;
-        let loads_none = match none.name {
-            "LOAD_CONST" => matches!(
-                self.m.objects[self.item(self.code.constants, none.arg).ok()?],
-                Object::None
-            ),
-            "LOAD_COMMON_CONSTANT" => none.arg == super::CommonConstant::NONE.argument(),
-            _ => false,
-        };
-        (loads_none
+        (matches!(none.name, "LOAD_CONST" | "LOAD_COMMON_CONSTANT")
+            && self.none_constant(*none)
             && delete.name.strip_prefix("DELETE_") == Some(name)
             && delete.arg == store.arg
             && (reraise.name, reraise.arg) == ("RERAISE", 1))
@@ -331,9 +324,8 @@ impl Body<'_, '_, '_> {
         })
     }
 
-    /// Locate POP_EXCEPT and the first instruction after normal binding cleanup.
+    /// Locate `POP_EXCEPT` and the first instruction after normal binding cleanup.
     pub(super) fn handler_pop(
-        &self,
         ops: &[Instruction],
         binding: usize,
         stop: usize,
@@ -370,7 +362,7 @@ impl Body<'_, '_, '_> {
         if ops.get(body.clone())?.last()?.name == "RAISE_VARARGS" {
             return Some((body, Exit::Raise));
         }
-        let (pop, after) = self.handler_pop(ops, binding, stop)?;
+        let (pop, after) = Self::handler_pop(ops, binding, stop)?;
         let exit = stop.checked_sub(1)?;
         if after > exit {
             return None;

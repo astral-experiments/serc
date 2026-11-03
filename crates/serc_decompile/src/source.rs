@@ -191,6 +191,7 @@ fn recover_scope<'m>(
         clause_exits: None,
         arm_exit: None,
         finally_unwind: None,
+        manager_exits: Vec::new(),
         class,
         annotations: Vec::new(),
         depth,
@@ -287,6 +288,7 @@ struct Body<'m, 'data, 'work> {
     // A nested guard can jump past the other arm to the enclosing continuation.
     arm_exit: Option<(usize, usize)>,
     finally_unwind: Option<usize>,
+    manager_exits: Vec<managers::ReturnExit>,
     terminal_returns: std::ops::Range<usize>,
     depth: usize,
     class: bool,
