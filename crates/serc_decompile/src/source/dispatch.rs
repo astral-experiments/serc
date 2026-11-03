@@ -94,7 +94,9 @@ impl Body<'_, '_, '_> {
         let cleanup = failed.checked_sub(4)?;
         let unwind = self.binding_unwind(ops, binding)?;
         let store = self.cleared_name(ops, cleanup)?;
-        ((unwind.target, unwind.depth, unwind.lasti) == (ops[cleanup].offset, 1, true)
+        let parent = self.flow.handler(binding)?;
+        ((unwind.target, unwind.depth, unwind.lasti) == (ops[cleanup].offset, parent.depth, true)
+            && parent.lasti
             && (store.name, store.arg) == (ops[binding].name, ops[binding].arg))
             .then_some(cleanup)
     }
@@ -102,7 +104,13 @@ impl Body<'_, '_, '_> {
     pub(super) fn binding_unwind(&self, ops: &[Instruction], binding: usize) -> Option<Handler> {
         self.flow
             .handler(binding + 1)
-            .filter(|h| h.lasti && h.depth == 1)
+            .filter(|h| {
+                h.lasti
+                    && self
+                        .flow
+                        .handler(binding)
+                        .is_some_and(|parent| parent.lasti && parent.depth == h.depth)
+            })
             .or_else(|| super::protected_regions::BoundParent::child_unwind(self, ops, binding))
     }
 

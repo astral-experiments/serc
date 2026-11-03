@@ -183,6 +183,60 @@ pub(super) fn after_except(
     (normal < end && flow.entered_from(normal, start..normal)).then_some(normal..end)
 }
 
+/// The compiler materializes a constant return after the last cleanup.
+pub(super) fn return_end(ops: &[Instruction], at: usize) -> Option<usize> {
+    match ops.get(at..)? {
+        [ret, ..] if ret.name == "RETURN_CONST" => Some(at + 1),
+        [load, ret, ..]
+            if matches!(
+                load.name,
+                "LOAD_CONST" | "LOAD_COMMON_CONSTANT" | "LOAD_SMALL_INT"
+            ) && ret.name == "RETURN_VALUE" =>
+        {
+            Some(at + 2)
+        }
+        _ => None,
+    }
+}
+
+/// A return site inside the child may still be waiting for its constant.
+pub(super) fn nested_return(
+    ops: &[Instruction],
+    flow: &Graph,
+    suite: Range<usize>,
+    outer: &mut Protected,
+    inner: &mut super::Handlers,
+) {
+    let Some(ret) = return_end(ops, outer.next) else {
+        return;
+    };
+    let mut children = inner.iter_mut().filter(|(at, child)| {
+        suite.contains(at)
+            && child.next == suite.end
+            && child.end + 1 == child.handler.start
+            && ops[child.end].name == "NOP"
+            && !break_marker(ops, flow, **at..child.end)
+            && flow.entered_from(suite.end, child.handler.clone())
+            && matches!(
+                child.clause,
+                Clause::Finally {
+                    terminal_unwind: None,
+                    ..
+                }
+            )
+    });
+    if let Some((_, child)) = children.next()
+        && children.next().is_none()
+        && let Clause::Finally {
+            deferred_return, ..
+        } = &mut child.clause
+        && deferred_return.start == deferred_return.end
+    {
+        *deferred_return = outer.next..ret;
+        outer.next = ret;
+    }
+}
+
 /// Match the normal copy to the exceptional one, up to its final reraise.
 pub(super) fn finally_region(
     ops: &[Instruction],
@@ -270,18 +324,24 @@ pub(super) fn finally_region(
     // with the constant materialized only after the normal cleanup.
     let mut next = normal.end;
     if deferred && !terminal {
-        next += match ops.get(next..)? {
-            [ret, ..] if ret.name == "RETURN_CONST" => 1,
-            [load, ret, ..]
-                if matches!(
-                    load.name,
-                    "LOAD_CONST" | "LOAD_COMMON_CONSTANT" | "LOAD_SMALL_INT"
-                ) && ret.name == "RETURN_VALUE" =>
+        if let Some(ret) = return_end(ops, next) {
+            next = ret;
+        } else {
+            // Another cleanup can intervene before the constant. Leave the
+            // return in its normal position until the enclosing suite is placed.
+            let outer = flow.handler(start)?;
+            let exceptional = flow.handler(cleanup)?;
+            if outer.lasti
+                || outer.start != ops[start].offset
+                || outer.end != ops.get(next)?.offset
+                || (outer.target, outer.depth, outer.lasti)
+                    != (exceptional.target, exceptional.depth, exceptional.lasti)
+                || exceptional.start != ops[cleanup].offset
+                || exceptional.end != ops.get(cleanup + 3)?.offset
             {
-                2
+                return None;
             }
-            _ => return None,
-        };
+        }
     }
     Some(Protected {
         return_exits: Vec::new(),

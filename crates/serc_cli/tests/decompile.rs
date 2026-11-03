@@ -2832,6 +2832,148 @@ result = [type(error).__name__ for error in result]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_constant_return_crosses_both_normal_cleanup_copies() {
+    check_fixture(
+        r"async def execute(wait, release, restore):
+    try:
+        try:
+            await wait()
+            return True
+        finally:
+            release()
+    finally:
+        restore()
+",
+        r"import asyncio, sys
+events = []
+async def run(wait_error, release_error, restore_error):
+    async def wait():
+        await asyncio.sleep(0)
+        if wait_error: raise wait_error
+    def release():
+        events.append(('release', sys.exception()))
+        if release_error: raise release_error
+    def restore():
+        events.append(('restore', sys.exception()))
+        if restore_error: raise restore_error
+    try: return await execute(wait, release, restore)
+    except BaseException as error: return error
+key, value, os_error = KeyError(), ValueError(), OSError()
+assert asyncio.run(run(None, None, None)) is True
+assert asyncio.run(run(key, None, None)) is key
+assert asyncio.run(run(key, value, os_error)) is os_error
+assert os_error.__context__ is value and value.__context__ is key
+assert events == [('release', None), ('restore', None), ('release', key), ('restore', key),
+                  ('release', key), ('restore', value)]
+result = [name for name, error in events]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_finally_retries_on_both_normal_and_exceptional_paths() {
+    check_fixture(
+        r"async def wait(action, acquire, record):
+    try:
+        record('entered')
+        try:
+            await action()
+            return True
+        finally:
+            record('removed')
+    finally:
+        interrupted = False
+        while True:
+            try:
+                await acquire()
+                break
+            except LookupError:
+                interrupted = True
+        if interrupted:
+            raise ArithmeticError
+",
+        r"import asyncio, sys
+result = []
+async def exercise(failure, retry):
+    async def action():
+        if failure: raise failure
+    async def acquire():
+        nonlocal retry
+        await asyncio.sleep(0)
+        result.append(('acquire', type(sys.exception()).__name__))
+        if retry:
+            retry = False
+            raise KeyError
+    def record(event): result.append((event, type(sys.exception()).__name__))
+    try: return await wait(action, acquire, record)
+    except BaseException as error: return error
+failure = ValueError()
+assert asyncio.run(exercise(None, False)) is True
+assert asyncio.run(exercise(failure, False)) is failure
+replaced = asyncio.run(exercise(failure, True))
+assert type(replaced) is ArithmeticError and replaced.__context__ is failure
+assert result == [('entered', 'NoneType'), ('removed', 'NoneType'), ('acquire', 'NoneType'),
+                  ('entered', 'NoneType'), ('removed', 'ValueError'), ('acquire', 'ValueError'),
+                  ('entered', 'NoneType'), ('removed', 'ValueError'), ('acquire', 'ValueError'), ('acquire', 'ValueError')]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_failed_reacquisition_notifies_after_clearing_the_saved_exception() {
+    check_fixture(
+        r"async def wait(action, acquire, record):
+    try:
+        try:
+            record('entered')
+            try:
+                await action()
+                return True
+            finally:
+                record('removed')
+        finally:
+            error = None
+            while True:
+                try:
+                    await acquire()
+                    break
+                except LookupError as exc:
+                    error = exc
+            if error is not None:
+                try:
+                    raise error
+                finally:
+                    error = None
+    except BaseException:
+        record('notify')
+        raise
+",
+        r"import asyncio, sys
+result = []
+async def run(err, interruptions):
+    async def action():
+        if err: raise err
+    async def acquire():
+        await asyncio.sleep(0)
+        cancel = next(interruptions)
+        if cancel: raise cancel
+    def record(event): result.append((event, sys.exception()))
+    try: return await wait(action, acquire, record)
+    except BaseException as e: return e
+original, first, last = ValueError(), KeyError(), IndexError()
+assert asyncio.run(run(None, iter([None]))) is True
+assert asyncio.run(run(original, iter([None]))) is original
+assert asyncio.run(run(original, iter([first, last, None]))) is last
+assert last.__context__ is original
+assert result == [('entered', None), ('removed', None),
+                  ('entered', None), ('removed', original), ('notify', original),
+                  ('entered', None), ('removed', original), ('notify', last)]
+result = [(event, type(error).__name__) for event, error in result]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn finally_runs_on_suspension_return_and_cancellation() {
     check_fixture(
         r"async def value(work, events):

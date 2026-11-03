@@ -13,6 +13,7 @@ mod groups;
 mod handler_rejoin;
 mod handler_returns;
 mod loop_exits;
+mod retry_finally;
 
 pub(super) use bound_parent::BoundParent;
 use finally::{break_marker, finally_region, returning_finally_loop};
@@ -315,8 +316,8 @@ fn region(
     if finalizer
         && group.entries.len() == 1
         && let Some(child) = group.child
-        && let Some(normal) =
-            finally::after_except(ops, owner, inner.get(&child)?, child, dispatch, cleanup)
+        && let Some(suite) = inner.get(&child)
+        && let Some(normal) = finally::after_except(ops, owner, suite, child, dispatch, cleanup)
     {
         let mut suite = inner.remove(&child)?;
         if let Clause::Except { finalizer, .. } = &mut suite.clause {
@@ -330,15 +331,9 @@ fn region(
     {
         return Some((start, region));
     }
-    let (start, end) = if entries.len() == 2
-        && let Some(child) = group.child
+    let (start, end) = if let Some(child) = group.child
         && let Some(suite) = inner.get(&child)
-        && matches!(suite.clause, Clause::Finally { .. })
-        && suite.handler == (start..index(first.end)?)
-        && suite.end == start
-        && suite.next == suite.handler.end
-        && flow.entered_from(start, child..start)
-        && entries[1].depth == first.depth
+        && groups::encloses_finalizer(ops, flow, entries, start, child, suite)
     {
         // The same outer try catches a raise from the inner suite and either
         // copy of its finally. Nest at the child's tracing NOP so the inner
@@ -350,7 +345,12 @@ fn region(
     if end > dispatch {
         return None;
     }
-    if finalizer && let Some(finally) = finally_region(ops, owner, start..end, dispatch, cleanup) {
+    let placed = finalizer
+        .then(|| finally_region(ops, owner, start..end, dispatch, cleanup))
+        .flatten()
+        .or_else(|| retry_finally::recover(ops, owner, start..end, dispatch, cleanup, inner));
+    if let Some(mut finally) = placed {
+        finally::nested_return(ops, flow, start..end, &mut finally, inner);
         return Some((start, finally));
     }
     let mut following = Vec::new();
@@ -494,7 +494,7 @@ fn region(
                 && flow.jump(next) == Some(to)
                 && flow.block(to).height == Some(first.depth);
             if following.is_empty()
-                && next == end
+                && (next == end || flow.jump(end) == Some(next))
                 && success.is_empty()
                 && let Some(after_break) =
                     loop_exits::retry_break(ops, flow, start..end, to, after_cleanup)
@@ -664,10 +664,15 @@ fn protected_end(
             && (parent.target, parent.depth, parent.lasti)
                 == (first.target, first.depth, first.lasti)
             && index(parent.end)? == unwind + 3
-            && (at == unwind || at == suite.next)
+            && (at == unwind
+                || at == suite.next
+                || (suite.handler == (at..index(entry.end)?) && suite.handler.end == suite.next))
         {
             cleanups.insert(unwind, unwind + 3);
             end = suite.next;
+            if at == suite.handler.start && index(entry.end)? == end {
+                continue;
+            }
             if at == end {
                 end = index(entry.end)?;
                 continue;
