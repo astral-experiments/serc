@@ -5961,6 +5961,24 @@ fn guarded_runtime_break_retains_its_line_before_cleanup() {
 }
 
 #[test]
+fn guarded_recovery_reaches_the_borrowed_load_after_a_pass_handler() {
+    let source = r"def read(retry, value):
+    try:
+        value = fetch()
+    except ValueError:
+        if retry:
+            try:
+                recover()
+            except OSError:
+                log()
+    except TypeError:
+        pass
+    consume(value)
+";
+    assert_matches_cpython(source, "recovery_borrow.py", &LEVELS);
+}
+
+#[test]
 fn ordinary_guarded_recovery_preserves_continuation_borrowing() {
     let source = "def probe(value, receiver, worker, flag):\n    try:\n        result = worker.decode(value)\n    except Failure:\n        if flag:\n            try:\n                result = worker.decode(worker.unpack(value))\n            except Failure:\n                receiver.problem(value)\n    if worker.accepts(result):\n        receiver.store(result.get(\"first\"))\n    receiver.store(value)\n    receiver.finish()\n";
     for conditional in [false, true] {
