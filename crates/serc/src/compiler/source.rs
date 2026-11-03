@@ -1717,11 +1717,11 @@ impl Compiler<'_> {
         &self,
         string: &ruff_python_ast::ExprStringLiteral,
     ) -> Constant {
-        if string
-            .value
-            .iter()
-            .all(|part| !part.as_str().contains('\u{fffd}'))
-        {
+        if string.value.iter().all(|part| {
+            let text = part.as_str();
+            // Only a UTF-8 sequence beginning with 0xef can encode U+FFFD.
+            memchr::memchr(0xef, text.as_bytes()).is_none() || !text.contains('\u{fffd}')
+        }) {
             return Constant::String(string.value.to_str().to_string());
         }
 

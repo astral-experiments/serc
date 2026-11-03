@@ -132,7 +132,6 @@ fn validate_with_statement_pruning<const PRUNE_STATEMENTS: bool>(
     let lowering_keyword_error = validator.lowering_keyword_error.get();
     let debug_pattern_replay =
         matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315)
-            && validator.may_have_debug_patterns
             && pattern_debug::body_has_debug_pattern(body);
     let mut numeric_symbol_replay = validator.lowering_numeric_error
         && matches!(python_version, PythonVersion::Py314 | PythonVersion::Py315);
@@ -418,7 +417,6 @@ fn new_validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
         collecting_comprehension_errors: false,
         deferred_comprehension_errors: RefCell::new(Vec::new()),
         source,
-        may_have_debug_patterns: source.contains("__debug__") || !source.is_ascii(),
         may_have_legacy_coroutines: matches!(
             python_version,
             PythonVersion::Py312 | PythonVersion::Py313
@@ -676,7 +674,6 @@ struct Validator<'source, 'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY:
     check_bare_starred: bool,
     has_declarations: bool,
     source: &'source str,
-    may_have_debug_patterns: bool,
     body: &'ast [Stmt],
     python_version: ast::PythonVersion,
     mapping_key_int_max_str_digits: Option<u32>,
@@ -1689,10 +1686,7 @@ impl<'ast, const PRUNE_STATEMENTS: bool, const FUTURE_ONLY: bool> Visitor<'ast>
         if let Stmt::Match(match_statement) = statement {
             let numeric_duplicate =
                 pattern_numeric::has_large_numeric_duplicate(match_statement, self.python_version);
-            if numeric_duplicate
-                || (self.may_have_debug_patterns
-                    && pattern_debug::has_debug_pattern(match_statement))
-            {
+            if numeric_duplicate || pattern_debug::has_debug_pattern(match_statement) {
                 self.lowering_numeric_error |= numeric_duplicate;
                 self.visit_debug_match(statement, match_statement);
                 return;

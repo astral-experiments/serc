@@ -22,9 +22,6 @@ pub(crate) fn validate(
     tokens: &Tokens,
     python_version: PythonVersion,
 ) -> Result<(), CompileError> {
-    if !source.contains("yield") {
-        return Ok(());
-    }
     let Some(comma) = invalid_comma(tokens) else {
         return Ok(());
     };

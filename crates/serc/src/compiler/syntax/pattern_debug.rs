@@ -92,18 +92,9 @@ pub(super) fn body_has_debug_pattern(body: &[Stmt]) -> bool {
                 walk_stmt(self, statement);
             }
         }
-        fn visit_expr(&mut self, expression: &'ast ast::Expr) {
-            if crate::stack_growth_required() {
-                return crate::grow_stack(|| self.visit_expr(expression));
-            }
-            ruff_python_ast::visitor::walk_expr(self, expression);
-        }
-        fn visit_pattern(&mut self, pattern: &'ast Pattern) {
-            if crate::stack_growth_required() {
-                return crate::grow_stack(|| self.visit_pattern(pattern));
-            }
-            walk_pattern(self, pattern);
-        }
+        // Match statements can only occur in statement suites.
+        fn visit_expr(&mut self, _expression: &'ast ast::Expr) {}
+        fn visit_pattern(&mut self, _pattern: &'ast Pattern) {}
     }
     let mut finder = Finder(false);
     finder.visit_body(body);

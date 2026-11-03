@@ -816,7 +816,8 @@ fn has_large_decimal_token(source: &str, tokens: &ruff_python_ast::token::Tokens
             return false;
         }
         let spelling = &source[token.range()];
-        if spelling.starts_with("0x")
+        if spelling.len() <= 640
+            || spelling.starts_with("0x")
             || spelling.starts_with("0X")
             || spelling.starts_with("0o")
             || spelling.starts_with("0O")
@@ -924,7 +925,7 @@ fn compile_normalized(
     let parse_options = ruff_python_parser::ParseOptions::from(ruff_python_parser::Mode::Module)
         .with_target_version(target_version);
     let may_depend_on_decimal_parse =
-        parse_int_max_str_digits.is_none() && may_depend_on_decimal_parse(source);
+        || parse_int_max_str_digits.is_none() && may_depend_on_decimal_parse(source);
     let parsed = ruff_python_parser::parse_unchecked(source, parse_options.clone())
         .try_into_module()
         .ok_or_else(|| CompileError::Internal("parser did not return a module".to_string()))?;
@@ -938,7 +939,7 @@ fn compile_normalized(
     if let Err(error) =
         delimiter_nesting::validate_parsed(source, &parse_options, options.python_version, parsed)
     {
-        return Err(if may_depend_on_decimal_parse {
+        return Err(if may_depend_on_decimal_parse() {
             unknown_decimal_parse()
         } else {
             error
@@ -977,7 +978,7 @@ fn compile_normalized(
         return Err(error);
     }
     if let Some(error) = parse_error {
-        if may_depend_on_decimal_parse {
+        if may_depend_on_decimal_parse() {
             return Err(unknown_decimal_parse());
         }
         let error = if let Some(yield_error) = yield_syntax::before_parse_error(
@@ -1054,7 +1055,7 @@ fn compile_normalized(
         }
     }
     if let Some(error) = parsed.unsupported_syntax_errors().first() {
-        if may_depend_on_decimal_parse {
+        if may_depend_on_decimal_parse() {
             return Err(unknown_decimal_parse());
         }
         return Err(prefer_type_alias_error(CompileError::invalid_syntax(
@@ -1064,7 +1065,8 @@ fn compile_normalized(
     }
     parsed_module.recover_bare_raises(&bare_raises);
     let parsed = &parsed_module;
-    if may_depend_on_decimal_parse
+    if source.len() > 640
+        && parse_int_max_str_digits.is_none()
         && has_large_decimal_token(source, parsed.tokens())
         && compiler::syntax::may_have_duplicate_mapping_key(parsed.suite())
     {
