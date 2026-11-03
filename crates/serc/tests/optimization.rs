@@ -15,6 +15,16 @@ use serc::{
 };
 
 #[test]
+fn formatted_comprehensions_inherit_the_complete_filter_location() {
+    for source in [
+        "def f(rows):\n    return ['key=%s' % (key,) for key in rows if key is not None]\n",
+        "def f(rows):\n    return ('key=%s' % (key,)\n            for key in rows\n            if key is None)\n",
+    ] {
+        assert_matches_cpython(source, "formatted_comprehension_filter.py", &LEVELS);
+    }
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
