@@ -189,6 +189,43 @@ fn identifiers_allow_unicode_continuation_characters() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_returning_try_reaches_its_fallback_only_after_a_handled_exception() {
+    check_fixture(
+        "async def receive(read, retry, record):\n    try:\n        return read()\n    except (BlockingIOError, InterruptedError):\n        record()\n    return await retry()\n",
+        r"
+import asyncio, sys
+log = []
+def record():
+    log.append(type(sys.exception()).__name__)
+async def retry():
+    log.append(sys.exception())
+    return 'retried'
+def fail():
+    raise BlockingIOError
+def unexpected():
+    raise ValueError
+async def exercise():
+    assert await receive(lambda: 'ok', retry, record) == 'ok'
+    assert not log
+    assert await receive(fail, retry, record) == 'retried'
+    try:
+        await receive(unexpected, retry, record)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('unmatched exception was swallowed')
+    assert log == ['BlockingIOError', None]
+asyncio.run(exercise())
+result = log",
+    );
+    check_fixture(
+        "def receive(read, retry, ready):\n    try:\n        return read()\n    except BlockingIOError:\n        pass\n    if ready():\n        return retry()\n    return None\n",
+        "def fail(): raise BlockingIOError\nresult = receive(fail, lambda: 1, lambda: True), receive(fail, lambda: 2, lambda: False)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn definitions_preserve_bindings() {
     check_fixture(
         "def outer(x=3, *, k=4):\n    def inner(y):\n        return x + y\n    return inner\n",

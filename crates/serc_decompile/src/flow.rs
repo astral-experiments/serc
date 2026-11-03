@@ -137,12 +137,11 @@ impl Graph {
             .map(|&id| self.blocks[id].ops.end - 1)
     }
 
-    /// End of the instructions reachable from `start` using normal edges.
-    /// Handlers interleaved with the body do not extend this boundary merely
-    /// because they can return or reraise.
-    pub(super) fn normal_end(&self, start: usize) -> usize {
+    /// End of the instructions reachable along normal edges from the given
+    /// starting instructions, including any continuations of handled exceptions.
+    pub(super) fn normal_end(&self, starts: impl IntoIterator<Item = usize>) -> usize {
         let mut seen = vec![false; self.blocks.len()];
-        let mut pending = vec![self.owner[start]];
+        let mut pending: Vec<_> = starts.into_iter().map(|i| self.owner[i]).collect();
         let mut end = 0;
         while let Some(id) = pending.pop() {
             if std::mem::replace(&mut seen[id], true) {

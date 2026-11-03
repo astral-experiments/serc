@@ -72,9 +72,8 @@ impl Body<'_, '_, '_> {
         limit: usize,
     ) -> Result<(), String> {
         if handlers.len() == bc.handlers.len()
-            && let Some(regions) = super::protected_regions::guarded(bc, &self.flow)
+            && let Some((regions, end)) = super::protected_regions::guarded(bc, &self.flow)
         {
-            let end = self.flow.normal_end(0);
             self.handlers = regions;
             if self.depth > 0 && !self.class {
                 self.index_terminal_returns(&bc.ops[..end], None);
@@ -417,7 +416,7 @@ impl Body<'_, '_, '_> {
                     return Err("unsupported continuation after with".into());
                 }
                 self.charge(ops.len())?;
-                normal_end = self.flow.normal_end(next).min(limit);
+                normal_end = self.flow.normal_end([next]).min(limit);
                 if self.none_return(&ops[next..normal_end]) {
                     return Ok(());
                 }

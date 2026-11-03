@@ -45,25 +45,23 @@ pub(super) fn suspended(bc: &Bytecode, flow: &Graph) -> Handlers {
 /// Use region recovery for ordinary scopes when a branch encloses the first
 /// try, or there are multiple protected entries. Every user handler must have
 /// a known placement before the normal traversal can skip its out-of-line code.
-pub(super) fn guarded(bc: &Bytecode, flow: &Graph) -> Option<Handlers> {
+pub(super) fn guarded(bc: &Bytecode, flow: &Graph) -> Option<(Handlers, usize)> {
     let first = bc.handlers.first()?;
     if first.lasti {
         return None;
     }
     let groups = groups(bc);
     let split = groups.get(&first.target)?.len() > 1;
-    if groups.len() == 1
+    let unguarded = groups.len() == 1
         && !split
         && !bc
             .ops
             .iter()
             .take_while(|op| op.offset < first.start)
-            .any(|op| op.jump.is_some_and(|target| target > first.start))
-    {
-        return None;
-    }
+            .any(|op| op.jump.is_some_and(|target| target > first.start));
     let mut result = Handlers::default();
     let mut unwinds = FxHashSet::default();
+    let mut starts = vec![0];
     for entries in groups.into_values() {
         let dispatch = bc
             .ops
@@ -71,13 +69,20 @@ pub(super) fn guarded(bc: &Bytecode, flow: &Graph) -> Option<Handlers> {
             .ok()?;
         let h = flow.handler(dispatch)?;
         let (start, suite) = region(&bc.ops, flow, &entries)?;
+        if suite.end == dispatch && suite.next > dispatch {
+            // The try returned. Only the handled exception reaches this
+            // continuation, so an ordinary walk from offset zero misses it.
+            starts.push(suite.next);
+        } else if unguarded {
+            return None;
+        }
         unwinds.insert((h.target, h.depth));
         result.insert(start, suite);
     }
     bc.handlers
         .iter()
         .all(|h| !h.lasti || unwinds.contains(&(h.target, h.depth)))
-        .then_some(result)
+        .then(|| (result, flow.normal_end(starts)))
 }
 
 fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usize, Protected)> {
@@ -112,15 +117,24 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
         }
         (Some(dispatch + 1..check), pop + 1, failed)
     };
-    // Inline handlers have a jump on the normal path that skips exactly their
-    // dispatch and unwind. Out-of-line handlers rejoin the normal continuation.
-    let next = if end + 1 == dispatch
-        && ops[end].name == "JUMP_FORWARD"
-        && flow.jump(end) == Some(cleanup + 3)
-    {
-        cleanup + 3
-    } else {
-        end
+    // An inline handler rejoins just past its unwind. When the try returns,
+    // that edge comes from POP_EXCEPT in the handler. Include RETURN_VALUE
+    // in the try suite before resuming at the jump target.
+    let after_cleanup = cleanup + 3;
+    let (end, next) = match ops.get(end..dispatch)? {
+        [jump] if jump.name == "JUMP_FORWARD" && flow.jump(end) == Some(after_cleanup) => {
+            (end, after_cleanup)
+        }
+        [ret]
+            if ret.name == "RETURN_VALUE"
+                && matches!(ops.get(body..stop)?, [.., pop, jump]
+                if pop.name == "POP_EXCEPT" && jump.name == "JUMP_FORWARD")
+                && after_cleanup < ops.len()
+                && flow.jump(stop - 1) == Some(after_cleanup) =>
+        {
+            (dispatch, after_cleanup)
+        }
+        _ => (end, end),
     };
     // At the tail of a for loop, a handler can rejoin the iterator directly.
     // The normal path either has a latch or always raises before END_FOR.
