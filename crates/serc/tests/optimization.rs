@@ -21849,6 +21849,23 @@ fn first_local_guard_after_finally_keeps_its_fresh_slot() {
 }
 
 #[test]
+fn manager_setups_reuse_the_function_definition_before_a_guard() {
+    let source = r"def run(manager, value, active):
+    if active:
+        return
+    with manager, manager, manager, manager, manager:
+        def worker():
+            return value, active
+        try:
+            if value is not None and active:
+                consume()
+        except ValueError:
+            pass
+";
+    assert_matches_cpython_versions(source, "case.py", &LEVELS, &[PythonVersion::Py314]);
+}
+
+#[test]
 fn nested_manager_setups_leave_unowned_slots_for_truth_jumps() {
     let source = r"def sample(value):
     def closure():
