@@ -1260,7 +1260,22 @@ pub(super) fn should_intern(value: &str) -> bool {
         return true;
     }
 
-    let (chunks, remainder) = value.as_bytes().as_chunks::<8>();
+    let (blocks, tail) = value.as_bytes().as_chunks::<128>();
+    for block in blocks {
+        #[expect(
+            clippy::needless_bitwise_bool,
+            reason = "eager byte predicates let LLVM vectorize the block"
+        )]
+        let valid = block.iter().fold(true, |valid, &byte| {
+            let letter = (byte | 0x20).wrapping_sub(b'a') <= b'z' - b'a';
+            let digit = byte.wrapping_sub(b'0') <= 9;
+            valid & (letter | digit | (byte == b'_'))
+        });
+        if !valid {
+            return false;
+        }
+    }
+    let (chunks, remainder) = tail.as_chunks::<8>();
     for &chunk in chunks {
         let word = u64::from_ne_bytes(chunk);
         if !is_ascii_identifier_word(word) {
@@ -1327,7 +1342,7 @@ mod intern_tests {
                     .bytes()
                     .all(|byte| byte == b'_' || byte.is_ascii_alphanumeric())
         };
-        for length in 0..=24 {
+        for length in (0..=24).chain(126..=130).chain(254..=258) {
             let mut value = "a".repeat(length);
             assert_eq!(should_intern(&value), scalar(&value));
             for position in 0..=length {

@@ -761,12 +761,13 @@ fn read_source(path: &Path, metadata: Option<&std::fs::Metadata>) -> io::Result<
     let Some(metadata) = metadata else {
         return fs_err::read(path);
     };
-    // The path can change before it is opened, and special files can report zero bytes.
-    // Cap the initial allocation and still read through EOF regardless of the snapshot.
-    let capacity = usize::try_from(metadata.len())
-        .unwrap_or(usize::MAX)
-        .min(1024 * 1024)
-        + 1;
+    let size = usize::try_from(metadata.len()).unwrap_or(usize::MAX);
+    if size >= 1024 * 1024 {
+        // Read directly into spare capacity instead of zero-initializing a large buffer.
+        return fs_err::read(path);
+    }
+    // Include space for an EOF probe, and still read to EOF if the snapshot was stale.
+    let capacity = size + 1;
     let mut contents = vec![0; capacity];
     let mut source = fs_err::File::open(path)?;
     let mut read = 0;
