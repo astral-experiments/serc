@@ -47,7 +47,10 @@ pub(super) fn groups(bc: &Bytecode, flow: &Graph) -> Vec<HandlerGroup> {
     let mut children = FxHashMap::default();
     for (target, child) in groups.values().filter_map(|group| enclosing(group)) {
         // A shared unwind alone cannot distinguish multiple possible owners.
-        children.entry(target).and_modify(|candidate| *candidate = None).or_insert(Some(child));
+        children
+            .entry(target)
+            .and_modify(|candidate| *candidate = None)
+            .or_insert(Some(child));
     }
     let mut ordered: Vec<_> = groups
         .into_iter()

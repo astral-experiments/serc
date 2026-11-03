@@ -28,14 +28,16 @@ pub(super) fn recover(
         .blocks_covering(dispatch + 1..reraise)
         .map(|b| b.ops.start)
         .find(|at| inner.contains_key(at))?;
-    if right <= dispatch || !flow.blocks_covering(dispatch..right).all(|b| {
-        flow.handler(b.ops.start)
-            .is_some_and(|h| (h.target, h.depth, h.lasti) == (unwind.target, unwind.depth, true))
-            || (flow.handler(b.ops.start).is_none()
+    if right <= dispatch
+        || !flow.blocks_covering(dispatch..right).all(|b| {
+            flow.handler(b.ops.start).is_some_and(|h| {
+                (h.target, h.depth, h.lasti) == (unwind.target, unwind.depth, true)
+            }) || (flow.handler(b.ops.start).is_none()
                 && ops[b.ops.clone()]
                     .iter()
                     .all(|op| op.name == "NOP" || op.name == "NOT_TAKEN"))
-    }) {
+        })
+    {
         return None;
     }
     let compare = |a: Range<usize>, b| owner.finally_copy_end(ops, a, b, CopyExit::Fallthrough);

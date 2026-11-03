@@ -38,7 +38,7 @@ enum Clause {
     },
     Finally {
         deferred_return: Range<usize>,
-        terminal_unwind: Option<usize>,
+        terminal_unwind: Option<(usize, super::finalizers::CopyExit)>,
     },
 }
 
@@ -690,8 +690,9 @@ fn protected_end(
                     && flow.block(end).ops == (end..at)
                     && flow.block(end).height == Some(0)
                     && flow.handler(end).is_none()
-                    && super::regions::constant_return(ops, at)
-                        .is_some_and(|(load, _)| load == end)))
+                    && super::regions::constant_return(ops, at).is_some_and(|(load, _)| {
+                        load == end + usize::from(ops[end].name == "NOT_TAKEN")
+                    })))
             && flow.incoming(at).any(|i| {
                 i < end
                     && flow.jump(i) == Some(at)
@@ -839,8 +840,22 @@ impl Body<'_, '_, '_> {
         self.active_try = outer;
         let (mut suite, returns) = suite?.pending_return()?;
         let mut next = entry.next;
-        let carried = returns && next == limit && matches!(entry.clause, Clause::Finally { .. });
-        if returns && !carried {
+        let terminal_unwind = match entry.clause {
+            Clause::Finally {
+                terminal_unwind, ..
+            } => terminal_unwind,
+            Clause::Except { .. } => None,
+        };
+        let consumes_return = terminal_unwind
+            .is_some_and(|(_, exit)| exit == super::finalizers::CopyExit::PendingReturn);
+        if consumes_return && !returns {
+            return Err("missing return value across finally".into());
+        }
+        let carried = returns
+            && !consumes_return
+            && next == limit
+            && matches!(entry.clause, Clause::Finally { .. });
+        if returns && !carried && !consumes_return {
             if next >= limit || ops[next].name != "RETURN_VALUE" {
                 return Err("unsupported return through suspended handler".into());
             }
@@ -863,18 +878,15 @@ impl Body<'_, '_, '_> {
                 "finally:".into()
             }
         };
-        let terminal_unwind = match &entry.clause {
-            Clause::Finally {
-                terminal_unwind, ..
-            } => *terminal_unwind,
-            Clause::Except { .. } => None,
-        };
-        let outer = std::mem::replace(&mut self.finally_unwind, terminal_unwind);
+        let outer = std::mem::replace(
+            &mut self.finally_unwind,
+            terminal_unwind.map(|(target, _)| target),
+        );
         let rejoin = match &entry.clause {
             Clause::Except {
                 binding, success, ..
             } if success.is_empty() && entry.handler_tail.is_none() => {
-                HandlerRejoin::new(ops, &self.flow, *binding, entry.next)
+                HandlerRejoin::new(ops, self, *binding, entry.next)
             }
             _ => None,
         };
@@ -926,7 +938,11 @@ impl Body<'_, '_, '_> {
             let body = self.lines.split_off(try_start);
             self.block("while True:", &body)?;
         }
-        if terminal_unwind.is_some() && entry.next > entry.end && (level > 0 || next < limit) {
+        if terminal_unwind.is_some()
+            && !consumes_return
+            && entry.next > entry.end
+            && (level > 0 || next < limit)
+        {
             self.line("return")?;
         }
         if carried {

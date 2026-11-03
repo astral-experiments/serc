@@ -2798,6 +2798,97 @@ result = [name for name, error in events]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn named_handler_exits_restore_the_exception_before_advancing() {
+    check_fixture(
+        r"def load(items, work, skip):
+    for item in items:
+        try:
+            work(item)
+        except KeyError as error:
+            if skip(error):
+                continue
+            raise
+
+def flush(value, pending, closing, work):
+    try:
+        if value is not None and pending is None and closing:
+            return
+        work()
+    except LookupError as error:
+        work(error)
+    except OSError as error:
+        work(error)
+",
+        r"import sys
+result = []
+def work(item):
+    result.append((item, type(sys.exception()).__name__))
+    if item < 0: raise KeyError(item)
+def skip(error):
+    assert sys.exception() is error
+    return error.args == (-1,)
+try:
+    raise ValueError()
+except ValueError:
+    try: load([-1, 2, -2, 3], work, skip)
+    except KeyError as error: assert error.args == (-2,)
+assert result == [(-1, 'ValueError'), (2, 'ValueError'), (-2, 'ValueError')]
+def flush_work(error=None):
+    if error is None: raise OSError()
+    assert sys.exception() is error
+    result.append(type(error).__name__)
+flush(1, None, True, flush_work)
+flush(1, None, False, flush_work)
+assert result[-1] == 'OSError'",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn guarded_finalizer_exits_consume_the_pending_value_once() {
+    check_fixture(
+        r"async def send(read, save, seek):
+    sent = 0
+    try:
+        while True:
+            size = await read()
+            if not size:
+                break
+            sent += size
+        return save(sent)
+    finally:
+        if sent and seek is not None:
+            seek(sent)
+",
+        r"import asyncio, sys
+result = []
+async def run(failure, seekable):
+    parts = iter([2, 3, 0])
+    async def read():
+        size = next(parts)
+        if size == 3 and failure == 'read': raise KeyError()
+        return size
+    def save(size):
+        result.append(('saved', size))
+        if failure == 'save': raise ValueError()
+        return size
+    def seek(size):
+        result.append((type(sys.exception()).__name__, size))
+        if failure == 'seek': raise OSError()
+    try: return await send(read, save, seek if seekable else None)
+    except Exception as error: return type(error)
+assert asyncio.run(run(None, True)) == 5
+assert asyncio.run(run(None, False)) == 5
+assert asyncio.run(run('read', True)) is KeyError
+assert asyncio.run(run('save', True)) is ValueError
+assert asyncio.run(run('seek', True)) is OSError
+assert result == [('saved', 5), ('NoneType', 5), ('saved', 5), ('KeyError', 2),
+                  ('saved', 5), ('ValueError', 5), ('saved', 5), ('NoneType', 5)]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn an_out_of_line_handler_retries_until_the_await_succeeds() {
     check_fixture(
         r"async def run(acquire, events):

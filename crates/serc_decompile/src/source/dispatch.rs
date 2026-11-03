@@ -670,7 +670,7 @@ impl Body<'_, '_, '_> {
         let header = self.except_header(ops, "except", arm.kind.clone(), arm.binding, level)?;
         let rejoin = match arm.exit {
             Exit::Jump(next) => {
-                super::protected_regions::HandlerRejoin::new(ops, &self.flow, arm.binding, next)
+                super::protected_regions::HandlerRejoin::new(ops, self, arm.binding, next)
             }
             _ => None,
         };

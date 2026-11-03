@@ -107,7 +107,7 @@ pub(super) fn returning_finally_loop(
         next: end,
         clause: Clause::Finally {
             deferred_return: end..end,
-            terminal_unwind: split.then_some(ops[cleanup].offset),
+            terminal_unwind: split.then_some((ops[cleanup].offset, CopyExit::ReturnNone)),
         },
         handler,
         try_exits: None,
@@ -303,7 +303,7 @@ pub(super) fn finally_region(
             next: end,
             clause: Clause::Finally {
                 deferred_return: end..end,
-                terminal_unwind: terminal.then_some(ops[cleanup].offset),
+                terminal_unwind: terminal.then_some((ops[cleanup].offset, CopyExit::ReturnNone)),
             },
             handler: copy,
             try_exits: None,
@@ -312,12 +312,18 @@ pub(super) fn finally_region(
         });
     }
     let marker = ops[end].name == "NOP";
+    let suite_start = suite.start;
     let deferred = marker && !break_marker(ops, flow, suite);
     let start = end + usize::from(marker);
-    let exit = if terminal {
-        CopyExit::ReturnNone
-    } else {
+    let exit = if !terminal {
         CopyExit::Fallthrough
+    } else if flow.handler(suite_start).is_some_and(|h| {
+        flow.block(end).ops.start == end && flow.block(end).height == Some(h.depth + 1)
+    }) {
+        // Every fallthrough arm consumes the value evaluated inside the try.
+        CopyExit::PendingReturn
+    } else {
+        CopyExit::ReturnNone
     };
     let normal = start..owner.finally_copy_end(ops, start..dispatch, copy.clone(), exit)?;
     // A return of a constant can leave a tracing NOP at its original site,
@@ -349,7 +355,7 @@ pub(super) fn finally_region(
         next,
         clause: Clause::Finally {
             deferred_return: normal.end..next,
-            terminal_unwind: terminal.then_some(ops[cleanup].offset),
+            terminal_unwind: terminal.then_some((ops[cleanup].offset, exit)),
         },
         handler: if terminal { copy } else { normal },
         try_exits: None,
