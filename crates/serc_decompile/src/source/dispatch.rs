@@ -544,7 +544,13 @@ impl Body<'_, '_, '_> {
         keep_return: bool,
     ) -> Result<(), String> {
         let header = self.except_header(ops, "except", arm.kind.clone(), arm.binding, level)?;
-        let fragment = self.protected_fragment(ops, arm.body.clone(), level, arm.copies)?;
+        let rejoin = match arm.exit {
+            Exit::Jump(next) => {
+                super::protected_regions::HandlerRejoin::new(ops, &self.flow, arm.binding, next)
+            }
+            _ => None,
+        };
+        let fragment = self.protected_fragment(ops, arm.body.clone(), level, arm.copies, rejoin)?;
         let mut suite = if matches!(arm.exit, Exit::ReturnValue) {
             let (suite, returns) = fragment.pending_return()?;
             if !returns {

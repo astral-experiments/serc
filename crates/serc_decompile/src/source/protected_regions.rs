@@ -8,10 +8,12 @@ use serc_bytecode::instructions::Handler;
 use super::{Body, Bytecode, Instruction};
 use crate::flow::Graph;
 mod finally;
+mod handler_rejoin;
 mod handler_returns;
 mod loop_exits;
 
 use finally::{break_marker, finally_region, returning_finally_loop};
+pub(super) use handler_rejoin::HandlerRejoin;
 use handler_returns::{enclosing_exception, nested_handler_return, returning_handler_child};
 
 pub(super) use loop_exits::iterator_return_block;
@@ -617,10 +619,11 @@ fn protected_end(
             continue;
         }
         // Once TO_BOOL succeeded, newer targets leave both the conditional
-        // jump and its latch outside the try. The taken edge reaches the
-        // protected break marker, the other returns to this same suite.
-        if matches!(ops.get(end..at), Some([test, marker, back])
-             if test.name.starts_with("POP_JUMP_IF_") && marker.name == "NOT_TAKEN" && back.name == "JUMP_BACKWARD")
+        // jump and its latch outside the try. The taken edge resumes the
+        // protected suite. 3.13 has no intervening monitoring marker.
+        if matches!(ops.get(end..at), Some([test, markers @ .., back])
+             if test.name.starts_with("POP_JUMP_IF_") && back.name == "JUMP_BACKWARD"
+                && (markers.is_empty() || matches!(markers, [marker] if marker.name == "NOT_TAKEN")))
             && flow.jump(end) == Some(at)
             && flow
                 .jump(at - 1)
@@ -713,9 +716,12 @@ impl Body<'_, '_, '_> {
         body: Range<usize>,
         level: usize,
         exits: Option<ExitCopies>,
+        rejoin: Option<HandlerRejoin>,
     ) -> Result<super::regions::Fragment, String> {
         let outer = std::mem::replace(&mut self.clause_exits, exits);
+        let outer_rejoin = std::mem::replace(&mut self.handler_rejoin, rejoin);
         let fragment = self.fragment(ops, body.start, body.end, level);
+        self.handler_rejoin = outer_rejoin;
         self.clause_exits = outer;
         fragment
     }
@@ -733,7 +739,7 @@ impl Body<'_, '_, '_> {
         }
         let outer = std::mem::replace(&mut self.active_try, self.flow.handler(start));
         std::mem::swap(&mut self.return_exits, &mut entry.return_exits);
-        let suite = self.protected_fragment(ops, start..entry.end, level, entry.try_exits);
+        let suite = self.protected_fragment(ops, start..entry.end, level, entry.try_exits, None);
         std::mem::swap(&mut self.return_exits, &mut entry.return_exits);
         self.active_try = outer;
         let (mut suite, returns) = suite?.pending_return()?;
@@ -769,8 +775,21 @@ impl Body<'_, '_, '_> {
             Clause::Except { .. } => None,
         };
         let outer = std::mem::replace(&mut self.finally_unwind, terminal_unwind);
-        let handler =
-            self.protected_fragment(ops, entry.handler.clone(), level, entry.handler_exits);
+        let rejoin = match &entry.clause {
+            Clause::Except {
+                binding, success, ..
+            } if success.is_empty() && entry.handler_tail.is_none() => {
+                HandlerRejoin::new(ops, &self.flow, *binding, entry.next)
+            }
+            _ => None,
+        };
+        let handler = self.protected_fragment(
+            ops,
+            entry.handler.clone(),
+            level,
+            entry.handler_exits,
+            rejoin,
+        );
         self.finally_unwind = outer;
         let handler = handler?;
         let handler = if let Some(tail) = &entry.handler_tail {

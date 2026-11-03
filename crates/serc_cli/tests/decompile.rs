@@ -3290,6 +3290,59 @@ for seq in ([0, 2], [None]):
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_filtered_loop_in_a_try_releases_its_resource_after_iteration() {
+    check_fixture(
+        "def clear(items, expired, discard, release):\n    try:\n        for item in items:\n            if expired(item):\n                discard(item)\n    finally:\n        release()\n",
+        r"import sys
+result = []
+def expired(value):
+    if value < 0: raise ValueError(value)
+    return value % 2
+def release(): result.append(('release', type(sys.exception()).__name__))
+clear([0, 1, 2], expired, result.append, release)
+try: clear([3, -1, 5], expired, result.append, release)
+except ValueError as exc: assert exc.args == (-1,)
+assert result == [1, ('release', 'NoneType'), 3, ('release', 'ValueError')]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_handler_branches_rejoin_with_the_previous_exception_restored() {
+    check_fixture(
+        r"def parse(items, read, record):
+    for item in items:
+        try:
+            read(item)
+        except LookupError:
+            if item < 3:
+                if not item or item in (1, 4):
+                    record('small')
+                else:
+                    record('two')
+            elif item == 3:
+                record('three')
+            else:
+                raise
+        record('after')
+",
+        r"import sys
+result = []
+def read(item):
+    if item >= 0: raise KeyError(item)
+def record(message):
+    result.append((message, type(sys.exception()).__name__))
+try: parse([-1, 0, 1, 2, 3, 4], read, record)
+except KeyError as err: assert err.args == (4,)
+else: raise AssertionError('lost reraise')
+assert result == [('after', 'NoneType'), ('small', 'KeyError'), ('after', 'NoneType'),
+                  ('small', 'KeyError'), ('after', 'NoneType'), ('two', 'KeyError'),
+                  ('after', 'NoneType'), ('three', 'KeyError'), ('after', 'NoneType')]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_handler_can_record_the_failure_before_continuing_the_iterator() {
     check_fixture(
         "def visit(items):\n    for item in items:\n        try:\n            value = read(item)\n        except KeyError:\n            record(item)\n            continue\n        emit(value)\n",

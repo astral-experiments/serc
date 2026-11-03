@@ -564,6 +564,7 @@ impl<'m, 'data> Body<'m, 'data, '_> {
                 loop_edges: None,
                 handlers: super::protected_regions::Handlers::default(),
                 clause_exits: None,
+                handler_rejoin: None,
                 arm_exit: None,
                 finally_unwind: None,
                 active_try: None,

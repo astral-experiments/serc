@@ -213,10 +213,9 @@ impl Body<'_, '_, '_> {
         .then_some(jump)
     }
 
-    /// At the end of an except suite's loop, a failed test can go straight
-    /// back to `FOR_ITER` outside the exception table. An explicit continue
-    /// inside the handler would protect that jump. Guard the remaining body
-    /// instead so the iterator advances implicitly.
+    /// At the end of a protected loop, a failed test can jump back to
+    /// `FOR_ITER` outside the exception table. An explicit continue would
+    /// protect that jump. Guard the remaining body instead.
     pub(super) fn guarded_iteration_tail(
         &self,
         ops: &[Instruction],
@@ -228,9 +227,14 @@ impl Body<'_, '_, '_> {
         };
         active.body_end == end
             && ops[active.header].name == "FOR_ITER"
-            && self.flow.handler(active.header).is_some_and(|h| h.lasti)
             && predicate.suite + 1 == predicate.target
             && predicate.target < end
+            && self.flow.handler(active.header).is_some_and(|h| {
+                h.lasti
+                    || self.flow.handler(predicate.target).is_some_and(|tail| {
+                        (tail.target, tail.depth, tail.lasti) == (h.target, h.depth, h.lasti)
+                    })
+            })
             && self.loop_transfer(ops, predicate.suite) == Some("continue")
             && self.flow.handler(predicate.suite).is_none()
             && self
