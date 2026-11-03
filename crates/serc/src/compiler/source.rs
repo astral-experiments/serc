@@ -1789,17 +1789,43 @@ impl Compiler<'_> {
         }
 
         if let Expr::BinOp(binary) = expression {
-            let runtime_operand = |operand: &Expr| match operand {
-                Expr::Name(name) => name.id.as_str() != "__debug__",
-                Expr::Attribute(_) | Expr::Call(_) => true,
-                _ => false,
-            };
+            /// Identifies leaves whose value is only available at runtime.
+            fn runtime_operand(operand: &Expr) -> bool {
+                match operand {
+                    Expr::Name(name) => name.id.as_str() != "__debug__",
+                    Expr::Attribute(_) | Expr::Call(_) => true,
+                    _ => false,
+                }
+            }
+
+            /// Arithmetic and indexing require the value of their operands.
+            fn runtime_arithmetic_operand(operand: &Expr) -> bool {
+                if crate::stack_growth_required() {
+                    return crate::grow_stack(|| runtime_arithmetic_operand(operand));
+                }
+                match operand {
+                    Expr::BinOp(binary) => {
+                        runtime_arithmetic_operand(&binary.left)
+                            || runtime_arithmetic_operand(&binary.right)
+                    }
+                    Expr::UnaryOp(unary) => runtime_arithmetic_operand(&unary.operand),
+                    Expr::Subscript(subscript) => runtime_arithmetic_operand(&subscript.value),
+                    _ => runtime_operand(operand),
+                }
+            }
             // Avoid folding and discarding the other operand.
             if runtime_operand(&binary.left) || runtime_operand(&binary.right) {
                 return None;
             }
-            if let Expr::BinOp(binary) = binary.left.as_ref() {
-                let mut left = binary.left.as_ref();
+            if let Expr::BinOp(prefix) = binary.left.as_ref() {
+                // A runtime term rules out folding the entire prefix. Bound this probe
+                // to the shorter operand so nested terms do not repeatedly walk the prefix.
+                if binary.right.range().len() < prefix.range.len()
+                    && runtime_arithmetic_operand(&binary.right)
+                {
+                    return None;
+                }
+                let mut left = prefix.left.as_ref();
                 while let Expr::BinOp(binary) = left {
                     left = &binary.left;
                 }
