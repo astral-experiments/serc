@@ -3602,6 +3602,24 @@ def unfinished():
         action()
         return '{big}'
     except Exception: return kept
+def guarded_return(log, transform):
+    try:
+        log.append('before return')
+        return transform('{big}')
+    except Exception:
+        log.append('caught')
+        return 17
+def managed_return(manager, log, transform):
+    with manager:
+        log.append('before return')
+        return transform('{big}')
+    log.append('suppressed')
+    return 17
+def managed_statement(manager, log, transform):
+    with manager:
+        transform('{big}')
+        log.append('after gap')
+        return transform(11)
 def guarded(flag, events):
     if flag:
         normal = 1
@@ -3637,6 +3655,25 @@ def guarded(flag, events):
         );
         assert!(text.contains("NotImplementedError('serc: unrecovered function tail')  # serc: unrecovered remainder of large"));
         assert!(text.contains("def after(x):"));
+        for (header, owner) in [
+            ("try:", "guarded_return"),
+            ("with manager:", "managed_return"),
+        ] {
+            assert!(text.contains(&format!(
+                "    {header}\n        log.append('before return')\n        raise NotImplementedError('serc: unrecovered function tail')  # serc: unrecovered tail of protected suite in {owner}"
+            )), "{version}: missing protected return in {owner}");
+        }
+        assert!(
+            text.contains("    except Exception:\n        log.append('caught')\n        return 17")
+        );
+        assert!(text.contains("    log.append('suppressed')\n    return 17"));
+        assert!(text.contains(
+            "    with manager:\n        ...  # serc: unrecovered statement in managed_statement"
+        ));
+        assert!(text.contains("        log.append('after gap')\n        return transform(11)"));
+        for name in ["guarded_return", "managed_return", "managed_statement"] {
+            assert!(text.contains(&format!("# serc: unplaced blocks in {name} (")));
+        }
         assert!(!text.contains("# serc: unplaced blocks in after ("));
         assert!(!text.contains("# serc: unplaced blocks in Labels ("));
         assert!(text.contains("# serc: detached function incomplete ("));

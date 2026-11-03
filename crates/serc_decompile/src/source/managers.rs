@@ -438,7 +438,16 @@ impl Body<'_, '_, '_> {
             }
         }
         let outer = std::mem::replace(&mut self.return_exits, exits);
-        let body = self.seeded(ops, start, end, level, seed);
+        let return_exit = self.work.partial
+            && managers
+                .iter()
+                .rev()
+                .try_fold(end, |at, (asynchronous, _, _)| {
+                    self.manager_exit(ops, at..*normal_end, *asynchronous, true)
+                })
+                .and_then(|at| ops.get(at))
+                .is_some_and(|op| op.name == "RETURN_VALUE");
+        let body = self.suite_fragment(ops, start..end, level, seed, return_exit);
         self.return_exits = outer;
         let (body, returns) = body?.pending_return()?;
         // Adjacent managers of the same kind share a header. A switch

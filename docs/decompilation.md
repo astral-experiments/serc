@@ -152,7 +152,9 @@ flags, names, local layout, and constants, including reference sharing.
 By default, if exact verification fails, serc emits best-effort source with a
 `# serc: best-effort decompilation` header. A function that reaches an
 unrecovered tail raises `NotImplementedError` with the message
-`serc: unrecovered function tail`. Earlier returns still take effect.
+`serc: unrecovered function tail`. When the bytecode shows a straight-line
+return through a `try` or `with`, serc can mark the missing tail inside that
+suite and show the handler or the continuation after the `with`.
 Module and class gaps use a marked ellipsis, as do missing statements within
 a function where the skipped paths rejoin with an empty evaluation stack.
 A comment at each gap names the affected scope. A best-effort result can differ

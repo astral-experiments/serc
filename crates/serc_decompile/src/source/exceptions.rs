@@ -72,7 +72,10 @@ impl Body<'_, '_, '_> {
             return Err(format!("unsupported handler depth at byte {}", entry.start));
         }
         self.region(ops, 0, start, 0)?;
-        let (suite, returns) = self.fragment(ops, start, end, 0)?.pending_return()?;
+        let return_exit = end + 1 == normal_end && ops[end].name == "RETURN_VALUE";
+        let (suite, returns) = self
+            .suite_fragment(ops, start..end, 0, Vec::new(), return_exit)?
+            .pending_return()?;
         let try_source_start = self.lines.len();
         self.try_block(&suite, start > 0 && ops[start - 1].name != "NOP")?;
         let star = ops
@@ -85,8 +88,7 @@ impl Body<'_, '_, '_> {
             && returns
             // Inlined comprehension cleanups may follow the normal return
             // before the user's dispatcher. They own no normal continuation.
-            && end + 1 == normal_end
-            && ops[end].name == "RETURN_VALUE"
+            && return_exit
             && ops.get(handler + 1).is_some_and(|op| {
                 op.name == "POP_TOP" || self.flow
                     .block(handler + 1)

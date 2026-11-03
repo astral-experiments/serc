@@ -76,7 +76,10 @@ pub(crate) fn partial(
         private_class: None,
     };
     let mut candidate = if let Some(candidate) = candidate {
-        candidate
+        Candidate {
+            source: super::layout::readable_primaries(candidate.source),
+            ..candidate
+        }
     } else {
         let source = scope(m, m.root, 0, false, &mut work)?;
         ruff_python_parser::parse_module(&source)
@@ -109,6 +112,13 @@ pub(crate) fn partial(
     Ok(result)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(super) enum GapKind {
+    Statement,
+    Remainder,
+    ProtectedTail,
+}
+
 impl Body<'_, '_, '_> {
     pub(super) fn partial_scope(&mut self, reason: &str, bc: &Bytecode) -> Result<String, String> {
         self.charge(self.lines.len())?;
@@ -119,7 +129,12 @@ impl Body<'_, '_, '_> {
             // the last checkpoint. Include its whole scope for context.
             self.partial_start = 0;
         }
-        self.gap(reason, &bc.ops, self.partial_start..bc.ops.len(), true)?;
+        self.gap(
+            reason,
+            &bc.ops,
+            self.partial_start..bc.ops.len(),
+            GapKind::Remainder,
+        )?;
         self.lexical_bindings(&bc.ops)?;
         Ok(std::mem::take(&mut self.lines))
     }
@@ -133,9 +148,27 @@ impl Body<'_, '_, '_> {
         i: usize,
     ) -> Result<Option<usize>, String> {
         let range = self.flow.block(i).ops.clone();
-        let Some(mut height) = self.flow.block(i).height else {
+        let Some(height) = self.flow.block(i).height else {
             return Ok(None);
         };
+        if let Some(next) = self.empty_stack_after(ops, range, i, height)? {
+            return Ok(Some(next));
+        }
+        Ok(self
+            .flow
+            .join(i)
+            .filter(|&n| n > i && self.flow.block(n).height == Some(0)))
+    }
+
+    /// Find the end of the failed statement in a straight-line range. In a
+    /// managed suite, measure from the stack above the saved exit callable.
+    pub(super) fn empty_stack_after(
+        &mut self,
+        ops: &[super::Instruction],
+        range: Range<usize>,
+        i: usize,
+        mut height: usize,
+    ) -> Result<Option<usize>, String> {
         self.charge(range.len())?;
         for (index, op) in ops[range.clone()].iter().enumerate() {
             let (pop, push) =
@@ -149,10 +182,7 @@ impl Body<'_, '_, '_> {
                 return Ok(Some(next));
             }
         }
-        Ok(self
-            .flow
-            .join(i)
-            .filter(|&n| n > i && self.flow.block(n).height == Some(0)))
+        Ok(None)
     }
 
     pub(super) fn gap(
@@ -160,27 +190,38 @@ impl Body<'_, '_, '_> {
         reason: &str,
         ops: &[super::Instruction],
         range: Range<usize>,
-        remainder: bool,
+        kind: GapKind,
     ) -> Result<(), String> {
         self.remember_cell_stores(&ops[range.clone()])?;
         let name = comment(self.m.text(self.code.qualname)?);
-        let extent = if remainder {
-            "remainder of"
-        } else {
-            "statement in"
+        let extent = match kind {
+            GapKind::Statement => "statement in",
+            GapKind::Remainder => "remainder of",
+            GapKind::ProtectedTail => "tail of protected suite in",
         };
-        let statement = if remainder && self.depth > 0 && !self.class {
-            // The original may shadow the exception or the builtins module.
-            // Introduce the import only on the path that reaches the gap.
-            let alias = self
-                .work
-                .tail_builtin_alias
-                .get_or_insert_with(|| tail_builtin_alias(self.m));
-            let import = format!("import builtins as {alias}");
-            let raise =
-                format!("raise {alias}.NotImplementedError('serc: unrecovered function tail')");
-            self.line(&import)?;
-            raise
+        let statement = if kind != GapKind::Statement && self.depth > 0 && !self.class {
+            let locals = self.m.tuple(self.code.locals)?;
+            let globals = self.m.tuple(self.m.code(self.m.root)?.names)?;
+            self.charge(locals.len() + globals.len())?;
+            let mut exception = "NotImplementedError".to_owned();
+            if locals.iter().chain(globals).any(|&id| {
+                matches!(
+                    self.m.objects[id],
+                    Object::Text {
+                        bytes: b"NotImplementedError",
+                        ..
+                    }
+                )
+            }) {
+                let alias = self
+                    .work
+                    .tail_builtin_alias
+                    .get_or_insert_with(|| tail_builtin_alias(self.m));
+                exception = format!("{alias}.NotImplementedError");
+                let import = format!("import builtins as {alias}");
+                self.line(&import)?;
+            }
+            format!("raise {exception}('serc: unrecovered function tail')")
         } else {
             "...".into()
         };
@@ -192,7 +233,8 @@ impl Body<'_, '_, '_> {
             range.end,
             comment(reason)
         ))?;
-        if remainder && self.code.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0 {
+        if kind != GapKind::Statement && self.code.flags & (CO_GENERATOR | CO_ASYNC_GENERATOR) != 0
+        {
             // If the missing tail contained the only yield, calling the
             // function must still create an iterator before it can raise.
             self.line("if False: yield  # serc: synthetic dead code")?;

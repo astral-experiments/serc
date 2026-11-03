@@ -11,6 +11,74 @@ use std::collections::BTreeMap;
 use super::{MAX_SOURCE, Module, Object};
 use serc_bytecode::target::code_flags::CO_NEWLOCALS;
 
+/// The lifter groups operands until precedence is known. For best-effort
+/// source, remove redundant grouping without reformatting diagnostic comments
+/// or changing physical lines.
+pub(super) fn readable_primaries(source: String) -> String {
+    if ![")(", ").", ")["]
+        .iter()
+        .any(|suffix| source.contains(suffix))
+    {
+        return source;
+    }
+    let Ok(parsed) = ruff_python_parser::parse_module(&source) else {
+        return source;
+    };
+    let mut visitor = PrimaryGroups {
+        source: &source,
+        parens: Vec::new(),
+    };
+    visitor.visit_body(parsed.suite());
+    if visitor.parens.is_empty() {
+        return source;
+    }
+    visitor.parens.sort_unstable();
+    let mut result = String::with_capacity(source.len() - visitor.parens.len());
+    let mut from = 0;
+    for at in visitor.parens {
+        result.push_str(&source[from..at]);
+        from = at + 1;
+    }
+    result.push_str(&source[from..]);
+    result
+}
+
+struct PrimaryGroups<'a> {
+    source: &'a str,
+    parens: Vec<usize>,
+}
+
+impl<'a> Visitor<'a> for PrimaryGroups<'_> {
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        let primary = match expr {
+            Expr::Call(call) => Some(call.func.as_ref()),
+            Expr::Attribute(attr) => Some(attr.value.as_ref()),
+            Expr::Subscript(index) => Some(index.value.as_ref()),
+            // Debug fields can include their original spelling in the value.
+            Expr::FString(_) | Expr::TString(_) => return,
+            _ => None,
+        };
+        if let Some(
+            base @ (Expr::Name(_) | Expr::Call(_) | Expr::Attribute(_) | Expr::Subscript(_)),
+        ) = primary
+        {
+            let open = expr.start().to_usize();
+            let close = base.end().to_usize();
+            if self.source.get(open..base.start().to_usize()) == Some("(")
+                && self.source.as_bytes().get(close) == Some(&b')')
+                && !self.source[base.range()].contains(['\r', '\n'])
+                && self.source[..open]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| c.is_ascii_punctuation() && c != '_' || c.is_whitespace())
+            {
+                self.parens.extend([open, close]);
+            }
+        }
+        walk_expr(self, expr);
+    }
+}
+
 #[derive(Default)]
 struct KeywordCalls<'a>(Vec<&'a [Keyword]>);
 
@@ -286,4 +354,26 @@ pub(super) fn partial(m: &Module<'_>, candidate: &Module<'_>, source: &str) -> O
     }
     result.push_str(&source[copied..]);
     (result != source).then_some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readable_primaries;
+
+    #[test]
+    fn removes_only_redundant_groups_around_primaries() {
+        let source = "((log).append)((items)[0])  # (log).append\n\
+                      (left + right).read()\n\
+                      if(flag).value: pass\n\
+                      ((log)\n .append)(1)\n\
+                      debug = f'{(log).name=}'\n";
+        assert_eq!(
+            readable_primaries(source.into()),
+            "log.append(items[0])  # (log).append\n\
+             (left + right).read()\n\
+             if(flag).value: pass\n\
+             (log\n .append)(1)\n\
+             debug = f'{(log).name=}'\n"
+        );
+    }
 }

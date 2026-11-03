@@ -686,7 +686,12 @@ impl Body<'_, '_, '_> {
                 // This edge leaves the function. The other edge can still
                 // run, so keep the missing tail inside the failed arm.
                 let prefix = self.lines.len();
-                self.gap(&reason, ops, start..target, true)?;
+                self.gap(
+                    &reason,
+                    ops,
+                    start..target,
+                    super::partial::GapKind::Remainder,
+                )?;
                 let missing = self.lines.split_off(prefix);
                 self.block(&format!("if {test}:"), &missing)?;
                 return Ok(target);

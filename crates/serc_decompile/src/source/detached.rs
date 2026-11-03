@@ -40,6 +40,7 @@ pub(super) fn mark(header: &mut String, id: Id) {
 }
 
 pub(super) fn take_marks(source: String) -> Candidate {
+    let source = super::layout::readable_primaries(source);
     if !source.contains(MARK) && !source.contains(blocks::MARK) {
         return Candidate::new(source, Vec::new());
     }
