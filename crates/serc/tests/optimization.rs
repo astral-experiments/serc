@@ -223,6 +223,24 @@ fn conditional_fallthrough_in_a_finally_suite_uses_a_fresh_marker() {
 }
 
 #[test]
+fn named_handler_in_a_break_finalizer_copies_the_result_return() {
+    let source = r"def dispatch(ready, value):
+    while ready:
+        try:
+            break
+        except KeyError:
+            pass
+        finally:
+            try:
+                clean()
+            except RuntimeError as error:
+                value = error
+    return value
+";
+    assert_matches_cpython(source, "break_handler_result.py", &LEVELS);
+}
+
+#[test]
 fn outer_finalizer_keeps_the_managed_return_value_join() {
     let source = r"async def finish(manager, ready):
     try:
