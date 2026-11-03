@@ -5061,3 +5061,90 @@ assert log == [1, 3] and values == ['host', 'host', 'host', 'b.c']
 result = log, values",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn module_finalizer_imports_on_normal_and_exceptional_paths() {
+    check_fixture(
+        r"try:
+    marker = bool(1)
+finally:
+    from math import sqrt
+
+def root(value):
+    return sqrt(value)
+",
+        "assert marker and root(9) == 3\nresult = root(16)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn async_for_continues_breaks_and_exhaustion_rejoin_the_right_iterator() {
+    check_fixture(
+        r"async def select(rows, emit):
+    async for item in rows:
+        if not item:
+            continue
+        if item < 0:
+            break
+        for value in range(item):
+            emit(value)
+    else:
+        emit('end')
+    emit('done')
+
+async def flatten(rows, emit):
+    async for row in rows:
+        async for item in row:
+            emit(item)
+",
+        r"import asyncio
+async def rows(values):
+    for v in values:
+        if isinstance(v, Exception): raise v
+        yield v
+log = []
+for values in ([], [0, 2], [1, -1, 4], [3, KeyError()]):
+    try:
+        asyncio.run(select(rows(values), log.append))
+    except KeyError:
+        log.append('error')
+assert log == ['end', 'done', 0, 1, 'end', 'done', 0, 'done', 0, 1, 2, 'error']
+asyncio.run(flatten(rows([rows([]), rows([4, 5])]), log.append))
+assert log[-2:] == [4, 5]
+result = log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn awaited_calls_rejoin_typed_handlers_with_a_bound_return() {
+    check_fixture(
+        r"async def read(take):
+    try:
+        line = await take()
+    except EOFError as err:
+        return err.args
+    except LookupError as err:
+        raise ValueError(err.args[0])
+    return line
+",
+        r"import asyncio
+async def take():
+    if isinstance(value, Exception): raise value
+    return value
+answers = []
+for value in (27, EOFError('partial'), KeyError('limit'), TypeError('other')):
+    try:
+        answers.append(asyncio.run(read(take)))
+    except ValueError as err:
+        assert err.__context__ is value
+        answers.append(err.args)
+    except TypeError as err:
+        assert err is value
+        answers.append('unmatched')
+assert answers == [27, ('partial',), ('limit',), 'unmatched']
+result = answers",
+    );
+}

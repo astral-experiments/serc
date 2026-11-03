@@ -1,3 +1,5 @@
+mod async_for;
+
 use std::fmt::Write as _;
 use std::ops::Range;
 
@@ -299,16 +301,24 @@ impl Body<'_, '_, '_> {
         };
         self.stack.is_empty()
             && active.body_end == end
-            && ops[active.header].name == "FOR_ITER"
+            && matches!(ops[active.header].name, "FOR_ITER" | "GET_ANEXT")
             && predicate.suite + 1 == predicate.target
             && predicate.target < end
             && (self.folded_break(ops, predicate.target, end)
-                || self.flow.handler(active.header).is_some_and(|h| {
-                    h.lasti
-                        || self.flow.handler(predicate.target).is_some_and(|tail| {
-                            (tail.target, tail.depth, tail.lasti) == (h.target, h.depth, h.lasti)
-                        })
-                }))
+                || self
+                    .flow
+                    .handler(if ops[active.header].name == "GET_ANEXT" {
+                        active.body_end
+                    } else {
+                        active.header
+                    })
+                    .is_some_and(|h| {
+                        h.lasti
+                            || self.flow.handler(predicate.target).is_some_and(|tail| {
+                                (tail.target, tail.depth, tail.lasti)
+                                    == (h.target, h.depth, h.lasti)
+                            })
+                    }))
             && self.loop_transfer(ops, predicate.suite) == Some("continue")
             && self.flow.handler(predicate.suite).is_none()
             && self.flow.entered_from(
@@ -467,15 +477,16 @@ impl Body<'_, '_, '_> {
 
     fn iterator_slots(&self, ops: &[Instruction], header: usize, count: usize) -> Option<usize> {
         let iter = header.checked_sub(1)?;
-        if ops[header].name != "FOR_ITER" || ops[iter].name != "GET_ITER" {
-            return None;
-        }
+        let depth = match (ops[header].name, ops[iter].name) {
+            ("FOR_ITER", "GET_ITER") => self.flow.for_iter_depth(header)?,
+            ("GET_ANEXT", "GET_AITER") => self.flow.handler(header)?.depth,
+            _ => return None,
+        };
         let (_, slots) = serc_bytecode::target::stack_counts_for(
             self.m.version,
             ops[iter].opcode,
             ops[iter].arg,
         );
-        let depth = self.flow.for_iter_depth(header)?;
         let expected = slots * count;
         // A loop in an except clause also carries the saved exception.
         (depth == expected
@@ -540,7 +551,7 @@ impl Body<'_, '_, '_> {
             header,
             body_end: body.end,
             iterators: self.loop_edges.map_or(0, |outer| outer.iterators)
-                + usize::from(ops[header].name == "FOR_ITER"),
+                + usize::from(matches!(ops[header].name, "FOR_ITER" | "GET_ANEXT")),
             after: None,
             copied_return: None,
         };

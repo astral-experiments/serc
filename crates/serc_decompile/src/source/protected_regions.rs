@@ -568,6 +568,22 @@ fn region(
             body..expression_end
         }
         [.., raise] if raise.name == "RAISE_VARARGS" => body..stop,
+        [.., ret]
+            if ret.name == "RETURN_VALUE"
+                && let Some((pop, after)) = Body::handler_pop(ops, binding, stop)
+                && pop > body
+                && after == stop - 1
+                && (ops[pop - 1].name, ops[pop - 1].arg) == ("SWAP", 2)
+                && flow.handler(pop - 1).is_some_and(|h| {
+                    h.lasti && h.target == unwind.target && h.depth == first.depth + 1
+                })
+                && flow.handler(pop).is_none_or(|h| h.target != unwind.target) =>
+        {
+            // The computed value crosses restoration of the saved exception
+            // and binding cleanup. Leave the return inside this except arm.
+            handler_tail = Some(after..stop);
+            body..pop - 1
+        }
         [.., jump]
             if matches!(
                 jump.name,

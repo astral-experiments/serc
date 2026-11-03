@@ -77,10 +77,10 @@ impl Body<'_, '_, '_> {
             self.handlers = super::protected_regions::collect(bc, self);
             let handled_end = super::protected_regions::handled_end(bc, self);
             if let Some(end) = handled_end
-                && ops.get(end).is_some_and(|op| op.name == "PUSH_EXC_INFO")
-                && let Some(handler) = self.flow.handler(end)
+                && let Some(dispatch) = self.dispatch_after_delegation(ops, end)
+                && let Some(handler) = self.flow.handler(dispatch)
                 && let Some((_, cleanup)) =
-                    super::dispatch::unwind(ops, &self.flow, end, handler.depth)
+                    super::dispatch::unwind(ops, &self.flow, dispatch, handler.depth)
                 && ops
                     .get(cleanup + 3)
                     .is_some_and(|op| Some(op.offset) == stop_handler)
@@ -105,6 +105,24 @@ impl Body<'_, '_, '_> {
         self.region(ops, 0, end, 0)
     }
 
+    fn dispatch_after_delegation(&self, ops: &[Instruction], end: usize) -> Option<usize> {
+        let dispatch =
+            if ops.get(end)?.name == "CLEANUP_THROW" {
+                // A throw into the await can resume its END_SEND. The trampoline
+                // precedes the user's dispatcher and has no source fallthrough.
+                let resume = self.flow.jump(end + 1)?;
+                if !self.flow.incoming(resume).any(|i| {
+                    ops[i].name == "SEND" && self.delegated_cleanup(ops, i + 1) == Some(end)
+                }) {
+                    return None;
+                }
+                end + 2
+            } else {
+                end
+            };
+        (ops.get(dispatch)?.name == "PUSH_EXC_INFO").then_some(dispatch)
+    }
+
     pub(super) fn delegated(
         &mut self,
         ops: &[Instruction],
@@ -119,30 +137,6 @@ impl Body<'_, '_, '_> {
             "yield from"
         };
         self.push(format!("({kind} {expr})"))?;
-        Ok(last + 1)
-    }
-
-    pub(super) fn async_loop(
-        &mut self,
-        ops: &[Instruction],
-        start: usize,
-        end: usize,
-        level: usize,
-    ) -> Result<usize, String> {
-        let iterable = self.expr()?;
-        let last = find(ops, start + 1, end, "END_ASYNC_FOR")?;
-        let bind = find(ops, start + 1, last, "END_SEND")? + 1;
-        let bind = bind + usize::from(ops[bind].name == "NOT_TAKEN");
-        let binding = self.binding(ops, bind, last)?;
-        let back = find(ops, binding.next, last, "JUMP_BACKWARD")?;
-        let suite = self
-            .seeded(ops, binding.next, back, level, binding.seed)?
-            .suite()?;
-        self.block(
-            &format!("async for {} in {iterable}:", binding.target),
-            &suite,
-        )?;
-        // 3.15 has a separate END_ASYNC_FOR cleanup operand.
         Ok(last + 1)
     }
 }
