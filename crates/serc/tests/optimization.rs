@@ -4741,6 +4741,28 @@ fn returning_else_keeps_live_cleanup_entry() {
 }
 
 #[test]
+fn nested_try_exits_keep_their_named_handler_cleanup() {
+    for otherwise in [
+        "",
+        "            else:\n                if ready:\n                    finish()\n",
+    ] {
+        let source = format!(
+            "def run(enabled, ready):
+    try:
+        work()
+    except OSError as error:
+        if enabled:
+            try:
+                read()
+            except KeyError:
+                recover(error)
+{otherwise}"
+        );
+        assert_matches_cpython(&source, "nested_named_cleanup.py", &LEVELS);
+    }
+}
+
+#[test]
 fn finalizer_copies_named_handler_cleanup_onto_elif_exits() {
     let source = r"def sample(primary, secondary, enabled, value):
     try:
