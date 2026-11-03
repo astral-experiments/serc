@@ -2222,6 +2222,32 @@ def bind(value):
 
 #[cfg(feature = "decompile")]
 #[test]
+fn failed_final_cases_advance_the_iterator() {
+    check_fixture(
+        r"def classify(items, read, enabled):
+    for item in items:
+        match read(item):
+            case Kind.first | Kind.second:
+                yield item
+            case Kind.last:
+                if enabled(item):
+                    yield -item
+",
+        r"class Kind:
+    first, second, last = 1, 2, 3
+events = []
+def read(item):
+    events.append(('read', item))
+    return item
+def enabled(item):
+    events.append(('enabled', item))
+    return len(events) % 2 == 0
+result = list(classify([3, 0, 2, 1, 0, 3, 3, 2], read, enabled)), events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn class_layout_matches_each_occurrence() {
     check_fixture(
         r"class C: pass
