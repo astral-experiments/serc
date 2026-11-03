@@ -1016,6 +1016,25 @@ fn loop_exhaustion_after_an_erased_alternative_keeps_its_own_line() {
 }
 
 #[test]
+fn a_nested_match_leaves_its_outer_guard_line_on_the_return() {
+    let source = r"def choose(item, value):
+    match item:
+        case Entry(field=data):
+            if data is not None:
+                match data:
+                    case Known():
+                        observe(data)
+                    case _:
+                        raise Error(data)
+    return value
+";
+    let capture = source.replace("case _:", "case fallback:");
+    for source in [source, &capture] {
+        assert_matches_cpython(source, "nested_match_return.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_guards_keep_their_case_exit_locations() {
     let source = r"async def dispatch(value, enabled, ready):
     try:
