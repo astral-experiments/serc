@@ -21317,6 +21317,38 @@ fn folded_protected_branch_before_elided_assertion_keeps_exit_location() {
 }
 
 #[test]
+fn empty_legacy_generator_try_exits_keep_their_unprotected_pop() {
+    for prefix in [
+        "async def run(value):\n",
+        "def run(value):\n    yield value\n",
+    ] {
+        let source = format!(
+            "{prefix}    try:\n        visit()\n    finally:\n        try:\n            pass\n        except LookupError:\n            recover()\n    return value\n"
+        );
+        assert_matches_cpython_versions(
+            &source,
+            "empty_generator_try.py",
+            &LEVELS,
+            &[PythonVersion::Py312],
+        );
+        for (body, handler) in [
+            ("pass", "except LookupError:"),
+            ("assert value", "except LookupError as error:"),
+        ] {
+            let source = format!(
+                "{prefix}    try:\n        {body}\n    {handler}\n        raise RuntimeError(value)\n    notify(value)\n"
+            );
+            assert_matches_cpython_versions(
+                &source,
+                "empty_generator_try_fallthrough.py",
+                &LEVELS,
+                &[PythonVersion::Py312],
+            );
+        }
+    }
+}
+
+#[test]
 fn folded_try_pass_after_branch_keeps_existing_exception_owner() {
     const TRACE: &str = r"
 import dis, marshal, sys, types
