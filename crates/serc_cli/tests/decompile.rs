@@ -5148,3 +5148,90 @@ assert answers == [27, ('partial',), ('limit',), 'unmatched']
 result = answers",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_terminal_nested_handler_restores_each_exception_before_the_success_exit() {
+    check_fixture(
+        r"def report(lookup, observe):
+    try:
+        callback = lookup()
+    except LookupError:
+        observe()
+        try:
+            raise ValueError from None
+        except ValueError:
+            observe()
+    else:
+        callback()
+
+def bound(lookup, retry, observe):
+    try:
+        lookup()
+    except LookupError as exc:
+        try:
+            retry()
+        except ValueError as exc:
+            observe(exc)
+",
+        r"import sys
+events = []
+def observe(*values):
+    err = sys.exception()
+    if values: assert values == (err,)
+    events.append((type(err).__name__, type(err.__context__).__name__))
+def missing(): raise KeyError
+def retry(): raise ValueError
+report(lambda: lambda: events.append('success'), observe)
+report(missing, observe)
+bound(missing, retry, observe)
+bound(missing, lambda: None, observe)
+assert sys.exception() is None
+assert events == ['success', ('KeyError', 'NoneType'), ('ValueError', 'KeyError'), ('ValueError', 'KeyError')]
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_suspended_inner_handler_reraises_into_its_enclosing_try() {
+    check_fixture(
+        r"async def connect(open_connection, close, report, debug):
+    try:
+        waiter = open_connection()
+        try:
+            await waiter
+        except BaseException:
+            close()
+            waiter = None
+            raise
+    except KeyboardInterrupt:
+        raise
+    except BaseException as err:
+        if debug:
+            report(err)
+",
+        r"import asyncio, sys
+events = []
+async def wait():
+    await asyncio.sleep(0)
+    if error: raise error
+def open_connection():
+    if immediate: raise error
+    return wait()
+def close():
+    assert sys.exception() is error
+    events.append('close')
+def report(err):
+    assert err is sys.exception() is error
+    events.append('report')
+for error, immediate, debug in [(None, False, True), (ValueError(), True, True), (ValueError(), False, True), (ValueError(), False, False), (KeyboardInterrupt(), False, True)]:
+    try:
+        asyncio.run(connect(open_connection, close, report, debug))
+    except KeyboardInterrupt as err:
+        assert err is error
+        events.append('propagated')
+assert events == ['report', 'close', 'report', 'close', 'close', 'propagated']
+result = events",
+    );
+}

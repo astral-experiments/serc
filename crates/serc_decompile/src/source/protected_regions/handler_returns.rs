@@ -46,9 +46,9 @@ pub(super) fn nested_handler_return(
     .then_some((expression_end, tail))
 }
 
-/// A nested try/except can own the entire matching arm. Its normal return
-/// ends at its own dispatch, and its last unmatched exception unwinds to the
-/// enclosing handler. Neither out-of-line dispatch belongs in the arm's text.
+/// A nested try/except can terminate a matching arm. Any prefix runs with
+/// the outer exception active. Neither out-of-line dispatch belongs in the
+/// arm's text.
 pub(in crate::source) fn returning_handler_child(
     ops: &[Instruction],
     owner: &Body<'_, '_, '_>,
@@ -57,7 +57,24 @@ pub(in crate::source) fn returning_handler_child(
     inner: &Handlers,
 ) -> Option<(usize, Option<Range<usize>>)> {
     let flow = &owner.flow;
-    let start = arm.clone().find(|&i| ops[i].name != "NOP")?;
+    let mut start = arm.start;
+    while start < arm.end && !inner.contains_key(&start) {
+        let block = flow.block(start);
+        let next = block.ops.end.min(arm.end);
+        if !ops[start..next].iter().all(|op| op.name == "NOP")
+            && (flow
+                .handler(start)
+                .is_none_or(|h| (h.target, h.depth, h.lasti) != (outer.target, outer.depth, true))
+                || flow.jump(next - 1).is_some()
+                || flow.fallthrough(block) != Some(next))
+        {
+            return None;
+        }
+        start = next;
+    }
+    if start >= arm.end {
+        return None;
+    }
     let child = inner.get(&start)?;
     let h = flow.handler(start)?;
     let dispatch = child.next;

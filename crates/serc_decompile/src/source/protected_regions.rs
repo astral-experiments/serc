@@ -101,7 +101,19 @@ pub(super) struct ExitCopies {
     width: usize,
 }
 
+/// Even after a coroutine has left every user handler, its implicit
+/// `StopIteration` conversion can still cover the copied return.
+fn outside_user_handlers(ops: &[Instruction], flow: &Graph, at: usize) -> bool {
+    flow.handler(at).is_none_or(|h| {
+        h.lasti && h.depth == 0 && Some(h.target) == super::suspension::stop_iteration_handler(ops)
+    })
+}
+
 impl ExitCopies {
+    pub(super) fn multiple(self) -> bool {
+        self.end - self.first > self.width
+    }
+
     pub(super) fn suffix(
         ops: &[Instruction],
         flow: &Graph,
@@ -123,7 +135,7 @@ impl ExitCopies {
         (body.end - first > width
             && flow
                 .blocks_covering(first..body.end)
-                .all(|b| flow.handler(b.ops.start).is_none())
+                .all(|b| outside_user_handlers(ops, flow, b.ops.start))
             && (first + width..body.end).step_by(width).all(|at| {
                 flow.block(at).ops.start == at && flow.entered_from(at, body.start..first)
             }))
@@ -146,7 +158,7 @@ impl ExitCopies {
             (ops[body.end].name == "POP_EXCEPT"
                 && block.ops == (body.end..end)
                 && block.height == Some(1)
-                && flow.handler(body.end).is_none())
+                && outside_user_handlers(ops, flow, body.end))
             .then_some(Self {
                 first: body.end,
                 end,
@@ -167,7 +179,7 @@ impl ExitCopies {
         let copy = target.checked_sub(self.width)?;
         (end == self.first
             && flow.block(copy).ops == (copy..target)
-            && flow.handler(copy).is_none()
+            && outside_user_handlers(ops, flow, copy)
             && flow.block(copy).height == Some(1)
             && ops[copy].name == "POP_EXCEPT"
             && super::comparisons::same_instructions(
@@ -547,12 +559,25 @@ fn region(
         _ if let Some((child_end, tail)) =
             returning_handler_child(ops, owner, body..stop, unwind, inner) =>
         {
+            // The child terminates the handler. Only the successful try can
+            // enter these statements, with its local bindings still live.
+            if following.is_empty()
+                && success.is_empty()
+                && next == end
+                && end < dispatch
+                && flow.block(end).ops == (end..dispatch)
+                && flow.incoming(end).all(|i| (start..end).contains(&i))
+                && let Some((ret, _)) = super::regions::constant_return(ops, dispatch)
+                && end < ret
+            {
+                success = end..ret;
+                next = ret;
+            }
             handler_tail = tail.filter(|_| !falls_off);
             body..child_end
         }
-        _ if !bound
-            && let Some((pop, ret)) =
-                parent.and_then(|parent| parent.handler_exit(owner, ops, stop))
+        _ if let Some((pop, ret)) =
+            parent.and_then(|parent| parent.handler_exit(owner, ops, binding, stop))
             && pop >= body =>
         {
             handler_tail = ret.map(|at| at..stop);
@@ -758,11 +783,12 @@ fn protected_end(
     let mut cleanups = FxHashMap::default();
     for entry in &entries[1..] {
         let at = index(entry.start)?;
+        let entry_end = index(entry.end)?;
         if (entry.depth, entry.lasti) != (first.depth, first.lasti) {
             return None;
         }
         if super::managers::bridges_try(ops, flow, end..at, first, &mut cleanups).is_some() {
-            end = index(entry.end)?;
+            end = entry_end;
             continue;
         }
         // The enclosing range can stop at a nested try and resume on its
@@ -773,7 +799,6 @@ fn protected_end(
             child += 1;
         }
         if let Some(suite) = inner.get(&child)
-            && let Some(normal) = suite.normal_finalizer()
             && let Some(h) = flow.handler(child)
             && let Some(unwind) = suite.unwind(ops, flow, h)
             && let Some(parent) = flow.handler(unwind)
@@ -782,32 +807,37 @@ fn protected_end(
                 == (first.target, first.depth, first.lasti)
             && index(parent.end)? == unwind + 3
             && (at == unwind
-                || at == suite.next
-                || (normal.start == at
-                    && normal.end == suite.next
-                    && suite.next <= index(entry.end)?))
+                || suite.normal_finalizer().is_some_and(|normal| {
+                    at == suite.next
+                        || (normal.start == at
+                            && normal.end == suite.next
+                            && suite.next <= entry_end)
+                }))
         {
             cleanups.insert(unwind, unwind + 3);
             end = suite.next;
-            if at == normal.start && normal.end == end {
+            if suite
+                .normal_finalizer()
+                .is_some_and(|normal| at == normal.start && normal.end == end)
+            {
                 // Protection can resume on the normal finalizer copy and
                 // continue into further statements in the enclosing try.
-                end = index(entry.end)?;
+                end = entry_end;
                 continue;
             }
             if at == end {
-                end = index(entry.end)?;
+                end = entry_end;
                 continue;
             }
         }
         if let Some(expected_end) = cleanups.remove(&at) {
-            if index(entry.end)? != expected_end {
+            if entry_end != expected_end {
                 return None;
             }
             continue;
         }
         if end + 1 == at && loop_exits::break_over_cleanup(ops, flow, end, first).is_some() {
-            end = index(entry.end)?;
+            end = entry_end;
             continue;
         }
         if end < at
@@ -828,11 +858,11 @@ fn protected_end(
                     })
             })
         {
-            end = index(entry.end)?;
+            end = entry_end;
             continue;
         }
         if super::loops::branch_gap(ops, flow, end..at, first) {
-            end = index(entry.end)?;
+            end = entry_end;
             continue;
         }
         let throw = flow.handler(end)?;
@@ -847,7 +877,7 @@ fn protected_end(
         {
             return None;
         }
-        end = index(entry.end)?;
+        end = entry_end;
         // A throw inside an out-of-line handler can resume END_SEND by
         // fallthrough. Its cleanup already belongs to this protected span.
         if (at..end).contains(&cleanup)
@@ -1058,8 +1088,9 @@ impl Body<'_, '_, '_> {
             ..
         } = &entry.clause
         {
+            let returns_none = next < limit && self.none_return(&ops[next..limit]);
             for arm in following {
-                self.emit_arm(ops, arm, level, true)?;
+                self.emit_arm(ops, arm, level, !(returns_none && arm.has_copied_exit()))?;
             }
             if !success.is_empty() {
                 let suite = self

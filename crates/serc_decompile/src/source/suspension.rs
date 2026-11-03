@@ -77,13 +77,7 @@ impl Body<'_, '_, '_> {
             self.handlers = super::protected_regions::collect(bc, self);
             let handled_end = super::protected_regions::handled_end(bc, self);
             if let Some(end) = handled_end
-                && let Some(dispatch) = self.dispatch_after_delegation(ops, end)
-                && let Some(handler) = self.flow.handler(dispatch)
-                && let Some((_, cleanup)) =
-                    super::dispatch::unwind(ops, &self.flow, dispatch, handler.depth)
-                && ops
-                    .get(cleanup + 3)
-                    .is_some_and(|op| Some(op.offset) == stop_handler)
+                && self.terminal_dispatch(ops, end, stop_handler)
             {
                 // The normal paths end at a placed dispatcher. Its returns
                 // were emitted inside the handler, including after a yield.
@@ -103,6 +97,34 @@ impl Body<'_, '_, '_> {
             self.index_terminal_returns(&ops[..end], stop_handler);
         }
         self.region(ops, 0, end, 0)
+    }
+
+    fn terminal_dispatch(&self, ops: &[Instruction], end: usize, stop: Option<usize>) -> bool {
+        let Some(mut dispatch) = self.dispatch_after_delegation(ops, end) else {
+            return false;
+        };
+        while let Some(h) = self.flow.handler(dispatch)
+            && let Some((_, unwind)) = super::dispatch::unwind(ops, &self.flow, dispatch, h.depth)
+            && let Some(next) = ops.get(unwind + 3)
+        {
+            if Some(next.offset) == stop {
+                return true;
+            }
+            // An inner handler can unwind directly into its enclosing try.
+            // Both dispatchers were placed before handled_end was computed.
+            if next.name != "PUSH_EXC_INFO"
+                || self.flow.handler(unwind).is_none_or(|outer| {
+                    outer.lasti
+                        || outer.target != next.offset
+                        || outer.start != ops[unwind].offset
+                        || outer.end != next.offset
+                })
+            {
+                break;
+            }
+            dispatch = unwind + 3;
+        }
+        false
     }
 
     fn dispatch_after_delegation(&self, ops: &[Instruction], end: usize) -> Option<usize> {
