@@ -15,6 +15,27 @@ use serc::{
 };
 
 #[test]
+fn nested_try_branch_copies_the_outer_constant_return() {
+    let source = r"def choose(outer, first, second, fallback):
+    try:
+        if outer:
+            try:
+                if first:
+                    pass
+                elif second:
+                    pass
+            except LookupError:
+                pass
+        elif fallback:
+            pass
+    except ValueError:
+        pass
+    return 0
+";
+    assert_matches_cpython(source, "nested_try_branch_return.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
