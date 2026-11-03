@@ -25636,6 +25636,29 @@ fn arithmetic_store_in_copied_finally_owns_outer_none_guard() {
 }
 
 #[test]
+fn unpacked_keyword_calls_leave_the_next_finalizer_guard_unowned() {
+    let source = r"def dispatch(client, state, ready):
+    try:
+        run()
+    except ValueError:
+        raise
+    finally:
+        try:
+            client.send(**state.options)
+            if ready:
+                finish()
+        finally:
+            close()
+";
+    assert_matches_cpython_versions(
+        source,
+        "unpacked_call_guard.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn folded_signed_tuple_preserves_finally_guard_owner() {
     for number in ["-1", "+2"] {
         let source = format!(
