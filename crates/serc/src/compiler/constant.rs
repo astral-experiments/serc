@@ -2874,6 +2874,10 @@ fn fold_float_floor_divide(left: &Constant, right: &Constant) -> Option<f64> {
 /// Round an exact integer ratio to binary64, as CPython's `long_true_divide` does.
 /// Quantizing subnormal results directly avoids rounding twice near underflow.
 fn fold_integer_true_divide(left: &Constant, right: &Constant) -> Option<f64> {
+    if let (Some(left), Some(right)) = (exact_integer_as_float(left), exact_integer_as_float(right))
+    {
+        return (right != 0.0).then(|| left / right);
+    }
     let left = folded_integer(left)?;
     let right = folded_integer(right)?;
     if right.digits.is_empty() {
@@ -2962,6 +2966,21 @@ fn fold_integer_true_divide(left: &Constant, right: &Constant) -> Option<f64> {
             | (significand & ((1 << 52) - 1))
     };
     Some(f64::from_bits(sign | magnitude))
+}
+
+/// Converts integers in the consecutive binary64 range without rounding either operand.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "the magnitude fits in the binary64 significand"
+)]
+fn exact_integer_as_float(value: &Constant) -> Option<f64> {
+    const LIMIT: u64 = 1 << f64::MANTISSA_DIGITS;
+    match value {
+        Constant::Int(value) if *value <= LIMIT => Some(*value as f64),
+        Constant::SignedInt(value) if value.unsigned_abs() <= LIMIT => Some(*value as f64),
+        Constant::Bool(value) => Some(f64::from(*value)),
+        _ => None,
+    }
 }
 
 fn fold_integer_arithmetic(
