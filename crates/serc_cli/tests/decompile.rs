@@ -3620,6 +3620,19 @@ def managed_statement(manager, log, transform):
         transform('{big}')
         log.append('after gap')
         return transform(11)
+def authenticate(key, manager, log, transform):
+    if key is not None:
+        try:
+            value = transform(key)
+            assert value, 'missing key'
+        finally:
+            log.append('closed')
+    else:
+        value = 'anonymous'
+    log.append(value)
+    sizes = {{item: len(item) for item in log}}
+    with manager:
+        transform('{big}')
 def guarded(flag, events):
     if flag:
         normal = 1
@@ -3674,6 +3687,20 @@ def guarded(flag, events):
         for name in ["guarded_return", "managed_return", "managed_statement"] {
             assert!(text.contains(&format!("# serc: unplaced blocks in {name} (")));
         }
+        let auth = text
+            .split_once("def authenticate(")
+            .unwrap()
+            .1
+            .split_once("\ndef ")
+            .unwrap()
+            .0;
+        assert!(
+            auth.contains("        try:\n            value = transform(key)"),
+            "{version}: {auth}"
+        );
+        assert!(auth.contains("        finally:\n            log.append('closed')"));
+        assert!(auth.contains("    else:\n        value = 'anonymous'\n    log.append(value)"));
+        assert!(auth.contains("    sizes = {item: len(item) for item in"));
         assert!(!text.contains("# serc: unplaced blocks in after ("));
         assert!(!text.contains("# serc: unplaced blocks in Labels ("));
         assert!(text.contains("# serc: detached function incomplete ("));

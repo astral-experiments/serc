@@ -13,6 +13,10 @@ pub(super) fn is_collection_insert(op: &Instruction) -> bool {
         )
 }
 
+pub(super) fn starts_restore(ops: &[Instruction]) -> bool {
+    matches!(ops, [swap, pop, ..] if (swap.name, swap.arg) == ("SWAP", 2) && pop.name == "POP_TOP")
+}
+
 /// Split leading comprehension restores from user handlers. A restore after
 /// the last return starts the out-of-line cleanup, even when a later try has
 /// its own handler after it. Inline restores are jumped over on success.
@@ -34,8 +38,7 @@ pub(super) fn protection<'a>(
             .ops
             .binary_search_by_key(&entry.target, |op| op.offset)
             .map_err(|_| "invalid comprehension handler")?;
-        if !matches!(&bc.ops[target..], [swap, pop, ..] if (swap.name, swap.arg) == ("SWAP", 2) && pop.name == "POP_TOP")
-        {
+        if !starts_restore(&bc.ops[target..]) {
             break;
         }
         first = first.min(target);

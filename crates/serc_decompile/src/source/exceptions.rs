@@ -71,6 +71,26 @@ impl Body<'_, '_, '_> {
         if entry.depth != 0 || entry.lasti {
             return Err(format!("unsupported handler depth at byte {}", entry.start));
         }
+        if self.work.partial
+            && self.depth > 0
+            && !self.class
+            && ops[..start].iter().any(|op| {
+                op.name.starts_with("POP_JUMP")
+                    && op.jump.is_some_and(|target| target > entry.start)
+            })
+            && let Some((regions, prefix_end)) =
+                super::protected_regions::guarded_prefix(bc, self, limit)
+        {
+            self.handlers = regions;
+            self.region(ops, 0, prefix_end, 0)?;
+            if self.stack.is_empty() {
+                self.partial_start = prefix_end;
+            }
+            return Err(format!(
+                "unplaced exception region at byte {}",
+                ops[prefix_end].offset
+            ));
+        }
         self.region(ops, 0, start, 0)?;
         let return_exit = end + 1 == normal_end && ops[end].name == "RETURN_VALUE";
         let (suite, returns) = self

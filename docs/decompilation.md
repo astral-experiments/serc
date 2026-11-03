@@ -157,6 +157,9 @@ return through a `try` or `with`, serc can mark the missing tail inside that
 suite and show the handler or the continuation after the `with`.
 Module and class gaps use a marked ellipsis, as do missing statements within
 a function where the skipped paths rejoin with an empty evaluation stack.
+A guarded `try` near the start of a function can also survive an unplaced
+handler later in the function. Its `except` or `finally` stays with the
+statements it protects.
 A comment at each gap names the affected scope. A best-effort result can differ
 in behavior from the input. Invalid cache headers, marshal data, and undecodable
 instruction streams still produce an error.

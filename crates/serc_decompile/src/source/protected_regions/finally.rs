@@ -337,7 +337,18 @@ pub(super) fn finally_region(
     // A return of a constant can leave a tracing NOP at its original site,
     // with the constant materialized only after the normal cleanup.
     let mut next = normal.end;
-    if deferred && !terminal {
+    // A successful assertion may jump to the NOP before cleanup. Its
+    // ordinary continuation jumps over the else arm of an enclosing if.
+    let joins_after_raise = ops.get(next)?.name == "JUMP_FORWARD"
+        && ops[end - 1].name == "RAISE_VARARGS"
+        && flow.handler(start).is_none()
+        && flow.handler(cleanup).is_none()
+        && flow.incoming(end).any(|i| {
+            (suite_start..end).contains(&i)
+                && ops[i].name.starts_with("POP_JUMP_IF_")
+                && flow.jump(i) == Some(end)
+        });
+    if deferred && !terminal && !joins_after_raise {
         if let Some(ret) = return_end(ops, next) {
             next = ret;
         } else {

@@ -210,6 +210,73 @@ pub(super) fn collect(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Handlers {
     result
 }
 
+/// A later, unplaced handler need not hide an independent guarded try near
+/// the start of a function. Stop before any range whose unwind or normal
+/// continuation would require a suite outside this prefix.
+pub(super) fn guarded_prefix(
+    bc: &Bytecode,
+    owner: &Body<'_, '_, '_>,
+    limit: usize,
+) -> Option<(Handlers, usize)> {
+    let ops = &bc.ops;
+    let handlers = collect(bc, owner);
+    let mut end = owner.flow.normal_end([0]).min(limit);
+    let mut suites = Vec::new();
+    let mut protection = None;
+    for &entry in &bc.handlers {
+        let start = ops
+            .binary_search_by_key(&entry.start, |op| op.offset)
+            .ok()?;
+        if start >= end {
+            break;
+        }
+        // CPython can leave a tracing instruction between two ranges of the
+        // same try. The placed suite already verified how they reconnect.
+        if protection.is_some_and(|(last, target, depth)| {
+            !entry.lasti && entry.end <= last && (entry.target, entry.depth) == (target, depth)
+        }) {
+            continue;
+        }
+        let dispatch = ops
+            .binary_search_by_key(&entry.target, |op| op.offset)
+            .ok()?;
+        if !entry.lasti && super::comprehensions::starts_restore(&ops[dispatch..]) {
+            let body_end = ops.partition_point(|op| op.offset < entry.end);
+            if ops[start..body_end]
+                .iter()
+                .any(super::comprehensions::is_collection_insert)
+            {
+                // The comprehension lifter owns the saved locals and the
+                // normal restore. Its exception path is compiler-generated.
+                continue;
+            }
+        }
+        if !entry.lasti
+            && let Some(suite) = handlers.get(&start)
+            && let Some(unwind) = suite.unwind(ops, &owner.flow, entry)
+            && owner.flow.handler(unwind).is_none()
+            && owner.flow.blocks_covering(dispatch..unwind).all(|block| {
+                owner
+                    .flow
+                    .handler(block.ops.start)
+                    .is_none_or(|h| h.lasti && h.target == ops[unwind].offset)
+            })
+        {
+            protection = Some((ops[suite.end].offset, entry.target, entry.depth));
+            suites.push((start, suite.next));
+        } else {
+            end = start;
+            break;
+        }
+    }
+    for &(start, next) in suites.iter().rev() {
+        if next > end {
+            end = start;
+        }
+    }
+    (suites.first()?.1 <= end && end < ops.len()).then_some((handlers, end))
+}
+
 /// Include normal continuations reachable solely through an except clause.
 /// A coroutine can also lack a return instruction to delimit its body.
 pub(super) fn handled_end(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<usize> {
