@@ -9,20 +9,25 @@ use std::ops::Range;
 
 pub(super) fn body_end(ops: &[Instruction], flow: &Graph, entry: Handler) -> Result<usize, String> {
     let mut end = boundary(ops, entry.end)?;
-    while let Some(next) = ops.get(end + 1)
-        && let Some(resume) = flow.handler(end + 1)
-        && resume.start == next.offset
+    while let Some((at, resume)) =
+        (end + 1..ops.len().min(end + 4)).find_map(|at| flow.handler(at).map(|resume| (at, resume)))
+        && resume.start == ops[at].offset
         && (resume.target, resume.depth, resume.lasti) == (entry.target, entry.depth, entry.lasti)
     {
-        match (ops[end].name, flow.handler(end)) {
-            ("NOT_TAKEN", None) if end > 0 && ops[end - 1].name.starts_with("POP_JUMP_IF_") => {}
-            ("YIELD_VALUE", Some(suspend))
-                if suspend.start == ops[end].offset
-                    && suspend.end == next.offset
-                    && !suspend.lasti
-                    && next.name == "RESUME"
-                    && ops[boundary(ops, suspend.target)?].name == "CLEANUP_THROW" => {}
-            _ => break,
+        if !super::loops::branch_gap(ops, flow, end..at, entry) {
+            let Some(suspend) = flow.handler(end) else {
+                break;
+            };
+            if at != end + 1
+                || ops[end].name != "YIELD_VALUE"
+                || ops[at].name != "RESUME"
+                || suspend.start != ops[end].offset
+                || suspend.end != ops[at].offset
+                || suspend.lasti
+                || ops[boundary(ops, suspend.target)?].name != "CLEANUP_THROW"
+            {
+                break;
+            }
         }
         end = boundary(ops, resume.end)?;
     }

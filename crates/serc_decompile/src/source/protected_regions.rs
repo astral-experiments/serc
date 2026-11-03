@@ -443,8 +443,17 @@ fn region(
             })
             && following_join.is_none_or(|to| to == join) =>
         {
-            success = end..join;
-            (end, join)
+            if join == end + 1
+                && ops[end].name == "RETURN_VALUE"
+                && flow.block(end).height == Some(first.depth + 1)
+            {
+                // The protected expression produced a pending return (often
+                // an await). Only the handler falls through to the join.
+                (join, join)
+            } else {
+                success = end..join;
+                (end, join)
+            }
         }
         [swap, pop, ret]
             if (swap.name, swap.arg) == ("SWAP", 2)
@@ -628,13 +637,14 @@ fn region(
                     && normal_value == value
                     && next < ret
                     && normal.ops.end <= dispatch
-                    && flow.incoming(next).any(|source| {
-                        source > next
-                            && flow.jump(source) == Some(next)
-                            && flow
-                                .handler(source)
-                                .is_some_and(|h| h.target == first.target)
-                    })
+                    && (owner.depth == 0 && owner.none_return(&ops[ret..normal.ops.end])
+                        || flow.incoming(next).any(|source| {
+                            source > next
+                                && flow.jump(source) == Some(next)
+                                && flow
+                                    .handler(source)
+                                    .is_some_and(|h| h.target == first.target)
+                        }))
                 {
                     success = next..ret;
                     next = ret;
@@ -764,44 +774,7 @@ fn protected_end(
             end = index(entry.end)?;
             continue;
         }
-        // Once TO_BOOL succeeded, newer targets leave both the conditional
-        // jump and its latch outside the try. The taken edge resumes the
-        // protected suite. 3.13 has no intervening monitoring marker.
-        if matches!(ops.get(end..at), Some([test, markers @ .., back])
-             if test.name.starts_with("POP_JUMP_IF_") && back.name == "JUMP_BACKWARD"
-                && (markers.is_empty() || matches!(markers, [marker] if marker.name == "NOT_TAKEN")))
-            && flow.jump(end) == Some(at)
-            && flow
-                .jump(at - 1)
-                .and_then(|head| flow.handler(head))
-                .is_some_and(|h| {
-                    (h.target, h.depth, h.lasti) == (first.target, first.depth, first.lasti)
-                })
-            && flow
-                .blocks_covering(end..at)
-                .all(|b| flow.handler(b.ops.start).is_none())
-        {
-            end = index(entry.end)?;
-            continue;
-        }
-        // A monitoring marker or a loop latch can sit outside the exception
-        // table between two parts of the same try. For the latch, require the
-        // preceding test to exit to the resumed span and the backedge to land
-        // inside this protection.
-        if at == end + 1
-            && end > 0
-            && flow.handler(end).is_none()
-            && ops[end - 1].name.starts_with("POP_JUMP_IF_")
-            && (ops[end].name == "NOT_TAKEN"
-                || (ops[end].name == "JUMP_BACKWARD"
-                    && flow.jump(end - 1) == Some(at)
-                    && flow
-                        .jump(end)
-                        .and_then(|i| flow.handler(i))
-                        .is_some_and(|h| {
-                            h.target == first.target && h.depth == first.depth && !h.lasti
-                        })))
-        {
+        if super::loops::branch_gap(ops, flow, end..at, first) {
             end = index(entry.end)?;
             continue;
         }
@@ -857,33 +830,32 @@ impl Body<'_, '_, '_> {
             })
     }
 
-    /// A handler placed inside the loop may live after the latch and jump
-    /// back into the loop after restoring the saved exception.
-    pub(super) fn handler_rejoins_loop(
+    /// An out-of-line handler may jump back into the normal layout after
+    /// restoring the saved exception. Attribute that edge to its placed try.
+    pub(super) fn handler_jumps_from(
         &self,
         ops: &[Instruction],
-        target: usize,
         body: Range<usize>,
+        source: usize,
+        target: usize,
     ) -> bool {
-        self.flow.incoming(target).all(|source| {
-            body.contains(&source)
-                || (matches!(
-                    ops[source].name,
-                    "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
-                ) && self.flow.jump(source) == Some(target)
-                    && self.handlers.iter().any(|(&start, suite)| {
-                        let Clause::Except { binding, .. } = suite.clause else {
-                            return false;
-                        };
-                        body.contains(&start)
-                            && start < suite.end
-                            && suite.end <= target
-                            && suite.next == target
-                            && suite.handler.end <= source
-                            && Self::handler_pop(ops, binding, source + 1)
-                                == Some((suite.handler.end, source))
-                    }))
-        })
+        matches!(
+            ops[source].name,
+            "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
+        ) && self.flow.jump(source) == Some(target)
+            && self.handlers.iter().any(|(&start, suite)| {
+                let Clause::Except { binding, .. } = suite.clause else {
+                    return false;
+                };
+                body.contains(&start)
+                    && start < suite.end
+                    && suite.end <= target
+                    && suite.next == target
+                    && suite.handler.end + 1 + 3 * usize::from(ops[binding].name != "POP_TOP")
+                        == source
+                    && Self::handler_pop(ops, binding, source + 1)
+                        == Some((suite.handler.end, source))
+            })
     }
 
     /// A nested try can own the rest of a manager's body. On an exception

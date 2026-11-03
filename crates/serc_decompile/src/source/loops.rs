@@ -1,4 +1,8 @@
 use std::fmt::Write as _;
+use std::ops::Range;
+
+use crate::flow::Graph;
+use serc_bytecode::instructions::Handler;
 
 use super::conditionals::Predicate;
 use super::regions::constant_return;
@@ -27,6 +31,52 @@ fn local_return(ops: &[Instruction], end: usize) -> Option<usize> {
     };
     (matches!(load.name, "LOAD_FAST" | "LOAD_FAST_BORROW") && ret.name == "RETURN_VALUE")
         .then_some(end - 2)
+}
+
+/// Protection can stop after truth conversion and resume in the guarded
+/// suite. The skipped instructions must be a monitoring marker or the test's
+/// other edge back to a header owned by the same try or context manager.
+pub(super) fn branch_gap(
+    ops: &[Instruction],
+    flow: &Graph,
+    gap: Range<usize>,
+    owner: Handler,
+) -> bool {
+    let Some(span) = ops.get(gap.clone()) else {
+        return false;
+    };
+    let test = match span {
+        [marker] if marker.name == "NOT_TAKEN" => {
+            return gap.start > 0
+                && ops[gap.start - 1].name.starts_with("POP_JUMP_IF_")
+                && flow.handler(gap.start).is_none();
+        }
+        [back] if gap.start > 0 && back.name == "JUMP_BACKWARD" => gap.start - 1,
+        [_, markers @ .., back]
+            if back.name == "JUMP_BACKWARD"
+                && matches!(
+                    markers,
+                    [] | [Instruction {
+                        name: "NOT_TAKEN",
+                        ..
+                    }]
+                ) =>
+        {
+            gap.start
+        }
+        _ => return false,
+    };
+    ops[test].name.starts_with("POP_JUMP_IF_")
+        && flow.jump(test) == Some(gap.end)
+        && flow
+            .jump(gap.end - 1)
+            .and_then(|i| flow.handler(i))
+            .is_some_and(|h| {
+                (h.target, h.depth, h.lasti) == (owner.target, owner.depth, owner.lasti)
+            })
+        && flow
+            .blocks_covering(gap)
+            .all(|b| flow.handler(b.ops.start).is_none())
 }
 
 impl Body<'_, '_, '_> {
@@ -247,7 +297,8 @@ impl Body<'_, '_, '_> {
         let Some(active) = self.loop_edges else {
             return false;
         };
-        active.body_end == end
+        self.stack.is_empty()
+            && active.body_end == end
             && ops[active.header].name == "FOR_ITER"
             && predicate.suite + 1 == predicate.target
             && predicate.target < end
@@ -260,9 +311,10 @@ impl Body<'_, '_, '_> {
                 }))
             && self.loop_transfer(ops, predicate.suite) == Some("continue")
             && self.flow.handler(predicate.suite).is_none()
-            && self
-                .flow
-                .entered_from(predicate.target, predicate.branch..predicate.target)
+            && self.flow.entered_from(
+                predicate.target,
+                predicate.header.unwrap_or(predicate.branch)..predicate.target,
+            )
     }
 
     /// Recover a constant-true loop whose paths return, raise, or come back
@@ -318,7 +370,10 @@ impl Body<'_, '_, '_> {
                 || (start != header
                     && !self.flow.entered_from(start, nop..after)
                     && !self.delegation_rejoins_loop(ops, start, nop..after)
-                    && !self.handler_rejoins_loop(ops, start, nop..after))
+                    && !self.flow.incoming(start).all(|from| {
+                        (nop..after).contains(&from)
+                            || self.handler_jumps_from(ops, nop..after, from, start)
+                    }))
                 || self.flow.jump(last).is_some_and(|to| {
                     !((nop..after).contains(&to)
                         || (to == after

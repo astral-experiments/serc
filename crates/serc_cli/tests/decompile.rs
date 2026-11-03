@@ -4706,6 +4706,59 @@ result = events",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_failed_await_rejoins_the_fallback_after_the_outer_guard() {
+    check_fixture(
+        r"async def transfer(native, allowed, fast, slow):
+    if native:
+        try:
+            return await fast()
+        except LookupError as error:
+            if not allowed:
+                raise
+    if not allowed:
+        raise RuntimeError
+    return await slow()
+",
+        r"import asyncio, sys
+events = []
+async def fast():
+    events.append('fast')
+    if fail: raise KeyError('send')
+    return 1
+async def slow():
+    assert sys.exception() is None
+    events.append('slow')
+    return 2
+for native, allowed, fail, expected in [(True, True, False, 1), (True, True, True, 2), (False, True, False, 2),
+                                        (True, False, True, KeyError), (False, False, False, RuntimeError)]:
+    try: outcome = asyncio.run(transfer(native, allowed, fast, slow))
+    except (KeyError, RuntimeError) as exc: outcome = type(exc)
+    assert outcome == expected
+assert events == ['fast', 'fast', 'slow', 'slow', 'fast']
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn terminal_module_try_keeps_alternative_definitions_exclusive() {
+    for available in [false, true] {
+        let operation = if available { "int('1')" } else { "int('')" };
+        check_fixture(
+            &format!(
+                "try:\n    seed = int('3')\nexcept ValueError:\n    seed = 0\ntry:\n    enabled = {operation}\nexcept ValueError:\n    def value(): return -1\nelse:\n    def value(): return enabled + seed\n"
+            ),
+            if available {
+                "result = value(); assert result == 4"
+            } else {
+                "result = value(); assert result == -1"
+            },
+        );
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn protected_while_iterations_retry_or_stop_before_their_shared_work() {
     check_fixture(
         r"def drain(take, accept):
@@ -4782,6 +4835,53 @@ for inputs, items in [(['a', 'missing', None], [1, 0, 2]), ([None], ['missing', 
     tasks = iter(inputs)
     worker(take, store, record, items)
 assert events == ['a', 'iteration', 'missing', 'iteration', 1, 'done', 'missing', 'done', 'done']
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_filtered_iterator_stays_inside_its_manager_across_a_yield() {
+    check_fixture(
+        r"def collect(manager, items):
+    with manager as keep:
+        result = []
+        for item in items:
+            if keep(item):
+                result.append(item)
+        yield result
+
+def matching(items, kind, subtype):
+    for item in items:
+        if item[0] == kind:
+            if subtype is None or item[1]() == subtype:
+                yield item[0]
+",
+        r"events = []
+class Manager:
+    def __enter__(self):
+        events.append('enter')
+        return self.keep
+    def keep(self, item):
+        events.append(item)
+        if item is None: raise ValueError
+        return bool(item)
+    def __exit__(self, kind, exc, trace):
+        events.append(kind.__name__ if kind else 'exit')
+        return kind is ValueError
+stream = collect(Manager(), [0, 3, 0])
+assert next(stream) == [3]
+assert events == ['enter', 0, 3, 0]
+stream.close()
+assert list(collect(Manager(), [None, 2])) == []
+assert list(collect(Manager(), [])) == [[]]
+assert events == ['enter', 0, 3, 0, 'GeneratorExit', 'enter', None, 'ValueError', 'enter', 'exit']
+def subtype():
+    events.append('subtype')
+    return 'plain'
+rows = [('image', subtype), ('text', subtype)]
+assert list(matching(rows, 'text', None)) == ['text'] and 'subtype' not in events
+assert list(matching(rows, 'text', 'plain')) == ['text'] and events.count('subtype') == 1
 result = events",
     );
 }

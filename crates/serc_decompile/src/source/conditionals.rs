@@ -269,6 +269,15 @@ impl Body<'_, '_, '_> {
         level: usize,
     ) -> Result<Option<(usize, String)>, String> {
         let mut branch = self.flow.block(start).ops.end - 1;
+        // The operand may raise inside a protected loop while its jump is
+        // outside the table. They still form a single short-circuit test.
+        if branch + 1 < end
+            && ops[branch + 1].name.starts_with("POP_JUMP_IF_")
+            && self.flow.fallthrough(self.flow.block(start)) == Some(branch + 1)
+            && self.flow.entered_from(branch + 1, branch..branch + 1)
+        {
+            branch += 1;
+        }
         if branch <= start || branch >= end || !ops[branch].name.starts_with("POP_JUMP_IF_") {
             return Ok(None);
         }
@@ -650,10 +659,10 @@ impl Body<'_, '_, '_> {
         let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
         if self.implicit_reraise(ops, tail)
             && target < end
-            && !self
-                .flow
-                .incoming(target)
-                .any(|from| (start..fallthrough_end).contains(&from))
+            && !self.flow.incoming(target).any(|from| {
+                (start..fallthrough_end).contains(&from)
+                    || self.handler_jumps_from(ops, start..fallthrough_end, from, target)
+            })
         {
             self.block(&format!("if {test}:"), &suite)?;
             let other = self.fragment(ops, target, end, level)?.suite()?;
@@ -672,7 +681,7 @@ impl Body<'_, '_, '_> {
                     && matches!(ops[end - 1].name, "RAISE_VARARGS" | "RERAISE")))
             // A physical return at the end of the suite can belong to a
             // nested guard. Its other edge still enters the shared tail.
-            && !self.flow.incoming(target).any(|from| (start..fallthrough_end).contains(&from))
+            && !self.flow.incoming(target).any(|from| (start..fallthrough_end).contains(&from) || self.handler_jumps_from(ops, start..fallthrough_end, from, target))
         {
             let other = self.fragment(ops, target, end, level)?.suite()?;
             let split_return = |s: &str| -> Option<(String, String)> {
