@@ -307,6 +307,36 @@ impl Body<'_, '_, '_> {
         Some((body.start..pop, outcome))
     }
 
+    pub(super) fn except_header(
+        &mut self,
+        ops: &[Instruction],
+        kind: Option<Range<usize>>,
+        binding: usize,
+        level: usize,
+    ) -> Result<String, String> {
+        let mut header = "except".to_owned();
+        if let Some(kind) = kind {
+            header.push(' ');
+            header.push_str(
+                &self
+                    .fragment(ops, kind.start, kind.end, level)?
+                    .expression()?,
+            );
+        }
+        let op = ops[binding];
+        if op.name != "POP_TOP" {
+            let table = if matches!(op.name, "STORE_NAME" | "STORE_GLOBAL") {
+                self.code.names
+            } else {
+                self.code.locals
+            };
+            header.push_str(" as ");
+            header.push_str(self.name(table, op.arg)?);
+        }
+        header.push(':');
+        Ok(header)
+    }
+
     pub(super) fn emit_dispatch(
         &mut self,
         ops: &[Instruction],
@@ -314,21 +344,7 @@ impl Body<'_, '_, '_> {
         try_source_start: usize,
     ) -> Result<(), String> {
         for arm in dispatch.arms {
-            let mut header = "except".to_owned();
-            if let Some(kind) = arm.kind {
-                header.push(' ');
-                header.push_str(&self.fragment(ops, kind.start, kind.end, 0)?.expression()?);
-            }
-            let op = ops[arm.binding];
-            if op.name != "POP_TOP" {
-                let table = if matches!(op.name, "STORE_NAME" | "STORE_GLOBAL") {
-                    self.code.names
-                } else {
-                    self.code.locals
-                };
-                header.push_str(" as ");
-                header.push_str(self.name(table, op.arg)?);
-            }
+            let header = self.except_header(ops, arm.kind, arm.binding, 0)?;
             let fragment = self.fragment(ops, arm.body.start, arm.body.end, 0)?;
             let mut suite = if matches!(arm.exit, Exit::ReturnValue) {
                 let (suite, returns) = fragment.pending_return()?;
@@ -349,7 +365,6 @@ impl Body<'_, '_, '_> {
                     suite.push_str(&tail);
                 }
             }
-            header.push(':');
             self.block(&header, &suite)?;
         }
         if !dispatch.success.is_empty() {

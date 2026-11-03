@@ -615,6 +615,59 @@ assert result == ['called']",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn compound_guards_share_the_exit_that_clears_the_exception_name() {
+    check_fixture(
+        r"def finish(work, closed, cancelled, notify):
+    try:
+        work()
+        if not closed():
+            notify(None)
+    except LookupError as error:
+        if not closed() and not cancelled():
+            notify(error)
+
+def discard(target):
+    if target is not None:
+        try:
+            del target.item
+        except AttributeError:
+            pass
+",
+        r"import sys
+result = []
+def run(fail, closed, cancelled):
+    events = []
+    def work():
+        if fail:
+            raise KeyError('work')
+    def check(name, answer):
+        events.append(name)
+        return answer
+    def notify(error):
+        assert error is sys.exception()
+        events.append(type(error).__name__)
+    finish(work, lambda: check('closed', closed), lambda: check('cancelled', cancelled), notify)
+    return events
+for fail in [False, True]:
+    for closed in [False, True]:
+        for cancelled in [False, True]:
+            result.append(run(fail, closed, cancelled))
+assert result == [['closed', 'NoneType']] * 2 + [['closed']] * 2 + [
+    ['closed', 'cancelled', 'KeyError'], ['closed', 'cancelled'], ['closed'], ['closed']]
+class Target:
+    pass
+t = Target()
+t.item = 1
+discard(None)
+discard(t)
+discard(t)
+assert not hasattr(t, 'item')
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn distinct_and_shared_constant_returns_keep_their_constant_order() {
     check_fixture(
         r"def early(ready, emit):

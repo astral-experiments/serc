@@ -11,8 +11,13 @@ use crate::flow::Graph;
 pub(super) type Handlers = FxHashMap<usize, Protected>;
 
 enum Clause {
-    Except(Option<Range<usize>>),
-    Finally { deferred_return: Range<usize> },
+    Except {
+        kind: Option<Range<usize>>,
+        binding: usize,
+    },
+    Finally {
+        deferred_return: Range<usize>,
+    },
 }
 
 pub(super) struct Protected {
@@ -20,9 +25,59 @@ pub(super) struct Protected {
     next: usize,
     clause: Clause,
     handler: Range<usize>,
+    try_exits: Option<ExitCopies>,
+    handler_exits: Option<ExitCopies>,
     // Resume after POP_EXCEPT for a loop transfer. A computed return keeps
     // its value across the pop and the following iterator cleanup.
     handler_tail: Option<Range<usize>>,
+}
+
+/// Consecutive copies of the same straight-line clause exit. A predicate can
+/// enter any copy at its first instruction, including past the lifted suite.
+#[derive(Clone, Copy)]
+pub(super) struct ExitCopies {
+    first: usize,
+    end: usize,
+    width: usize,
+}
+
+impl ExitCopies {
+    fn suffix(ops: &[Instruction], flow: &Graph, body: Range<usize>, width: usize) -> Option<Self> {
+        let mut first = body.end.checked_sub(width)?;
+        if first < body.start {
+            return None;
+        }
+        let exit = &ops[first..body.end];
+        while first - body.start >= width
+            && super::comparisons::same_instructions(&ops[first - width..first], exit)
+        {
+            first -= width;
+        }
+        // Each additional copy is an unprotected exit entered from this
+        // clause. A jump from another suite still needs its own destination.
+        (body.end - first > width
+            && flow
+                .blocks_covering(first..body.end)
+                .all(|b| flow.handler(b.ops.start).is_none())
+            && (first + width..body.end).step_by(width).all(|at| {
+                flow.block(at).ops.start == at && flow.entered_from(at, body.start..first)
+            }))
+        .then_some(Self {
+            first,
+            end: body.end,
+            width,
+        })
+    }
+
+    pub(super) fn destination(self, target: usize) -> usize {
+        if (self.first..self.end).contains(&target)
+            && (target - self.first).is_multiple_of(self.width)
+        {
+            self.first
+        } else {
+            target
+        }
+    }
 }
 
 fn groups(bc: &Bytecode) -> FxHashMap<usize, Vec<Handler>> {
@@ -35,21 +90,18 @@ fn groups(bc: &Bytecode) -> FxHashMap<usize, Vec<Handler>> {
     groups
 }
 
-pub(super) fn suspended(bc: &Bytecode, flow: &Graph) -> Handlers {
+pub(super) fn suspended(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Handlers {
     groups(bc)
         .into_values()
-        .filter_map(|entries| region(&bc.ops, flow, &entries))
+        .filter_map(|entries| region(&bc.ops, owner, &entries))
         .collect()
 }
 
 /// Use region recovery for ordinary scopes when a branch encloses the first
 /// try, or there are multiple protected entries. Every user handler must have
 /// a known placement before the normal traversal can skip its out-of-line code.
-pub(super) fn guarded(
-    bc: &Bytecode,
-    flow: &Graph,
-    none_return: impl Fn(&[Instruction]) -> bool,
-) -> Option<(Handlers, usize)> {
+pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handlers, usize)> {
+    let flow = &owner.flow;
     let first = bc.handlers.first()?;
     if first.lasti {
         return None;
@@ -73,7 +125,7 @@ pub(super) fn guarded(
             .binary_search_by_key(&entries[0].target, |op| op.offset)
             .ok()?;
         let h = flow.handler(dispatch)?;
-        let (start, mut suite) = region(&bc.ops, flow, &entries)?;
+        let (start, mut suite) = region(&bc.ops, owner, &entries)?;
         if suite.end == dispatch && suite.next > dispatch {
             // The try returned. Only the handled exception reaches this
             // continuation, so an ordinary walk from offset zero misses it.
@@ -81,21 +133,26 @@ pub(super) fn guarded(
         } else if single_dispatch
             && first.depth == 0
             && suite.next == suite.end
-            && let Some((second, _)) = super::regions::constant_return(&bc.ops, dispatch)
-            && suite.end < second
-            && none_return(&bc.ops[suite.end..second])
-            && none_return(&bc.ops[second..dispatch])
+            && let Some((last, _)) = super::regions::constant_return(&bc.ops, dispatch)
+            && owner.none_return(&bc.ops[last..dispatch])
+            && let Some(copies) =
+                ExitCopies::suffix(&bc.ops, flow, start..dispatch, dispatch - last)
+            && copies.first == suite.end
             && flow.unprotected_suite(suite.end..dispatch)
-            && flow
-                .incoming(second)
-                .any(|i| (start..suite.end).contains(&i))
             && flow.normal_end([0]) == dispatch
         {
-            // The final guard has two copies of the implicit return outside
+            // The final guards have copies of the implicit return outside
             // the protected suite. Its successful paths both leave the scope.
+            suite.try_exits = Some(copies);
             suite.next = dispatch;
-        } else if unguarded {
+        } else if unguarded && suite.handler_exits.is_none() {
             return None;
+        }
+        if let Clause::Except { binding, .. } = suite.clause
+            && bc.ops[binding].name != "POP_TOP"
+        {
+            let name_cleanup = flow.handler(binding + 1)?;
+            unwinds.insert((name_cleanup.target, name_cleanup.depth));
         }
         unwinds.insert((h.target, h.depth));
         result.insert(start, suite);
@@ -106,7 +163,12 @@ pub(super) fn guarded(
         .then(|| (result, flow.normal_end(starts)))
 }
 
-fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usize, Protected)> {
+fn region(
+    ops: &[Instruction],
+    owner: &Body<'_, '_, '_>,
+    entries: &[Handler],
+) -> Option<(usize, Protected)> {
+    let flow = &owner.flow;
     let index = |offset| ops.binary_search_by_key(&offset, |op| op.offset).ok();
     let first = entries[0];
     let start = index(first.start)?;
@@ -126,18 +188,22 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
     {
         return Some((start, finally));
     }
-    let (kind, body, stop) = if ops.get(dispatch + 1)?.name == "POP_TOP" {
-        (None, dispatch + 2, cleanup)
+    let (kind, binding, stop) = if ops.get(dispatch + 1)?.name == "POP_TOP" {
+        (None, dispatch + 1, cleanup)
     } else {
         let (check, pop, failed) = super::dispatch::typed_handler(flow, ops, dispatch + 1)?;
-        if ops[pop].name != "POP_TOP"
-            || failed + 1 != cleanup
-            || (ops[failed].name, ops[failed].arg) != ("RERAISE", 0)
-        {
+        if failed + 1 != cleanup || (ops[failed].name, ops[failed].arg) != ("RERAISE", 0) {
             return None;
         }
-        (Some(dispatch + 1..check), pop + 1, failed)
+        let stop = if ops[pop].name == "POP_TOP" {
+            failed
+        } else {
+            owner.exception_name_cleanup(ops, pop, failed)?
+        };
+        (Some(dispatch + 1..check), pop, stop)
     };
+    let body = binding + 1;
+    let bound = ops[binding].name != "POP_TOP";
     // An inline handler rejoins just past its unwind. When the try returns,
     // that edge comes from POP_EXCEPT in the handler. Include RETURN_VALUE
     // in the try suite before resuming at the jump target.
@@ -166,10 +232,12 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
     }
     .filter(|&i| i < start && flow.for_iter_depth(i) == Some(first.depth));
     let mut handler_tail = None;
+    let mut handler_exits = None;
     let handler = match ops.get(body..stop)? {
         [.., raise] if raise.name == "RAISE_VARARGS" => body..stop,
         [.., pop, jump]
-            if pop.name == "POP_EXCEPT"
+            if !bound
+                && pop.name == "POP_EXCEPT"
                 && matches!(
                     jump.name,
                     "JUMP_FORWARD" | "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
@@ -191,7 +259,8 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
             body..stop - 2
         }
         [.., ret]
-            if for_header.is_some()
+            if !bound
+                && for_header.is_some()
                 && matches!(ret.name, "RETURN_VALUE" | "RETURN_CONST")
                 && let Some(pop) = (body..stop).rfind(|&i| ops[i].name == "POP_EXCEPT")
                 && matches!(ops[pop + 1].name, "SWAP" | "POP_TOP") =>
@@ -208,13 +277,21 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
             // successful try. CPython copies it instead of jumping backwards.
             let (load, value) = super::regions::constant_return(ops, stop)?;
             let width = stop - load;
-            if load <= body
-                || ops[load - 1].name != "POP_EXCEPT"
+            let clear = if bound { 3 } else { 0 };
+            let pop = load.checked_sub(clear + 1)?;
+            if pop < body
+                || ops[pop].name != "POP_EXCEPT"
+                || (bound
+                    && !super::comparisons::same_instructions(
+                        &ops[pop + 1..load],
+                        &ops[stop..stop + clear],
+                    ))
                 || super::regions::constant_return(ops, next + width) != Some((next, value))
             {
                 return None;
             }
-            body..load - 1
+            handler_exits = ExitCopies::suffix(ops, flow, body..stop, stop - pop);
+            body..handler_exits.map_or(pop, |copies| copies.first)
         }
     };
     Some((
@@ -222,7 +299,9 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
         Protected {
             end,
             next,
-            clause: Clause::Except(kind),
+            clause: Clause::Except { kind, binding },
+            try_exits: None,
+            handler_exits,
             handler,
             handler_tail,
         },
@@ -302,6 +381,8 @@ fn finally_region(
             deferred_return: normal.end..next,
         },
         handler: normal,
+        try_exits: None,
+        handler_exits: None,
         handler_tail: None,
     })
 }
@@ -368,6 +449,19 @@ fn protected_end(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Opti
 }
 
 impl Body<'_, '_, '_> {
+    fn protected_fragment(
+        &mut self,
+        ops: &[Instruction],
+        body: Range<usize>,
+        level: usize,
+        exits: Option<ExitCopies>,
+    ) -> Result<super::regions::Fragment, String> {
+        let outer = std::mem::replace(&mut self.clause_exits, exits);
+        let fragment = self.fragment(ops, body.start, body.end, level);
+        self.clause_exits = outer;
+        fragment
+    }
+
     pub(super) fn protected_region(
         &mut self,
         ops: &[Instruction],
@@ -380,7 +474,7 @@ impl Body<'_, '_, '_> {
             return Ok(None);
         }
         let (mut suite, returns) = self
-            .fragment(ops, start, entry.end, level)?
+            .protected_fragment(ops, start..entry.end, level, entry.try_exits)?
             .pending_return()?;
         let mut next = entry.next;
         if returns {
@@ -390,13 +484,9 @@ impl Body<'_, '_, '_> {
             next += 1;
         }
         let header = match &entry.clause {
-            Clause::Except(Some(kind)) => {
-                let expr = self
-                    .fragment(ops, kind.start, kind.end, level)?
-                    .expression()?;
-                format!("except {expr}:")
+            Clause::Except { kind, binding } => {
+                self.except_header(ops, kind.clone(), *binding, level)?
             }
-            Clause::Except(None) => "except:".into(),
             Clause::Finally { deferred_return } => {
                 if !deferred_return.is_empty() {
                     suite.push_str(
@@ -408,7 +498,8 @@ impl Body<'_, '_, '_> {
                 "finally:".into()
             }
         };
-        let handler = self.fragment(ops, entry.handler.start, entry.handler.end, level)?;
+        let handler =
+            self.protected_fragment(ops, entry.handler.clone(), level, entry.handler_exits)?;
         let handler = if let Some(tail) = &entry.handler_tail {
             handler.resume(self, ops, tail.clone(), level)?
         } else {

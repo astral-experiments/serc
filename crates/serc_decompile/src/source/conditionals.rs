@@ -82,7 +82,9 @@ impl Body<'_, '_, '_> {
     ) -> Result<Predicate, String> {
         let fall =
             |i: usize| i + 1 + usize::from(ops.get(i + 1).is_some_and(|op| op.name == "NOT_TAKEN"));
+        let exits = self.clause_exits;
         let arms = |i: usize, jump: usize| {
+            let jump = exits.map_or(jump, |copies| copies.destination(jump));
             if ops[i].name == "POP_JUMP_IF_TRUE" {
                 (jump, fall(i))
             } else {
@@ -191,20 +193,6 @@ impl Body<'_, '_, '_> {
     ) -> Result<usize, String> {
         let value = self.expr()?;
         let mut predicate = self.predicate(ops, i, value, end, level, header)?;
-        // CPython may copy the return after a terminal try onto both
-        // edges of its final guard. Both exits are outside the protected
-        // suite; the surrounding try owns their common continuation.
-        if predicate.target > end
-            && self.terminal_returns.contains(&end)
-            && self.terminal_returns.contains(&predicate.target)
-            && self.none_return(&ops[end..predicate.target])
-            && self
-                .flow
-                .handler(predicate.branch)
-                .is_some_and(|h| !h.lasti && h.depth == 0)
-        {
-            predicate.target = end;
-        }
         if let Some(latch) = self.enclosing_continue_latch(ops, &predicate, end) {
             predicate.suite = predicate.target;
             predicate.target = end;

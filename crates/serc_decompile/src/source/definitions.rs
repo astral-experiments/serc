@@ -563,6 +563,7 @@ impl<'m, 'data> Body<'m, 'data, '_> {
                 flow,
                 loop_edges: None,
                 handlers: super::protected_regions::Handlers::default(),
+                clause_exits: None,
                 terminal_returns: 0..0,
                 class: false,
                 annotations: Vec::new(),

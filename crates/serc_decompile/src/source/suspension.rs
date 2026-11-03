@@ -44,7 +44,7 @@ impl Body<'_, '_, '_> {
         {
             ops.len() - 2
         } else {
-            self.handlers = super::protected_regions::suspended(bc, &self.flow);
+            self.handlers = super::protected_regions::suspended(bc, self);
             ops.iter()
                 .rposition(|op| matches!(op.name, "RETURN_VALUE" | "RETURN_CONST"))
                 .ok_or("generator has no return")?
