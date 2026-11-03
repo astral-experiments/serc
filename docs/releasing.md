@@ -52,30 +52,27 @@ or deployment protection rules.
    `astral.sh/serc/VERSION/install.{sh,ps1}`, must redirect to
    `https://releases.astral.sh/github/serc/releases/download/VERSION/serc-installer.{sh,ps1}`.
 
-3. Grant `astral-releases-bot` access to Serc and configure
-   `RELEASES_STS_API_URL` in the `release` environment with the existing release
-   broker's base URL. Serc's `.github/secure-token-service-release.json` permits
-   `release.yml` on `main` to request `contents: write` and `workflows: write`.
-   The latter allows tagging the selected commit even if `main` advances across
-   workflow changes while artifacts are building.
-4. Configure Serc authorization in
+3. Serc's GitHub release job uses its built-in `GITHUB_TOKEN` with
+   `contents: write` to tag the commit that produced the artifacts.
+4. Configure `RELEASES_STS_API_URL` in the `release` environment with the
+   release broker's base URL and grant `astral-releases-bot` access to
    [`astral-sh/versions`](https://github.com/astral-sh/versions/blob/main/.github/secure-token-service-release.json)
-   before publishing version metadata. The policy must identify Serc by
-   repository ID `1385584662`, owner ID `115962839`, and its immutable OIDC
-   subject. It permits `release.yml` to call `publish-versions.yml` from `main`
-   in the `release` environment and request `contents: write` and
-   `pull_requests: write` for `astral-sh/versions`. The release bot must also
-   have access to that repository. The first release creates `v1/serc.ndjson`;
-   the versions repository's existing workflow mirrors it to R2.
-5. Configure PyPI trusted publishing for project `serc`, owner `astral-sh`,
-   repository `serc`, workflow `release.yml`, and environment `release`. For a
-   new project, register a
+   to publish version metadata. Its policy must identify Serc by repository ID
+   `1385584662`, owner ID `330068706`, and its immutable OIDC subject. It
+   permits `release.yml` to call `publish-versions.yml` from `main` in the
+   `release` environment and request `contents: write` and
+   `pull_requests: write` for `astral-sh/versions`. Its workflow mirrors
+   `v1/serc.ndjson` to R2.
+5. Configure PyPI trusted publishing for project `serc`, owner
+   `astral-experiments`, repository `serc`, workflow `release.yml`, and
+   environment `release`. For a new project, register a
    [pending trusted publisher](https://docs.pypi.org/trusted-publishers/creating-a-project-through-oidc/)
    and transfer the project to Astral's PyPI organization after creation.
 6. Apply the Serc policy in `astral-sh/crates-policies` with `confirm=true`. Its
    existing production token bootstraps `serc` and `serc-cli`, then enables
-   trusted publishing from `astral-sh/serc`, workflow `release.yml`, environment
-   `release`, with `trustpub_only: true`. Serc does not need a registry token.
+   trusted publishing from `astral-experiments/serc`, workflow `release.yml`,
+   environment `release`, with `trustpub_only: true`. Serc does not need a
+   registry token.
 7. For release preparation, grant `astral-automations-bot` access to Serc and
    configure `STS_API_URL` in the `automations` environment. The broker reads
    `.github/secure-token-service.json` from `main`; its policy permits
