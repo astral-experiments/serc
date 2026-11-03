@@ -17,7 +17,7 @@ pub(super) struct Dispatch {
 
 pub(super) struct Arm {
     kind: Option<Range<usize>>,
-    binding: usize,
+    pub(super) binding: usize,
     body: Range<usize>,
     exit: Exit,
     copies: Option<ExitCopies>,
@@ -28,6 +28,12 @@ enum Exit {
     Jump(usize),
     Return(Range<usize>),
     ReturnValue,
+}
+
+impl Arm {
+    pub(super) fn returns(&self) -> bool {
+        matches!(self.exit, Exit::Return(_) | Exit::ReturnValue)
+    }
 }
 
 /// The false edge of the match selects the next clause or the final reraise.
@@ -242,6 +248,16 @@ impl Body<'_, '_, '_> {
         if join.is_some_and(|dest| !(success..handler).contains(&dest)) {
             return None;
         }
+        if matches!(arms.as_slice(), [arm] if matches!(arm.exit, Exit::ReturnValue)) {
+            // The handler evaluated its own return with an active exception.
+            // Only the successful try can reach the remaining statements.
+            return Some(Dispatch {
+                arms,
+                success: success..success,
+                continuation: success..handler,
+                retry: false,
+            });
+        }
         if let [arm] = arms.as_slice()
             && matches!(arm.exit, Exit::Raise)
             && success < handler
@@ -368,8 +384,65 @@ impl Body<'_, '_, '_> {
     ) -> Option<(Vec<Arm>, Option<usize>)> {
         let (arms, join) = self.handler_arms(ops, start, cleanup)?;
         arms.iter()
-            .all(|arm| matches!(arm.exit, Exit::Raise | Exit::Jump(_)))
+            .all(|arm| match &arm.exit {
+                // An expression evaluated after POP_EXCEPT belongs to a
+                // continuation outside the handler. Constants can return here.
+                Exit::Return(tail) => super::regions::constant_return(ops, tail.end)
+                    .is_some_and(|(load, _)| load == tail.start),
+                Exit::Raise | Exit::ReturnValue | Exit::Jump(_) => true,
+            })
             .then_some((arms, join))
+    }
+
+    /// The try already returned its pending value. Each matched handler may
+    /// raise, evaluate its own return, or restore the previous exception and
+    /// reach a shared continuation copied after its `POP_EXCEPT`.
+    pub(super) fn returning_handlers(
+        &mut self,
+        ops: &[Instruction],
+        handler: usize,
+    ) -> Result<(), String> {
+        let (_, cleanup) = unwind(ops, &self.flow, handler, 1).ok_or("missing handler unwind")?;
+        let (mut arms, join) = self
+            .handler_arms(ops, handler + 1, cleanup)
+            .ok_or("unsupported returning exception dispatch")?;
+        if join.is_some() {
+            return Err("unsupported exception continuation".into());
+        }
+        let tails: Vec<_> = arms
+            .iter()
+            .filter_map(|arm| match &arm.exit {
+                Exit::Return(tail) => Some(&ops[tail.clone()]),
+                _ => None,
+            })
+            .collect();
+        let copied = tails.len() > 1
+            && tails
+                .windows(2)
+                .all(|pair| super::comparisons::same_instructions(pair[0], pair[1]));
+        let mut continuation = None;
+        for arm in &mut arms {
+            if let Exit::Return(tail) = &arm.exit
+                && (copied
+                    || super::regions::constant_return(ops, tail.end)
+                        .is_none_or(|(load, _)| load != tail.start))
+            {
+                // This expression runs after the exception binding is cleared.
+                let source = self.fragment(ops, tail.start, tail.end, 0)?.suite()?;
+                if continuation.as_ref().is_some_and(|prior| prior != &source) {
+                    return Err("distinct handler continuations".into());
+                }
+                continuation = Some(source);
+                arm.exit = Exit::Jump(tail.start);
+            }
+            self.emit_arm(ops, arm, 0, true)?;
+        }
+        if let Some(continuation) = continuation {
+            for line in continuation.lines() {
+                self.line(line)?;
+            }
+        }
+        Ok(())
     }
 
     /// Locate `POP_EXCEPT` and the first instruction after normal binding cleanup.

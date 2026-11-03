@@ -217,6 +217,14 @@ pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handle
             .ok()?;
         let h = flow.handler(dispatch)?;
         let (start, mut suite) = region(&bc.ops, owner, &entries, &result)?;
+        // A standalone try may have a continuation copied into its terminal
+        // arms. Let the complete dispatch compare the copies before placing it.
+        if unguarded
+            && matches!(&suite.clause, Clause::Except { following, .. }
+                if following.iter().any(super::dispatch::Arm::returns))
+        {
+            return None;
+        }
         if suite.end == dispatch && suite.next > dispatch {
             // The try returned. Only the handled exception reaches this
             // continuation, so an ordinary walk from offset zero misses it.
@@ -251,11 +259,16 @@ pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handle
                 return None;
             }
         }
-        if let Clause::Except { binding, .. } = suite.clause
-            && bc.ops[binding].name != "POP_TOP"
+        if let Clause::Except {
+            binding, following, ..
+        } = &suite.clause
         {
-            let name_cleanup = flow.handler(binding + 1)?;
-            unwinds.insert((name_cleanup.target, name_cleanup.depth));
+            for bind in std::iter::once(*binding).chain(following.iter().map(|arm| arm.binding)) {
+                if bc.ops[bind].name != "POP_TOP" {
+                    let cleanup = flow.handler(bind + 1)?;
+                    unwinds.insert((cleanup.target, cleanup.depth));
+                }
+            }
         }
         unwinds.insert((h.target, h.depth));
         result.insert(start, suite);
@@ -428,9 +441,13 @@ fn region(
                 {
                     return None;
                 }
-                // A handler consisting only of the backedge can be a source
-                // continue followed by ordinary statements in the loop.
+                // An explicit continue can have the same edges as a handler
+                // falling through before an else. Its POP_EXCEPT has its own
+                // source line, even when the handler did work before it.
                 if body < pop
+                    && owner.instruction_lines(ops).is_ok_and(|lines| {
+                        lines[pop].is_none_or(|line| lines[body..pop].contains(&Some(line)))
+                    })
                     && let Some(latch) = iterator_success_latch(owner, ops, start..next, to)
                 {
                     success = next..latch;
@@ -768,7 +785,7 @@ impl Body<'_, '_, '_> {
         } = &entry.clause
         {
             for arm in following {
-                self.emit_arm(ops, arm, level, false)?;
+                self.emit_arm(ops, arm, level, true)?;
             }
             if !success.is_empty() {
                 let suite = self

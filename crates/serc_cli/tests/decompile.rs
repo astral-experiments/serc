@@ -745,6 +745,84 @@ assert result == [(('v',), 'ValueError'), ('after', 'NoneType')]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn returning_handlers_keep_the_exception_until_their_expression_finishes() {
+    check_fixture(
+        r"def read(operation, observe):
+    try:
+        return operation()
+    except KeyError as err:
+        raise ValueError(err.args) from err
+    except TypeError as err:
+        return observe(err)
+    except ArithmeticError:
+        return 8
+
+def receive(operation, observe):
+    try:
+        operation()
+    except LookupError:
+        return observe()
+    return observe()
+",
+        r"import sys
+result = []
+def fail(exc):
+    def call(): raise exc
+    return call
+def observe(*args):
+    result.append((type(sys.exception()).__name__, args == (sys.exception(),)))
+    return 9
+assert read(lambda: 1, observe) == 1
+try: read(fail(KeyError('key')), observe)
+except ValueError as err: assert err.__cause__.args == ('key',)
+else: raise AssertionError('lost exception')
+assert read(fail(TypeError('bad')), observe) == 9
+assert read(fail(ZeroDivisionError()), observe) == 8
+assert receive(fail(IndexError()), observe) == receive(lambda: 1, observe) == 9
+assert result == [('TypeError', True), ('IndexError', False), ('NoneType', False)]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn returning_arms_skip_later_protected_statements() {
+    check_fixture(
+        r"def process(read, record, proceed):
+    try:
+        value = read()
+    except KeyError as err:
+        record(err)
+        return
+    except IndexError as err:
+        record(err)
+        return
+    except ValueError as err:
+        record(err)
+        return
+    if value is None:
+        return
+    try:
+        proceed(value)
+    except TypeError as err:
+        record(err)
+",
+        r"import sys
+result = []
+def record(exc): result.append((type(exc).__name__, exc is sys.exception()))
+def proceed(value):
+    result.append(value)
+    if value == 2: raise TypeError()
+for value in (KeyError(), IndexError(), ValueError(), None, 1, 2):
+    def read():
+        if isinstance(value, Exception): raise value
+        return value
+    process(read, record, proceed)
+assert result == [('KeyError', True), ('IndexError', True), ('ValueError', True), 1, 2, ('TypeError', True)]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_returning_try_preserves_the_raising_handler() {
     check_fixture(
         r"def lookup(operation, key):
@@ -3171,6 +3249,23 @@ result.append(tuple(type(c).__name__ for c in first_loop.__code__.co_consts))
 for seq in ([0, 2], [None]):
     result.append(first_loop(iter(seq).__next__))
 ",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_handler_can_record_the_failure_before_continuing_the_iterator() {
+    check_fixture(
+        "def visit(items):\n    for item in items:\n        try:\n            value = read(item)\n        except KeyError:\n            record(item)\n            continue\n        emit(value)\n",
+        r"import sys
+result = []
+def read(item):
+    if item == 2: raise KeyError()
+    return item * 10
+def record(item): result.append((item, type(sys.exception()).__name__))
+def emit(value): result.append((value, sys.exception()))
+visit([1, 2, 3])
+assert result == [(10, None), (2, 'KeyError'), (30, None)]",
     );
 }
 
