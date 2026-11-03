@@ -76,14 +76,28 @@ impl Body<'_, '_, '_> {
         } else {
             self.handlers = super::protected_regions::collect(bc, self);
             let handled_end = super::protected_regions::handled_end(bc, self);
-            ops.iter()
-                .rposition(|op| matches!(op.name, "RETURN_VALUE" | "RETURN_CONST"))
-                // A copied return in a break arm can precede the loop latch.
-                .map(|last| {
-                    (last + 1).max(handled_end.unwrap_or_else(|| self.flow.normal_end([0])))
-                })
-                .or(handled_end)
-                .ok_or("unsupported returnless suspension scope")?
+            if let Some(end) = handled_end
+                && ops.get(end).is_some_and(|op| op.name == "PUSH_EXC_INFO")
+                && let Some(handler) = self.flow.handler(end)
+                && let Some((_, cleanup)) =
+                    super::dispatch::unwind(ops, &self.flow, end, handler.depth)
+                && ops
+                    .get(cleanup + 3)
+                    .is_some_and(|op| Some(op.offset) == stop_handler)
+            {
+                // The normal paths end at a placed dispatcher. Its returns
+                // were emitted inside the handler, including after a yield.
+                end
+            } else {
+                ops.iter()
+                    .rposition(|op| matches!(op.name, "RETURN_VALUE" | "RETURN_CONST"))
+                    // A copied return in a break arm can precede the loop latch.
+                    .map(|last| {
+                        (last + 1).max(handled_end.unwrap_or_else(|| self.flow.normal_end([0])))
+                    })
+                    .or(handled_end)
+                    .ok_or("unsupported returnless suspension scope")?
+            }
         };
         if self.depth > 0 && !self.class {
             self.index_terminal_returns(&ops[..end], stop_handler);

@@ -378,6 +378,24 @@ impl Body<'_, '_, '_> {
         let mut join = join.unwrap_or(handler);
         let mut continuation = join..handler;
         if let [arm] = arms.as_mut_slice() {
+            // A constant return after POP_EXCEPT (and any binding cleanup)
+            // still exits the handler. Only the successful try reaches the
+            // intervening work before the out-of-line dispatch.
+            if !arm.body.is_empty()
+                && let Exit::Return(tail) = &arm.exit
+                && super::regions::constant_return(ops, tail.end)
+                    .is_some_and(|(load, _)| load == tail.start)
+                && success < handler
+                && super::regions::constant_return(ops, handler)
+                    .is_none_or(|(load, _)| success < load)
+            {
+                return Some(Dispatch {
+                    arms,
+                    success: success..success,
+                    continuation: success..handler,
+                    retry: false,
+                });
+            }
             // A lone empty handler may return a constant, or fall through to
             // a separate return after a successful else has exited. In the
             // latter case the expression runs after POP_EXCEPT has restored

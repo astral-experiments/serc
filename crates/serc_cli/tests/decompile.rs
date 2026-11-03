@@ -4506,3 +4506,44 @@ for x in [False, None, Flag()]:
 result = log",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn terminal_handlers_skip_the_success_continuation() {
+    check_fixture(
+        r"def handshake(start, report, ready):
+    try:
+        value = start()
+    except ValueError as exc:
+        report(exc)
+        return
+    if value:
+        ready(value)
+    ready('done')
+
+def tasks(items):
+    try:
+        for item in items:
+            yield item
+    except ValueError as exc:
+        yield str(exc)
+",
+        r"import sys
+events = []
+def report(exc):
+    assert sys.exception() is exc
+    events.append(str(exc))
+def fail():
+    raise ValueError('handshake')
+handshake(fail, report, events.append)
+handshake(lambda: 'ready', report, events.append)
+assert events == ['handshake', 'ready', 'done']
+def broken():
+    yield 1
+    raise ValueError('iterator')
+partial = tasks(broken())
+assert next(partial) == 1 and next(partial) == 'iterator'
+partial.close()
+result = events, list(tasks(broken())), list(tasks([1, 2]))",
+    );
+}
