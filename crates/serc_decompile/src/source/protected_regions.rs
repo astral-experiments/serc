@@ -412,6 +412,23 @@ fn region(
     let (end, mut next) = match ops.get(end..dispatch)? {
         _ if parent.is_some() => (end, dispatch),
         _ if let Some((_, after)) = after_handler => (dispatch, after),
+        // An out-of-line handler can jump backwards past a try-else. Only
+        // normal completion of the protected suite enters that else, which
+        // may itself contain another placed try.
+        _ if matches!(ops[stop - 1].name, "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT")
+            && let Some(join) = flow.jump(stop - 1)
+            && (end + 1..dispatch).contains(&join)
+            && flow.block(join).height == Some(first.depth)
+            && Body::handler_pop(ops, binding, stop).is_some_and(|(pop, after)| body <= pop && after == stop - 1)
+            && flow.blocks_in(end..join).all(|block| {
+                [flow.jump(block.ops.end - 1), flow.fallthrough(block)]
+                    .into_iter().flatten().all(|to| (end..=join).contains(&to))
+            })
+            && following_join.is_none_or(|to| to == join) =>
+        {
+            success = end..join;
+            (end, join)
+        }
         [swap, pop, ret]
             if (swap.name, swap.arg) == ("SWAP", 2)
                 && pop.name == "POP_EXCEPT"

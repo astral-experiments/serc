@@ -4672,6 +4672,40 @@ result = events, list(tasks(broken())), list(tasks([1, 2]))",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn nested_try_else_arms_rejoin_the_same_unprotected_continuation() {
+    check_fixture(
+        r"def dispatch(read, run, record):
+    try:
+        request = read()
+    except KeyError:
+        reply = record('request failed')
+    else:
+        try:
+            value = run(request)
+        except ValueError:
+            reply = record('call failed')
+        else:
+            reply = record(value)
+    record(reply)
+",
+        r"import sys
+events = []
+def read_bad(): raise KeyError
+def run_bad(request): raise ValueError
+def record(label):
+    events.append((label, type(sys.exception()).__name__))
+    return 'send'
+for read, run in [(read_bad, run_bad), (lambda: 3, run_bad), (lambda: 3, lambda x: x * 2)]:
+    dispatch(read, run, record)
+assert events == [('request failed', 'KeyError'), ('send', 'NoneType'),
+                  ('call failed', 'ValueError'), ('send', 'NoneType'),
+                  (6, 'NoneType'), ('send', 'NoneType')]
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn protected_while_iterations_retry_or_stop_before_their_shared_work() {
     check_fixture(
         r"def drain(take, accept):
