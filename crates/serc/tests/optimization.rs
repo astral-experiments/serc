@@ -1254,6 +1254,16 @@ fn async_iterator_exhaustion_keeps_copied_branch_exit() {
 }
 
 #[test]
+fn a_copied_finalizer_keeps_its_pop_on_the_conditional_fallthrough() {
+    for exit in ["raise value", "return value"] {
+        let source = format!(
+            "def run(choose, value):\n    try:\n        if choose:\n            first(value)\n        else:\n            last(value)\n    except ValueError:\n        pass\n    finally:\n        {exit}\n"
+        );
+        assert_matches_cpython(&source, "conditional_finalizer_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn conditional_try_arms_share_the_normal_exit_before_copying() {
     for exit in [
         "return item",
