@@ -297,9 +297,9 @@ impl Body<'_, '_, '_> {
             }
             "LOAD_LOCALS" if self.class && self.class_parameters(&ops[i..end])? => Ok(i + 3),
             "COPY"
-                if let Some(all) = super::builtin_calls::truth_guard(&ops[i..end])
+                if let Some(builtin) = super::builtin_calls::guarded_builtin(&ops[i..end])
                     && let Some(fallback) =
-                        self.optimized_truth_generator(&ops[..end], i + 3, all)? =>
+                        self.optimized_generator(&ops[..end], i + 3, builtin)? =>
             {
                 Ok(fallback)
             }

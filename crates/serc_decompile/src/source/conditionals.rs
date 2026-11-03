@@ -273,6 +273,7 @@ impl Body<'_, '_, '_> {
         // outside the table. They still form a single short-circuit test.
         if branch + 1 < end
             && ops[branch + 1].name.starts_with("POP_JUMP_IF_")
+            && self.flow.jump(branch).is_none()
             && self.flow.fallthrough(self.flow.block(start)) == Some(branch + 1)
             && self.flow.entered_from(branch + 1, branch..branch + 1)
         {
@@ -285,7 +286,7 @@ impl Body<'_, '_, '_> {
         // predicate consumes their shared result. The expression lifter checks
         // both paths and the identity guard before returning that operand.
         if branch >= start + 3
-            && super::builtin_calls::truth_guard(&ops[branch - 3..=branch]).is_some()
+            && super::builtin_calls::guarded_builtin(&ops[branch - 3..=branch]).is_some()
             && let Some(fallback) = self.flow.jump(branch)
             && (branch + 1..end).contains(&fallback)
             && let Some(join) = self.flow.fallthrough(self.flow.block(fallback))
@@ -472,23 +473,28 @@ impl Body<'_, '_, '_> {
             return self.finally_break(ops, predicate, handler, level, end);
         }
         let test = predicate.test(true);
-        // A binary expression's left operand is already on the stack. When
-        // CPython copies the final operation and return into both arms, join
-        // the right operands so the left operand still runs before the test.
+        // The left operand or callable is already on the stack. When CPython
+        // copies the operation and return into both arms, join the final
+        // operands so earlier arguments still run before the test.
+        let protection = |i| self.flow.handler(i).map(|h| (h.target, h.depth, h.lasti));
         if !self.stack.is_empty()
             && fallthrough_end >= start + 3
             && end >= target + 3
-            && ops[end - 2].name == "BINARY_OP"
+            && (ops[end - 2].name == "BINARY_OP"
+                || (ops[end - 2].name == "CALL" && ops[end - 2].arg > 0))
             && ops[end - 1].name == "RETURN_VALUE"
+            && protection(fallthrough_end - 2) == protection(end - 2)
             && super::comparisons::same_instructions(
                 &ops[fallthrough_end - 2..fallthrough_end],
                 &ops[end - 2..end],
             )
+            && let Ok(yes) = self
+                .fragment(ops, start, fallthrough_end - 2, level)
+                .and_then(Fragment::expression)
+            && let Ok(no) = self
+                .fragment(ops, target, end - 2, level)
+                .and_then(Fragment::expression)
         {
-            let yes = self
-                .fragment(ops, start, fallthrough_end - 2, level)?
-                .expression()?;
-            let no = self.fragment(ops, target, end - 2, level)?.expression()?;
             self.push(format!("({yes} if {test} else {no})"))?;
             return Ok(end - 2);
         }

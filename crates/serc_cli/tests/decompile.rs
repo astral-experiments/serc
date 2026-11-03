@@ -1141,6 +1141,30 @@ assert result == ['left', 'guard'] * 2",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_copied_call_preserves_lookup_and_argument_evaluation_order() {
+    check_fixture(
+        r"def dispatch(owner, first, guard, yes, no):
+    return owner.call(first(), yes() if guard() else no())
+",
+        r"result = []
+class Owner:
+    @property
+    def call(self):
+        result.append('lookup')
+        return lambda a, b: result.append((a, b))
+def record(value):
+    def evaluate():
+        result.append(value)
+        return value
+    return evaluate
+for guard in (True, False):
+    dispatch(Owner(), record(1), record(guard), record(2), record(3))
+assert result == ['lookup', 1, True, 2, (1, 2), 'lookup', 1, False, 3, (1, 3)]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn nested_guards_keep_their_implicit_return_blocks() {
     check_fixture(
         r"def rotate(default, exists, emit):
@@ -1525,6 +1549,29 @@ fn optimized_generator_calls_keep_short_circuiting_and_shadowing() {
     check_fixture(
         "def both(xs, log):\n    a = all(log(x) for x in xs)\n    b = any(log(x) for x in xs)\n    return a, b\ndef first(xs): return any(x for x in xs)\n",
         "seen = []\ndef observe(x): seen.append(x); return x\nresult = [both([1, 0, 2], observe), first([]), seen.copy()]\nall = any = tuple\nresult += [both([0, 2], observe), first([3, 4]), seen.copy()]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn guarded_collection_calls_keep_the_generator_and_shadowed_callable() {
+    check_fixture(
+        r"def collect(items, observe):
+    a = tuple(observe(x) for x in items)
+    b = list(observe(x) for x in items)
+    return a, b, set(observe(x) for x in items)
+",
+        r"seen = []
+def observe(item):
+    seen.append(item)
+    return item
+assert collect([2, 1, 2], observe) == ((2, 1, 2), [2, 1, 2], {1, 2})
+assert seen == [2, 1, 2] * 3
+def take_one(iterator): return next(iterator)
+tuple = list = set = take_one
+assert collect([5, 6], observe) == (5, 5, 5)
+assert seen[-3:] == [5, 5, 5]
+result = seen",
     );
 }
 
