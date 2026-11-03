@@ -94,7 +94,7 @@ pub(crate) fn partial(
         candidate.source = aligned;
         first = compile(&candidate.source, OptimizationLevel::Zero);
     }
-    let formatting_bytes = candidate.source.len() - unformatted;
+    let formatting_bytes = candidate.source.len().saturating_sub(unformatted);
     let warned = super::warnings::annotate(m, &mut candidate, first, compile);
     let mut result = detached::append(m, candidate, &mut work, &warned, formatting_bytes)?;
     if let Some(difference) = warned.get(&m.root) {

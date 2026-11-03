@@ -2,10 +2,20 @@
 //! the callable's identity. The other arm calls the original name normally.
 use super::{Body, CommonConstant, Instruction, Object, Value, comparisons::same_instructions};
 
-pub(super) fn truth_builtin(arg: u32) -> Option<bool> {
-    if arg == CommonConstant::BUILTIN_ALL.argument() {
+pub(super) fn truth_guard(ops: &[Instruction]) -> Option<bool> {
+    let [copy, constant, compare, branch, ..] = ops else {
+        return None;
+    };
+    if (copy.name, copy.arg) != ("COPY", 1)
+        || constant.name != "LOAD_COMMON_CONSTANT"
+        || (compare.name, compare.arg) != ("IS_OP", 0)
+        || branch.name != "POP_JUMP_IF_FALSE"
+    {
+        return None;
+    }
+    if constant.arg == CommonConstant::BUILTIN_ALL.argument() {
         Some(true)
-    } else if arg == CommonConstant::BUILTIN_ANY.argument() {
+    } else if constant.arg == CommonConstant::BUILTIN_ANY.argument() {
         Some(false)
     } else {
         None

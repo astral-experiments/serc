@@ -3,9 +3,11 @@
 //! and compact a one-statement suite only when a later class needs the room.
 use ruff_python_ast::{
     Stmt,
+    token::TokenKind,
     visitor::{Visitor, walk_stmt},
 };
 use ruff_source_file::LineIndex;
+use ruff_text_size::Ranged;
 use std::collections::BTreeMap;
 
 use super::{MAX_SOURCE, Module, Object};
@@ -169,23 +171,48 @@ pub(super) fn partial(m: &Module<'_>, candidate: &Module<'_>, source: &str) -> O
         .iter()
         .rposition(|(line, wanted)| line == wanted)
         .map_or(0, |i| i + 1);
+    // The AST generator separates a class header from its first method with
+    // a blank line. Removing that separator can keep the next class on its
+    // original line. Use tokens so newlines inside strings remain untouched.
+    let blanks: Vec<_> = parsed
+        .tokens()
+        .windows(3)
+        .filter(|t| {
+            t[0].kind() == TokenKind::Colon
+                && t[1].kind() == TokenKind::Newline
+                && t[2].kind() == TokenKind::NonLogicalNewline
+                && t[1].end() == t[2].start()
+                && &source[t[2].range()] == "\n"
+        })
+        .map(|t| t[2].start().to_usize())
+        .collect();
+    let mut blanks = blanks.as_slice();
     let mut result = String::new();
     let mut copied = 0;
-    let mut extra = 0;
-    for &(line, wanted) in &sites[start..] {
-        let gap = wanted.saturating_sub(line + extra);
-        if gap == 0 || gap > 1024 || source.len() + extra + gap > MAX_SOURCE {
-            continue;
-        }
+    let mut shift = 0isize;
+    for (i, &(line, wanted)) in sites.iter().enumerate() {
         let at = suites.index.line_starts()[line - 1].to_usize();
+        let adjusted = line.checked_add_signed(shift)?;
+        let (before, rest) = blanks.split_at(blanks.partition_point(|&blank| blank < at));
+        blanks = rest;
+        let remove = adjusted.saturating_sub(wanted).min(before.len());
+        for &blank in &before[before.len() - remove..] {
+            result.push_str(&source[copied..blank]);
+            copied = blank + 1;
+        }
+        shift -= isize::try_from(remove).ok()?;
         result.push_str(&source[copied..at]);
-        result.extend(std::iter::repeat_n('\n', gap));
         copied = at;
-        extra += gap;
-    }
-    if extra == 0 {
-        return None;
+        // Before the last already aligned class, only replace lines we
+        // removed. Adding more would shift that class past its original site.
+        let target = if i < start { wanted.min(line) } else { wanted };
+        let gap = target.saturating_sub(adjusted - remove);
+        if (gap <= 1024 || i < start) && source.len().checked_add_signed(shift)? + gap <= MAX_SOURCE
+        {
+            result.extend(std::iter::repeat_n('\n', gap));
+            shift += isize::try_from(gap).ok()?;
+        }
     }
     result.push_str(&source[copied..]);
-    Some(result)
+    (result != source).then_some(result)
 }

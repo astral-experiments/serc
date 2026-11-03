@@ -166,6 +166,43 @@ fn branches_preserve_call_order() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn mixed_guards_short_circuit_before_entering_a_generator() {
+    check_fixture(
+        r"def choose(first, second, items, visit, emit):
+    if first() or second() and any(visit(x) for x in items):
+        emit()
+
+def nested(a, b, c, d, emit):
+    if a() and (b() or c() is None and d()):
+        emit()
+
+def regroup(a, b, c, d, emit):
+    if a() or (not b() or c()) and d():
+        emit(1)
+    emit(2)
+",
+        r"result = []
+def record(value):
+    result.append(value)
+    return value
+def ready(name, value):
+    return lambda: (record(name), value)[1]
+for a, b in [(True, True), (False, False), (False, True)]:
+    choose(ready('a', a), ready('b', b), [0, 1, 2], record, lambda: record('yes'))
+assert result == ['a', 'yes', 'a', 'b', 'a', 'b', 0, 1, 'yes']
+result.clear()
+for a, b, c in [(False, True, None), (True, True, None), (True, False, 1), (True, False, None)]:
+    nested(ready('a', a), ready('b', b), ready('c', c), ready('d', True), lambda: record('yes'))
+assert result == ['a', 'a', 'b', 'yes', 'a', 'b', 'c', 'a', 'b', 'c', 'd', 'yes']
+result.clear()
+regroup(ready('a', False), ready('b', False), ready('c', True), ready('d', True), record)
+assert result == ['a', 'b', 'd', 1, 2]
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn embedded_operands_keep_their_grouping() {
     check_fixture(
         "pairs = {(1, 2): 3, (4,): 5}\ndef f(x=(bound := (1, 2)), *, y=(other := (4,))):\n    return pairs[x], pairs[y]\n",
@@ -2233,7 +2270,9 @@ fn normal_flow_warnings_list_the_original_successors() {
     for version in common::PYTHON_VERSIONS {
         let built = common::python_command(version).args(["-c", r"import dis, importlib.util, marshal, sys, types
 from pathlib import Path
-code = compile('def keep(x): return x\ndef route(a, b, effect):\n    if a and b: effect()\n', 'guard.py', 'exec')
+source = 'def keep(x): return x\ndef route(a, b, effect):\n    if a and b: effect()\n'
+source += '\n' * 16 + 'class First:\n    def method(self):\n        return 1\nclass Next:\n    pass\n'
+code = compile(source, 'guard.py', 'exec')
 constants = list(code.co_consts)
 index = next(i for i, c in enumerate(constants) if isinstance(c, types.CodeType) and c.co_name == 'route')
 route = constants[index]
@@ -2267,12 +2306,16 @@ Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12) + marshal.
         fs_err::write(&recovered, source).unwrap();
         let checked = common::python_command(version).args(["-c", r"import dis, marshal, re, runpy, sys, types
 from pathlib import Path
-route = next(c for c in marshal.loads(Path(sys.argv[1]).read_bytes()[16:]).co_consts if isinstance(c, types.CodeType) and c.co_name == 'route')
+children = {c.co_name: c for c in marshal.loads(Path(sys.argv[1]).read_bytes()[16:]).co_consts if isinstance(c, types.CodeType)}
+route = children['route']
 listing = Path(sys.argv[2]).read_text().split('# serc: original blocks (normal control flow differs) in route ')[1]
 ops = list(dis.get_instructions(route))
 assert [(int(m[1]), m[2]) for m in re.finditer(r'^# +(\d+)  (\w+) ', listing, re.M)] == [(op.offset, op.opname) for op in ops]
 assert [int(n) for n in re.findall(r'^# block .* jump (\d+)$', listing, re.M)] == [op.argval for op in ops if op.opname == 'POP_JUMP_IF_FALSE']
 scope = runpy.run_path(sys.argv[2])
+if sys.version_info >= (3, 13):
+    for name in ['First', 'Next']:
+        assert scope[name].__firstlineno__ == children[name].co_firstlineno
 calls = []
 for a in [False, True]:
     for b in [False, True]:
