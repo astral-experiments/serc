@@ -2674,6 +2674,94 @@ assert result == [1, 2, 42]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn cancellation_reaches_the_handler_after_either_finalizer_copy() {
+    check_fixture(
+        r"async def acquire(wait, release, wake):
+    try:
+        try:
+            await wait()
+        finally:
+            release()
+    except LookupError:
+        wake()
+        raise
+    return True
+",
+        r"import asyncio, sys
+events = []
+async def run(wait_error, release_error):
+    async def wait():
+        await asyncio.sleep(0)
+        if wait_error:
+            raise wait_error
+    def release():
+        events.append(('release', sys.exception()))
+        if release_error:
+            raise release_error
+    def wake():
+        events.append(('wake', sys.exception()))
+    try:
+        return await acquire(wait, release, wake)
+    except BaseException as error:
+        return error
+key, index, value = KeyError(), IndexError(), ValueError()
+assert asyncio.run(run(None, None)) is True
+assert asyncio.run(run(key, None)) is key
+assert asyncio.run(run(value, index)) is index
+assert index.__context__ is value
+assert asyncio.run(run(value, None)) is value
+assert events == [('release', None), ('release', key), ('wake', key),
+                  ('release', value), ('wake', index), ('release', value)]
+result = [name for name, error in events]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_raising_async_handler_runs_the_trailing_finally() {
+    check_fixture(
+        r"async def serve(wait, close, clear):
+    try:
+        await wait()
+    except LookupError:
+        try:
+            await close()
+        finally:
+            raise
+    finally:
+        clear()
+",
+        r"import asyncio, sys
+events = []
+async def run(wait_error, close_error):
+    async def wait():
+        await asyncio.sleep(0)
+        if wait_error:
+            raise wait_error
+    async def close():
+        events.append(('close', sys.exception()))
+        await asyncio.sleep(0)
+        if close_error:
+            raise close_error
+    def clear(): events.append(('clear', sys.exception()))
+    try:
+        return await serve(wait, close, clear)
+    except BaseException as error:
+        return error
+key, value = KeyError(), ValueError()
+assert asyncio.run(run(None, None)) is None
+assert asyncio.run(run(key, None)) is key
+assert asyncio.run(run(key, value)) is value
+assert value.__context__ is key
+assert asyncio.run(run(value, None)) is value
+assert events == [('clear', None), ('close', key), ('clear', key),
+                  ('close', key), ('clear', value), ('clear', value)]
+result = [name for name, error in events]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn finally_runs_on_suspension_return_and_cancellation() {
     check_fixture(
         r"async def value(work, events):
