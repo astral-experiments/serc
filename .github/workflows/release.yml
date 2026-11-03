@@ -303,7 +303,7 @@ jobs:
       name: release
     permissions:
       "attestations": "write"
-      "contents": "write"
+      "contents": "read"
       "id-token": "write"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -329,10 +329,21 @@ jobs:
             artifacts/*.ps1
             artifacts/*.zip
             artifacts/*.tar.gz
+      - name: Get release token
+        id: release-token
+        uses: astral-sh/github-actions/simple-token-service@eb81cf4d13127c3f9539f621c17e4c65327636c8
+        with:
+          exchange-url: ${{ secrets.RELEASES_STS_API_URL }}/exchange
+          audience: ${{ secrets.RELEASES_STS_API_URL }}
+          repository: astral-experiments/serc
+          # Workflow permission is required to create a release tag after `main` advances across workflow changes.
+          permissions: |
+            contents: write
+            workflows: write
       - name: Create GitHub Release
         shell: bash
         env:
-          GH_TOKEN: ${{ github.token }}
+          GH_TOKEN: ${{ steps.release-token.outputs.token }}
           PRERELEASE_FLAG: "${{ fromJson(needs.host.outputs.val).announcement_is_prerelease && '--prerelease' || '' }}"
           ANNOUNCEMENT_TITLE: "${{ fromJson(needs.host.outputs.val).announcement_title }}"
           ANNOUNCEMENT_BODY: "${{ fromJson(needs.host.outputs.val).announcement_github_body }}"
