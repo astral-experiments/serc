@@ -15,6 +15,27 @@ use serc::{
 };
 
 #[test]
+fn a_shared_named_cleanup_locates_its_split_implicit_return() {
+    let source = r"def finish(enabled, value):
+    try:
+        try:
+            if enabled:
+                try:
+                    work()
+                except ValueError as error:
+                    if value:
+                        pass
+                    else:
+                        record(value)
+        except LookupError:
+            pass
+    except OSError:
+        pass
+";
+    assert_matches_cpython(source, "split_handler_return.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
