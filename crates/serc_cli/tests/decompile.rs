@@ -512,6 +512,38 @@ assert result == [1, 1, 'b', ('b',), 'b', 2, ('c',), 3, ('d',), ('d',)]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn distinct_and_shared_constant_returns_keep_their_constant_order() {
+    check_fixture(
+        r"def early(ready, emit):
+    if ready:
+        emit('first')
+        return 'done'
+    emit('last')
+    return 'done'
+
+def common(ready, emit):
+    if ready:
+        emit('first')
+    else:
+        emit('last')
+    return 'done'
+
+def early_none(ready, emit):
+    if ready:
+        emit('first')
+        return
+    emit('last')
+",
+        r"result = []
+for f in [early, common, early_none]:
+    for ready in [True, False]:
+        result.append(f(ready, result.append))
+assert result == ['first', 'done', 'last', 'done'] * 2 + ['first', None, 'last', None]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_copied_local_return_skips_the_for_else_suite() {
     check_fixture(
         r"def visit(source, emit):

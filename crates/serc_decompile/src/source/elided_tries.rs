@@ -5,12 +5,6 @@ use super::{Body, Bytecode, Instruction};
 impl Body<'_, '_, '_> {
     pub(super) fn elided_tries(&mut self, bc: &Bytecode, normal_end: usize) -> Result<(), String> {
         let ops = &bc.ops;
-        let lines = serc_bytecode::locations::instruction_lines(
-            self.m.bytes(self.code.locations)?,
-            self.code.first_line,
-            self.m.bytes(self.code.bytecode)?.len(),
-            ops,
-        )?;
         let mut cursor = 0;
         let mut start = normal_end;
         while start < ops.len() {
@@ -29,6 +23,7 @@ impl Body<'_, '_, '_> {
             {
                 return Err("unsupported elided try cleanup".into());
             }
+            let lines = self.instruction_lines(ops)?;
             let clause_line = lines[start + 1..cleanup]
                 .iter()
                 .copied()

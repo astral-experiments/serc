@@ -161,6 +161,26 @@ impl Body<'_, '_, '_> {
         })
     }
 
+    // A shared return can be copied to both arms. Distinct source lines
+    // distinguish an authored early return, unless the compiler assigned an
+    // implicit None return the line of the preceding statement. The caller
+    // requires that preceding statement to belong to the early arm.
+    fn distinct_constant_returns(&self, ops: &[Instruction], left: usize, right: usize) -> bool {
+        let Some((a, av)) = super::regions::constant_return(ops, left) else {
+            return false;
+        };
+        let Some((b, bv)) = super::regions::constant_return(ops, right) else {
+            return false;
+        };
+        if av != bv || a == 0 {
+            return false;
+        }
+        self.instruction_lines(ops).is_ok_and(|lines| {
+            matches!((lines[a - 1], lines[a], lines[b]),
+                (Some(prev), Some(early), Some(late)) if prev < early && early < late)
+        })
+    }
+
     pub(super) fn conditional(
         &mut self,
         ops: &[Instruction],
@@ -363,16 +383,18 @@ impl Body<'_, '_, '_> {
                     // An early constant return can guard a loop with a
                     // different return inside it, followed by the same
                     // constant at exhaustion. Keep the guard's own exit.
-                    if left.is_empty()
-                        && super::regions::constant_return(ops, fallthrough_end)
-                            .is_some_and(|(at, _)| at == start)
-                        && self.flow.blocks_in(target..end).any(|block| {
-                            block.ops.end < end
-                                && matches!(
-                                    ops[block.ops.end - 1].name,
-                                    "RETURN_CONST" | "RETURN_VALUE"
-                                )
-                        })
+                    if (!left.is_empty()
+                        && self.distinct_constant_returns(ops, fallthrough_end, end))
+                        || (left.is_empty()
+                            && super::regions::constant_return(ops, fallthrough_end)
+                                .is_some_and(|(at, _)| at == start)
+                            && self.flow.blocks_in(target..end).any(|block| {
+                                block.ops.end < end
+                                    && matches!(
+                                        ops[block.ops.end - 1].name,
+                                        "RETURN_CONST" | "RETURN_VALUE"
+                                    )
+                            }))
                     {
                         self.block(&format!("if {test}:"), &suite)?;
                         self.line(other.trim_end_matches('\n'))?;

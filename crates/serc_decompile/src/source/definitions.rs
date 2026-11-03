@@ -557,6 +557,7 @@ impl<'m, 'data> Body<'m, 'data, '_> {
                 id,
                 stack: Vec::new(),
                 lines: String::new(),
+                instruction_lines: std::cell::OnceCell::new(),
                 partial_prefix: 0,
                 partial_start: 0,
                 flow,
