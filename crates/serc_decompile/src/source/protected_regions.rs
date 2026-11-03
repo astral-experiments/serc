@@ -686,7 +686,7 @@ impl Body<'_, '_, '_> {
         }
         let header = match &entry.clause {
             Clause::Except { kind, binding, .. } => {
-                self.except_header(ops, kind.clone(), *binding, level)?
+                self.except_header(ops, "except", kind.clone(), *binding, level)?
             }
             Clause::Finally {
                 deferred_return, ..

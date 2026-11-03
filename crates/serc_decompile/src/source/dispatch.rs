@@ -82,15 +82,26 @@ impl Body<'_, '_, '_> {
     }
 
     fn cleared_name(&self, ops: &[Instruction], cleanup: usize) -> Option<Instruction> {
-        let [none, store, delete, reraise] = ops.get(cleanup..cleanup + 4)? else {
+        let reraise = ops.get(cleanup + 3)?;
+        if (reraise.name, reraise.arg) != ("RERAISE", 1) {
+            return None;
+        }
+        self.cleared_binding(ops, cleanup)
+    }
+
+    pub(super) fn cleared_binding(
+        &self,
+        ops: &[Instruction],
+        cleanup: usize,
+    ) -> Option<Instruction> {
+        let [none, store, delete] = ops.get(cleanup..cleanup + 3)? else {
             return None;
         };
         let name = store.name.strip_prefix("STORE_")?;
         (matches!(none.name, "LOAD_CONST" | "LOAD_COMMON_CONSTANT")
             && self.none_constant(*none)
             && delete.name.strip_prefix("DELETE_") == Some(name)
-            && delete.arg == store.arg
-            && (reraise.name, reraise.arg) == ("RERAISE", 1))
+            && delete.arg == store.arg)
             .then_some(*store)
     }
 
@@ -424,11 +435,12 @@ impl Body<'_, '_, '_> {
     pub(super) fn except_header(
         &mut self,
         ops: &[Instruction],
+        keyword: &str,
         kind: Option<Range<usize>>,
         binding: usize,
         level: usize,
     ) -> Result<String, String> {
-        let mut header = "except".to_owned();
+        let mut header = keyword.to_owned();
         if let Some(kind) = kind {
             header.push(' ');
             header.push_str(
@@ -458,7 +470,7 @@ impl Body<'_, '_, '_> {
         level: usize,
         keep_return: bool,
     ) -> Result<(), String> {
-        let header = self.except_header(ops, arm.kind.clone(), arm.binding, level)?;
+        let header = self.except_header(ops, "except", arm.kind.clone(), arm.binding, level)?;
         let fragment = self.protected_fragment(ops, arm.body.clone(), level, arm.copies)?;
         let mut suite = if matches!(arm.exit, Exit::ReturnValue) {
             let (suite, returns) = fragment.pending_return()?;

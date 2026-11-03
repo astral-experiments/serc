@@ -3136,6 +3136,40 @@ result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is 
 
 #[cfg(feature = "decompile")]
 #[test]
+fn exception_groups_offer_the_remainder_to_each_handler() {
+    check_fixture(
+        r"def dispatch(work, observe, fail):
+    try:
+        work()
+    except* ValueError as values:
+        observe(values)
+        if fail:
+            raise RuntimeError('new') from values
+    except* OSError as errors:
+        observe(errors)
+    else:
+        observe(None)
+    observe('after')
+",
+        r"import sys
+result = []
+def shape(e):
+    if isinstance(e, BaseExceptionGroup): return (e.message, tuple(map(shape, e.exceptions)))
+    if isinstance(e, BaseException): return (type(e).__name__, e.args)
+    return e
+def observe(e): result.append((shape(e), shape(sys.exception())))
+for children in ([], [ValueError('v')], [OSError('io')], [ValueError(1), OSError(2)], [ExceptionGroup('nested', [OSError(1), KeyError(2)]), ValueError(3)]):
+    for fail in (True, False):
+        def work():
+            if children: raise ExceptionGroup('original', children)
+        try: dispatch(work, observe, fail)
+        except BaseException as exc: result.append(('raised', shape(exc)))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_nested_try_else_rejoins_the_outer_exception_handler() {
     check_fixture(
         r"def probe(work, record):

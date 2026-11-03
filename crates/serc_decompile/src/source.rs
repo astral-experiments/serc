@@ -9,6 +9,7 @@ mod definitions;
 mod detached;
 mod dispatch;
 mod elided_tries;
+mod exception_groups;
 mod exceptions;
 mod finalizers;
 mod layout;
