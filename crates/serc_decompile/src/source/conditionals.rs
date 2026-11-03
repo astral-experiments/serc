@@ -320,6 +320,14 @@ impl Body<'_, '_, '_> {
                 return Err("unsupported assertion argument".into());
             };
             self.line(&format!("assert {test}{msg}"))?;
+            // At the end of a function each successful short-circuit edge may
+            // have its own implicit return. An explicit return merges them.
+            if end == self.terminal_returns.end
+                && self.terminal_returns.contains(&target)
+                && self.terminal_returns.len() > self.flow.block(target).ops.len()
+            {
+                return Ok(end);
+            }
             return Ok(target);
         }
         if self.loop_edges.is_some()

@@ -180,6 +180,9 @@ def regroup(a, b, c, d, emit):
     if a() or (not b() or c()) and d():
         emit(1)
     emit(2)
+
+def require(a, b, c, message):
+    assert a() or b() and c(), message()
 ",
         r"result = []
 def record(value):
@@ -197,6 +200,13 @@ assert result == ['a', 'a', 'b', 'yes', 'a', 'b', 'c', 'a', 'b', 'c', 'd', 'yes'
 result.clear()
 regroup(ready('a', False), ready('b', False), ready('c', True), ready('d', True), record)
 assert result == ['a', 'b', 'd', 1, 2]
+result.clear()
+for a, b, c in [(True, False, False), (False, True, True), (False, False, True)]:
+    try:
+        require(ready('a', a), ready('b', b), ready('c', c), ready('message', 42))
+    except AssertionError as exc:
+        record(exc.args)
+assert result == ['a', 'a', 'b', 'c', 'a', 'b', 'message', (42,)]
 ",
     );
 }
