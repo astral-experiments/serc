@@ -55,6 +55,28 @@ fn nested_finally_guard_inherits_the_preceding_calls_handler() {
 }
 
 #[test]
+fn an_iterator_break_keeps_the_finalizer_call_line_on_its_jump() {
+    let source = r"def advance(values, active):
+    try:
+        for value in values:
+            try:
+                break
+            except:
+                pass
+            finally:
+                if active:
+                    finish(value)
+    except ValueError:
+        pass
+    try:
+        pass
+    except TypeError:
+        pass
+";
+    assert_matches_cpython(source, "iterator_break_finalizer_call.py", &LEVELS);
+}
+
+#[test]
 fn reraising_cleanup_leaves_one_iterator_discard_predecessor() {
     let source = r"def scan(items, manager):
     with manager:
