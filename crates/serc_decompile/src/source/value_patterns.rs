@@ -339,11 +339,6 @@ impl Body<'_, '_, '_> {
                 }
                 join = Some(after);
                 tail
-            } else if body_end < end
-                && self.at_loop_tail(end)
-                && self.loop_transfer(ops, tail) == Some("continue")
-            {
-                tail
             } else {
                 body_end
             };

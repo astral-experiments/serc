@@ -218,7 +218,16 @@ pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handle
             .ops
             .iter()
             .take_while(|op| op.offset < first.start)
-            .any(|op| op.jump.is_some_and(|target| target > first.start));
+            .any(|op| op.jump.is_some_and(|target| target > first.start))
+        && !bc
+            .ops
+            .iter()
+            .take_while(|op| op.offset < first.target)
+            .any(|op| {
+                op.offset >= first.end
+                    && op.name == "JUMP_BACKWARD"
+                    && op.jump.is_some_and(|target| target < first.start)
+            });
     let mut result = Handlers::default();
     let mut unwinds = FxHashSet::default();
     let mut starts = vec![0];
@@ -501,6 +510,18 @@ fn region(
             {
                 retry = true;
                 next = after_break;
+            } else if to < start
+                && ops[to..start].iter().all(|op| op.name == "NOP")
+                && flow.block(to).height == Some(first.depth)
+                && end < dispatch
+                && ops[dispatch - 1].name == "JUMP_BACKWARD"
+                && flow
+                    .jump(dispatch - 1)
+                    .is_some_and(|latch| latch == to || (latch == to + 1 && latch < start))
+            {
+                // A successful iteration has work between the try and the
+                // latch. The handler jumps over it to the while header.
+                handler_tail = Some(stop - 1..stop);
             } else if to != next
                 && Some(to) != for_header
                 && !shared_latch
@@ -778,6 +799,26 @@ fn protected_end(
 }
 
 impl Body<'_, '_, '_> {
+    /// A loop may walk over a whole protected suite whose dispatcher lives
+    /// after the latch. The suite lifter owns that exceptional path.
+    pub(super) fn loop_contains_handler(
+        &self,
+        ops: &[Instruction],
+        entry: Handler,
+        body: Range<usize>,
+    ) -> bool {
+        let Ok(start) = ops.binary_search_by_key(&entry.start, |op| op.offset) else {
+            return false;
+        };
+        !entry.lasti
+            && body.contains(&start)
+            && self.handlers.get(&start).is_some_and(|suite| {
+                ops.get(suite.end).is_some_and(|op| op.offset == entry.end)
+                    && start < suite.next
+                    && suite.next <= body.end
+            })
+    }
+
     /// A nested try can own the rest of a manager's body. On an exception
     /// its final unwind must transfer control to this manager's exit.
     pub(super) fn managed_child_end(

@@ -2232,6 +2232,18 @@ fn failed_final_cases_advance_the_iterator() {
             case Kind.last:
                 if enabled(item):
                     yield -item
+
+def count(items, emit):
+    count = 0
+    for item in items:
+        match item:
+            case 1:
+                emit(item)
+            case 2:
+                continue
+            case _:
+                emit(count)
+        count += 1
 ",
         r"class Kind:
     first, second, last = 1, 2, 3
@@ -2242,7 +2254,10 @@ def read(item):
 def enabled(item):
     events.append(('enabled', item))
     return len(events) % 2 == 0
-result = list(classify([3, 0, 2, 1, 0, 3, 3, 2], read, enabled)), events",
+seen = []
+count([2, 0, 1, 2, 2, 0], seen.append)
+assert seen == [0, 1, 2]
+result = list(classify([3, 0, 2, 1, 0, 3, 3, 2], read, enabled)), events, seen",
     );
 }
 
@@ -4545,5 +4560,75 @@ partial = tasks(broken())
 assert next(partial) == 1 and next(partial) == 'iterator'
 partial.close()
 result = events, list(tasks(broken())), list(tasks([1, 2]))",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn protected_while_iterations_retry_or_stop_before_their_shared_work() {
+    check_fixture(
+        r"def drain(take, accept):
+    while True:
+        try:
+            item = take()
+        except KeyError:
+            break
+        accept(item)
+
+def retry(take, accept):
+    while True:
+        try:
+            item = take()
+        except KeyError:
+            continue
+        accept(item)
+",
+        r"seen = []
+def take():
+    value = next(items)
+    if value is None: raise KeyError
+    return value
+items = iter([1, None, 2])
+drain(take, seen.append)
+assert seen == [1] and list(items) == [2]
+items = iter([1, None, 2])
+try: retry(take, seen.append)
+except StopIteration: pass
+assert seen == [1, 1, 2]
+result = seen",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn iterator_breaks_rejoin_an_outer_latch_or_a_shared_return() {
+    check_fixture(
+        r"def first(groups, emit):
+    for group in groups:
+        for value in group:
+            if value:
+                emit(value)
+                break
+
+def preferred(initial, lookup):
+    value = initial
+    try:
+        items = lookup()
+    except KeyError:
+        pass
+    else:
+        for value in items:
+            if '.' in value:
+                break
+        else:
+            value = initial
+    return value
+",
+        r"log = []
+first([[0, 1, 2], [], [0], [3, 4]], log.append)
+def missing(): raise KeyError
+values = [preferred('host', f) for f in (missing, lambda: [], lambda: ['a', 'b'], lambda: ['a', 'b.c', 'd.e'])]
+assert log == [1, 3] and values == ['host', 'host', 'host', 'b.c']
+result = log, values",
     );
 }

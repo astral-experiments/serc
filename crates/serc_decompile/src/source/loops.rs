@@ -238,12 +238,13 @@ impl Body<'_, '_, '_> {
             && ops[active.header].name == "FOR_ITER"
             && predicate.suite + 1 == predicate.target
             && predicate.target < end
-            && self.flow.handler(active.header).is_some_and(|h| {
-                h.lasti
-                    || self.flow.handler(predicate.target).is_some_and(|tail| {
-                        (tail.target, tail.depth, tail.lasti) == (h.target, h.depth, h.lasti)
-                    })
-            })
+            && (self.folded_break(ops, predicate.target, end)
+                || self.flow.handler(active.header).is_some_and(|h| {
+                    h.lasti
+                        || self.flow.handler(predicate.target).is_some_and(|tail| {
+                            (tail.target, tail.depth, tail.lasti) == (h.target, h.depth, h.lasti)
+                        })
+                }))
             && self.loop_transfer(ops, predicate.suite) == Some("continue")
             && self.flow.handler(predicate.suite).is_none()
             && self
@@ -295,7 +296,10 @@ impl Body<'_, '_, '_> {
                 let current = self.active_try.is_some_and(|entry| {
                     (entry.target, entry.depth, entry.lasti) == (h.target, h.depth, h.lasti)
                 });
-                !current && !generator_exit && self.delegated_cleanup(ops, start).is_none()
+                !current
+                    && !generator_exit
+                    && self.delegated_cleanup(ops, start).is_none()
+                    && !self.loop_contains_handler(ops, h, nop + 1..latch)
             });
             if protected
                 || (start != header
@@ -479,10 +483,14 @@ impl Body<'_, '_, '_> {
             .or_else(|| {
                 // The exhaustion path may contain another loop before the
                 // shared return. Only fold a local load after iterator cleanup.
-                local_return(ops, end).filter(|&at| {
-                    ops[header].name == "FOR_ITER"
-                        && self.flow.block(at).ops.end == end
-                        && self.flow.handler(at).is_none()
+                [end, end + 2].into_iter().find_map(|stop| {
+                    // In a try-else the dispatcher may already own the
+                    // return immediately following this fragment.
+                    local_return(ops, stop).filter(|&at| {
+                        ops[header].name == "FOR_ITER"
+                            && self.flow.block(at).ops.end == stop
+                            && self.flow.handler(at).is_none()
+                    })
                 })
             })
             .filter(|&start| start >= exhausted);
@@ -538,7 +546,7 @@ impl Body<'_, '_, '_> {
         level: usize,
     ) -> Result<usize, String> {
         let exit = self.flow.target(header)?;
-        if exit > end || exit <= header + 2 || ops[exit].name != "END_FOR" {
+        if exit > end || exit <= header + 2 || ops.get(exit).is_none_or(|op| op.name != "END_FOR") {
             return Err("unsupported for-loop exit".into());
         }
 
@@ -549,22 +557,42 @@ impl Body<'_, '_, '_> {
                 ops.get(exit + 1)
                     .is_some_and(|op| matches!(op.name, "POP_ITER" | "POP_TOP")),
             );
+        // An inner break at the end of an outer iteration can jump directly
+        // to the outer header. Exhaustion takes the same jump after END_FOR.
+        let outer_latch = self.loop_edges.filter(|outer| {
+            ops[exit - 1].name == "JUMP_BACKWARD"
+                && self.flow.jump(exit - 1) == Some(outer.header)
+                && ops
+                    .get(after_cleanup)
+                    .is_some_and(|op| op.name == "JUMP_BACKWARD")
+                && self.flow.jump(after_cleanup) == Some(outer.header)
+                && self
+                    .iterator_slots(ops, header, outer.iterators + 1)
+                    .is_some_and(|slots| {
+                        exit - header > slots + 1
+                            && ops[exit - 1 - slots..exit - 1]
+                                .iter()
+                                .all(|op| op.name == "POP_TOP")
+                    })
+        });
         // A loop whose body always exits has no latch. Its last transfer
         // belongs to the body and must be emitted.
         let body_end = if self.flow.jump(exit - 1) == Some(header) {
             exit - 1
-        } else if matches!(
-            ops[exit - 1].name,
-            "RETURN_VALUE" | "RETURN_CONST" | "RAISE_VARARGS" | "JUMP_FORWARD"
-        ) || (ops[exit - 1].name == "JUMP_BACKWARD"
-            && self
-                .flow
-                .jump(exit - 1)
-                .is_some_and(|to| (header + 1..exit).contains(&to))
-            && self
-                .flow
-                .incoming(header)
-                .any(|from| (header + 1..exit).contains(&from)))
+        } else if outer_latch.is_some()
+            || matches!(
+                ops[exit - 1].name,
+                "RETURN_VALUE" | "RETURN_CONST" | "RAISE_VARARGS" | "JUMP_FORWARD"
+            )
+            || (ops[exit - 1].name == "JUMP_BACKWARD"
+                && self
+                    .flow
+                    .jump(exit - 1)
+                    .is_some_and(|to| (header + 1..exit).contains(&to))
+                && self
+                    .flow
+                    .incoming(header)
+                    .any(|from| (header + 1..exit).contains(&from)))
         {
             // A nested loop may own the last jump while an earlier arm
             // advances the iterator. Keep both transfers in the body.
@@ -573,7 +601,14 @@ impl Body<'_, '_, '_> {
             return Err("unsupported for-loop latch".into());
         };
         let binding = self.binding(ops, header + 1, body_end)?;
-        let active = self.loop_exits(ops, header, binding.next..body_end, after_cleanup, end)?;
+        let mut active =
+            self.loop_exits(ops, header, binding.next..body_end, after_cleanup, end)?;
+        if let Some(outer) = outer_latch {
+            if active.after.is_some() {
+                return Err("multiple loop exit targets".into());
+            }
+            active.after = Some(outer.header);
+        }
         let outer = self.loop_edges.replace(active);
         let suite = self
             .seeded(ops, binding.next, body_end, level, binding.seed)?
