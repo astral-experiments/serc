@@ -482,10 +482,10 @@ impl Body<'_, '_, '_> {
         if fallthrough_end == target
             && target < end
             && self.stack.is_empty()
-            && matches!(
+            && (matches!(
                 ops[tail].name,
                 "RAISE_VARARGS" | "RETURN_VALUE" | "RETURN_CONST"
-            )
+            ) || self.implicit_reraise(ops, tail))
         {
             self.charge(fallthrough_end - start)?;
             if let Some(join) = self.threaded_arm_join(start..fallthrough_end, end) {
@@ -500,6 +500,20 @@ impl Body<'_, '_, '_> {
             }
         }
         let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
+        if self.implicit_reraise(ops, tail)
+            && target < end
+            && !self
+                .flow
+                .incoming(target)
+                .any(|from| (start..fallthrough_end).contains(&from))
+        {
+            self.block(&format!("if {test}:"), &suite)?;
+            let other = self.fragment(ops, target, end, level)?.suite()?;
+            if !other.is_empty() {
+                self.block("else:", &other)?;
+            }
+            return Ok(end);
+        }
         if matches!(ops[tail].name, "RETURN_CONST" | "RETURN_VALUE")
             && end > target
             && (matches!(ops[end - 1].name, "RETURN_CONST" | "RETURN_VALUE")

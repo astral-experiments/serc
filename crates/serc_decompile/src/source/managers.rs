@@ -239,11 +239,16 @@ impl Body<'_, '_, '_> {
             Some(next) => next,
             None => {
                 let next = self.after_with_suppression(ops, &entry)?;
-                if next > end && self.none_return(&ops[next..self.flow.normal_end([next])]) {
-                    end
-                } else {
-                    next
+                if next <= enter || next >= ops.len() {
+                    return Err("unsupported continuation after with".into());
                 }
+                if next > end {
+                    self.charge(ops.len())?;
+                    if self.none_return(&ops[next..self.flow.normal_end([next])]) {
+                        return Ok(Some(end));
+                    }
+                }
+                next
             }
         };
         Ok(Some(next))

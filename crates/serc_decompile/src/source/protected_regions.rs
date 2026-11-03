@@ -18,6 +18,7 @@ enum Clause {
     },
     Finally {
         deferred_return: Range<usize>,
+        terminal_unwind: Option<usize>,
     },
 }
 
@@ -102,6 +103,25 @@ pub(super) fn suspended(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Handlers {
         }
     }
     result
+}
+
+/// If a coroutine only raises, there is no return instruction to delimit
+/// its body. Include continuations reachable solely through an except clause.
+pub(super) fn returnless_end(bc: &Bytecode, flow: &Graph, handlers: &Handlers) -> Option<usize> {
+    let mut starts = vec![0];
+    for group in groups(bc) {
+        let entry = group.first()?;
+        let start = bc
+            .ops
+            .binary_search_by_key(&entry.start, |op| op.offset)
+            .ok()?;
+        let suite = handlers.get(&start)?;
+        if bc.ops.get(suite.end)?.offset == entry.target && suite.next > suite.end {
+            bc.ops.get(suite.next)?;
+            starts.push(suite.next);
+        }
+    }
+    Some(flow.normal_end(starts))
 }
 
 /// Use region recovery for ordinary scopes when a branch encloses the first
@@ -204,7 +224,7 @@ fn region(
         && ops[dispatch + 1].name != "POP_TOP"
         && ops[dispatch + 1].name != "BUILD_LIST"
         && super::dispatch::typed_handler(flow, ops, dispatch + 1).is_none()
-        && let Some(finally) = finally_region(ops, flow, start..end, dispatch, cleanup)
+        && let Some(finally) = finally_region(ops, owner, start..end, dispatch, cleanup)
     {
         return Some((start, finally));
     }
@@ -403,16 +423,25 @@ fn guarded_return_end(
 /// Match the normal copy to the exceptional one, up to its final reraise.
 fn finally_region(
     ops: &[Instruction],
-    flow: &Graph,
+    owner: &Body<'_, '_, '_>,
     suite: Range<usize>,
     dispatch: usize,
     cleanup: usize,
 ) -> Option<Protected> {
+    let flow = &owner.flow;
     let reraise = cleanup.checked_sub(1)?;
     let exceptional = dispatch + 1..reraise;
     if exceptional.is_empty() || (ops[reraise].name, ops[reraise].arg) != ("RERAISE", 0) {
         return None;
     }
+    let terminal = ops[exceptional.clone()]
+        .iter()
+        .any(|op| (op.name, op.arg) == ("RERAISE", 0));
+    let copy = if terminal {
+        dispatch + 1..cleanup
+    } else {
+        exceptional
+    };
     let end = suite.end;
     // If every normal path raises, CPython emits only the exceptional copy.
     if ops[end - 1].name == "RAISE_VARARGS"
@@ -432,8 +461,9 @@ fn finally_region(
             next: end,
             clause: Clause::Finally {
                 deferred_return: end..end,
+                terminal_unwind: terminal.then_some(ops[cleanup].offset),
             },
-            handler: exceptional,
+            handler: copy,
             try_exits: None,
             handler_exits: None,
             handler_tail: None,
@@ -441,11 +471,11 @@ fn finally_region(
     }
     let deferred = ops[end].name == "NOP";
     let start = end + usize::from(deferred);
-    let normal = start..super::finalizers::copy_end(ops, flow, start..dispatch, exceptional)?;
+    let normal = start..owner.finally_copy_end(ops, start..dispatch, copy.clone(), terminal)?;
     // A return of a constant can leave a tracing NOP at its original site,
     // with the constant materialized only after the normal cleanup.
     let mut next = normal.end;
-    if deferred {
+    if deferred && !terminal {
         next += match ops.get(next..)? {
             [ret, ..] if ret.name == "RETURN_CONST" => 1,
             [load, ret, ..]
@@ -464,8 +494,9 @@ fn finally_region(
         next,
         clause: Clause::Finally {
             deferred_return: normal.end..next,
+            terminal_unwind: terminal.then_some(ops[cleanup].offset),
         },
-        handler: normal,
+        handler: if terminal { copy } else { normal },
         try_exits: None,
         handler_exits: None,
         handler_tail: None,
@@ -607,7 +638,9 @@ impl Body<'_, '_, '_> {
             Clause::Except { kind, binding, .. } => {
                 self.except_header(ops, kind.clone(), *binding, level)?
             }
-            Clause::Finally { deferred_return } => {
+            Clause::Finally {
+                deferred_return, ..
+            } => {
                 if !deferred_return.is_empty() {
                     suite.push_str(
                         &self
@@ -618,8 +651,17 @@ impl Body<'_, '_, '_> {
                 "finally:".into()
             }
         };
+        let terminal_unwind = match &entry.clause {
+            Clause::Finally {
+                terminal_unwind, ..
+            } => *terminal_unwind,
+            Clause::Except { .. } => None,
+        };
+        let outer = std::mem::replace(&mut self.finally_unwind, terminal_unwind);
         let handler =
-            self.protected_fragment(ops, entry.handler.clone(), level, entry.handler_exits)?;
+            self.protected_fragment(ops, entry.handler.clone(), level, entry.handler_exits);
+        self.finally_unwind = outer;
+        let handler = handler?;
         let handler = if let Some(tail) = &entry.handler_tail {
             handler.resume(self, ops, tail.clone(), level)?
         } else {
@@ -634,6 +676,9 @@ impl Body<'_, '_, '_> {
                 .fragment(ops, success.start, success.end, level)?
                 .suite()?;
             self.block("else:", &suite)?;
+        }
+        if terminal_unwind.is_some() && entry.next > entry.end && (level > 0 || next < limit) {
+            self.line("return")?;
         }
         Ok(Some(next))
     }

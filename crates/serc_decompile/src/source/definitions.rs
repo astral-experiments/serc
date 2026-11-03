@@ -565,6 +565,7 @@ impl<'m, 'data> Body<'m, 'data, '_> {
                 handlers: super::protected_regions::Handlers::default(),
                 clause_exits: None,
                 arm_exit: None,
+                finally_unwind: None,
                 terminal_returns: 0..0,
                 class: false,
                 annotations: Vec::new(),

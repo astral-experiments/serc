@@ -190,6 +190,7 @@ fn recover_scope<'m>(
         terminal_returns: 0..0,
         clause_exits: None,
         arm_exit: None,
+        finally_unwind: None,
         class,
         annotations: Vec::new(),
         depth,
@@ -285,6 +286,7 @@ struct Body<'m, 'data, 'work> {
     clause_exits: Option<protected_regions::ExitCopies>,
     // A nested guard can jump past the other arm to the enclosing continuation.
     arm_exit: Option<(usize, usize)>,
+    finally_unwind: Option<usize>,
     terminal_returns: std::ops::Range<usize>,
     depth: usize,
     class: bool,

@@ -239,6 +239,7 @@ impl Body<'_, '_, '_> {
             return Ok(next);
         }
         match op.name {
+            "RERAISE" if self.implicit_reraise(ops, i) => Ok(i + 1),
             // CPython builds a constant set display by updating an empty
             // set from a frozenset constant. Its elements belong directly
             // in the display, including when that display is itself starred.

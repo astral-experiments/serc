@@ -2231,6 +2231,57 @@ prepare(lambda: result.append('read'), restore)",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn branching_finalizers_propagate_the_active_exception() {
+    check_fixture(
+        r"def hold(box, overwrite, observe):
+    try:
+        saved = box[:]
+        del box[:]
+        yield
+    finally:
+        if overwrite:
+            observe('restore')
+            box[:] = saved
+        else:
+            observe('append')
+            box.append(saved)
+
+async def fail(error, flag, observe):
+    try:
+        raise error
+    finally:
+        if flag:
+            observe('left')
+        else:
+            observe('right')
+",
+        r"import asyncio, sys
+result = []
+def observe(label):
+    active = sys.exception()
+    result.append((label, type(active).__name__))
+    if replace:
+        raise LookupError(label)
+for replace in (True, False):
+    for flag in (True, False):
+        for exit in ('close', 'throw', 'finish'):
+            box = [1, 2]
+            it = hold(box, flag, observe)
+            next(it)
+            try:
+                if exit == 'close': it.close()
+                elif exit == 'throw': it.throw(ValueError())
+                else: next(it)
+            except BaseException as exc: result.append(type(exc).__name__)
+            result.append(box)
+        try: asyncio.run(fail(KeyError(), flag, observe))
+        except Exception as exc: result.append(type(exc).__name__)
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn nested_finalizers_run_under_the_right_active_exception() {
     check_fixture(
         r"async def unwind(wait, failure, emit):

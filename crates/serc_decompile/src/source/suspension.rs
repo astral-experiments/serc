@@ -52,8 +52,11 @@ impl Body<'_, '_, '_> {
             self.handlers = super::protected_regions::suspended(bc, self);
             ops.iter()
                 .rposition(|op| matches!(op.name, "RETURN_VALUE" | "RETURN_CONST"))
-                .ok_or("generator has no return")?
-                + 1
+                .map(|last| last + 1)
+                .or_else(|| {
+                    super::protected_regions::returnless_end(bc, &self.flow, &self.handlers)
+                })
+                .ok_or("unsupported returnless suspension scope")?
         };
         if self.depth > 0 && !self.class {
             self.index_terminal_returns(&ops[..end], stop_handler);
