@@ -7,6 +7,9 @@ use serc_bytecode::instructions::Handler;
 
 use super::{Body, Bytecode, Instruction};
 use crate::flow::Graph;
+mod finally;
+
+use finally::{break_marker, finally_region, returning_finally_loop};
 
 pub(super) type Handlers = FxHashMap<usize, Protected>;
 
@@ -24,6 +27,7 @@ enum Clause {
 }
 
 pub(super) struct Protected {
+    return_exits: Vec<super::regions::ReturnExit>,
     end: usize,
     next: usize,
     clause: Clause,
@@ -223,18 +227,22 @@ fn region(
         return None;
     }
 
+    let (unwind, cleanup) = super::dispatch::unwind(ops, flow, dispatch, first.depth + 1)?;
+    let finalizer = unwind.start == ops[dispatch].offset
+        && ops[dispatch + 1].name != "POP_TOP"
+        && ops[dispatch + 1].name != "BUILD_LIST"
+        && super::dispatch::typed_handler(flow, ops, dispatch + 1).is_none()
+        && super::finalizers::owns_cleanup(ops, owner, dispatch..cleanup, unwind);
+    if finalizer
+        && let Some(region) = returning_finally_loop(ops, owner, entries, start, dispatch, cleanup)
+    {
+        return Some((start, region));
+    }
     let end = protected_end(ops, flow, entries, inner)?;
     if end > dispatch {
         return None;
     }
-    let (unwind, cleanup) = super::dispatch::unwind(ops, flow, dispatch, first.depth + 1)?;
-    if unwind.start == ops[dispatch].offset
-        && super::finalizers::owns_cleanup(ops, flow, dispatch..cleanup, unwind)
-        && ops[dispatch + 1].name != "POP_TOP"
-        && ops[dispatch + 1].name != "BUILD_LIST"
-        && super::dispatch::typed_handler(flow, ops, dispatch + 1).is_none()
-        && let Some(finally) = finally_region(ops, owner, start..end, dispatch, cleanup)
-    {
+    if finalizer && let Some(finally) = finally_region(ops, owner, start..end, dispatch, cleanup) {
         return Some((start, finally));
     }
     let mut following = Vec::new();
@@ -373,6 +381,7 @@ fn region(
     Some((
         start,
         Protected {
+            return_exits: Vec::new(),
             end,
             next,
             clause: Clause::Except {
@@ -431,99 +440,6 @@ fn guarded_return_end(
         }
         _ => None,
     }
-}
-
-/// Match the normal copy to the exceptional one, up to its final reraise.
-fn finally_region(
-    ops: &[Instruction],
-    owner: &Body<'_, '_, '_>,
-    suite: Range<usize>,
-    dispatch: usize,
-    cleanup: usize,
-) -> Option<Protected> {
-    let flow = &owner.flow;
-    let reraise = cleanup.checked_sub(1)?;
-    let exceptional = dispatch + 1..reraise;
-    if exceptional.is_empty() || (ops[reraise].name, ops[reraise].arg) != ("RERAISE", 0) {
-        return None;
-    }
-    let terminal = ops[exceptional.clone()]
-        .iter()
-        .any(|op| (op.name, op.arg) == ("RERAISE", 0));
-    let copy = if terminal {
-        dispatch + 1..cleanup
-    } else {
-        exceptional
-    };
-    let end = suite.end;
-    // If every normal path raises, CPython emits only the exceptional copy.
-    if ops[end - 1].name == "RAISE_VARARGS"
-        && flow.blocks_in(suite.clone()).all(|block| {
-            let last = block.ops.end - 1;
-            let jump = flow.jump(last);
-            let fallthrough = flow.fallthrough(block);
-            [jump, fallthrough]
-                .into_iter()
-                .flatten()
-                .all(|dest| suite.contains(&dest))
-                && (jump.is_some() || fallthrough.is_some() || ops[last].name == "RAISE_VARARGS")
-        })
-    {
-        return Some(Protected {
-            end,
-            next: end,
-            clause: Clause::Finally {
-                deferred_return: end..end,
-                terminal_unwind: terminal.then_some(ops[cleanup].offset),
-            },
-            handler: copy,
-            try_exits: None,
-            handler_exits: None,
-            handler_tail: None,
-        });
-    }
-    let marker = ops[end].name == "NOP";
-    let deferred = marker && !break_marker(ops, flow, suite);
-    let start = end + usize::from(marker);
-    let normal = start..owner.finally_copy_end(ops, start..dispatch, copy.clone(), terminal)?;
-    // A return of a constant can leave a tracing NOP at its original site,
-    // with the constant materialized only after the normal cleanup.
-    let mut next = normal.end;
-    if deferred && !terminal {
-        next += match ops.get(next..)? {
-            [ret, ..] if ret.name == "RETURN_CONST" => 1,
-            [load, ret, ..]
-                if matches!(
-                    load.name,
-                    "LOAD_CONST" | "LOAD_COMMON_CONSTANT" | "LOAD_SMALL_INT"
-                ) && ret.name == "RETURN_VALUE" =>
-            {
-                2
-            }
-            _ => return None,
-        };
-    }
-    Some(Protected {
-        end,
-        next,
-        clause: Clause::Finally {
-            deferred_return: normal.end..next,
-            terminal_unwind: terminal.then_some(ops[cleanup].offset),
-        },
-        handler: if terminal { copy } else { normal },
-        try_exits: None,
-        handler_exits: None,
-        handler_tail: None,
-    })
-}
-
-/// A break can jump to a tracing NOP before the finalizer. Its operand
-/// stack is empty there and execution continues after cleanup.
-fn break_marker(ops: &[Instruction], flow: &Graph, suite: Range<usize>) -> bool {
-    ops[suite.end].name == "NOP"
-        && flow.incoming(suite.end).any(|i| {
-            suite.contains(&i) && ops[i].name == "JUMP_FORWARD" && flow.jump(i) == Some(suite.end)
-        })
 }
 
 fn protected_end(
@@ -689,14 +605,17 @@ impl Body<'_, '_, '_> {
         start: usize,
         limit: usize,
         level: usize,
-        entry: &Protected,
+        entry: &mut Protected,
     ) -> Result<Option<usize>, String> {
         if entry.next > limit || !self.stack.is_empty() {
             return Ok(None);
         }
-        let (mut suite, returns) = self
-            .protected_fragment(ops, start..entry.end, level, entry.try_exits)?
-            .pending_return()?;
+        let outer = std::mem::replace(&mut self.active_try, self.flow.handler(start));
+        std::mem::swap(&mut self.return_exits, &mut entry.return_exits);
+        let suite = self.protected_fragment(ops, start..entry.end, level, entry.try_exits);
+        std::mem::swap(&mut self.return_exits, &mut entry.return_exits);
+        self.active_try = outer;
+        let (mut suite, returns) = suite?.pending_return()?;
         let mut next = entry.next;
         let carried = returns && next == limit && matches!(entry.clause, Clause::Finally { .. });
         if returns && !carried {

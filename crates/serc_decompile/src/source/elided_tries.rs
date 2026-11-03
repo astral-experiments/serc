@@ -43,9 +43,14 @@ impl Body<'_, '_, '_> {
             // paths. Its exceptional copy ends by reraising the exception.
             let copy = start + 1..cleanup - 1;
             if (ops[cleanup - 1].name, ops[cleanup - 1].arg) == ("RERAISE", 0)
-                && finalizers::owns_cleanup(ops, &self.flow, start..cleanup, handler)
+                && finalizers::owns_cleanup(ops, self, start..cleanup, handler)
                 && !copy.is_empty()
-                && let Some(after) = self.finally_copy_end(ops, cursor..normal_end, copy, false)
+                && let Some(after) = self.finally_copy_end(
+                    ops,
+                    cursor..normal_end,
+                    copy,
+                    finalizers::CopyExit::Fallthrough,
+                )
             {
                 let suite = self.fragment(ops, cursor, after, 0)?.suite()?;
                 self.block("finally:", &suite)?;

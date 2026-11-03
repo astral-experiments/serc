@@ -3136,6 +3136,71 @@ result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is 
 
 #[cfg(feature = "decompile")]
 #[test]
+fn returning_loops_await_the_finalizer_on_every_exit() {
+    check_fixture(
+        r"async def transfer(limit, read, write, record, restore):
+    sent = 0
+    try:
+        while True:
+            if limit:
+                if sent >= limit:
+                    return sent
+            item = await read()
+            if not item:
+                return sent
+            await write(item)
+            sent += item
+    finally:
+        if sent:
+            record(sent)
+        await restore()
+
+async def count(read, seek):
+    total = 0
+    try:
+        while True:
+            n = await read()
+            if n <= 0:
+                return total
+            total += n
+    finally:
+        if total > 0:
+            seek(total)
+",
+        r"import asyncio, sys
+result = []
+async def run(limit, failure, replace):
+    pieces = iter([1, 2, 0])
+    def record(event): result.append((event, type(sys.exception()).__name__))
+    async def read():
+        value = next(pieces)
+        record(('read', value))
+        await asyncio.sleep(0)
+        if value == 2 and failure == 'read': raise asyncio.CancelledError()
+        return value
+    async def write(value):
+        record(('write', value))
+        await asyncio.sleep(0)
+        if value == 2 and failure == 'write': raise OSError()
+    async def restore():
+        record('restore')
+        await asyncio.sleep(0)
+        if replace: raise LookupError()
+    try: result.append(await transfer(limit, read, write, record, restore))
+    except BaseException as exc: result.append(type(exc).__name__)
+    pieces = iter([1, 2, 0] if limit else [0])
+    try: result.append(await count(read, record))
+    except BaseException as exc: result.append(type(exc).__name__)
+for limit in (0, 1, 3):
+    for failure in (None, 'write', 'read'):
+        for replace in (False, True):
+            asyncio.run(run(limit, failure, replace))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn finalizers_protect_loop_predicates_and_pending_managed_returns() {
     check_fixture(
         r"def run(step, ready, cleanup):

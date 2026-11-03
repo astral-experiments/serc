@@ -1,16 +1,11 @@
 //! Recover context manager entries, protected bodies, and suppression exits.
+use super::regions::ReturnExit;
 use super::{Body, Bytecode, Instruction, Value, exceptions::boundary};
 use crate::flow::Graph;
 use rustc_hash::FxHashMap;
 use serc_bytecode::instructions::Handler;
 use serc_bytecode::target::operands::SpecialMethod;
 use std::ops::Range;
-
-pub(super) struct ReturnExit {
-    pub(super) start: usize,
-    pub(super) ret: usize,
-    pub(super) pending: bool,
-}
 
 pub(super) fn body_end(ops: &[Instruction], flow: &Graph, entry: Handler) -> Result<usize, String> {
     let mut end = boundary(ops, entry.end)?;
@@ -433,9 +428,9 @@ impl Body<'_, '_, '_> {
                 end = body_end(ops, &self.flow, next)?;
             }
         }
-        let outer = std::mem::replace(&mut self.manager_exits, exits);
+        let outer = std::mem::replace(&mut self.return_exits, exits);
         let body = self.seeded(ops, start, end, level, seed);
-        self.manager_exits = outer;
+        self.return_exits = outer;
         let (body, returns) = body?.pending_return()?;
         // Adjacent managers of the same kind share a header. A switch
         // between with and async with requires a nested suite.

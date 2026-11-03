@@ -216,7 +216,10 @@ impl Body<'_, '_, '_> {
             }
             let protected = self.flow.handler(start).is_some_and(|h| {
                 let generator_exit = Some(h.target) == stop && h.depth == 0 && h.lasti;
-                !generator_exit && self.delegated_cleanup(ops, start).is_none()
+                let current = self.active_try.is_some_and(|entry| {
+                    (entry.target, entry.depth, entry.lasti) == (h.target, h.depth, h.lasti)
+                });
+                !current && !generator_exit && self.delegated_cleanup(ops, start).is_none()
             });
             if protected
                 || (start != header
@@ -250,7 +253,7 @@ impl Body<'_, '_, '_> {
 
     /// The out-of-line `CLEANUP_THROW` rejoins the same `END_SEND` as the
     /// in-loop `SEND`. Only accept that edge from outside the loop.
-    fn delegation_rejoins_loop(
+    pub(super) fn delegation_rejoins_loop(
         &self,
         ops: &[Instruction],
         start: usize,

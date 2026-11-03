@@ -29,7 +29,7 @@ impl Body<'_, '_, '_> {
     }
 
     /// Resolve the exception edge of a delegated yield and verify that
-    /// its cleanup jump returns to the delegation's own `END_SEND`.
+    /// its cleanup returns to the delegation's own `END_SEND`.
     pub(super) fn delegated_cleanup(&self, ops: &[Instruction], at: usize) -> Option<usize> {
         if !self.suspended() || ops.get(at)?.name != "YIELD_VALUE" {
             return None;
@@ -44,11 +44,11 @@ impl Body<'_, '_, '_> {
             && h.end == ops.get(at + 1)?.offset
             && !h.lasti
             && ops[cleanup].name == "CLEANUP_THROW"
-            && matches!(
-                ops.get(cleanup + 1)?.name,
-                "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
-            )
-            && self.flow.jump(cleanup + 1) == Some(resume))
+            && (cleanup + 1 == resume
+                || (matches!(
+                    ops.get(cleanup + 1)?.name,
+                    "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
+                ) && self.flow.jump(cleanup + 1) == Some(resume))))
         .then_some(cleanup)
     }
 
