@@ -149,6 +149,46 @@ impl Body<'_, '_, '_> {
         }
     }
 
+    /// A continue inside a handler restores the saved exception before it
+    /// jumps. Only drop that slot when the destination is the active iterator
+    /// and the preceding instructions belong to its handler's unwind range.
+    pub(super) fn handler_continue(
+        &self,
+        ops: &[Instruction],
+        pop: usize,
+        limit: usize,
+    ) -> Option<usize> {
+        let jump = pop + 1;
+        if !self.stack.is_empty() || jump >= limit || self.loop_transfer(ops, jump)? != "continue" {
+            return None;
+        }
+        let header = self.flow.jump(jump)?;
+        if ops[header].name != "FOR_ITER" {
+            return None;
+        }
+        let depth = self.flow.for_iter_depth(header)? + 1;
+        let block = self.flow.block(pop);
+        let mut from = pop.checked_sub(1)?;
+        if ops[from].name == "NOT_TAKEN" {
+            from = from.checked_sub(1)?;
+        }
+        let (handler, _) = super::dispatch::unwind(ops, &self.flow, from, depth)?;
+        (block.ops.end == jump + 1
+            && matches!(
+                &ops[block.ops.start..pop],
+                [] | [Instruction {
+                    name: "NOT_TAKEN",
+                    ..
+                }]
+            )
+            && block.height == Some(depth)
+            && self
+                .flow
+                .handler(pop)
+                .is_none_or(|outer| outer.target != handler.target))
+        .then_some(jump)
+    }
+
     /// At the end of an except suite's loop, a failed test can go straight
     /// back to `FOR_ITER` outside the exception table. An explicit continue
     /// inside the handler would protect that jump. Guard the remaining body

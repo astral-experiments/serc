@@ -3136,6 +3136,41 @@ result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is 
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_later_handler_can_continue_the_iterator_or_reraise() {
+    check_fixture(
+        r"def reserve(items, attempt, retry):
+    for item in items:
+        try:
+            value = attempt(item)
+        except FileExistsError:
+            continue
+        except PermissionError:
+            if retry(item):
+                continue
+            else:
+                raise
+        return value, item
+    raise FileExistsError()
+",
+        r"import sys
+result = []
+def attempt(item):
+    result.append(('attempt', item, sys.exception() is None))
+    if item == 0: raise FileExistsError()
+    if item < 0: raise PermissionError(item)
+    return 7
+def retry(item):
+    result.append(('retry', sys.exception().args))
+    return item == -1
+for items in ([0, -1, 4], [-2, 7], [0]):
+    try: result.append(reserve(items, attempt, retry))
+    except OSError as exc: result.append((type(exc).__name__, exc.args))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn separate_bound_handler_arms_reach_their_own_cleanup() {
     check_fixture(
         r"def send(work, first, record):

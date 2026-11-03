@@ -352,6 +352,7 @@ impl Body<'_, '_, '_> {
                 self.line("break")?;
                 Ok(self.flow.block(i).ops.end)
             }
+            "POP_EXCEPT" if let Some(jump) = self.handler_continue(ops, i, end) => Ok(jump),
             "SWAP" | "POP_TOP" if let Some(next) = self.iterator_return(ops, i, end) => Ok(next),
             "SWAP" if let Some(ret) = self.handler_value_return(ops, i, end) => Ok(ret),
             "SWAP" if super::comparisons::is_link(&ops[i..end]) => {
