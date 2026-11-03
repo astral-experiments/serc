@@ -12,10 +12,10 @@ use super::{
 };
 
 pub(super) struct Header {
-    copies: usize,
+    pub(super) copies: usize,
     operand: usize,
     compare: usize,
-    branch: usize,
+    pub(super) branch: usize,
 }
 
 pub(super) fn header(ops: &[Instruction], mut at: usize, version: PythonVersion) -> Option<Header> {
@@ -74,7 +74,7 @@ pub(super) fn header(ops: &[Instruction], mut at: usize, version: PythonVersion)
         })
 }
 
-fn after_test(ops: &[Instruction], branch: usize) -> usize {
+pub(super) fn after_test(ops: &[Instruction], branch: usize) -> usize {
     branch + 1 + usize::from(ops.get(branch + 1).is_some_and(|op| op.name == "NOT_TAKEN"))
 }
 
@@ -95,21 +95,29 @@ struct CaseTest {
 }
 
 impl Body<'_, '_, '_> {
-    fn pattern_operand(
+    pub(super) fn pattern_expression(
+        &mut self,
+        ops: &[Instruction],
+        start: usize,
+        end: usize,
+        level: usize,
+    ) -> Result<String, String> {
+        let text = self.fragment(ops, start, end, level)?.expression()?;
+        let parsed = ruff_python_parser::parse_expression(&text).map_err(|e| e.to_string())?;
+        Ok(Generator::new(&Indentation::default(), LineEnding::Lf).expr(parsed.expr()))
+    }
+
+    pub(super) fn pattern_operand(
         &mut self,
         ops: &[Instruction],
         test: &Header,
         level: usize,
     ) -> Result<String, String> {
-        Ok(if test.compare == test.branch {
-            "None".into()
+        if test.compare == test.branch {
+            Ok("None".into())
         } else {
-            let text = self
-                .fragment(ops, test.operand, test.compare, level)?
-                .expression()?;
-            let parsed = ruff_python_parser::parse_expression(&text).map_err(|e| e.to_string())?;
-            Generator::new(&Indentation::default(), LineEnding::Lf).expr(parsed.expr())
-        })
+            self.pattern_expression(ops, test.operand, test.compare, level)
+        }
     }
 
     fn copied_alternatives(

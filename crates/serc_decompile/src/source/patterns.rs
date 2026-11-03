@@ -44,6 +44,22 @@ impl Body<'_, '_, '_> {
         let copied = ops[i].name == "COPY";
         let head = i + usize::from(copied);
         let op = ops[head];
+        if op.name == "MATCH_SEQUENCE"
+            && let Some(arms) = self.terminal_sequence_cases(&ops[..end], i, level)
+        {
+            let subject = self.expr()?;
+            let mut cases = String::new();
+            for (pattern, body) in arms {
+                let suite = self.fragment(ops, body.start, body.end, level)?.suite()?;
+                if pattern == "_" && ops[body.start].name != "NOP" && suite.lines().count() == 1 {
+                    writeln!(cases, "case _: {}", suite.trim_end()).unwrap();
+                } else {
+                    case(&mut cases, &pattern, &suite);
+                }
+            }
+            self.block(&format!("match {subject}:"), &cases)?;
+            return Ok(end);
+        }
         let mut class = None;
         if op.name == "MATCH_CLASS" {
             let keys = self.expr()?;

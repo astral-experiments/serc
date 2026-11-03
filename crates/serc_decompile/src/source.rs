@@ -23,6 +23,7 @@ mod patterns;
 mod protected_regions;
 mod regions;
 mod strings;
+mod structural_patterns;
 mod suspension;
 pub(super) mod synthetic;
 mod type_params;
