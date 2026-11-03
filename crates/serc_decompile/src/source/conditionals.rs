@@ -380,6 +380,9 @@ impl Body<'_, '_, '_> {
         }
         if self.loop_edges.is_some()
             && let Some(handler) = self.flow.handler(i)
+            && self
+                .active_try
+                .is_none_or(|active| active.target != handler.target)
             && !handler.lasti
             && handler.depth > 0
             && ops
@@ -553,6 +556,13 @@ impl Body<'_, '_, '_> {
                     if ops[tail].name == "RETURN_CONST"
                         || ops[end - 1].name == "RETURN_CONST"
                         || (target + 2 == end && ops[target].name == "LOAD_FAST_BORROW")
+                        // Two unprotected iterator cleanups are separate
+                        // returns. A conditional expression shares its cleanup.
+                        || self.active_try.is_some_and(|h| {
+                            [tail, end - 1].into_iter().all(|ret|
+                                super::protected_regions::iterator_return_block(
+                                    ops, &self.flow, self.flow.block(ret).ops.clone(), h.depth))
+                        })
                     {
                         self.block(&format!("if {test}:"), &suite)?;
                         self.line(&format!("return {b}"))?;

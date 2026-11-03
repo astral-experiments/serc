@@ -410,36 +410,42 @@ fn guarded_return_end(
 ) -> Option<usize> {
     let block = flow.block(suite.end);
     let next = block.ops.end;
-    if block.ops.start != suite.end
-        || next >= dispatch
-        || flow.handler(suite.end).is_some()
-        || block.height != Some(depth + 1)
-        || !flow
-            .incoming(next)
-            .any(|i| suite.contains(&i) && ops[i].name.starts_with("POP_JUMP_IF_"))
-    {
+    if block.ops.start != suite.end || next >= dispatch {
         return None;
     }
-    let (ret, cleanup) = ops[block.ops.clone()].split_last()?;
-    if ret.name != "RETURN_VALUE" {
-        return None;
+    let skipped = flow.incoming(next).any(|i| {
+        suite.contains(&i) && ops[i].name.starts_with("POP_JUMP_IF_") && flow.jump(i) == Some(next)
+    });
+    if depth == 0 {
+        return (skipped
+            && block.height == Some(1)
+            && flow.handler(suite.end).is_none()
+            && matches!(&ops[block.ops.clone()], [ret] if ret.name == "RETURN_VALUE"))
+        .then_some(next);
     }
-    match cleanup {
-        [] if depth == 0 => Some(next),
-        [swap, pops @ ..]
-            if depth > 0
-                && swap.name == "SWAP"
-                && swap.arg as usize == depth + 1
-                && pops.len() == depth
-                && pops.iter().all(|op| op.name == "POP_TOP")
-                && flow.jump(next).is_some_and(|header| {
-                    ops[header].name == "FOR_ITER" && flow.for_iter_depth(header) == Some(depth)
-                }) =>
-        {
-            Some(next)
-        }
-        _ => None,
-    }
+    let header = |i: usize| {
+        i < suite.start && ops[i].name == "FOR_ITER" && flow.for_iter_depth(i) == Some(depth)
+    };
+    // When both arms return, the handler owns the only edge back to the
+    // iterator. Otherwise the skipped return must lead to this loop's latch.
+    (iterator_return_block(ops, flow, block.ops.clone(), depth)
+        && ((ops[next].name == "END_FOR" && flow.incoming(next).any(header))
+            || (skipped && flow.jump(next).is_some_and(header))))
+    .then_some(next)
+}
+
+pub(super) fn iterator_return_block(
+    ops: &[Instruction],
+    flow: &Graph,
+    span: Range<usize>,
+    depth: usize,
+) -> bool {
+    depth > 0
+        && flow.block(span.start).ops == span
+        && flow.block(span.start).height == Some(depth + 1)
+        && flow.handler(span.start).is_none()
+        && matches!(&ops[span], [swap, pops @ .., ret] if (swap.name, swap.arg as usize) == ("SWAP", depth + 1)
+            && pops.len() == depth && pops.iter().all(|op| op.name == "POP_TOP") && ret.name == "RETURN_VALUE")
 }
 
 fn protected_end(
@@ -493,6 +499,20 @@ fn protected_end(
             if index(entry.end)? != expected_end {
                 return None;
             }
+            continue;
+        }
+        if end < at
+            && iterator_return_block(ops, flow, end..at, first.depth)
+            && flow.incoming(at).any(|i| {
+                i < end
+                    && flow.jump(i) == Some(at)
+                    && ops[i].name.starts_with("POP_JUMP_IF_")
+                    && flow.handler(i).is_some_and(|h| {
+                        (h.target, h.depth, h.lasti) == (first.target, first.depth, false)
+                    })
+            })
+        {
+            end = index(entry.end)?;
             continue;
         }
         // Once TO_BOOL succeeded, newer targets leave both the conditional

@@ -3136,6 +3136,37 @@ result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is 
 
 #[cfg(feature = "decompile")]
 #[test]
+fn either_return_can_consume_the_iterator_after_a_protected_call() {
+    check_fixture(
+        r"def choose(items, select, build):
+    for item in items:
+        try:
+            if select(item):
+                return build(item, 1)
+            else:
+                return build(item, 2)
+        except KeyError:
+            pass
+    return None
+",
+        r"import sys
+result = []
+def select(item):
+    result.append(('select', item, sys.exception() is None))
+    if item == 'skip': raise KeyError()
+    return item != 'second'
+def build(item, arm):
+    result.append(('build', item, arm))
+    if item == 'bad': raise KeyError()
+    return arm
+for items in ([], ['bad', 'skip'], ['bad', 'first'], ['skip', 'second', 'unused']):
+    result.append(choose(items, select, build))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn returning_loops_await_the_finalizer_on_every_exit() {
     check_fixture(
         r"async def transfer(limit, read, write, record, restore):
