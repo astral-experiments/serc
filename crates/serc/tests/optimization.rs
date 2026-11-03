@@ -1254,6 +1254,29 @@ fn async_iterator_exhaustion_keeps_copied_branch_exit() {
 }
 
 #[test]
+fn a_final_guard_locates_the_normal_exit_before_async_cleanup() {
+    let source = r"async def run(manager, value):
+    async with manager:
+        outer = acquire()
+        try:
+            if first(value):
+                pass
+            elif second(value):
+                try:
+                    pass
+                except ValueError as error:
+                    pass
+                finally:
+                    await inner.stop()
+        except ValueError as error:
+            pass
+        finally:
+            await outer.stop()
+";
+    assert_matches_cpython(source, "guarded_async_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn conditional_try_arms_share_the_normal_exit_before_copying() {
     for exit in [
         "return item",
