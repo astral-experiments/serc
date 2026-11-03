@@ -15,6 +15,24 @@ use serc::{
 };
 
 #[test]
+fn nested_finalizer_guards_copy_iterator_returns_in_source_order() {
+    let source = r"def process(items, options):
+    for item in items:
+        try:
+            consume(item)
+        except Interrupted:
+            break
+        finally:
+            if options.enabled:
+                if options.preview:
+                    show(item)
+                if options.save:
+                    save(item)
+";
+    assert_matches_cpython(source, "copied_iterator_return_order.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
