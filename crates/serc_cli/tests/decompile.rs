@@ -3136,6 +3136,83 @@ result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is 
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_suspended_cleanups_final_guard_rejoins_the_while_test() {
+    check_fixture(
+        r"async def drain(tasks, errors):
+    seen = []
+    while tasks:
+        task = tasks.pop()
+        try:
+            if await task():
+                seen.append(1)
+        except ValueError as exc:
+            errors.append(exc.args)
+    return seen
+
+def first_loop(step):
+    while 1:
+        value = step()
+        if value is None:
+            return
+        if value:
+            break
+    return value
+",
+        r"import asyncio
+result = []
+def task(value):
+    async def run():
+        if value < 0: raise ValueError(value)
+        return value
+    return run
+errors = []
+result.append((asyncio.run(drain(list(map(task, [1, 0, -1, 1])), errors)), errors))
+result.append(tuple(type(c).__name__ for c in first_loop.__code__.co_consts))
+for seq in ([0, 2], [None]):
+    result.append(first_loop(iter(seq).__next__))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn only_the_successful_iteration_enters_the_delegating_else_suite() {
+    check_fixture(
+        r"def walk(items, visit, fail):
+    for item in items:
+        yield item
+        if item:
+            try:
+                visit(item)
+            except KeyError:
+                if fail is not None:
+                    fail(item)
+            except ValueError:
+                if fail is not None:
+                    fail(item)
+                else:
+                    raise
+            else:
+                yield from children(item)
+",
+        r"import sys
+result = []
+def visit(item):
+    if item == 1: raise KeyError()
+    if item == 2: raise ValueError()
+def children(item):
+    yield item * 10
+    if item == 4: raise KeyError('during else')
+def record(item): result.append((item, type(sys.exception()).__name__))
+for callback in (record, None):
+    try: result.extend(walk(range(5), visit, callback))
+    except Exception as exc: result.append((type(exc).__name__, exc.args))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_later_handler_can_continue_the_iterator_or_reraise() {
     check_fixture(
         r"def reserve(items, attempt, retry):

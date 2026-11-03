@@ -360,16 +360,16 @@ impl Body<'_, '_, '_> {
         Some((arms, join))
     }
 
-    pub(super) fn raising_arms(
+    pub(super) fn following_arms(
         &self,
         ops: &[Instruction],
         start: usize,
         cleanup: usize,
-    ) -> Option<Vec<Arm>> {
-        let (arms, _) = self.handler_arms(ops, start, cleanup)?;
+    ) -> Option<(Vec<Arm>, Option<usize>)> {
+        let (arms, join) = self.handler_arms(ops, start, cleanup)?;
         arms.iter()
-            .all(|arm| matches!(arm.exit, Exit::Raise))
-            .then_some(arms)
+            .all(|arm| matches!(arm.exit, Exit::Raise | Exit::Jump(_)))
+            .then_some((arms, join))
     }
 
     /// Locate `POP_EXCEPT` and the first instruction after normal binding cleanup.

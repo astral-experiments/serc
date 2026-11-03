@@ -9,9 +9,13 @@ use super::{Body, Bytecode, Instruction};
 use crate::flow::Graph;
 mod finally;
 mod handler_returns;
+mod loop_exits;
 
 use finally::{break_marker, finally_region, returning_finally_loop};
 use handler_returns::{enclosing_exception, nested_handler_return, returning_handler_child};
+
+pub(super) use loop_exits::iterator_return_block;
+use loop_exits::{guarded_return_end, iterator_success_latch};
 
 pub(super) type Handlers = FxHashMap<usize, Protected>;
 
@@ -296,14 +300,15 @@ fn region(
         return Some((start, finally));
     }
     let mut following = Vec::new();
+    let mut following_join = None;
     let (kind, binding, stop) = if ops.get(dispatch + 1)?.name == "POP_TOP" {
         (None, dispatch + 1, cleanup)
     } else {
         let (check, pop, failed) = super::dispatch::typed_handler(flow, ops, dispatch + 1)?;
         if failed + 1 != cleanup || (ops[failed].name, ops[failed].arg) != ("RERAISE", 0) {
-            // Further matches that only raise have no normal continuation
-            // to reconcile with the first arm or the successful try.
-            following = owner.raising_arms(ops, failed, cleanup)?;
+            // Any later matches that fall through must rejoin the same
+            // iterator as the first arm. Check that after placing its else.
+            (following, following_join) = owner.following_arms(ops, failed, cleanup)?;
         }
         let stop = if ops[pop].name == "POP_TOP" {
             failed
@@ -423,7 +428,16 @@ fn region(
                 {
                     return None;
                 }
-                handler_tail = Some(stop - 1..stop);
+                // A handler consisting only of the backedge can be a source
+                // continue followed by ordinary statements in the loop.
+                if body < pop
+                    && let Some(latch) = iterator_success_latch(owner, ops, start..next, to)
+                {
+                    success = next..latch;
+                    next = latch;
+                } else {
+                    handler_tail = Some(stop - 1..stop);
+                }
             }
             body..pop
         }
@@ -486,6 +500,18 @@ fn region(
             body..handler_exits.map_or(pop, |copies| copies.first)
         }
     };
+    let try_exits = loop_exits::copied_latch(ops, flow, start..end, next);
+    if try_exits.is_some() {
+        next += 1;
+    }
+    if let Some(header) = following_join
+        && (ops[header].name != "FOR_ITER"
+            || flow.for_iter_depth(header) != Some(first.depth)
+            || ops[next].name != "JUMP_BACKWARD"
+            || flow.jump(next) != Some(header))
+    {
+        return None;
+    }
     Some((
         start,
         Protected {
@@ -498,62 +524,12 @@ fn region(
                 success,
                 following,
             },
-            try_exits: None,
+            try_exits,
             handler_exits,
             handler,
             handler_tail,
         },
     ))
-}
-
-/// A guarded return evaluates its value under protection but returns it
-/// outside the table. In a for loop the same block first drops the iterator.
-/// The other arm skips the whole epilogue and continues after the try.
-fn guarded_return_end(
-    ops: &[Instruction],
-    flow: &Graph,
-    suite: Range<usize>,
-    dispatch: usize,
-    depth: usize,
-) -> Option<usize> {
-    let block = flow.block(suite.end);
-    let next = block.ops.end;
-    if block.ops.start != suite.end || next >= dispatch {
-        return None;
-    }
-    let skipped = flow.incoming(next).any(|i| {
-        suite.contains(&i) && ops[i].name.starts_with("POP_JUMP_IF_") && flow.jump(i) == Some(next)
-    });
-    if depth == 0 {
-        return (skipped
-            && block.height == Some(1)
-            && flow.handler(suite.end).is_none()
-            && matches!(&ops[block.ops.clone()], [ret] if ret.name == "RETURN_VALUE"))
-        .then_some(next);
-    }
-    let header = |i: usize| {
-        i < suite.start && ops[i].name == "FOR_ITER" && flow.for_iter_depth(i) == Some(depth)
-    };
-    // When both arms return, the handler owns the only edge back to the
-    // iterator. Otherwise the skipped return must lead to this loop's latch.
-    (iterator_return_block(ops, flow, block.ops.clone(), depth)
-        && ((ops[next].name == "END_FOR" && flow.incoming(next).any(header))
-            || (skipped && flow.jump(next).is_some_and(header))))
-    .then_some(next)
-}
-
-pub(super) fn iterator_return_block(
-    ops: &[Instruction],
-    flow: &Graph,
-    span: Range<usize>,
-    depth: usize,
-) -> bool {
-    depth > 0
-        && flow.block(span.start).ops == span
-        && flow.block(span.start).height == Some(depth + 1)
-        && flow.handler(span.start).is_none()
-        && matches!(&ops[span], [swap, pops @ .., ret] if (swap.name, swap.arg as usize) == ("SWAP", depth + 1)
-            && pops.len() == depth && pops.iter().all(|op| op.name == "POP_TOP") && ret.name == "RETURN_VALUE")
 }
 
 fn protected_end(

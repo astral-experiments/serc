@@ -28,6 +28,28 @@ fn local_return(ops: &[Instruction], end: usize) -> Option<usize> {
 }
 
 impl Body<'_, '_, '_> {
+    /// 3.14+ retains the first constant loop test even after folding it.
+    /// A leading loop can therefore distinguish `while 1` from `while True`.
+    fn constant_loop(
+        &mut self,
+        ops: &[Instruction],
+        marker: usize,
+        suite: &str,
+    ) -> Result<(), String> {
+        if self.m.version >= super::PythonVersion::Py314
+            && ops[..marker]
+                .iter()
+                .all(|op| matches!(op.name, "COPY_FREE_VARS" | "MAKE_CELL" | "RESUME"))
+            && let Some(&id) = self.m.tuple(self.code.constants)?.first()
+            && let super::Object::Int(value) = self.m.objects[id]
+            && value != 0
+        {
+            self.block(&format!("while {value}:"), suite)
+        } else {
+            self.block("while True:", suite)
+        }
+    }
+
     fn copied_return(
         &self,
         ops: &[Instruction],
@@ -130,7 +152,7 @@ impl Body<'_, '_, '_> {
         };
         let mut suite = body.suite()?;
         writeln!(suite, "if {test}:\n    break").unwrap();
-        self.block("while True:", &suite)?;
+        self.constant_loop(ops, nop, &suite)?;
         Ok(Some(jump + 1))
     }
 
@@ -283,7 +305,7 @@ impl Body<'_, '_, '_> {
         });
         let body = self.fragment(ops, nop + 1, latch, level);
         self.loop_edges = outer;
-        self.block("while True:", &body?.suite()?)?;
+        self.constant_loop(ops, nop, &body?.suite()?)?;
         if let Some(at) = copied_return {
             self.region(ops, at, self.flow.block(at).ops.end, level)?;
         }
