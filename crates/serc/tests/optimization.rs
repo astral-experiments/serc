@@ -15,6 +15,30 @@ use serc::{
 };
 
 #[test]
+fn conditional_exits_share_the_named_handler_cleanup() {
+    let source = r"def check(ready, value):
+    try:
+        visit(value)
+    except ValueError as error:
+        if ready:
+            assert value, str(error)
+    finish(value)
+
+def choose(first, second, value):
+    try:
+        visit(value)
+    except ValueError as error:
+        if first:
+            return error
+        elif second:
+            if value:
+                report(error)
+    finish(value)
+";
+    assert_matches_cpython(source, "handler_cleanup.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
