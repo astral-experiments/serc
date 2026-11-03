@@ -8422,6 +8422,16 @@ fn erased_loop_prefix_keeps_the_enclosing_condition_return() {
 }
 
 #[test]
+fn nested_match_guard_keeps_the_assignment_fallthrough_position() {
+    for action in ["options[value] = ready", "notify(ready)"] {
+        let source = format!(
+            "def choose(value, options, ready):\n    match value:\n        case 1:\n            if ready or valid(value):\n                if ready:\n                    pass\n                else:\n                    {action}\n    return consume(options, ready)\n"
+        );
+        assert_matches_cpython(&source, "case.py", &LEVELS);
+    }
+}
+
+#[test]
 fn nested_match_case_guard_keeps_each_exit_position() {
     let source = r"async def run(outer, inner, first, second, visit):
     try:
