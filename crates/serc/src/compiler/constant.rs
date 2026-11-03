@@ -781,18 +781,28 @@ impl Compiler<'_> {
         Ok(())
     }
 
-    /// Captures removed operands for a collection synthesized from constant expressions.
+    /// Captures removed operands for a folded collection, using the values when already available.
     pub(super) fn record_folded_collection_operands<'ast>(
         &mut self,
         expressions: impl Iterator<Item = &'ast Expr>,
+        folded_values: Option<&[Constant]>,
     ) -> Result<Option<std::ops::Range<usize>>, CompileError> {
         if self.context.python_version <= PythonVersion::Py313 {
             return Ok(None);
         }
         let first = self.output.deferred_constants.len();
         let mut needs_admissions = false;
+        let mut folded_values = folded_values.unwrap_or_default().iter();
         for expression in expressions {
-            self.record_folded_value(expression)?;
+            // The collection already owns the parsed limbs for an integer literal.
+            // Compound expressions still need their individual operand admissions.
+            if let Some(value @ Constant::BigInt { .. }) = folded_values.next()
+                && matches!(expression, Expr::NumberLiteral(_))
+            {
+                self.add_constant(value.clone())?;
+            } else {
+                self.record_folded_value(expression)?;
+            }
             needs_admissions |=
                 contains_negative_empty_repetition(expression, self.context.python_version);
         }
@@ -4644,11 +4654,53 @@ fn pack_integer_bytes(bytes: impl Iterator<Item = u8>) -> Vec<u16> {
 /// Pack binary, octal, or hexadecimal digits into little-endian 15-bit marshal limbs.
 fn power_of_two_digits(digits: &str, bits_per_digit: u32) -> Vec<u16> {
     let digits = digits.trim_start_matches(['0', '_']);
+    if bits_per_digit == 4
+        && digits.len() >= 15
+        && memchr::memchr(b'_', digits.as_bytes()).is_none()
+    {
+        return hexadecimal_limbs(digits.as_bytes());
+    }
     let digits = digits
         .chars()
         .rev()
         .filter_map(|digit| digit.to_digit(1 << bits_per_digit));
     pack_integer_digits(digits, bits_per_digit)
+}
+
+/// Fifteen hexadecimal digits occupy exactly four 15-bit marshal limbs.
+fn hexadecimal_limbs(digits: &[u8]) -> Vec<u16> {
+    fn decode_eight(bytes: [u8; 8]) -> u32 {
+        // Valid hexadecimal digits carry their value in the low nibble.
+        // Letters have bit 6 set and need an additional nine.
+        let bytes = u64::from_be_bytes(bytes);
+        let nibbles = (bytes & 0x0f0f_0f0f_0f0f_0f0f) + 9 * ((bytes >> 6) & 0x0101_0101_0101_0101);
+        let pairs = (nibbles | (nibbles >> 4)) & 0x00ff_00ff_00ff_00ff;
+        let quads = (pairs | (pairs >> 8)) & 0x0000_ffff_0000_ffff;
+        ((quads | (quads >> 16)) & 0xffff_ffff) as u32
+    }
+
+    let mut limbs = Vec::with_capacity(digits.len().div_ceil(15) * 4);
+    let mut chunks = digits.rchunks_exact(15);
+    for chunk in &mut chunks {
+        // The two eight-digit reads share their middle nibble.
+        let high = decode_eight(*chunk.first_chunk().unwrap());
+        let low = decode_eight(*chunk.last_chunk().unwrap());
+        let value = (u64::from(high) << 28) | u64::from(low);
+        limbs.extend_from_slice(&[
+            (value & 0x7fff) as u16,
+            ((value >> 15) & 0x7fff) as u16,
+            ((value >> 30) & 0x7fff) as u16,
+            ((value >> 45) & 0x7fff) as u16,
+        ]);
+    }
+    let mut high = chunks.remainder().iter().fold(0_u64, |value, &digit| {
+        (value << 4) | u64::from((digit & 15) + 9 * (digit >> 6))
+    });
+    while high != 0 {
+        limbs.push((high & 0x7fff) as u16);
+        high >>= 15;
+    }
+    limbs
 }
 
 /// Pack little-endian digits of up to eight bits into 15-bit marshal limbs.
@@ -4697,6 +4749,23 @@ mod tests {
             ] {
                 assert_eq!(super::big_integer_digits(&token), expected, "{token}");
             }
+        }
+    }
+
+    #[test]
+    fn hexadecimal_blocks_preserve_every_nibble_and_partial_limb() {
+        let alphabet = b"1e2D3c4B5a69780F";
+        for length in 1..=91 {
+            let digits: String = (0..length)
+                .map(|index| char::from(alphabet[(index + length) % alphabet.len()]))
+                .collect();
+            // Separators use the digit-by-digit path and leave the integer unchanged.
+            let separated: String = digits.chars().flat_map(|digit| ['_', digit]).collect();
+            assert_eq!(
+                super::big_integer_digits(&format!("0x000{digits}")),
+                super::big_integer_digits(&format!("0X{separated}")),
+                "length {length}"
+            );
         }
     }
 

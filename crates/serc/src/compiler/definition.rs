@@ -742,8 +742,10 @@ impl Compiler<'_> {
                     hidden_owner_slots +=
                         folded_constant_owner_slots(default, self.context.python_version);
                 }
-                let operand_folds =
-                    self.record_folded_collection_operands(positional_defaults.iter().copied())?;
+                let operand_folds = self.record_folded_collection_operands(
+                    positional_defaults.iter().copied(),
+                    Some(&defaults),
+                )?;
                 self.assembler.set_location(definition_location);
                 self.emit_deferred_constant(Constant::Tuple(defaults))?;
                 self.attach_folded_operand_admissions(operand_folds);

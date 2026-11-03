@@ -3189,9 +3189,10 @@ impl<'source> Compiler<'source> {
                 {
                     let first_fold = self.output.deferred_constants.len();
                     if self.context.python_version == crate::PythonVersion::Py314 {
-                        operand_folds = self.record_folded_collection_operands(std::iter::once(
-                            expression.value.as_ref(),
-                        ))?;
+                        operand_folds = self.record_folded_collection_operands(
+                            std::iter::once(expression.value.as_ref()),
+                            None,
+                        )?;
                     } else {
                         self.record_folded_value(&expression.value)?;
                     }

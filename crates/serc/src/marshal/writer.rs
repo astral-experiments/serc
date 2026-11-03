@@ -570,9 +570,8 @@ impl Writer<'_, '_, '_> {
                 digit_count
             },
         );
-        for digit in value {
-            self.output.extend_from_slice(&digit.to_le_bytes());
-        }
+        self.output
+            .extend(value.iter().copied().flat_map(u16::to_le_bytes));
     }
 }
 
