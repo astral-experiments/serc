@@ -323,6 +323,44 @@ impl Body<'_, '_, '_> {
         }
     }
 
+    /// A nested with can interrupt its parent's protected range. Normal exit
+    /// and suppression must reach the same continuation under the outer with.
+    fn nested_manager_resume(
+        &self,
+        ops: &[Instruction],
+        binding: usize,
+        parent: Handler,
+    ) -> Option<(Handler, usize)> {
+        let op = ops.get(binding)?;
+        let inner = self.flow.handler(binding)?;
+        if inner.start != op.offset
+            || !inner.lasti
+            || inner.depth <= parent.depth
+            || !is_manager_handler(ops, &inner).ok()?
+        {
+            return None;
+        }
+        let after = self.after_with_suppression(ops, &inner).ok()?;
+        let join = if matches!(
+            ops.get(after)?.name,
+            "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
+        ) {
+            self.flow.jump(after)?
+        } else {
+            after
+        };
+        if join <= binding || join >= ops.len() {
+            return None;
+        }
+        let resume = self.flow.handler(join - 1)?;
+        let cleanup = boundary(ops, resume.start).ok()?;
+        (cleanup > binding
+            && (resume.target, resume.depth, resume.lasti)
+                == (parent.target, parent.depth, parent.lasti)
+            && self.manager_exit(ops, cleanup..join, false, false) == Some(join))
+        .then_some((resume, join))
+    }
+
     fn manager_await_end(
         &self,
         ops: &[Instruction],
@@ -403,6 +441,23 @@ impl Body<'_, '_, '_> {
                 && inner.lasti
                 && is_manager_handler(ops, &inner)?
             {
+                // A later with can have ordinary statements before its entry
+                // or after its exit. Keep them inside the outer suite.
+                if let Some((resume, join)) = self.nested_manager_resume(ops, end, entry)
+                    && (join < boundary(ops, resume.end)?
+                        || seed.is_empty()
+                            && body_start < end
+                            && self
+                                .empty_stack_after(
+                                    ops,
+                                    body_start..self.flow.block(body_start).ops.end.min(end),
+                                    body_start,
+                                    0,
+                                )?
+                                .is_some())
+                {
+                    break (body_start, end);
+                }
                 previous_body = Some(body_start);
                 entry = inner;
             } else {
@@ -411,30 +466,35 @@ impl Body<'_, '_, '_> {
         };
         // An early return splits the protected body around its normal
         // __exit__ call. The next arm is still inside the same manager.
-        while let Some(next) = self
-            .managed_child_end(ops, end, entry)
-            .or_else(|| self.managed_async_iteration_end(ops, end, entry))
-        {
-            if next > *normal_end {
-                return Err("nested try escapes manager body".into());
-            }
-            end = if let Some(resume) = self.flow.handler(next)
-                && resume.start == ops[next].offset
-                && (resume.target, resume.depth, resume.lasti)
-                    == (entry.target, entry.depth, entry.lasti)
-            {
-                body_end(ops, &self.flow, resume)?
-            } else {
-                next
-            };
-        }
         let mut exits = Vec::new();
-        if let [(asynchronous, _, _)] = managers.as_slice() {
-            while let Some((exit, next)) =
-                self.manager_return_exit(ops, end..*normal_end, entry, *asynchronous)
+        loop {
+            if let Some((resume, _)) = self.nested_manager_resume(ops, end, entry) {
+                end = body_end(ops, &self.flow, resume)?;
+            } else if let Some(next) = self
+                .managed_child_end(ops, end, entry)
+                .or_else(|| self.managed_async_iteration_end(ops, end, entry))
+            {
+                // The normal copy of a finally may already be protected by
+                // this manager when the next ordinary statement is reached.
+                end = if let Some(resume) = self.flow.handler(next)
+                    && (resume.target, resume.depth, resume.lasti)
+                        == (entry.target, entry.depth, entry.lasti)
+                {
+                    body_end(ops, &self.flow, resume)?
+                } else {
+                    next
+                };
+            } else if let [(asynchronous, _, _)] = managers.as_slice()
+                && let Some((exit, next)) =
+                    self.manager_return_exit(ops, end..*normal_end, entry, *asynchronous)
             {
                 exits.push(exit);
                 end = body_end(ops, &self.flow, next)?;
+            } else {
+                break;
+            }
+            if end > *normal_end {
+                return Err("nested suite escapes manager body".into());
             }
         }
         let outer = std::mem::replace(&mut self.return_exits, exits);
@@ -489,7 +549,7 @@ impl Body<'_, '_, '_> {
         for (i, (asynchronous, _, manager)) in managers.iter().enumerate().rev() {
             next = self
                 .manager_exit(ops, next..*normal_end, *asynchronous, returns)
-                .ok_or("unsupported manager exit")?;
+                .ok_or_else(|| format!("unsupported manager exit at byte {}", ops[next].offset))?;
             if i > 0
                 && !returns
                 && ops.get(next).is_some_and(|op| op.name == "JUMP_FORWARD")

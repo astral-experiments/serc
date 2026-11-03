@@ -5363,6 +5363,48 @@ result = events",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn nested_managers_keep_intervening_statements_in_the_outer_suite() {
+    check_output(
+        r"def send(outer, inner, log, stop):
+    with outer:
+        log.append('entered')
+        if stop:
+            return
+        with inner as writer:
+            writer.send()
+        log.append('sent')
+    return log
+
+def start(outer, inner, log):
+    with outer:
+        log.append('entered')
+        with inner as writer:
+            try:
+                writer.send()
+            finally:
+                log.append('cleanup')
+            log.append('done')
+    return log
+",
+        r"from contextlib import nullcontext
+log = []
+class Writer:
+    def send(self): log.append('write')
+outer, inner = nullcontext(), nullcontext(Writer())
+assert send(outer, inner, log, True) is None
+assert send(outer, inner, log, False) is log
+assert start(outer, inner, log) is log
+result = log
+assert result == ['entered', 'entered', 'write', 'sent', 'entered', 'write', 'cleanup', 'done']",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert_eq!(source.matches("        with inner as writer:").count(), 2);
+        },
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn terminal_returns_and_managed_raises_have_no_missing_tail() {
     check_fixture(
         r"def first(items):
