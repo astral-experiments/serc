@@ -347,6 +347,25 @@ fn protected_value_match_preserves_case_and_failure_exits() {
 }
 
 #[test]
+fn nested_conditionals_copy_a_guarded_try_exit_onto_the_local_return() {
+    let source = r"def sample(value, found, ready):
+    if found:
+        if ready:
+            try:
+                if missing(value):
+                    raise ValueError(value)
+            except TimeoutError as error:
+                pass
+        else:
+            raise ValueError(value)
+    elif value:
+        pass
+    return value
+";
+    assert_matches_cpython(source, "nested_guard_return.py", &LEVELS);
+}
+
+#[test]
 fn protected_value_match_with_multiple_handlers_locates_its_failure() {
     let source = r"async def choose(item, flag):
     try:
