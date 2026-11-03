@@ -263,13 +263,13 @@ The checker never executes corpus code.
 
 | CPython   | Compilable modules | Strictly verified | Coverage | Verified code objects / total | Modules with dead suites / live guards |
 | --------- | -----------------: | ----------------: | -------: | ----------------------------: | -------------------------------------: |
-| 3.12.14   |              2,190 |             1,891 |    86.3% |                8,352 / 11,063 |                                 48 / 1 |
-| 3.13.15   |              2,209 |             1,895 |    85.8% |                8,524 / 11,562 |                                 48 / 1 |
-| 3.14.5    |              2,246 |             1,882 |    83.8% |               10,295 / 14,082 |                                 53 / 5 |
-| 3.15.0rc2 |              2,266 |             1,902 |    83.9% |               10,331 / 14,114 |                                 57 / 8 |
+| 3.12.14   |              2,190 |             1,894 |    86.5% |                8,356 / 11,063 |                                 48 / 1 |
+| 3.13.15   |              2,209 |             1,898 |    85.9% |                8,528 / 11,562 |                                 48 / 1 |
+| 3.14.5    |              2,246 |             1,886 |    84.0% |               10,300 / 14,082 |                                 53 / 5 |
+| 3.15.0rc2 |              2,266 |             1,906 |    84.1% |               10,336 / 14,114 |                                 57 / 8 |
 
 The code-object count includes each module and its nested code. Only objects
-from strictly verified modules count here. On 3.14, 167 of the 364 refusals
+from strictly verified modules count here. On 3.14, 168 of the 360 refusals
 produced a candidate that failed verification. The most frequent differences
 were instructions, exception tables, and constants. Remaining recovery gaps
 include nested exception cleanup, overlapping branches and loops, and patterns
@@ -296,10 +296,10 @@ packages in subdirectories are outside this sample.
 
 | CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
 | --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
-| 3.12.14   |     164 |                         164 / 51 |                          25 / 3 |                           6,407 / 97 / 8,040 |
-| 3.13.15   |     153 |                        153 / 153 |                          26 / 1 |                            6,068 / 1 / 7,720 |
-| 3.14.5    |     154 |                          154 / 0 |                          24 / 0 |                            6,257 / 0 / 8,064 |
-| 3.15.0rc2 |     152 |                          152 / 0 |                          22 / 0 |                            6,389 / 0 / 8,259 |
+| 3.12.14   |     164 |                         164 / 51 |                          25 / 3 |                           6,475 / 97 / 8,040 |
+| 3.13.15   |     153 |                        153 / 153 |                          26 / 1 |                            6,132 / 1 / 7,720 |
+| 3.14.5    |     154 |                          154 / 0 |                          24 / 0 |                            6,298 / 0 / 8,064 |
+| 3.15.0rc2 |     152 |                          152 / 0 |                          22 / 0 |                            6,415 / 0 / 8,259 |
 
 A compilable file can contain placeholders. The last column pairs code objects
 by qualified name and occurrence and compares executable fields, including
@@ -308,8 +308,8 @@ independent CPython comparisons omit source locations and marshal reference
 identity. The serc verifier additionally checks reference sharing. This pycdc
 revision rejected the 3.14 and 3.15 cache magic values.
 
-Across the four runs, 56 of the 623 outputs also include detached definitions.
-Their 450 commented entries are available for inspection and contribute no
+Across the four runs, 54 of the 623 outputs also include detached definitions.
+Their 402 commented entries are available for inspection and contribute no
 executable code objects to the comparison.
 
 ```console
@@ -324,22 +324,25 @@ report breaks out executable matches and detached definitions by package.
 
 | CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
 | --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
-| 3.12.14   |     519 |                        519 / 257 |                        306 / 25 |                      10,061 / 1,076 / 11,772 |
-| 3.13.15   |     477 |                        477 / 404 |                        261 / 14 |                          9,972 / 14 / 11,740 |
-| 3.14.5    |     498 |                          498 / 0 |                         263 / 0 |                          10,737 / 0 / 12,586 |
-| 3.15.0rc2 |     539 |                          539 / 0 |                         280 / 0 |                          11,450 / 0 / 13,544 |
+| 3.12.14   |     519 |                        519 / 257 |                        310 / 25 |                      10,124 / 1,076 / 11,772 |
+| 3.13.15   |     477 |                        477 / 404 |                        265 / 14 |                         10,037 / 14 / 11,740 |
+| 3.14.5    |     498 |                          498 / 0 |                         268 / 0 |                          10,808 / 0 / 12,586 |
+| 3.15.0rc2 |     539 |                          539 / 0 |                         283 / 0 |                          11,505 / 0 / 13,544 |
 
 On 3.14.5, the largest gaps by number of unmatched code objects are in `idlelib`
-(254), `asyncio` (238), and `multiprocessing` (162). A mismatch counts once per
+(235), `asyncio` (233), and `multiprocessing` (160). A mismatch counts once per
 code object, so a single lost method can also cause its enclosing class and
-module to miss.
+module to miss. In 180 package modules the executable source contains at least
+one marked unrecovered remainder. The most common diagnostic is an unsupported
+conditional destination (296 remainders), followed by an unsupported backward
+jump (60).
 
-An independent CFG check recompiled the 235 best-effort package modules on
+An independent CFG check recompiled the 230 best-effort package modules on
 3.14.5 at all three optimization levels. It paired uniquely named functions
-whose recovered body had no marked gap. Of 2,774 such functions with a
-conditional branch and no exception table, 20 had different normal edges at
-every level. Of 934 functions with an exception table in the original or a
-candidate, 144 had different normal edges and 199 had a different exception
+whose recovered body had no marked gap. Of 2,725 such functions with a
+conditional branch and no exception table, 15 had different normal edges at
+every level. Of 951 functions with an exception table in the original or a
+candidate, 141 had different normal edges and 196 had a different exception
 table at every level. A matching graph does not check instruction operands.
 
 On the same target, 21 of the 498 package modules produced a warning about the
@@ -367,19 +370,20 @@ Moving a guarded raise out of the `try` statement's `else` suite preserved the
 normal edges but dropped a tracing `NOP`, shifting the exception handler by two
 bytes. Restoring the `else` reproduced the function's executable fields.
 
-The `pycdc_only` map lists every scope that pycdc matched and serc missed. Any
-entry fails either standard-library comparison, even if serc matches more scopes
-overall. Both standard-library samples passed on all four targets.
+The comparison checks exact code objects from compilable pycdc files
+(`pycdc_only`) and independently compilable functions from invalid files
+(`pycdc_fragment_only`). It keeps the class names pycdc emitted and skips
+ambiguous definitions. Only functions with matching executable fields count. On
+3.12.14, serc matched all 1,512 verified functions from invalid pycdc package
+files and all 1,066 from invalid top-level files.
 
-The Ruff sample (`--corpus ruff`) uses the same revision and fixture directories
-as the strict check. Its `pycdc_only` entries are informational. The map was
-empty on all four targets. On 3.12 and 3.13, earlier misses included Unicode
-identifiers with combining marks. On 3.12 they also included tuple dictionary
-keys and function signatures with tuple defaults or assignment expressions.
+Either kind of miss fails the standard-library CI check. The Ruff sample
+(`--corpus ruff`) uses the same revision and fixture directories as the strict
+check and reports both kinds of miss.
 
 | CPython   | Modules | Compilable output (serc / pycdc) | Matching modules (serc / pycdc) | Matching code objects (serc / pycdc / total) |
 | --------- | ------: | -------------------------------: | ------------------------------: | -------------------------------------------: |
-| 3.12.14   |   2,190 |                    2,190 / 1,569 |                     1,892 / 754 |                      10,143 / 3,194 / 11,063 |
-| 3.13.15   |   2,209 |                    2,209 / 2,040 |                     1,896 / 337 |                        10,501 / 337 / 11,562 |
-| 3.14.5    |   2,246 |                        2,246 / 0 |                       1,883 / 0 |                          12,755 / 0 / 14,082 |
-| 3.15.0rc2 |   2,266 |                        2,266 / 0 |                       1,903 / 0 |                          12,773 / 0 / 14,114 |
+| 3.12.14   |   2,190 |                    2,190 / 1,569 |                     1,895 / 754 |                      10,153 / 3,194 / 11,063 |
+| 3.13.15   |   2,209 |                    2,209 / 2,040 |                     1,899 / 337 |                        10,513 / 337 / 11,562 |
+| 3.14.5    |   2,246 |                        2,246 / 0 |                       1,887 / 0 |                          12,768 / 0 / 14,082 |
+| 3.15.0rc2 |   2,266 |                        2,266 / 0 |                       1,907 / 0 |                          12,785 / 0 / 14,114 |

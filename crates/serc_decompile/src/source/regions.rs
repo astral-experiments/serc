@@ -52,15 +52,17 @@ impl Fragment {
         Ok(self.stack)
     }
 
-    pub(super) fn expression(mut self) -> Result<String, String> {
-        if self.lines.is_empty()
-            && self.stack.len() == 1
-            && let Some(value) = self.stack.pop().and_then(Value::expression_text)
-        {
-            Ok(value)
-        } else {
-            Err("region is not a single expression".into())
+    fn single_operand(mut self) -> Result<Value, String> {
+        if self.lines.is_empty() && self.stack.len() == 1 {
+            return Ok(self.stack.pop().unwrap());
         }
+        Err("region is not a single expression".into())
+    }
+
+    pub(super) fn expression(self) -> Result<String, String> {
+        self.single_operand()?
+            .expression_text()
+            .ok_or_else(|| "region is not a single expression".into())
     }
     pub(super) fn key_value(mut self) -> Result<(String, String), String> {
         let Some(value) = self.stack.pop().and_then(Value::expression_text) else {
@@ -476,9 +478,10 @@ impl Body<'_, '_, '_> {
             return Err("unsupported short-circuit shape".into());
         }
         let lhs = self.expr()?;
-        let rhs = self
+        let operand = self
             .fragment(ops, discard + 1, target, level)?
-            .expression()?;
+            .single_operand()?;
+        let rhs = self.render_expression(operand)?;
         self.push(format!("({lhs} {operator} {rhs})"))?;
         Ok(target)
     }

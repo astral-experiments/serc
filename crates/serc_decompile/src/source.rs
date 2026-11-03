@@ -358,7 +358,12 @@ impl Body<'_, '_, '_> {
     }
 
     fn expr(&mut self) -> Result<String, String> {
-        match self.pop()? {
+        let value = self.pop()?;
+        self.render_expression(value)
+    }
+
+    fn render_expression(&mut self, value: Value) -> Result<String, String> {
+        match value {
             Value::Function(def) => self.lambda(&def),
             value => value
                 .expression_text()

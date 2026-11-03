@@ -309,7 +309,7 @@ jobs:
   decompile-corpus:
     name: "Decompiler corpus"
     runs-on: ubuntu-24.04
-    timeout-minutes: 20
+    timeout-minutes: 35
     permissions:
       contents: read
     env: *rust-env
@@ -324,10 +324,27 @@ jobs:
         run: cargo test -p serc-cli --no-default-features --locked --test decompile
       - name: "Build the decompiler"
         run: cargo build -p serc-cli --features decompile --locked
-      - name: "Recompile recovered modules on each pinned interpreter"
+      - name: "Check out the pycdc comparison revision"
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          repository: zrax/pycdc
+          ref: b4289760970dbc399684f1e155ec6d1ea1cc787e
+          path: .ci/pycdc
+          persist-credentials: false
+      - name: "Build pycdc"
+        run: |
+          cmake -S .ci/pycdc -B "$RUNNER_TEMP/pycdc-build" -DCMAKE_CXX_COMPILER=clang++
+          cmake --build "$RUNNER_TEMP/pycdc-build" --target pycdc --parallel 4
+      - name: "Check decompilation on each pinned interpreter"
+        shell: bash
         run: |
           for python in "$SERC_TEST_PYTHON_312" "$SERC_TEST_PYTHON_313" "$SERC_TEST_PYTHON" "$SERC_TEST_PYTHON_315"; do
+            "$python" -B -m unittest discover -s scripts -p 'test_decompile*.py'
             "$python" -I -B scripts/check_decompile_corpus.py target/debug/serc
+            for corpus in stdlib stdlib-packages ruff; do
+              "$python" -I -B scripts/compare_decompile_quality.py target/debug/serc "$RUNNER_TEMP/pycdc-build/pycdc" --corpus "$corpus" |
+                jq -c '{python, corpus, pycdc_only, pycdc_fragment_only}'
+            done
           done
 
   benchmark:
