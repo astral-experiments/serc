@@ -1,16 +1,15 @@
 //! An async iterator exhausts through the exception edge of `GET_ANEXT`.
 //! The handler and its else suite can follow the normal return of the scope.
 use super::{Body, Instruction};
+use serc_bytecode::instructions::Handler;
 
 impl Body<'_, '_, '_> {
-    pub(in crate::source) fn async_loop(
-        &mut self,
+    fn async_iteration(
+        &self,
         ops: &[Instruction],
-        start: usize,
+        header: usize,
         end: usize,
-        level: usize,
-    ) -> Result<usize, String> {
-        let header = start + 1;
+    ) -> Result<(usize, usize, usize), String> {
         let handler = self
             .flow
             .handler(header)
@@ -41,6 +40,46 @@ impl Body<'_, '_, '_> {
             .rev()
             .find(|&i| (bind..end.min(cleanup)).contains(&i) && ops[i].name == "JUMP_BACKWARD")
             .ok_or("missing async-for latch")?;
+        Ok((bind, latch, cleanup))
+    }
+
+    /// Both receiving and exhausting the iterator reenter the same manager.
+    /// A throw from a body block must also reach that manager's exit.
+    pub(in crate::source) fn managed_async_iteration_end(
+        &self,
+        ops: &[Instruction],
+        header: usize,
+        manager: Handler,
+    ) -> Option<usize> {
+        if ops.get(header)?.name != "GET_ANEXT"
+            || ops.get(header.checked_sub(1)?)?.name != "GET_AITER"
+        {
+            return None;
+        }
+        let (bind, latch, cleanup) = self.async_iteration(ops, header, ops.len()).ok()?;
+        let owns =
+            |h: Handler| (h.target, h.depth, h.lasti) == (manager.target, manager.depth, true);
+        let exhausted = self.flow.handler(cleanup)?;
+        if !owns(exhausted)
+            || !self.flow.blocks_covering(bind..latch + 1).all(|b| {
+                self.flow.handler(b.ops.start).is_some_and(owns)
+                    || ops[b.ops.clone()].iter().all(|op| op.name == "NOT_TAKEN")
+            })
+        {
+            return None;
+        }
+        super::super::exceptions::boundary(ops, exhausted.end).ok()
+    }
+
+    pub(in crate::source) fn async_loop(
+        &mut self,
+        ops: &[Instruction],
+        start: usize,
+        end: usize,
+        level: usize,
+    ) -> Result<usize, String> {
+        let header = start + 1;
+        let (bind, latch, cleanup) = self.async_iteration(ops, header, end)?;
         let iterable = self.expr()?;
         let binding = self.binding(ops, bind, latch)?;
         let active = self.loop_exits(ops, header, binding.next..latch, latch + 1, end)?;

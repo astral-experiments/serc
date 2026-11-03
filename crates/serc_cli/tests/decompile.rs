@@ -5280,3 +5280,130 @@ assert events == ['report', 'close', 'report', 'close', 'close', 'propagated']
 result = events",
     );
 }
+
+#[cfg(feature = "decompile")]
+#[test]
+fn managed_retries_restore_the_outer_exception_before_leaving_the_manager() {
+    check_fixture(
+        r"def next_item(manager, take, wait, finished):
+    with manager:
+        try:
+            item = take()
+        except IndexError:
+            if finished():
+                raise StopIteration from None
+            wait()
+            try:
+                item = take()
+            except IndexError:
+                if finished():
+                    raise StopIteration from None
+                raise TimeoutError from None
+    return item
+",
+        r"import sys
+events = []
+class Manager:
+    def __enter__(self): events.append('enter')
+    def __exit__(self, kind, err, tb):
+        assert err is sys.exception()
+        events.append(kind.__name__ if kind else 'exit')
+def take():
+    value = next(items)
+    if isinstance(value, Exception): raise value
+    return value
+def wait():
+    assert isinstance(sys.exception(), IndexError)
+    events.append('wait')
+for inputs, checks in [([11], []), ([IndexError(), 12], [False]), ([IndexError()], [True]), ([IndexError(), IndexError()], [False, False]), ([IndexError(), IndexError()], [False, True])]:
+    items, done = iter(inputs), iter(checks)
+    try: events.append(next_item(Manager(), take, wait, lambda: next(done)))
+    except (TimeoutError, StopIteration) as err: assert err.__suppress_context__
+assert events == ['enter', 'exit', 11, 'enter', 'wait', 'exit', 12, 'enter', 'StopIteration', 'enter', 'wait', 'TimeoutError', 'enter', 'wait', 'StopIteration']
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn terminal_returns_and_managed_raises_have_no_missing_tail() {
+    check_fixture(
+        r"def first(items):
+    values = [item * 2 for item in items]
+    try:
+        return values[0]
+    except IndexError:
+        raise ValueError('empty')
+
+def optional(read, recover):
+    try:
+        return read()
+    except:
+        recover()
+
+def raise_only(manager, take):
+    with manager:
+        raise take()
+",
+        r"import contextlib, sys
+assert first([11]) == 22
+try: first([])
+except ValueError as err: assert isinstance(err.__context__, IndexError)
+else: raise AssertionError
+def interrupted(): raise KeyboardInterrupt
+events = []
+assert optional(lambda: 12, events.clear) == 12
+assert optional(interrupted, lambda: events.append(type(sys.exception()).__name__)) is None
+assert events == ['KeyboardInterrupt']
+assert raise_only(contextlib.suppress(ValueError), ValueError) is None
+try: raise_only(contextlib.suppress(ValueError), RuntimeError)
+except RuntimeError: pass
+else: raise AssertionError
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn managed_async_iterators_exhaust_close_and_unwind_through_each_exit() {
+    check_fixture(
+        r"async def stream(outer, inner, rows):
+    async with outer, inner:
+        async for item in rows:
+            yield item
+
+async def mixed(manager, rows):
+    with manager:
+        async for item in rows:
+            yield item
+",
+        r"import asyncio
+events = []
+class Manager:
+    def __init__(self, name, suppress=False):
+        self.name, self.suppress = name, suppress
+    def __enter__(self): events.append((self.name, 'enter'))
+    def __exit__(self, kind, err, tb):
+        events.append((self.name, kind.__name__ if kind else 'normal'))
+        return self.suppress and kind is ValueError
+    async def __aenter__(self): return self.__enter__()
+    async def __aexit__(self, *exc): return self.__exit__(*exc)
+async def rows(*values):
+    for v in values:
+        await asyncio.sleep(0)
+        if isinstance(v, Exception): raise v
+        yield v
+async def exercise():
+    a, b = Manager('a'), Manager('b', True)
+    assert [v async for v in stream(a, b, rows(1, 2))] == [1, 2]
+    assert [v async for v in stream(a, b, rows(ValueError()))] == []
+    g = stream(a, b, rows(3, 4))
+    assert await anext(g) == 3
+    await g.aclose()
+    assert [v async for v in mixed(a, rows(5))] == [5]
+asyncio.run(exercise())
+start = [('a', 'enter'), ('b', 'enter')]
+assert events == start + [('b', 'normal'), ('a', 'normal')] + start + [('b', 'ValueError'), ('a', 'normal')] + start + [('b', 'GeneratorExit'), ('a', 'GeneratorExit'), ('a', 'enter'), ('a', 'normal')]
+result = events",
+    );
+}

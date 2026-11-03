@@ -83,10 +83,12 @@ impl Body<'_, '_, '_> {
         }
         if !star
             && returns
-            && end + 1 == handler
+            // Inlined comprehension cleanups may follow the normal return
+            // before the user's dispatcher. They own no normal continuation.
+            && end + 1 == normal_end
             && ops[end].name == "RETURN_VALUE"
-            && ops.get(handler + 1).is_some_and(|_| {
-                self.flow
+            && ops.get(handler + 1).is_some_and(|op| {
+                op.name == "POP_TOP" || self.flow
                     .block(handler + 1)
                     .ops
                     .clone()

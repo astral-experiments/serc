@@ -160,7 +160,7 @@ impl Body<'_, '_, '_> {
         let ops = &bc.ops;
         let mut ranges = handlers.iter();
         let mut cursor = 0;
-        let mut normal_end = self.flow.normal_end([0]).min(limit);
+        let mut normal_end = self.flow.iteration_end(ops, [0]).min(limit);
         let mut depth = None;
         while cursor < normal_end {
             // Skip ranges that resume outer protection during the previous
@@ -310,7 +310,7 @@ impl Body<'_, '_, '_> {
             .count();
         if pop.name != "POP_TOP"
             || restore.name != "POP_EXCEPT"
-            || self.flow.block(target).height != Some(2 + pops)
+            || self.flow.block(target).height != Some(entry.depth + 3)
             || !(2..=3).contains(&pops)
         {
             return Err("unsupported with suppression cleanup".into());
@@ -358,6 +358,7 @@ impl Body<'_, '_, '_> {
                 .get(handler + 2)
                 .is_some_and(|op| (op.name, op.arg) == ("GET_AWAITABLE", 2)))
         };
+        let scope_end = *normal_end;
         let mut managers = Vec::new();
         let mut previous_body = None;
         let mut seed = Vec::new();
@@ -391,7 +392,7 @@ impl Body<'_, '_, '_> {
                 self.expr()?
             };
             let (item, body_start, loaded) = self.manager_item(manager, ops, start, end)?;
-            managers.push((asynchronous, item));
+            managers.push((asynchronous, item, entry));
             seed = loaded;
 
             // Each additional item starts where the enclosing protected range
@@ -410,7 +411,10 @@ impl Body<'_, '_, '_> {
         };
         // An early return splits the protected body around its normal
         // __exit__ call. The next arm is still inside the same manager.
-        while let Some(next) = self.managed_child_end(ops, end, entry) {
+        while let Some(next) = self
+            .managed_child_end(ops, end, entry)
+            .or_else(|| self.managed_async_iteration_end(ops, end, entry))
+        {
             if next > *normal_end {
                 return Err("nested try escapes manager body".into());
             }
@@ -425,7 +429,7 @@ impl Body<'_, '_, '_> {
             };
         }
         let mut exits = Vec::new();
-        if let [(asynchronous, _)] = managers.as_slice() {
+        if let [(asynchronous, _, _)] = managers.as_slice() {
             while let Some((exit, next)) =
                 self.manager_return_exit(ops, end..*normal_end, entry, *asynchronous)
             {
@@ -444,7 +448,7 @@ impl Body<'_, '_, '_> {
             let header = if group[0].0 { "async with" } else { "with" };
             let items = group
                 .iter()
-                .map(|(_, item)| item.as_str())
+                .map(|(_, item, _)| item.as_str())
                 .collect::<Vec<_>>();
             self.line(&format!("{indent}{header} {}:", items.join(", ")))?;
             indent.push_str("    ");
@@ -456,11 +460,41 @@ impl Body<'_, '_, '_> {
             self.line(&format!("{indent}{line}"))?;
         }
 
+        // A manager whose body raises on every path has no normal exit
+        // call. Suppression still resumes through its exceptional cleanup.
+        if !returns
+            && managers.len() == 1
+            && ops.get(end).is_some_and(|op| op.offset == entry.target)
+            && end > start
+            && ops[end - 1].name == "RAISE_VARARGS"
+            && self.flow.blocks_covering(start..end).all(|b| {
+                [self.flow.jump(b.ops.end - 1), self.flow.fallthrough(b)]
+                    .into_iter()
+                    .flatten()
+                    .all(|to| (start..end).contains(&to))
+            })
+        {
+            return Ok(None);
+        }
         let mut next = end;
-        for (asynchronous, _) in managers.iter().rev() {
+        for (i, (asynchronous, _, manager)) in managers.iter().enumerate().rev() {
             next = self
                 .manager_exit(ops, next..*normal_end, *asynchronous, returns)
                 .ok_or("unsupported manager exit")?;
+            if i > 0
+                && !returns
+                && ops.get(next).is_some_and(|op| op.name == "JUMP_FORWARD")
+                && let Some(join) = self.flow.jump(next)
+                && self.after_with_suppression(ops, manager)? == join
+            {
+                // Both successful exit and suppression skip the inner
+                // dispatcher before running the enclosing manager's exit.
+                *normal_end = scope_end.min(boundary(ops, managers[i - 1].2.target)?);
+                if join >= *normal_end {
+                    return Err("nested manager exit escapes its suite".into());
+                }
+                next = join;
+            }
         }
         if returns {
             if ops.get(next).is_none_or(|op| op.name != "RETURN_VALUE") {

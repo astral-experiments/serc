@@ -556,6 +556,14 @@ fn region(
     let mut handler_exits = None;
     let handler = match ops.get(body..stop)? {
         _ if let Some((pop, _)) = after_handler => body..pop,
+        _ if !bound
+            && next == end
+            && following.is_empty()
+            && let Some(pop) =
+                handler_rejoin::after_retry(ops, owner, body..stop, next, unwind, inner) =>
+        {
+            body..pop
+        }
         _ if let Some((child_end, tail)) =
             returning_handler_child(ops, owner, body..stop, unwind, inner) =>
         {

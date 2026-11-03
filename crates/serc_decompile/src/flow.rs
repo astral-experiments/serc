@@ -8,7 +8,7 @@ pub(super) use packing::same_packed_flow;
 use std::ops::Range;
 
 use serc_bytecode::PythonVersion;
-use serc_bytecode::instructions::{Bytecode, Handler};
+use serc_bytecode::instructions::{Bytecode, Handler, Instruction};
 use serc_bytecode::target::{is_scope_exit_for, is_unconditional_jump, opcodes, stack_counts_for};
 
 pub(super) struct Block {
@@ -144,6 +144,33 @@ impl Graph {
     /// End of the instructions reachable along normal edges from the given
     /// starting instructions, including any continuations of handled exceptions.
     pub(super) fn normal_end(&self, starts: impl IntoIterator<Item = usize>) -> usize {
+        self.walk_end(starts, |_| None)
+    }
+
+    /// At source level async iteration also completes on `StopAsyncIteration`.
+    /// Follow that edge only from a reached iterator header to its cleanup.
+    pub(super) fn iteration_end(
+        &self,
+        ops: &[Instruction],
+        starts: impl IntoIterator<Item = usize>,
+    ) -> usize {
+        self.walk_end(starts, |b| {
+            let (target, h) = b.handler?;
+            let header = ops.get(b.ops.start)?;
+            (header.name == "GET_ANEXT"
+                && !h.lasti
+                && h.start == header.offset
+                && b.height == Some(h.depth)
+                && ops.get(self.blocks[target].ops.start)?.name == "END_ASYNC_FOR")
+                .then_some(target)
+        })
+    }
+
+    fn walk_end(
+        &self,
+        starts: impl IntoIterator<Item = usize>,
+        extra: impl Fn(&Block) -> Option<usize>,
+    ) -> usize {
         let mut seen = vec![false; self.blocks.len()];
         let mut pending: Vec<_> = starts.into_iter().map(|i| self.owner[i]).collect();
         let mut end = 0;
@@ -153,7 +180,11 @@ impl Graph {
             }
             let block = &self.blocks[id];
             end = end.max(block.ops.end);
-            pending.extend([block.jump, block.fallthrough].into_iter().flatten());
+            pending.extend(
+                [block.jump, block.fallthrough, extra(block)]
+                    .into_iter()
+                    .flatten(),
+            );
         }
         end
     }
