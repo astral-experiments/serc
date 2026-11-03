@@ -497,6 +497,32 @@ assert result == (0, 'unused', [0])",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_constant_loop_reenters_after_exhausting_its_nested_iterator() {
+    check_fixture(
+        r"def search(read, match, visit):
+    while True:
+        batch = read()
+        if batch is None:
+            return
+        for item in batch:
+            visit(item)
+            if match(item):
+                return item
+",
+        r"result = []
+def find(batches, target):
+    seen = []
+    found = search(iter(batches).__next__, lambda x: x == target, seen.append)
+    result.append((found, seen))
+find([[], [1], [2, 3], [4]], 2)
+find([[1], [], None, [2]], 2)
+assert result == [(2, [1, 2]), (None, [1])]
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_successful_match_can_skip_the_remaining_cases() {
     check_fixture(
         r"def resolve(name, ready, log):

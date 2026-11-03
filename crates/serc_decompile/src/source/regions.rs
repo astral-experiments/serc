@@ -405,6 +405,12 @@ impl Body<'_, '_, '_> {
             {
                 Ok(next)
             }
+            "NOP"
+                if self.stack.is_empty()
+                    && let Some(next) = self.unconditional_loop(ops, i, end, level)? =>
+            {
+                Ok(next)
+            }
             "POP_TOP" | "POP_ITER"
                 if self.stack.is_empty()
                     && i + 1 < end

@@ -137,6 +137,53 @@ impl Body<'_, '_, '_> {
         }
     }
 
+    /// Recover a constant-true loop whose paths return, raise, or come back
+    /// to its header. Older targets leave the header NOP just before the
+    /// ordinary backedge target, but an explicit continue can still visit it.
+    pub(super) fn unconditional_loop(
+        &mut self,
+        ops: &[Instruction],
+        nop: usize,
+        end: usize,
+        level: usize,
+    ) -> Result<Option<usize>, String> {
+        let header = nop + usize::from(self.m.version < super::PythonVersion::Py314);
+        if header >= end || self.flow.block(header).ops.start != header {
+            return Ok(None);
+        }
+        let Some(latch) = self.flow.incoming(header).rev().find(|&i| {
+            (nop + 1..end).contains(&i)
+                && ops[i].name == "JUMP_BACKWARD"
+                && self.flow.jump(i) == Some(header)
+        }) else {
+            return Ok(None);
+        };
+        let after = latch + 1;
+        for block in self.flow.blocks_in(header..after) {
+            let start = block.ops.start;
+            let last = block.ops.end - 1;
+            if self.flow.handler(start).is_some()
+                || (start != header && !self.flow.entered_from(start, nop..after))
+                || self.flow.jump(last).is_some_and(|to| {
+                    !((nop..after).contains(&to)
+                        || (to == after && ops[last].name == "JUMP_FORWARD"))
+                })
+            {
+                return Ok(None);
+            }
+        }
+        let outer = self.loop_edges.replace(Loop {
+            header: nop,
+            body_end: latch,
+            after: Some(after),
+            copied_return: None,
+        });
+        let body = self.fragment(ops, nop + 1, latch, level);
+        self.loop_edges = outer;
+        self.block("while True:", &body?.suite()?)?;
+        Ok(Some(after))
+    }
+
     pub(super) fn folded_break(&self, ops: &[Instruction], i: usize, end: usize) -> bool {
         let Some(active) = self.loop_edges else {
             return false;
