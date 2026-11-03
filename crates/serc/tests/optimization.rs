@@ -21317,6 +21317,39 @@ fn folded_protected_branch_before_elided_assertion_keeps_exit_location() {
 }
 
 #[test]
+fn legacy_threading_stops_at_an_omitted_normal_try_pop() {
+    let source = r"def optional(ready):
+    try:
+        if ready:
+            before()
+            if __debug__:
+                visit()
+    except LookupError:
+        recover()
+    done()
+
+def checked(value):
+    try:
+        if value:
+            assert (
+                True
+                if check(value)
+                else False
+            ), 'expected'
+    except AssertionError as error:
+        pass
+    done(value)
+    return True
+";
+    assert_matches_cpython_versions(
+        source,
+        "threaded_try_pop.py",
+        &LEVELS,
+        &[PythonVersion::Py313],
+    );
+}
+
+#[test]
 fn folded_try_pass_after_branch_keeps_existing_exception_owner() {
     const TRACE: &str = r"
 import dis, marshal, sys, types
