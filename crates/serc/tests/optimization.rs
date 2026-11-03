@@ -23636,6 +23636,28 @@ fn nested_else_assertion_exit_inherits_its_success_operand() {
 }
 
 #[test]
+fn protected_conditional_discards_leave_an_unlocated_normal_exit() {
+    for expression in [
+        "await fetch(value) if active else read(value)",
+        "active and read(value)",
+    ] {
+        let source = format!(
+            "async def sample(value, ordinary, active):
+    try:
+        if ordinary:
+            await update(value)
+        else:
+            {expression}
+    except LookupError:
+        raise
+    finish(value)
+"
+        );
+        assert_matches_cpython(&source, "conditional_discard_exit.py", &LEVELS);
+    }
+}
+
+#[test]
 fn loop_breaks_preserve_shared_try_exit_positions() {
     for source in [
         "async def run(items, left, right, flag, value):\n    if right:\n        pass\n    elif flag:\n        try:\n            try:\n                async for value in items:\n                    if flag:\n                        break\n                else:\n                    if flag:\n                        value = left\n            except ValueError:\n                pass\n        finally:\n            pass\n    else:\n        raise ValueError\n    observe(value)\n",
