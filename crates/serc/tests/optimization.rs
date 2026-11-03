@@ -73,6 +73,26 @@ fn reraising_cleanup_leaves_one_iterator_discard_predecessor() {
 }
 
 #[test]
+fn a_fused_loop_prefix_preserves_the_unowned_threaded_finally_jump() {
+    let source = r"def collect(items, manager):
+    with manager:
+        while True:
+            first, second = items
+            try:
+                break
+            finally:
+                if not first:
+                    inspect(second)
+";
+    assert_matches_cpython_versions(
+        source,
+        "fused_finally_jump.py",
+        &LEVELS,
+        &[PythonVersion::Py314],
+    );
+}
+
+#[test]
 fn post_try_fusion_survives_the_removed_fallthrough_jump() {
     let source = r"import checks
 
