@@ -15959,6 +15959,25 @@ fn erased_match_cases_keep_unlocated_loop_exits() {
 }
 
 #[test]
+fn guarded_empty_match_cases_thread_to_the_loop_backedge() {
+    let source = r"def visit(items, value):
+    for item in items:
+        match item:
+            case 1 if value == 2:
+                pass
+            case _:
+                pass
+
+def consume(items, ready):
+    for item in items:
+        match item:
+            case Entry(flag=True) if ready:
+                pass
+";
+    assert_matches_cpython(source, "guarded_empty_match.py", &LEVELS);
+}
+
+#[test]
 fn erased_match_cases_preserve_loop_backedges() {
     for body in [
         "assert item",
