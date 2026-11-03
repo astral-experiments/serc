@@ -15,6 +15,17 @@ use serc::{
 };
 
 #[test]
+fn module_loop_keeps_the_shared_true_edge_after_assertions_are_removed() {
+    let source = r"for item in items:
+    if first or second or third:
+        assert seen(item)
+    else:
+        assert check(item)
+";
+    assert_matches_cpython(source, "erased_loop_else.py", &LEVELS);
+}
+
+#[test]
 fn named_handler_continue_counts_the_inner_try_before_its_finally_guard() {
     let source = r"def scan(items, keep):
     for item in items:
