@@ -12,10 +12,10 @@ use super::{
 };
 
 pub(super) struct Header {
-    copies: usize,
+    pub(super) copies: usize,
     operand: usize,
     compare: usize,
-    branch: usize,
+    pub(super) branch: usize,
 }
 
 pub(super) fn header(ops: &[Instruction], mut at: usize, version: PythonVersion) -> Option<Header> {
@@ -64,15 +64,17 @@ pub(super) fn header(ops: &[Instruction], mut at: usize, version: PythonVersion)
     let compare = at;
     at += 1;
     at += usize::from(ops.get(at).is_some_and(|op| op.name == "TO_BOOL"));
-    (ops.get(at)?.name == "POP_JUMP_IF_FALSE").then_some(Header {
-        copies,
-        operand,
-        compare,
-        branch: at,
-    })
+    (ops.get(at)?.name == "POP_JUMP_IF_FALSE"
+        || (copies == 0 && ops[at].name == "POP_JUMP_IF_TRUE"))
+        .then_some(Header {
+            copies,
+            operand,
+            compare,
+            branch: at,
+        })
 }
 
-fn after_test(ops: &[Instruction], branch: usize) -> usize {
+pub(super) fn after_test(ops: &[Instruction], branch: usize) -> usize {
     branch + 1 + usize::from(ops.get(branch + 1).is_some_and(|op| op.name == "NOT_TAKEN"))
 }
 
@@ -93,21 +95,29 @@ struct CaseTest {
 }
 
 impl Body<'_, '_, '_> {
-    fn pattern_operand(
+    pub(super) fn pattern_expression(
+        &mut self,
+        ops: &[Instruction],
+        start: usize,
+        end: usize,
+        level: usize,
+    ) -> Result<String, String> {
+        let text = self.fragment(ops, start, end, level)?.expression()?;
+        let parsed = ruff_python_parser::parse_expression(&text).map_err(|e| e.to_string())?;
+        Ok(Generator::new(&Indentation::default(), LineEnding::Lf).expr(parsed.expr()))
+    }
+
+    pub(super) fn pattern_operand(
         &mut self,
         ops: &[Instruction],
         test: &Header,
         level: usize,
     ) -> Result<String, String> {
-        Ok(if test.compare == test.branch {
-            "None".into()
+        if test.compare == test.branch {
+            Ok("None".into())
         } else {
-            let text = self
-                .fragment(ops, test.operand, test.compare, level)?
-                .expression()?;
-            let parsed = ruff_python_parser::parse_expression(&text).map_err(|e| e.to_string())?;
-            Generator::new(&Indentation::default(), LineEnding::Lf).expr(parsed.expr())
-        })
+            self.pattern_expression(ops, test.operand, test.compare, level)
+        }
     }
 
     fn copied_alternatives(
@@ -169,6 +179,28 @@ impl Body<'_, '_, '_> {
     ) -> Result<CaseTest, String> {
         let mut copies = test.copies;
         let mut pattern = self.pattern_operand(ops, &test, level)?;
+        if ops[test.branch].name == "POP_JUMP_IF_TRUE" {
+            // At the end of a loop, a failed final case can fall through to
+            // a copy of the latch. Its successful comparison jumps over it.
+            let latch = after_test(ops, test.branch);
+            let body = self.flow.target(test.branch)?;
+            if copies != 0
+                || body != latch + 1
+                || body >= ops.len()
+                || self.loop_transfer(ops, latch) != Some("continue")
+                || !self.at_loop_tail(ops.len())
+            {
+                return Err("unsupported reversed value pattern".into());
+            }
+            return Ok(CaseTest {
+                pattern,
+                copies,
+                body,
+                body_end: ops.len(),
+                fail: ops.len(),
+                fallback: None,
+            });
+        }
         let mut matched = None;
         loop {
             let fail = self.flow.target(test.branch)?;
@@ -251,6 +283,7 @@ impl Body<'_, '_, '_> {
         let mut join = None;
         let mut saved = true;
         while saved && let Some(test) = header(ops, at, self.m.version) {
+            let reversed = ops[test.branch].name == "POP_JUMP_IF_TRUE";
             let CaseTest {
                 mut pattern,
                 copies,
@@ -274,7 +307,7 @@ impl Body<'_, '_, '_> {
             }
             saved = copies > usize::from(capture);
             let next = fail + usize::from(capture);
-            if body < fail {
+            if !reversed && body < fail {
                 let guard = self.flow.block(body).ops.end - 1;
                 if guard < fail
                     && ops[guard].name == "POP_JUMP_IF_FALSE"
@@ -305,6 +338,11 @@ impl Body<'_, '_, '_> {
                     return Err("inconsistent match continuation".into());
                 }
                 join = Some(after);
+                tail
+            } else if body_end < end
+                && self.at_loop_tail(end)
+                && self.loop_transfer(ops, tail) == Some("continue")
+            {
                 tail
             } else {
                 body_end

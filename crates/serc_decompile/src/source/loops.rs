@@ -158,6 +158,10 @@ impl Body<'_, '_, '_> {
         Ok(Some(jump + 1))
     }
 
+    pub(super) fn at_loop_tail(&self, end: usize) -> bool {
+        self.loop_edges.is_some_and(|loop_| loop_.body_end == end)
+    }
+
     pub(super) fn loop_transfer(&self, ops: &[Instruction], i: usize) -> Option<&'static str> {
         let active = self.loop_edges?;
         if !matches!(ops[i].name, "JUMP_BACKWARD" | "JUMP_FORWARD") {

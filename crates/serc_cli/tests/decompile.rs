@@ -2163,6 +2163,35 @@ def mixed(a, b, c):
 
 #[cfg(feature = "decompile")]
 #[test]
+fn successive_comparison_chains_skip_their_own_failure_blocks() {
+    check_fixture(
+        r"def valid(enabled, read, a, b):
+    if enabled and 0 <= read(a) <= 12 and 1 <= read(b) <= 31:
+        return read(42)
+    return None
+
+def either(read, a, b):
+    if 0 < read(a) < 5 or 7 < read(b) < 10:
+        return read(42)
+    return None
+",
+        r"result = []
+def read(value):
+    result.append(value)
+    return value
+assert valid(False, read, 4, 8) is None and result == []
+assert valid(True, read, -1, 8) is None and result == [-1]
+assert valid(True, read, 13, 8) is None and result[-1] == 13
+assert valid(True, read, 1, 32) is None and result[-2:] == [1, 32]
+assert valid(True, read, 1, 31) == 42 and result[-3:] == [1, 31, 42]
+assert either(read, 2, 0) == 42 and result[-2:] == [2, 42]
+assert either(read, 6, 9) == 42 and result[-3:] == [6, 9, 42]
+assert either(read, 0, 7) is None and result[-2:] == [0, 7]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn value_patterns_and_guards() {
     check_fixture(
         r#"events = []
@@ -2188,6 +2217,74 @@ def bind(value):
         case rest: return rest
 "#,
         "result = [classify(x) for x in [17, 0, False, None, 'z']], [bind(x) for x in [0, 3, 4]], [group(x) for x in [0, 1, 3, None, 9, 2]], events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn failed_final_cases_advance_the_iterator() {
+    check_fixture(
+        r"def classify(items, read, enabled):
+    for item in items:
+        match read(item):
+            case Kind.first | Kind.second:
+                yield item
+            case Kind.last:
+                if enabled(item):
+                    yield -item
+",
+        r"class Kind:
+    first, second, last = 1, 2, 3
+events = []
+def read(item):
+    events.append(('read', item))
+    return item
+def enabled(item):
+    events.append(('enabled', item))
+    return len(events) % 2 == 0
+result = list(classify([3, 0, 2, 1, 0, 3, 3, 2], read, enabled)), events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_patterns_discard_only_unmatched_siblings() {
+    check_fixture(
+        r"def classify(value):
+    match value:
+        case [None | Item(1) | Item(label=':'), Item(label='go'), Item(2 | 3)]:
+            return 'first'
+        case [Item(2), Item(label='go'), Item(3, label=s)]:
+            return s
+        case [Item(label=':' | ';'), Item(label='end'), Item(3) | Item(4)]:
+            return 'last'
+        case _:
+            return 'other'
+",
+        r"events = []
+class Item:
+    __match_args__ = ('kind',)
+    def __init__(self, k, label):
+        self.k, self.text = k, label
+    @property
+    def kind(self):
+        events.append(('kind', self.k))
+        return self.k
+    @property
+    def label(self):
+        events.append(('label', self.text))
+        if self.text == 'raise': raise ValueError
+        return self.text
+one, two, three, four = [Item(k, str(k)) for k in range(1, 5)]
+go, end, colon, semi, bad = [Item(0, s) for s in ('go', 'end', ':', ';', 'raise')]
+answers = []
+for value in [None, [], [None, go, four], [None, go, two], [one, go, three],
+              [two, go, three], [colon, end, three], [semi, end, four],
+              [bad, end, two], [None, end, bad]]:
+    try: answers.append(classify(value))
+    except ValueError: answers.append('raised')
+assert answers == ['other', 'other', 'other', 'first', 'first', '3', 'last', 'last', 'raised', 'other']
+result = answers, events",
     );
 }
 

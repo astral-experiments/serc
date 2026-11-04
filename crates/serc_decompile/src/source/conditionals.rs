@@ -8,6 +8,7 @@ pub(super) struct Predicate {
     pub(super) branch: usize,
     pub(super) suite: usize,
     pub(super) target: usize,
+    pub(super) comparison_cleanup: Option<usize>,
 }
 
 impl Predicate {
@@ -45,9 +46,30 @@ fn negate_if(value: String, invert: bool) -> String {
 struct Term {
     start: usize,
     branch: usize,
+    suite: usize,
+    comparison_cleanup: Option<usize>,
     yes: usize,
     no: usize,
     value: String,
+}
+
+impl Term {
+    fn comparison(start: usize, chain: Predicate) -> Self {
+        let (yes, no) = if chain.fallthrough_true {
+            (chain.suite, chain.target)
+        } else {
+            (chain.target, chain.suite)
+        };
+        Self {
+            start,
+            branch: chain.branch,
+            suite: chain.suite,
+            comparison_cleanup: chain.comparison_cleanup,
+            yes,
+            no,
+            value: chain.value,
+        }
+    }
 }
 
 impl Body<'_, '_, '_> {
@@ -123,6 +145,8 @@ impl Body<'_, '_, '_> {
         Ok(Term {
             start,
             branch,
+            suite: fall,
+            comparison_cleanup: None,
             value: condition(name, value),
             yes,
             no,
@@ -135,23 +159,27 @@ impl Body<'_, '_, '_> {
     fn predicate(
         &mut self,
         ops: &[Instruction],
-        first: usize,
-        value: String,
+        initial: Term,
         end: usize,
         level: usize,
         header: Option<usize>,
     ) -> Result<Predicate, String> {
-        let mut terms = vec![self.term(ops, first, first, value)?];
+        let first = initial.start;
+        let mut terms = vec![initial];
         for _ in 0..32 {
             let last = terms.last().unwrap();
-            let start = fallthrough(ops, last.branch);
+            let start = last.suite;
             if start >= end || last.yes == last.no || !self.flow.entered_from(start, first..start) {
                 break;
             }
-            let Some((branch, value)) = self.predicate_operand(ops, start, end, level)? else {
+            let mut rhs = if let Some(chain) = self.comparison_operand(ops, start, end, level) {
+                Term::comparison(start, chain)
+            } else if let Some((branch, value)) = self.predicate_operand(ops, start, end, level)? {
+                self.term(ops, start, branch, value)?
+            } else {
                 break;
             };
-            let mut rhs = self.term(ops, start, branch, value)?;
+            let branch = rhs.branch;
             while let Some(lhs) = terms.last()
                 && self.flow.entered_from(rhs.start, lhs.start..rhs.start)
                 && let Some((op, invert)) = self.shared_exit(lhs, &rhs, end)
@@ -183,7 +211,7 @@ impl Body<'_, '_, '_> {
             terms.push(rhs);
         }
         let term = terms.into_iter().next().unwrap();
-        let suite = fallthrough(ops, term.branch);
+        let suite = term.suite;
         let fallthrough_true = term.yes == suite;
         Ok(Predicate {
             header,
@@ -192,7 +220,25 @@ impl Body<'_, '_, '_> {
             suite,
             fallthrough_true,
             target: if fallthrough_true { term.no } else { term.yes },
+            comparison_cleanup: term.comparison_cleanup,
         })
+    }
+
+    pub(super) fn extend_comparison(
+        &mut self,
+        ops: &[Instruction],
+        start: usize,
+        chain: Predicate,
+        level: usize,
+    ) -> Result<Predicate, String> {
+        let header = chain.header;
+        self.predicate(
+            ops,
+            Term::comparison(start, chain),
+            ops.len(),
+            level,
+            header,
+        )
     }
 
     fn shared_exit(&self, lhs: &Term, rhs: &Term, end: usize) -> Option<(&'static str, bool)> {
@@ -293,7 +339,13 @@ impl Body<'_, '_, '_> {
         header: Option<usize>,
     ) -> Result<usize, String> {
         let value = self.expr()?;
-        let mut predicate = self.predicate(ops, i, value, end, level, header)?;
+        let initial = self.term(ops, i, i, value)?;
+        let mut predicate = self.predicate(ops, initial, end, level, header)?;
+        if let Some(cleanup) = predicate.comparison_cleanup
+            && predicate.suite < cleanup
+        {
+            return self.comparison_suites(&ops[..end], &predicate, cleanup, level);
+        }
         if self.conditional_break(ops, predicate.target, end) {
             self.block(&format!("if {}:", predicate.test(false)), "break")?;
             return Ok(predicate.suite);
@@ -597,7 +649,12 @@ impl Body<'_, '_, '_> {
                     // RETURN_VALUE. RETURN_CONST on 3.12/3.13 instead belongs
                     // to a separate return, as does a borrowed alternate local
                     // on the newer targets.
-                    if ops[tail].name == "RETURN_CONST"
+                    if predicate.comparison_cleanup.is_some_and(|at| {
+                        // Earlier failed links return directly. A conditional
+                        // expression would jump to a shared result instead.
+                        super::regions::constant_return(ops, self.flow.block(at).ops.end)
+                            .is_some_and(|(load, _)| load == at + 1)
+                    }) || ops[tail].name == "RETURN_CONST"
                         || ops[end - 1].name == "RETURN_CONST"
                         || (target + 2 == end && ops[target].name == "LOAD_FAST_BORROW")
                         // Two unprotected iterator cleanups are separate
