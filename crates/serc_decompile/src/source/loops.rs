@@ -137,6 +137,78 @@ impl Body<'_, '_, '_> {
         }
     }
 
+    /// At the end of an except suite's loop, a failed test can go straight
+    /// back to `FOR_ITER` outside the exception table. An explicit continue
+    /// inside the handler would protect that jump. Guard the remaining body
+    /// instead so the iterator advances implicitly.
+    pub(super) fn guarded_iteration_tail(
+        &self,
+        ops: &[Instruction],
+        predicate: &Predicate,
+        end: usize,
+    ) -> bool {
+        let Some(active) = self.loop_edges else {
+            return false;
+        };
+        active.body_end == end
+            && ops[active.header].name == "FOR_ITER"
+            && self.flow.handler(active.header).is_some_and(|h| h.lasti)
+            && predicate.suite + 1 == predicate.target
+            && predicate.target < end
+            && self.loop_transfer(ops, predicate.suite) == Some("continue")
+            && self.flow.handler(predicate.suite).is_none()
+            && self
+                .flow
+                .entered_from(predicate.target, predicate.branch..predicate.target)
+    }
+
+    /// Recover a constant-true loop whose paths return, raise, or come back
+    /// to its header. Older targets leave the header NOP just before the
+    /// ordinary backedge target, but an explicit continue can still visit it.
+    pub(super) fn unconditional_loop(
+        &mut self,
+        ops: &[Instruction],
+        nop: usize,
+        end: usize,
+        level: usize,
+    ) -> Result<Option<usize>, String> {
+        let header = nop + usize::from(self.m.version < super::PythonVersion::Py314);
+        if header >= end || self.flow.block(header).ops.start != header {
+            return Ok(None);
+        }
+        let Some(latch) = self.flow.incoming(header).rev().find(|&i| {
+            (nop + 1..end).contains(&i)
+                && ops[i].name == "JUMP_BACKWARD"
+                && self.flow.jump(i) == Some(header)
+        }) else {
+            return Ok(None);
+        };
+        let after = latch + 1;
+        for block in self.flow.blocks_in(header..after) {
+            let start = block.ops.start;
+            let last = block.ops.end - 1;
+            if self.flow.handler(start).is_some()
+                || (start != header && !self.flow.entered_from(start, nop..after))
+                || self.flow.jump(last).is_some_and(|to| {
+                    !((nop..after).contains(&to)
+                        || (to == after && ops[last].name == "JUMP_FORWARD"))
+                })
+            {
+                return Ok(None);
+            }
+        }
+        let outer = self.loop_edges.replace(Loop {
+            header: nop,
+            body_end: latch,
+            after: Some(after),
+            copied_return: None,
+        });
+        let body = self.fragment(ops, nop + 1, latch, level);
+        self.loop_edges = outer;
+        self.block("while True:", &body?.suite()?)?;
+        Ok(Some(after))
+    }
+
     pub(super) fn folded_break(&self, ops: &[Instruction], i: usize, end: usize) -> bool {
         let Some(active) = self.loop_edges else {
             return false;
@@ -169,7 +241,15 @@ impl Body<'_, '_, '_> {
             ops[iter].opcode,
             ops[iter].arg,
         );
-        (self.flow.for_iter_depth(header) == Some(slots)).then_some(slots)
+        let depth = self.flow.for_iter_depth(header)?;
+        // A loop in an except clause also carries the saved exception.
+        (depth == slots
+            || (depth == slots + 1
+                && self
+                    .flow
+                    .handler(header)
+                    .is_some_and(|h| h.lasti && h.depth == 1)))
+        .then_some(slots)
     }
 
     /// A return inside a for suite discards the iterator that the source
@@ -190,8 +270,11 @@ impl Body<'_, '_, '_> {
         let pop = i + usize::from(computed);
         let next = pop + slots;
         let stop = self.flow.block(i).ops.end;
-        if next >= stop || stop > end || ops[pop..next].iter().any(|op| op.name != "POP_TOP") {
+        if next > stop || stop > end || ops[pop..next].iter().any(|op| op.name != "POP_TOP") {
             return None;
+        }
+        if !computed && next == stop {
+            return self.handler_constant_return(ops, i, next, end);
         }
         let returns = if computed {
             next + 1 == stop && ops[next].name == "RETURN_VALUE"

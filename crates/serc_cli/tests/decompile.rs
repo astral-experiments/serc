@@ -166,6 +166,53 @@ fn branches_preserve_call_order() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn mixed_guards_short_circuit_before_entering_a_generator() {
+    check_fixture(
+        r"def choose(first, second, items, visit, emit):
+    if first() or second() and any(visit(x) for x in items):
+        emit()
+
+def nested(a, b, c, d, emit):
+    if a() and (b() or c() is None and d()):
+        emit()
+
+def regroup(a, b, c, d, emit):
+    if a() or (not b() or c()) and d():
+        emit(1)
+    emit(2)
+
+def require(a, b, c, message):
+    assert a() or b() and c(), message()
+",
+        r"result = []
+def record(value):
+    result.append(value)
+    return value
+def ready(name, value):
+    return lambda: (record(name), value)[1]
+for a, b in [(True, True), (False, False), (False, True)]:
+    choose(ready('a', a), ready('b', b), [0, 1, 2], record, lambda: record('yes'))
+assert result == ['a', 'yes', 'a', 'b', 'a', 'b', 0, 1, 'yes']
+result.clear()
+for a, b, c in [(False, True, None), (True, True, None), (True, False, 1), (True, False, None)]:
+    nested(ready('a', a), ready('b', b), ready('c', c), ready('d', True), lambda: record('yes'))
+assert result == ['a', 'a', 'b', 'yes', 'a', 'b', 'c', 'a', 'b', 'c', 'd', 'yes']
+result.clear()
+regroup(ready('a', False), ready('b', False), ready('c', True), ready('d', True), record)
+assert result == ['a', 'b', 'd', 1, 2]
+result.clear()
+for a, b, c in [(True, False, False), (False, True, True), (False, False, True)]:
+    try:
+        require(ready('a', a), ready('b', b), ready('c', c), ready('message', 42))
+    except AssertionError as exc:
+        record(exc.args)
+assert result == ['a', 'a', 'b', 'c', 'a', 'b', 'message', (42,)]
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn embedded_operands_keep_their_grouping() {
     check_fixture(
         "pairs = {(1, 2): 3, (4,): 5}\ndef f(x=(bound := (1, 2)), *, y=(other := (4,))):\n    return pairs[x], pairs[y]\n",
@@ -497,6 +544,32 @@ assert result == (0, 'unused', [0])",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_constant_loop_reenters_after_exhausting_its_nested_iterator() {
+    check_fixture(
+        r"def search(read, match, visit):
+    while True:
+        batch = read()
+        if batch is None:
+            return
+        for item in batch:
+            visit(item)
+            if match(item):
+                return item
+",
+        r"result = []
+def find(batches, target):
+    seen = []
+    found = search(iter(batches).__next__, lambda x: x == target, seen.append)
+    result.append((found, seen))
+find([[], [1], [2, 3], [4]], 2)
+find([[1], [], None, [2]], 2)
+assert result == [(2, [1, 2]), (None, [1])]
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_successful_match_can_skip_the_remaining_cases() {
     check_fixture(
         r"def resolve(name, ready, log):
@@ -610,6 +683,161 @@ def action():
 for check in [lambda: False, fail, lambda: True]:
     assert guarded(check, action) is None
 assert result == ['called']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn compound_guards_share_the_exit_that_clears_the_exception_name() {
+    check_fixture(
+        r"def finish(work, closed, cancelled, notify):
+    try:
+        work()
+        if not closed():
+            notify(None)
+    except LookupError as error:
+        if not closed() and not cancelled():
+            notify(error)
+
+def discard(target):
+    if target is not None:
+        try:
+            del target.item
+        except AttributeError:
+            pass
+",
+        r"import sys
+result = []
+def run(fail, closed, cancelled):
+    events = []
+    def work():
+        if fail:
+            raise KeyError('work')
+    def check(name, answer):
+        events.append(name)
+        return answer
+    def notify(error):
+        assert error is sys.exception()
+        events.append(type(error).__name__)
+    finish(work, lambda: check('closed', closed), lambda: check('cancelled', cancelled), notify)
+    return events
+for fail in [False, True]:
+    for closed in [False, True]:
+        for cancelled in [False, True]:
+            result.append(run(fail, closed, cancelled))
+assert result == [['closed', 'NoneType']] * 2 + [['closed']] * 2 + [
+    ['closed', 'cancelled', 'KeyError'], ['closed', 'cancelled'], ['closed'], ['closed']]
+class Target:
+    pass
+t = Target()
+t.item = 1
+discard(None)
+discard(t)
+discard(t)
+assert not hasattr(t, 'item')
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_handler_search_restores_the_exception_only_after_a_match() {
+    check_fixture(
+        r"def apply(update, matches, errors):
+    try:
+        update()
+    except OSError as why:
+        for e in errors:
+            if matches(e) and why.errno == e:
+                break
+        else:
+            raise
+",
+        r"import sys
+result = []
+error = OSError(2, 'missing')
+def fail():
+    raise error
+def matches(e):
+    assert sys.exception() is error
+    result.append(e)
+    return True
+apply(lambda: None, matches, [9])
+apply(fail, matches, [1, 2, 3])
+try:
+    apply(fail, matches, [4])
+except OSError as caught:
+    assert caught is error
+else:
+    assert False
+assert sys.exception() is None and result == [1, 2, 4]
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn guarded_returns_cross_only_their_own_iterator_cleanup() {
+    check_fixture(
+        r"def locate(names, lookup, fallback):
+    for name in names:
+        try:
+            if lookup(name):
+                return name
+        except LookupError:
+            pass
+    try:
+        if lookup(fallback):
+            return fallback
+    except LookupError:
+        raise ValueError(fallback)
+    raise RuntimeError
+",
+        r"result = []
+def lookup(name):
+    result.append(name)
+    if name is None:
+        raise KeyError
+    return name == 'hit'
+assert locate([None, 'skip', 'hit', 'unused'], lookup, 'unused') == 'hit'
+assert locate([], lookup, 'hit') == 'hit'
+for fallback, error in [(None, ValueError), ('absent', RuntimeError)]:
+    try:
+        locate([], lookup, fallback)
+    except error:
+        pass
+    else:
+        assert False
+assert result == [None, 'skip', 'hit', 'hit', None, 'absent']
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_nested_guard_can_jump_directly_to_the_following_try() {
+    check_fixture(
+        r"def apply(platform, follow, needed, set_mode):
+    if platform:
+        if follow:
+            if needed():
+                set_mode(1)
+        else:
+            set_mode(2)
+    try:
+        set_mode(3)
+    except ValueError:
+        pass
+",
+        r"result = []
+def set_mode(mode):
+    result.append(mode)
+    if mode == 3:
+        raise ValueError
+for platform, follow, needed in [(False, True, True), (True, False, False), (True, True, False), (True, True, True)]:
+    apply(platform, follow, lambda: needed, set_mode)
+assert result == [3, 2, 3, 3, 1, 3]
+",
     );
 }
 
@@ -2154,7 +2382,9 @@ fn normal_flow_warnings_list_the_original_successors() {
     for version in common::PYTHON_VERSIONS {
         let built = common::python_command(version).args(["-c", r"import dis, importlib.util, marshal, sys, types
 from pathlib import Path
-code = compile('def keep(x): return x\ndef route(a, b, effect):\n    if a and b: effect()\n', 'guard.py', 'exec')
+source = 'def keep(x): return x\ndef route(a, b, effect):\n    if a and b: effect()\n'
+source += '\n' * 16 + 'class First:\n    def method(self):\n        return 1\nclass Next:\n    pass\n'
+code = compile(source, 'guard.py', 'exec')
 constants = list(code.co_consts)
 index = next(i for i, c in enumerate(constants) if isinstance(c, types.CodeType) and c.co_name == 'route')
 route = constants[index]
@@ -2188,12 +2418,16 @@ Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12) + marshal.
         fs_err::write(&recovered, source).unwrap();
         let checked = common::python_command(version).args(["-c", r"import dis, marshal, re, runpy, sys, types
 from pathlib import Path
-route = next(c for c in marshal.loads(Path(sys.argv[1]).read_bytes()[16:]).co_consts if isinstance(c, types.CodeType) and c.co_name == 'route')
+children = {c.co_name: c for c in marshal.loads(Path(sys.argv[1]).read_bytes()[16:]).co_consts if isinstance(c, types.CodeType)}
+route = children['route']
 listing = Path(sys.argv[2]).read_text().split('# serc: original blocks (normal control flow differs) in route ')[1]
 ops = list(dis.get_instructions(route))
 assert [(int(m[1]), m[2]) for m in re.finditer(r'^# +(\d+)  (\w+) ', listing, re.M)] == [(op.offset, op.opname) for op in ops]
 assert [int(n) for n in re.findall(r'^# block .* jump (\d+)$', listing, re.M)] == [op.argval for op in ops if op.opname == 'POP_JUMP_IF_FALSE']
 scope = runpy.run_path(sys.argv[2])
+if sys.version_info >= (3, 13):
+    for name in ['First', 'Next']:
+        assert scope[name].__firstlineno__ == children[name].co_firstlineno
 calls = []
 for a in [False, True]:
     for b in [False, True]:

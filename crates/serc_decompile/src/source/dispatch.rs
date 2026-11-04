@@ -72,10 +72,18 @@ impl Body<'_, '_, '_> {
         failed: usize,
     ) -> Option<usize> {
         let cleanup = failed.checked_sub(4)?;
-        let [none, store, delete, reraise] = ops.get(cleanup..failed)? else {
+        let unwind = self.flow.handler(binding + 1)?;
+        let store = self.cleared_name(ops, cleanup)?;
+        ((unwind.target, unwind.depth, unwind.lasti) == (ops[cleanup].offset, 1, true)
+            && (store.name, store.arg) == (ops[binding].name, ops[binding].arg))
+            .then_some(cleanup)
+    }
+
+    fn cleared_name(&self, ops: &[Instruction], cleanup: usize) -> Option<Instruction> {
+        let [none, store, delete, reraise] = ops.get(cleanup..cleanup + 4)? else {
             return None;
         };
-        let unwind = self.flow.handler(binding + 1)?;
+        let name = store.name.strip_prefix("STORE_")?;
         let loads_none = match none.name {
             "LOAD_CONST" => matches!(
                 self.m.objects[self.item(self.code.constants, none.arg).ok()?],
@@ -84,14 +92,47 @@ impl Body<'_, '_, '_> {
             "LOAD_COMMON_CONSTANT" => none.arg == super::CommonConstant::NONE.argument(),
             _ => false,
         };
-        ((unwind.target, unwind.depth, unwind.lasti) == (none.offset, 1, true)
-            && loads_none
-            && (store.name, store.arg) == (ops[binding].name, ops[binding].arg)
-            && store.name.starts_with("STORE_")
-            && delete.name.strip_prefix("DELETE_") == store.name.strip_prefix("STORE_")
+        (loads_none
+            && delete.name.strip_prefix("DELETE_") == Some(name)
             && delete.arg == store.arg
             && (reraise.name, reraise.arg) == ("RERAISE", 1))
-            .then_some(cleanup)
+            .then_some(*store)
+    }
+
+    /// After dropping the iterator a return also restores the active exception
+    /// and, for a bound handler, clears its name exactly as on unwind.
+    pub(super) fn handler_constant_return(
+        &self,
+        ops: &[Instruction],
+        protected: usize,
+        pop: usize,
+        end: usize,
+    ) -> Option<usize> {
+        if pop >= end || ops[pop].name != "POP_EXCEPT" || self.flow.handler(pop).is_some() {
+            return None;
+        }
+        let stop = self.flow.block(pop).ops.end;
+        let (load, _) = super::regions::constant_return(ops, stop)?;
+        if stop > end || load <= pop {
+            return None;
+        }
+        if load == pop + 1 {
+            unwind(ops, &self.flow, protected, 1)?;
+        } else {
+            let h = self.flow.handler(protected)?;
+            let cleanup = ops.binary_search_by_key(&h.target, |op| op.offset).ok()?;
+            self.cleared_name(ops, cleanup)?;
+            if !h.lasti
+                || h.depth != 1
+                || !super::comparisons::same_instructions(
+                    &ops[pop + 1..load],
+                    &ops[cleanup..cleanup + 3],
+                )
+            {
+                return None;
+            }
+        }
+        Some(load)
     }
 
     pub(super) fn exception_dispatch(
@@ -307,6 +348,36 @@ impl Body<'_, '_, '_> {
         Some((body.start..pop, outcome))
     }
 
+    pub(super) fn except_header(
+        &mut self,
+        ops: &[Instruction],
+        kind: Option<Range<usize>>,
+        binding: usize,
+        level: usize,
+    ) -> Result<String, String> {
+        let mut header = "except".to_owned();
+        if let Some(kind) = kind {
+            header.push(' ');
+            header.push_str(
+                &self
+                    .fragment(ops, kind.start, kind.end, level)?
+                    .expression()?,
+            );
+        }
+        let op = ops[binding];
+        if op.name != "POP_TOP" {
+            let table = if matches!(op.name, "STORE_NAME" | "STORE_GLOBAL") {
+                self.code.names
+            } else {
+                self.code.locals
+            };
+            header.push_str(" as ");
+            header.push_str(self.name(table, op.arg)?);
+        }
+        header.push(':');
+        Ok(header)
+    }
+
     pub(super) fn emit_dispatch(
         &mut self,
         ops: &[Instruction],
@@ -314,21 +385,7 @@ impl Body<'_, '_, '_> {
         try_source_start: usize,
     ) -> Result<(), String> {
         for arm in dispatch.arms {
-            let mut header = "except".to_owned();
-            if let Some(kind) = arm.kind {
-                header.push(' ');
-                header.push_str(&self.fragment(ops, kind.start, kind.end, 0)?.expression()?);
-            }
-            let op = ops[arm.binding];
-            if op.name != "POP_TOP" {
-                let table = if matches!(op.name, "STORE_NAME" | "STORE_GLOBAL") {
-                    self.code.names
-                } else {
-                    self.code.locals
-                };
-                header.push_str(" as ");
-                header.push_str(self.name(table, op.arg)?);
-            }
+            let header = self.except_header(ops, arm.kind, arm.binding, 0)?;
             let fragment = self.fragment(ops, arm.body.start, arm.body.end, 0)?;
             let mut suite = if matches!(arm.exit, Exit::ReturnValue) {
                 let (suite, returns) = fragment.pending_return()?;
@@ -349,7 +406,6 @@ impl Body<'_, '_, '_> {
                     suite.push_str(&tail);
                 }
             }
-            header.push(':');
             self.block(&header, &suite)?;
         }
         if !dispatch.success.is_empty() {

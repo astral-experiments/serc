@@ -20,6 +20,36 @@ impl Predicate {
     }
 }
 
+fn fallthrough(ops: &[Instruction], branch: usize) -> usize {
+    branch + 1 + usize::from(ops.get(branch + 1).is_some_and(|op| op.name == "NOT_TAKEN"))
+}
+
+// On identity branches this is the condition that is true on fallthrough.
+fn condition(name: &str, value: String) -> String {
+    match name {
+        "POP_JUMP_IF_NONE" => format!("({value}) is not None"),
+        "POP_JUMP_IF_NOT_NONE" => format!("({value}) is None"),
+        _ => value,
+    }
+}
+
+fn negate_if(value: String, invert: bool) -> String {
+    if invert {
+        format!("not ({value})")
+    } else {
+        value
+    }
+}
+
+/// A sequence of tests with two remaining destinations.
+struct Term {
+    start: usize,
+    branch: usize,
+    yes: usize,
+    no: usize,
+    value: String,
+}
+
 impl Body<'_, '_, '_> {
     /// CPython may give each short-circuit edge a distinct copy of the same
     /// implicit function exit. Only a suffix of unprotected, empty-stack
@@ -68,9 +98,36 @@ impl Body<'_, '_, '_> {
         }
     }
 
-    /// Fold consecutive predicate blocks that share a true or false successor.
-    /// A and B only compose when short-circuiting A reaches the same successor
-    /// as one outcome of B. Keep the physical fallthrough for suite recovery.
+    fn term(
+        &self,
+        ops: &[Instruction],
+        start: usize,
+        branch: usize,
+        value: String,
+    ) -> Result<Term, String> {
+        let name = ops[branch].name;
+        let jump = self.flow.target(branch)?;
+        let jump = self
+            .clause_exits
+            .map_or(jump, |copies| copies.destination(jump));
+        let fall = fallthrough(ops, branch);
+        let (yes, no) = if name == "POP_JUMP_IF_TRUE" {
+            (jump, fall)
+        } else {
+            (fall, jump)
+        };
+        Ok(Term {
+            start,
+            branch,
+            value: condition(name, value),
+            yes,
+            no,
+        })
+    }
+
+    /// Reduce adjacent tests once they share an exit. For `a or b and c`
+    /// the right pair reduces first. An unfinished term belongs to a later
+    /// suite and is left for the normal statement traversal.
     fn predicate(
         &mut self,
         ops: &[Instruction],
@@ -80,85 +137,112 @@ impl Body<'_, '_, '_> {
         level: usize,
         header: Option<usize>,
     ) -> Result<Predicate, String> {
-        let fall =
-            |i: usize| i + 1 + usize::from(ops.get(i + 1).is_some_and(|op| op.name == "NOT_TAKEN"));
-        let arms = |i: usize, jump: usize| {
-            if ops[i].name == "POP_JUMP_IF_TRUE" {
-                (jump, fall(i))
-            } else {
-                (fall(i), jump)
-            }
-        };
-        // For either identity branch, use the test that is true on fallthrough.
-        let condition = |i: usize, value: String| match ops[i].name {
-            "POP_JUMP_IF_NONE" => format!("({value}) is not None"),
-            "POP_JUMP_IF_NOT_NONE" => format!("({value}) is None"),
-            _ => value,
-        };
-        let mut value = condition(first, value);
-        let mut branch = first;
-        let (mut yes, mut no) = arms(branch, self.flow.target(branch)?);
+        let mut terms = vec![self.term(ops, first, first, value)?];
         for _ in 0..32 {
-            let start = fall(branch);
-            if start >= end || yes == no || !self.flow.entered_from(start, first..start) {
+            let last = terms.last().unwrap();
+            let start = fallthrough(ops, last.branch);
+            if start >= end || last.yes == last.no || !self.flow.entered_from(start, first..start) {
                 break;
             }
-            let next = self.flow.block(start).ops.end - 1;
-            if next >= end
-                || next == start
-                || !matches!(
-                    ops[next].name,
-                    "POP_JUMP_IF_FALSE"
-                        | "POP_JUMP_IF_TRUE"
-                        | "POP_JUMP_IF_NONE"
-                        | "POP_JUMP_IF_NOT_NONE"
-                )
+            let Some((branch, value)) = self.predicate_operand(ops, start, end, level)? else {
+                break;
+            };
+            let mut rhs = self.term(ops, start, branch, value)?;
+            while let Some(lhs) = terms.last()
+                && self.flow.entered_from(rhs.start, lhs.start..rhs.start)
+                && let Some((op, invert)) = self.shared_exit(lhs, &rhs, end)
             {
-                break;
+                self.charge(lhs.value.len() + rhs.value.len() + 16)?;
+                let lhs = terms.pop().unwrap();
+                let right = negate_if(rhs.value, invert);
+                rhs.value = format!("({} {op} {right})", lhs.value);
+                rhs.start = lhs.start;
+                if invert {
+                    std::mem::swap(&mut rhs.yes, &mut rhs.no);
+                }
             }
-            let (b_yes, b_no) = arms(next, self.flow.target(next)?);
-            let same_exit = |a, b| {
-                a == b
-                    || (end == self.terminal_returns.end
-                        && self.terminal_returns.contains(&a)
-                        && self.terminal_returns.contains(&b))
-            };
-            let (operator, invert) = if yes == start && same_exit(no, b_no) {
-                ("and", false)
-            } else if yes == start && same_exit(no, b_yes) {
-                ("and", true)
-            } else if no == start && same_exit(yes, b_yes) {
-                ("or", false)
-            } else if no == start && same_exit(yes, b_no) {
-                ("or", true)
-            } else {
-                break;
-            };
-            // A suite containing statements can also end in a conditional.
-            // Only combine blocks that produce a single predicate value.
-            let stop = next - usize::from(ops[next - 1].name == "TO_BOOL");
-            let Ok(rhs) = self
-                .fragment(ops, start, stop, level)
-                .and_then(Fragment::expression)
-            else {
-                break;
-            };
-            let rhs = condition(next, rhs);
-            let rhs = if invert { format!("not ({rhs})") } else { rhs };
-            self.charge(value.len() + rhs.len() + 8)?;
-            value = format!("({value} {operator} {rhs})");
-            (yes, no) = if invert { (b_no, b_yes) } else { (b_yes, b_no) };
-            branch = next;
+            terms.push(rhs);
         }
-        let start = fall(branch);
+        let term = terms.into_iter().next().unwrap();
+        let suite = fallthrough(ops, term.branch);
+        let fallthrough_true = term.yes == suite;
         Ok(Predicate {
             header,
-            value,
-            branch,
-            suite: start,
-            target: if yes == start { no } else { yes },
-            fallthrough_true: yes == start,
+            value: term.value,
+            branch: term.branch,
+            suite,
+            fallthrough_true,
+            target: if fallthrough_true { term.no } else { term.yes },
         })
+    }
+
+    fn shared_exit(&self, lhs: &Term, rhs: &Term, end: usize) -> Option<(&'static str, bool)> {
+        let same = |a, b| {
+            a == b
+                || (end == self.terminal_returns.end
+                    && self.terminal_returns.contains(&a)
+                    && self.terminal_returns.contains(&b))
+        };
+        if lhs.yes == rhs.start && same(lhs.no, rhs.no) {
+            Some(("and", false))
+        } else if lhs.yes == rhs.start && same(lhs.no, rhs.yes) {
+            Some(("and", true))
+        } else if lhs.no == rhs.start && same(lhs.yes, rhs.yes) {
+            Some(("or", false))
+        } else if lhs.no == rhs.start && same(lhs.yes, rhs.no) {
+            Some(("or", true))
+        } else {
+            None
+        }
+    }
+
+    fn predicate_operand(
+        &mut self,
+        ops: &[Instruction],
+        start: usize,
+        end: usize,
+        level: usize,
+    ) -> Result<Option<(usize, String)>, String> {
+        let mut branch = self.flow.block(start).ops.end - 1;
+        if branch <= start || branch >= end || !ops[branch].name.starts_with("POP_JUMP_IF_") {
+            return Ok(None);
+        }
+        // A guarded all()/any() has an inlined loop and a fallback call. The
+        // predicate consumes their shared result. The expression lifter checks
+        // both paths and the identity guard before returning that operand.
+        if branch >= start + 3
+            && super::builtin_calls::truth_guard(&ops[branch - 3..=branch]).is_some()
+            && let Some(fallback) = self.flow.jump(branch)
+            && (branch + 1..end).contains(&fallback)
+            && let Some(join) = self.flow.fallthrough(self.flow.block(fallback))
+            && (fallback + 1..end).contains(&join)
+        {
+            branch = self.flow.block(join).ops.end - 1;
+            if branch >= end || !ops[branch].name.starts_with("POP_JUMP_IF_") {
+                return Ok(None);
+            }
+            self.charge(branch - start)?;
+            if self.flow.blocks_in(start..branch + 1).any(|block| {
+                let i = block.ops.end - 1;
+                (block.ops.start > start
+                    && !self.flow.entered_from(block.ops.start, start..branch + 1))
+                    || (i != branch
+                        && self
+                            .flow
+                            .jump(i)
+                            .is_some_and(|to| !(start..=branch).contains(&to)))
+            }) {
+                return Ok(None);
+            }
+        }
+        let stop = branch - usize::from(ops[branch - 1].name == "TO_BOOL");
+        // A statement suite may also end in a test. It is an operand only
+        // when it leaves a single expression and emits no statements.
+        Ok(self
+            .fragment(ops, start, stop, level)
+            .and_then(Fragment::expression)
+            .ok()
+            .map(|value| (branch, value)))
     }
 
     // A shared return can be copied to both arms. Distinct source lines
@@ -191,28 +275,33 @@ impl Body<'_, '_, '_> {
     ) -> Result<usize, String> {
         let value = self.expr()?;
         let mut predicate = self.predicate(ops, i, value, end, level, header)?;
-        // CPython may copy the return after a terminal try onto both
-        // edges of its final guard. Both exits are outside the protected
-        // suite; the surrounding try owns their common continuation.
-        if predicate.target > end
-            && self.terminal_returns.contains(&end)
-            && self.terminal_returns.contains(&predicate.target)
-            && self.none_return(&ops[end..predicate.target])
-            && self
-                .flow
-                .handler(predicate.branch)
-                .is_some_and(|h| !h.lasti && h.depth == 0)
-        {
-            predicate.target = end;
-        }
+        predicate.target = self.local_join(ops, predicate.target, end);
         if let Some(latch) = self.enclosing_continue_latch(ops, &predicate, end) {
             predicate.suite = predicate.target;
             predicate.target = end;
             predicate.fallthrough_true = !predicate.fallthrough_true;
             return self.while_loop(ops, &predicate, &latch, end, level);
         }
+        if self.guarded_iteration_tail(ops, &predicate, end) {
+            let suite = self.fragment(ops, predicate.target, end, level)?.suite()?;
+            self.block(&format!("if {}:", predicate.test(false)), &suite)?;
+            return Ok(end);
+        }
         let fallthrough_end = predicate.target;
         self.conditional_suites(ops, &predicate, fallthrough_end, end, level)
+    }
+
+    // CPython can thread a nested arm directly to the enclosing join.
+    // Falling off this fragment runs the caller's jump to the same place.
+    fn local_join(&self, ops: &[Instruction], destination: usize, end: usize) -> usize {
+        if destination > end
+            && ops.get(end).is_some_and(|op| op.name == "JUMP_FORWARD")
+            && self.flow.jump(end) == Some(destination)
+        {
+            end
+        } else {
+            destination
+        }
     }
 
     pub(super) fn conditional_suites(
@@ -250,6 +339,14 @@ impl Body<'_, '_, '_> {
                 return Err("unsupported assertion argument".into());
             };
             self.line(&format!("assert {test}{msg}"))?;
+            // At the end of a function each successful short-circuit edge may
+            // have its own implicit return. An explicit return merges them.
+            if end == self.terminal_returns.end
+                && self.terminal_returns.contains(&target)
+                && self.terminal_returns.len() > self.flow.block(target).ops.len()
+            {
+                return Ok(end);
+            }
             return Ok(target);
         }
         if self.loop_edges.is_some()
@@ -307,17 +404,7 @@ impl Body<'_, '_, '_> {
         if ops[tail].name == "JUMP_FORWARD" {
             // With a returning or looping arm there may be no common forward
             // postdominator. The other arm still jumps over its alternate.
-            let destination = self.flow.target(tail)?;
-            // CPython can send both arms of a nested conditional directly
-            // to the enclosing join. The caller owns the jump at `end`.
-            let join = if destination > end
-                && ops.get(end).is_some_and(|op| op.name == "JUMP_FORWARD")
-                && self.flow.jump(end) == Some(destination)
-            {
-                end
-            } else {
-                destination
-            };
+            let join = self.local_join(ops, self.flow.target(tail)?, end);
             if join <= target || join > end {
                 return Err("unsupported conditional join".into());
             }

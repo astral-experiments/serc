@@ -72,8 +72,7 @@ impl Body<'_, '_, '_> {
         limit: usize,
     ) -> Result<(), String> {
         if handlers.len() == bc.handlers.len()
-            && let Some((regions, end)) =
-                super::protected_regions::guarded(bc, &self.flow, |ops| self.none_return(ops))
+            && let Some((regions, end)) = super::protected_regions::guarded(bc, self)
         {
             self.handlers = regions;
             if self.depth > 0 && !self.class {

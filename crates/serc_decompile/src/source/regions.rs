@@ -270,12 +270,7 @@ impl Body<'_, '_, '_> {
             }
             "LOAD_LOCALS" if self.class && self.class_parameters(&ops[i..end])? => Ok(i + 3),
             "COPY"
-                if op.arg == 1
-                    && let [constant, compare, branch, ..] = &ops[i + 1..end]
-                    && constant.name == "LOAD_COMMON_CONSTANT"
-                    && (compare.name, compare.arg) == ("IS_OP", 0)
-                    && branch.name == "POP_JUMP_IF_FALSE"
-                    && let Some(all) = super::builtin_calls::truth_builtin(constant.arg)
+                if let Some(all) = super::builtin_calls::truth_guard(&ops[i..end])
                     && let Some(fallback) =
                         self.optimized_truth_generator(&ops[..end], i + 3, all)? =>
             {
@@ -402,6 +397,12 @@ impl Body<'_, '_, '_> {
             "NOP"
                 if self.stack.is_empty()
                     && let Some(next) = self.bottom_tested_loop(ops, i, end, level)? =>
+            {
+                Ok(next)
+            }
+            "NOP"
+                if self.stack.is_empty()
+                    && let Some(next) = self.unconditional_loop(ops, i, end, level)? =>
             {
                 Ok(next)
             }
