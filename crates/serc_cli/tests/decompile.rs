@@ -1516,6 +1516,56 @@ fn unpacking_comprehensions_use_the_target_iteration_order() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn nested_managers_suspend_and_resume_after_suppression() {
+    check_fixture(
+        r"def paused(first, second):
+    with first as a, second as b:
+        yield a, b
+    yield 'after'
+
+async def run(first, second, read):
+    async with first as a, second as b:
+        return await read(a, b)
+    return 'suppressed'
+",
+        r"import asyncio
+from contextlib import contextmanager, asynccontextmanager
+log = []
+@contextmanager
+def manager(name, suppress):
+    log.append(('enter', name))
+    try:
+        yield name
+    except ValueError:
+        log.append(('caught', name))
+        if not suppress: raise
+    finally:
+        log.append(('exit', name))
+@asynccontextmanager
+async def delayed(name, suppress):
+    await asyncio.sleep(0)
+    with manager(name, suppress) as value:
+        yield value
+    await asyncio.sleep(0)
+for outer, inner in [(True, False), (False, True), (False, False)]:
+    it = paused(manager('a', outer), manager('b', inner))
+    log.append(next(it))
+    try: log.append(it.throw(ValueError()))
+    except ValueError: log.append('raised')
+    it.close()
+    for fail in [False, True]:
+        async def read(a, b):
+            await asyncio.sleep(0)
+            if fail: raise ValueError()
+            return a, b
+        try: log.append(asyncio.run(run(delayed('a', outer), delayed('b', inner), read)))
+        except ValueError: log.append('raised')
+result = log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn consecutive_managers_keep_separate_exception_paths() {
     check_fixture(
         "def run(manager, emit):\n    with manager(1) as a, manager(2) as b:\n        emit(a, b)\n    emit('between')\n    with manager(3) as c:\n        emit(c)\n    emit('done')\n    return 17\n",
@@ -2081,6 +2131,92 @@ fn comprehensions_inside_returning_exception_handlers() {
     check_fixture(
         "def values(items, work):\n    before = [x + 1 for x in items]\n    try: work()\n    except KeyError: before.append(5)\n    return before\n",
         "def fail(): raise KeyError\nresult = values([1], fail), values([3], lambda: None)\nassert result == ([2,5],[4])",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn cleanup_copies_restore_locals_on_close_and_reraise() {
+    check_fixture(
+        r"def save(box, fail):
+    try:
+        saved = box[:]
+        del box[:]
+        yield
+    finally:
+        if fail:
+            box[:] = saved
+        else:
+            box.append(saved)
+        box.append(42)
+
+def prepare(read, restore):
+    try:
+        read()
+    except:
+        restore()
+        raise
+",
+        r"import sys
+result = []
+for fail in (True, False):
+    for close in (True, False):
+        box = [1, 2]
+        it = save(box, fail)
+        next(it)
+        if close:
+            it.close()
+        else:
+            try: it.throw(ValueError('thrown'))
+            except ValueError as exc: result.append(exc.args)
+        result.append(box)
+def fail(): raise KeyboardInterrupt('read')
+def restore(): result.append(sys.exception().args)
+try: prepare(fail, restore)
+except KeyboardInterrupt as exc: result.append(exc.args)
+prepare(lambda: result.append('read'), restore)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_finalizers_run_under_the_right_active_exception() {
+    check_fixture(
+        r"async def unwind(wait, failure, emit):
+    try:
+        await wait()
+    except ValueError as exc:
+        if exc.args:
+            emit('caught')
+    try:
+        if failure is not None:
+            try:
+                raise failure
+            finally:
+                emit('inner')
+    finally:
+        emit('outer')
+    return 42
+",
+        r"import asyncio, sys
+async def scenario(wait_error, failure, replace):
+    events = []
+    def emit(label):
+        active = sys.exception()
+        events.append((label, type(active).__name__, active.args if active else None))
+        if label == replace: raise RuntimeError(label)
+    async def wait():
+        await asyncio.sleep(0)
+        if wait_error is not None: raise wait_error
+    try:
+        value = await unwind(wait, failure, emit)
+    except Exception as exc:
+        value = type(exc).__name__, exc.args
+    return events, value
+result = [asyncio.run(scenario(wait_error, failure, replace))
+          for wait_error in [None, ValueError(), ValueError('caught'), TypeError('uncaught')]
+          for failure in [None, KeyError('failed')]
+          for replace in [None, 'inner', 'outer']]",
     );
 }
 
@@ -2772,6 +2908,64 @@ fn truth_tests_preserve_user_conversions_and_short_circuit_returns() {
 log = []
 a, b = Flag('a', False), Flag('b', True)
 result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is a, log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn managers_inside_try_keep_the_exception_and_success_paths() {
+    check_fixture(
+        r"async def run(manager, work, emit):
+    try:
+        async with manager:
+            await work()
+    except ValueError:
+        emit('handled')
+    else:
+        emit('done')
+
+def rows(cm):
+    try:
+        with cm as values:
+            for value in values:
+                yield value
+    except ValueError as exc:
+        raise KeyError(*exc.args)
+",
+        r"import asyncio, sys
+from contextlib import asynccontextmanager, contextmanager
+result = []
+async def scenario(fail, suppress):
+    @asynccontextmanager
+    async def manager():
+        if fail == 'enter': raise ValueError('enter')
+        try: yield
+        except ValueError:
+            if not suppress: raise
+        finally:
+            await asyncio.sleep(0)
+            if fail == 'exit': raise ValueError('exit')
+    async def work():
+        await asyncio.sleep(0)
+        if fail == 'work': raise ValueError('work')
+    def emit(label):
+        active = sys.exception()
+        result.append((label, active.args if active else None))
+        if fail == 'done': raise ValueError(label)
+    try: await run(manager(), work, emit)
+    except ValueError as exc: result.append(('outside', exc.args))
+for fail in ['enter', 'work', 'exit', 'done', None]:
+    for suppress in [False, True]:
+        asyncio.run(scenario(fail, suppress))
+@contextmanager
+def values():
+    try: yield [1, 2]
+    finally: result.append(('closed', type(sys.exception()).__name__))
+it = rows(values())
+result.append(next(it))
+try: it.throw(ValueError('bad row'))
+except KeyError as exc: result.append(exc.args)
+result.extend(rows(values()))",
     );
 }
 

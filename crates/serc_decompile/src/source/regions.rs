@@ -233,6 +233,11 @@ impl Body<'_, '_, '_> {
             }
         }
         let op = ops[i];
+        if matches!(op.name, "COPY" | "BEFORE_WITH" | "BEFORE_ASYNC_WITH")
+            && let Some(next) = self.inline_manager(ops, i, end, level)?
+        {
+            return Ok(next);
+        }
         match op.name {
             // CPython builds a constant set display by updating an empty
             // set from a frozenset constant. Its elements belong directly

@@ -298,6 +298,30 @@ impl Body<'_, '_, '_> {
         })
     }
 
+    /// Locate POP_EXCEPT and the first instruction after normal binding cleanup.
+    pub(super) fn handler_pop(
+        &self,
+        ops: &[Instruction],
+        binding: usize,
+        stop: usize,
+    ) -> Option<(usize, usize)> {
+        let pop = (binding + 1..stop).rfind(|&i| ops[i].name == "POP_EXCEPT")?;
+        let mut after = pop + 1;
+        if ops[binding].name != "POP_TOP" {
+            // The normal exit must clear the same name as the unwind.
+            if !ops
+                .get(after..after + 3)?
+                .iter()
+                .zip(ops.get(stop..stop + 3)?)
+                .all(|(a, b)| (a.name, a.arg) == (b.name, b.arg))
+            {
+                return None;
+            }
+            after += 3;
+        }
+        Some((pop, after))
+    }
+
     fn handler_body(
         &self,
         ops: &[Instruction],
@@ -313,20 +337,7 @@ impl Body<'_, '_, '_> {
         if ops.get(body.clone())?.last()?.name == "RAISE_VARARGS" {
             return Some((body, Exit::Raise));
         }
-        let pop = body.clone().rfind(|&i| ops[i].name == "POP_EXCEPT")?;
-        let mut after = pop + 1;
-        if stop != next {
-            // The normal exit must clear the same name as the unwind.
-            if !ops
-                .get(after..after + 3)?
-                .iter()
-                .zip(&ops[stop..next])
-                .all(|(a, b)| (a.name, a.arg) == (b.name, b.arg))
-            {
-                return None;
-            }
-            after += 3;
-        }
+        let (pop, after) = self.handler_pop(ops, binding, stop)?;
         let exit = stop.checked_sub(1)?;
         if after > exit {
             return None;

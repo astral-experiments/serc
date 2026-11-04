@@ -1,52 +1,12 @@
 //! The exception table records protected intervals and unwind targets. CPython
 //! duplicates cleanup on normal paths and places the exceptional copy out of line.
 use super::conditionals::Predicate;
-use super::{Body, Bytecode, Instruction, Value};
+use super::{Body, Bytecode, Instruction};
 use serc_bytecode::instructions::Handler;
-use serc_bytecode::target::operands::SpecialMethod;
 
-fn boundary(ops: &[Instruction], offset: usize) -> Result<usize, String> {
+pub(super) fn boundary(ops: &[Instruction], offset: usize) -> Result<usize, String> {
     ops.binary_search_by_key(&offset, |op| op.offset)
         .map_err(|_| "invalid exception boundary".into())
-}
-
-fn is_manager_handler(ops: &[Instruction], entry: &Handler) -> Result<bool, String> {
-    let target = boundary(ops, entry.target)?;
-    Ok(ops[target].name == "PUSH_EXC_INFO"
-        && ops
-            .get(target + 1)
-            .is_some_and(|op| op.name == "WITH_EXCEPT_START"))
-}
-
-/// Locate the implicit manager protocol immediately before a protected binding.
-pub(super) fn manager_entry(ops: &[Instruction], asynchronous: bool) -> Result<usize, String> {
-    let (before_with, enter_method, exit_method) = if asynchronous {
-        (
-            "BEFORE_ASYNC_WITH",
-            SpecialMethod::__AENTER__,
-            SpecialMethod::__AEXIT__,
-        )
-    } else {
-        (
-            "BEFORE_WITH",
-            SpecialMethod::__ENTER__,
-            SpecialMethod::__EXIT__,
-        )
-    };
-    match ops {
-        [.., before] if before.name == before_with => Ok(ops.len() - 1),
-        [.., copy, exit, swap2, swap3, enter, call]
-            if (copy.name, copy.arg) == ("COPY", 1)
-                && (exit.name, exit.arg) == ("LOAD_SPECIAL", exit_method.argument())
-                && (swap2.name, swap2.arg) == ("SWAP", 2)
-                && (swap3.name, swap3.arg) == ("SWAP", 3)
-                && (enter.name, enter.arg) == ("LOAD_SPECIAL", enter_method.argument())
-                && (call.name, call.arg) == ("CALL", 0) =>
-        {
-            Ok(ops.len() - 6)
-        }
-        _ => Err("unsupported manager entry".into()),
-    }
 }
 
 impl Body<'_, '_, '_> {
@@ -197,11 +157,15 @@ impl Body<'_, '_, '_> {
             return self.region(ops, join, normal_end, 0);
         }
         if ops.get(handler + 1).is_some_and(|op| op.name == "POP_TOP") {
-            let stop = ops[handler + 2..]
-                .iter()
-                .position(|op| op.name == "POP_EXCEPT")
-                .map(|n| handler + 2 + n)
+            let (_, cleanup) = super::dispatch::unwind(ops, &self.flow, handler, entry.depth + 1)
                 .ok_or("missing bare exception cleanup")?;
+            let stop = if ops[cleanup - 1].name == "RAISE_VARARGS" {
+                cleanup
+            } else {
+                (handler + 2..cleanup)
+                    .find(|&i| ops[i].name == "POP_EXCEPT")
+                    .ok_or("missing bare exception exit")?
+            };
             let suite = self.fragment(ops, handler + 2, stop, 0)?.suite()?;
             self.block("except:", &suite)?;
             return self.region(ops, end, normal_end, 0);
@@ -366,179 +330,5 @@ impl Body<'_, '_, '_> {
         )?;
         self.block("finally:", &cleanup)?;
         Ok(next)
-    }
-
-    pub(super) fn manager_item(
-        &mut self,
-        manager: String,
-        ops: &[Instruction],
-        start: usize,
-        end: usize,
-    ) -> Result<(String, usize, Vec<Value>), String> {
-        if ops.get(start).is_some_and(|op| op.name == "POP_TOP") {
-            return Ok((manager, start + 1, Vec::new()));
-        }
-        let binding = self.binding(ops, start, end)?;
-        Ok((
-            format!("{manager} as {}", binding.target),
-            binding.next,
-            binding.seed,
-        ))
-    }
-
-    fn with_statement(
-        &mut self,
-        bc: &Bytecode,
-        handlers: &[Handler],
-        limit: usize,
-    ) -> Result<(), String> {
-        let ops = &bc.ops;
-        let mut ranges = handlers.iter().peekable();
-        let mut cursor = 0;
-        let mut normal_end = limit;
-        let depth = handlers[0].depth;
-        while cursor < normal_end {
-            // Skip ranges that resume outer protection during the previous
-            // group's cleanup. Only a subsequent independent manager at the
-            // same depth starts another statement.
-            let Some(entry) = ranges.find(|range| range.start >= ops[cursor].offset) else {
-                break;
-            };
-            if entry.depth != depth
-                || !entry.lasti
-                || boundary(ops, entry.start)? >= normal_end
-                || !is_manager_handler(ops, entry)?
-            {
-                break;
-            }
-            if let Some(next) =
-                self.manager_group(ops, cursor, entry, &mut ranges, &mut normal_end)?
-            {
-                cursor = next;
-            } else {
-                // A return expression can raise before the return takes effect.
-                // Suppression by the outermost manager resumes after the with.
-                let next = self.after_with_suppression(ops, entry)?;
-                if next <= cursor || next >= limit {
-                    return Err("unsupported continuation after with".into());
-                }
-                self.charge(ops.len())?;
-                normal_end = self.flow.normal_end([next]).min(limit);
-                if self.none_return(&ops[next..normal_end]) {
-                    return Ok(());
-                }
-                cursor = next;
-            }
-        }
-        self.region(ops, cursor, normal_end, 0)
-    }
-
-    fn after_with_suppression(
-        &self,
-        ops: &[Instruction],
-        entry: &Handler,
-    ) -> Result<usize, String> {
-        let handler = boundary(ops, entry.target)?;
-        let branch = self.flow.block(handler).ops.end - 1;
-        if ops[branch].name != "POP_JUMP_IF_TRUE" {
-            return Err("unsupported with suppression test".into());
-        }
-        let target = self.flow.target(branch)?;
-        let [pop, restore, rest @ ..] = &ops[target..] else {
-            return Err("missing with suppression cleanup".into());
-        };
-        // The cleanup discards the active exception, restores the previous one,
-        // and pops the saved instruction offset and manager protocol operands.
-        let pops = rest
-            .iter()
-            .take(4)
-            .take_while(|op| op.name == "POP_TOP")
-            .count();
-        if pop.name != "POP_TOP"
-            || restore.name != "POP_EXCEPT"
-            || self.flow.block(target).height != Some(2 + pops)
-            || !(2..=3).contains(&pops)
-        {
-            return Err("unsupported with suppression cleanup".into());
-        }
-        let next = target + 2 + pops;
-        if ops.get(next).is_some_and(|op| op.name == "JUMP_FORWARD") {
-            self.flow.target(next)
-        } else {
-            Ok(next)
-        }
-    }
-
-    /// Recover one with statement, including adjacent items in its header.
-    /// Return the normal continuation, or None for a return through the managers.
-    fn manager_group<'a>(
-        &mut self,
-        ops: &[Instruction],
-        cursor: usize,
-        mut entry: &'a Handler,
-        ranges: &mut std::iter::Peekable<std::slice::Iter<'a, Handler>>,
-        normal_end: &mut usize,
-    ) -> Result<Option<usize>, String> {
-        let mut managers = Vec::new();
-        let mut previous_body = None;
-        let mut seed = Vec::new();
-        let (start, end) = loop {
-            let start = boundary(ops, entry.start)?;
-            let end = boundary(ops, entry.end)?;
-            let handler = boundary(ops, entry.target)?;
-            *normal_end = (*normal_end).min(handler);
-            if start >= end || end > *normal_end {
-                return Err("unsupported manager layout".into());
-            }
-            let enter = manager_entry(&ops[..start], false)?;
-            let manager = if let Some(previous) = previous_body {
-                self.seeded(ops, previous, enter, 0, std::mem::take(&mut seed))?
-                    .expression()?
-            } else {
-                self.region(ops, cursor, enter, 0)?;
-                self.expr()?
-            };
-            let (item, body_start, loaded) = self.manager_item(manager, ops, start, end)?;
-            managers.push(item);
-            seed = loaded;
-
-            // Each additional item starts where the enclosing protected range
-            // ends. The enclosing handler resumes protection during inner cleanup.
-            if let Some(&inner) = ranges.peek()
-                && inner.start == entry.end
-                && inner.depth > entry.depth
-                && inner.lasti
-                && is_manager_handler(ops, inner)?
-            {
-                ranges.next();
-                previous_body = Some(body_start);
-                entry = inner;
-            } else {
-                break (body_start, end);
-            }
-        };
-        let (body, returns) = self.seeded(ops, start, end, 0, seed)?.pending_return()?;
-        self.block(&format!("with {}:", managers.join(", ")), &body)?;
-
-        let mut next = end;
-        for _ in &managers {
-            let exit = ops[next..*normal_end]
-                .iter()
-                .position(|op| op.name == "CALL")
-                .map(|n| next + n)
-                .ok_or("unsupported manager exit")?;
-            if exit + 1 >= *normal_end || ops[exit + 1].name != "POP_TOP" {
-                return Err("unsupported manager result".into());
-            }
-            next = exit + 2;
-        }
-        if returns {
-            if ops.get(next).is_none_or(|op| op.name != "RETURN_VALUE") {
-                return Err("unsupported return through with".into());
-            }
-            Ok(None)
-        } else {
-            Ok(Some(next))
-        }
     }
 }
