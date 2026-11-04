@@ -148,11 +148,70 @@ impl Body<'_, '_, '_> {
                 args.push(format!("**({keywords})"));
             }
         }
-        self.emit_call(&args)
+        self.emit_call(&args.join(", "))
     }
 
     pub(super) fn keyword_call(&mut self, argc: u32, keys: &str) -> Result<(), String> {
         self.call(argc, &tuple_items(keys)?)
+    }
+
+    pub(super) fn located_keyword_call(
+        &mut self,
+        ops: &[Instruction],
+        call: usize,
+    ) -> Result<(), String> {
+        let keys = tuple_items(&self.expr()?)?;
+        let argc = ops[call].arg;
+        if let Some(value) = self.special_call(argc, &keys)? {
+            self.stack.push(value);
+            return Ok(());
+        }
+        let args = self.call_args(argc, &keys)?;
+        let mut breaks = vec![false; args.len()];
+        if keys.len() > 1
+            && call > 0
+            && ops[call - 1].name == "LOAD_CONST"
+            && let Ok(lines) = self.instruction_lines.as_deref()
+        {
+            // Walk straight-line argument producers backwards from the keyword
+            // tuple. A line break between packable locals prevents CPython
+            // from fusing the last load of one argument with the next.
+            let start = self.flow.block(call).ops.start;
+            let mut cursor = call - 1;
+            'args: for index in (args.len() - keys.len() + 1..args.len()).rev() {
+                let mut need = 1;
+                while need != 0 {
+                    if cursor <= start {
+                        break 'args;
+                    }
+                    cursor -= 1;
+                    let op = ops[cursor];
+                    let (pop, push) =
+                        serc_bytecode::target::stack_counts_for(self.m.version, op.opcode, op.arg);
+                    if push > need {
+                        break 'args;
+                    }
+                    need = need - push + pop;
+                }
+                if cursor > start {
+                    let (a, b) = (ops[cursor - 1], ops[cursor]);
+                    breaks[index] = matches!(a.name, "LOAD_FAST" | "LOAD_FAST_BORROW")
+                        && a.name == b.name
+                        && a.arg < 16
+                        && b.arg < 16
+                        && matches!((lines[cursor - 1], lines[cursor]), (Some(a), Some(b)) if a != b);
+                }
+            }
+            self.charge(call - 1 - cursor)?;
+        }
+        let mut rendered = String::new();
+        for (index, arg) in args.iter().enumerate() {
+            if index > 0 {
+                rendered.push_str(if breaks[index] { ",\n    " } else { ", " });
+            }
+            rendered.push_str(arg);
+        }
+        self.emit_call(&rendered)
     }
 
     pub(super) fn call_args(&mut self, argc: u32, keys: &[String]) -> Result<Vec<String>, String> {

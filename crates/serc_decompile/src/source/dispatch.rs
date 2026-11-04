@@ -207,6 +207,32 @@ impl Body<'_, '_, '_> {
         Some(load)
     }
 
+    /// One branch of an except suite may restore the saved exception and
+    /// return while its sibling raises. Every incoming edge must still carry
+    /// that handler's single saved exception.
+    pub(super) fn handler_branch_return(
+        &self,
+        ops: &[Instruction],
+        pop: usize,
+        end: usize,
+    ) -> Option<usize> {
+        let block = self.flow.block(pop);
+        if !self.stack.is_empty() || block.ops.start != pop || block.height != Some(1) {
+            return None;
+        }
+        let mut incoming = self.flow.incoming(pop);
+        let first = incoming.next()?;
+        let owner = self.flow.handler(first)?;
+        if !incoming.all(|i| {
+            self.flow.handler(i).is_some_and(|h| {
+                (h.target, h.depth, h.lasti) == (owner.target, owner.depth, owner.lasti)
+            })
+        }) {
+            return None;
+        }
+        self.handler_constant_return(ops, first, pop, end)
+    }
+
     pub(super) fn exception_dispatch(
         &self,
         bc: &super::Bytecode,
@@ -363,7 +389,7 @@ impl Body<'_, '_, '_> {
                 .filter(|(load, _)| {
                     *load > at
                         && self.none_return(&ops[*load..handler])
-                        && self.instruction_lines(ops).is_ok_and(|lines| {
+                        && self.instruction_lines.as_deref().is_ok_and(|lines| {
                             lines[*load].is_some() && lines[*load] == lines[*load - 1]
                         })
                 })
@@ -378,6 +404,24 @@ impl Body<'_, '_, '_> {
         let mut join = join.unwrap_or(handler);
         let mut continuation = join..handler;
         if let [arm] = arms.as_mut_slice() {
+            // A constant return after POP_EXCEPT (and any binding cleanup)
+            // still exits the handler. Only the successful try reaches the
+            // intervening work before the out-of-line dispatch.
+            if !arm.body.is_empty()
+                && let Exit::Return(tail) = &arm.exit
+                && super::regions::constant_return(ops, tail.end)
+                    .is_some_and(|(load, _)| load == tail.start)
+                && success < handler
+                && super::regions::constant_return(ops, handler)
+                    .is_none_or(|(load, _)| success < load)
+            {
+                return Some(Dispatch {
+                    arms,
+                    success: success..success,
+                    continuation: success..handler,
+                    retry: false,
+                });
+            }
             // A lone empty handler may return a constant, or fall through to
             // a separate return after a successful else has exited. In the
             // latter case the expression runs after POP_EXCEPT has restored

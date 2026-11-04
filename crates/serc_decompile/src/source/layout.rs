@@ -1,10 +1,8 @@
-//! Since 3.13, a class body's first line is also an executable constant.
-//! Match class occurrences in source order, including the first decorator,
-//! and compact a one-statement suite only when a later class needs the room.
+//! Preserve source lines that affect instructions or executable constants.
 use ruff_python_ast::{
-    Stmt,
+    Expr, Keyword, Stmt,
     token::TokenKind,
-    visitor::{Visitor, walk_stmt},
+    visitor::{Visitor, walk_expr, walk_stmt},
 };
 use ruff_source_file::LineIndex;
 use ruff_text_size::Ranged;
@@ -12,6 +10,79 @@ use std::collections::BTreeMap;
 
 use super::{MAX_SOURCE, Module, Object};
 use serc_bytecode::target::code_flags::CO_NEWLOCALS;
+
+#[derive(Default)]
+struct KeywordCalls<'a>(Vec<&'a [Keyword]>);
+
+impl<'a> Visitor<'a> for KeywordCalls<'a> {
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if let Expr::Call(call) = expr
+            && call.arguments.keywords.len() > 1
+        {
+            self.0.push(&call.arguments.keywords);
+        }
+        walk_expr(self, expr);
+    }
+}
+
+/// The AST generator normally puts a call on one line. Keep the argument
+/// boundaries that the instruction lifter split to preserve local-load packing.
+pub(super) fn keyword_lines(raw: &str, suite: &[Stmt], formatted: &str) -> Option<String> {
+    if !raw.contains(",\n") {
+        return None;
+    }
+    let mut before = KeywordCalls::default();
+    before.visit_body(suite);
+    let parsed = ruff_python_parser::parse_module(formatted).ok()?;
+    let mut after = KeywordCalls::default();
+    after.visit_body(parsed.suite());
+    if before.0.len() != after.0.len() {
+        return None;
+    }
+    let mut starts = Vec::new();
+    for (a, b) in before.0.into_iter().zip(after.0) {
+        if a.len() != b.len()
+            || !a
+                .iter()
+                .zip(b)
+                .all(|(x, y)| x.arg.as_deref() == y.arg.as_deref())
+        {
+            return None;
+        }
+        for (original, target) in a.windows(2).zip(b.windows(2)) {
+            let sep = &raw[original[0].end().to_usize()..original[1].start().to_usize()];
+            if sep.contains('\n') && formatted[..target[1].start().to_usize()].ends_with(", ") {
+                starts.push(target[1].start());
+            }
+        }
+    }
+    if starts.is_empty() {
+        return None;
+    }
+    starts.sort_unstable();
+    let lines = LineIndex::from_source_text(formatted);
+    let mut result = String::new();
+    let mut from = 0;
+    for offset in starts {
+        let at = offset.to_usize();
+        result.push_str(&formatted[from..at - 1]);
+        let line = lines
+            .line_start(lines.line_index(offset), formatted)
+            .to_usize();
+        let indent = formatted[line..at]
+            .bytes()
+            .take_while(|&b| b == b' ')
+            .count();
+        result.push('\n');
+        result.extend(std::iter::repeat_n(' ', indent + 4));
+        from = at;
+        if result.len() > MAX_SOURCE {
+            return None;
+        }
+    }
+    result.push_str(&formatted[from..]);
+    (result.len() <= MAX_SOURCE).then_some(result)
+}
 
 pub(super) fn class_candidates(m: &Module<'_>, candidates: &mut Vec<String>) -> Result<(), String> {
     let mut targets: BTreeMap<&str, Vec<usize>> = BTreeMap::default();

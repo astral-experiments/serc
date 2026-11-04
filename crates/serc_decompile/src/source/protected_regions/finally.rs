@@ -140,7 +140,6 @@ pub(super) fn after_except(
         || !success.is_empty()
         || child.handler_tail.is_some()
         || child.next != child.end
-        || ops[child.end].name != "NOP"
         || (ops[cleanup - 1].name, ops[cleanup - 1].arg) != ("RERAISE", 0)
     {
         return None;
@@ -173,7 +172,16 @@ pub(super) fn after_except(
     }) {
         return None;
     }
-    let normal = child.end + 1;
+    let normal = if ops[child.end].name == "NOP" {
+        child.end + 1
+    } else if flow.block(child.end).ops.start == child.end
+        && flow.block(child.end).height == Some(handler.depth + 1)
+    {
+        // A computed return is already on the stack as the finalizer starts.
+        child.end
+    } else {
+        return None;
+    };
     let end = owner.finally_copy_end(
         ops,
         normal..match_start,

@@ -55,6 +55,43 @@ pub(super) struct Protected {
     handler_tail: Option<Range<usize>>,
 }
 
+impl Protected {
+    /// In a combined try/except/finally the first unwind enters the finalizer.
+    /// Its own unwind is the one that propagates to the enclosing suite.
+    fn unwind(&self, ops: &[Instruction], flow: &Graph, entry: Handler) -> Option<usize> {
+        let index = |offset| ops.binary_search_by_key(&offset, |op| op.offset).ok();
+        let (_, unwind) =
+            super::dispatch::unwind(ops, flow, index(entry.target)?, entry.depth + 1)?;
+        if let Clause::Except {
+            finalizer: Some(normal),
+            ..
+        } = &self.clause
+        {
+            let outer = flow.handler(unwind)?;
+            if outer.lasti
+                || outer.depth != entry.depth
+                || outer.start != ops[unwind].offset
+                || outer.end != ops.get(unwind + 3)?.offset
+                || normal.end != self.next
+            {
+                return None;
+            }
+            let (_, last) =
+                super::dispatch::unwind(ops, flow, index(outer.target)?, outer.depth + 1)?;
+            Some(last)
+        } else {
+            Some(unwind)
+        }
+    }
+
+    fn normal_finalizer(&self) -> Option<&Range<usize>> {
+        match &self.clause {
+            Clause::Finally { .. } => Some(&self.handler),
+            Clause::Except { finalizer, .. } => finalizer.as_ref(),
+        }
+    }
+}
+
 /// Consecutive copies of the same straight-line clause exit. A predicate can
 /// enter any copy at its first instruction, including past the lifted suite.
 #[derive(Clone, Copy)]
@@ -218,7 +255,16 @@ pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handle
             .ops
             .iter()
             .take_while(|op| op.offset < first.start)
-            .any(|op| op.jump.is_some_and(|target| target > first.start));
+            .any(|op| op.jump.is_some_and(|target| target > first.start))
+        && !bc
+            .ops
+            .iter()
+            .take_while(|op| op.offset < first.target)
+            .any(|op| {
+                op.offset >= first.end
+                    && op.name == "JUMP_BACKWARD"
+                    && op.jump.is_some_and(|target| target < first.start)
+            });
     let mut result = Handlers::default();
     let mut unwinds = FxHashSet::default();
     let mut starts = vec![0];
@@ -374,6 +420,18 @@ fn region(
     let body = binding + 1;
     let bound = ops[binding].name != "POP_TOP";
     let end = guarded_return_end(ops, flow, start..end, dispatch, first.depth).unwrap_or(end);
+    // The iterator's successful cleanup can leave a tracing NOP between the
+    // end of protection and the join shared by the break and the handler.
+    let end = if ops[end].name == "NOP"
+        && flow.jump(stop - 1) == Some(end + 1)
+        && flow.incoming(end + 1).any(|i| {
+            (start..end).contains(&i)
+                && loop_exits::break_over_cleanup(ops, flow, i, first) == Some(end + 1)
+        }) {
+        end + 1
+    } else {
+        end
+    };
     // An inline handler rejoins just past its unwind. When the try returns,
     // that edge comes from POP_EXCEPT in the handler. Include RETURN_VALUE
     // in the try suite before resuming at the jump target.
@@ -403,6 +461,37 @@ fn region(
     let (end, mut next) = match ops.get(end..dispatch)? {
         _ if parent.is_some() => (end, dispatch),
         _ if let Some((_, after)) = after_handler => (dispatch, after),
+        // An out-of-line handler can jump backwards past a try-else. Only
+        // normal completion of the protected suite enters that else, which
+        // may itself contain another placed try.
+        _ if matches!(
+            ops[stop - 1].name,
+            "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
+        ) && let Some(join) = flow.jump(stop - 1)
+            && (end + 1..dispatch).contains(&join)
+            && flow.block(join).height == Some(first.depth)
+            && Body::handler_pop(ops, binding, stop)
+                .is_some_and(|(pop, after)| body <= pop && after == stop - 1)
+            && flow.blocks_in(end..join).all(|block| {
+                [flow.jump(block.ops.end - 1), flow.fallthrough(block)]
+                    .into_iter()
+                    .flatten()
+                    .all(|to| (end..=join).contains(&to))
+            })
+            && following_join.is_none_or(|to| to == join) =>
+        {
+            if join == end + 1
+                && ops[end].name == "RETURN_VALUE"
+                && flow.block(end).height == Some(first.depth + 1)
+            {
+                // The protected expression produced a pending return (often
+                // an await). Only the handler falls through to the join.
+                (join, join)
+            } else {
+                success = end..join;
+                (end, join)
+            }
+        }
         [swap, pop, ret]
             if (swap.name, swap.arg) == ("SWAP", 2)
                 && pop.name == "POP_EXCEPT"
@@ -501,6 +590,18 @@ fn region(
             {
                 retry = true;
                 next = after_break;
+            } else if to < start
+                && ops[to..start].iter().all(|op| op.name == "NOP")
+                && flow.block(to).height == Some(first.depth)
+                && end < dispatch
+                && ops[dispatch - 1].name == "JUMP_BACKWARD"
+                && flow
+                    .jump(dispatch - 1)
+                    .is_some_and(|latch| latch == to || (latch == to + 1 && latch < start))
+            {
+                // A successful iteration has work between the try and the
+                // latch. The handler jumps over it to the while header.
+                handler_tail = Some(stop - 1..stop);
             } else if to != next
                 && Some(to) != for_header
                 && !shared_latch
@@ -519,7 +620,7 @@ fn region(
                 // falling through before an else. Its POP_EXCEPT has its own
                 // source line, even when the handler did work before it.
                 if body < pop
-                    && owner.instruction_lines(ops).is_ok_and(|lines| {
+                    && owner.instruction_lines.as_deref().is_ok_and(|lines| {
                         lines[pop].is_none_or(|line| lines[body..pop].contains(&Some(line)))
                     })
                     && let Some(latch) = iterator_success_latch(owner, ops, start..next, to)
@@ -573,13 +674,14 @@ fn region(
                     && normal_value == value
                     && next < ret
                     && normal.ops.end <= dispatch
-                    && flow.incoming(next).any(|source| {
-                        source > next
-                            && flow.jump(source) == Some(next)
-                            && flow
-                                .handler(source)
-                                .is_some_and(|h| h.target == first.target)
-                    })
+                    && (owner.depth == 0 && owner.none_return(&ops[ret..normal.ops.end])
+                        || flow.incoming(next).any(|source| {
+                            source > next
+                                && flow.jump(source) == Some(next)
+                                && flow
+                                    .handler(source)
+                                    .is_some_and(|h| h.target == first.target)
+                        }))
                 {
                     success = next..ret;
                     next = ret;
@@ -655,10 +757,9 @@ fn protected_end(
             child += 1;
         }
         if let Some(suite) = inner.get(&child)
-            && matches!(suite.clause, Clause::Finally { .. })
+            && let Some(normal) = suite.normal_finalizer()
             && let Some(h) = flow.handler(child)
-            && let Some((_, unwind)) =
-                super::dispatch::unwind(ops, flow, index(h.target)?, h.depth + 1)
+            && let Some(unwind) = suite.unwind(ops, flow, h)
             && let Some(parent) = flow.handler(unwind)
             && parent.start == ops[unwind].offset
             && (parent.target, parent.depth, parent.lasti)
@@ -666,11 +767,16 @@ fn protected_end(
             && index(parent.end)? == unwind + 3
             && (at == unwind
                 || at == suite.next
-                || (suite.handler == (at..index(entry.end)?) && suite.handler.end == suite.next))
+                || (normal.start == at
+                    && normal.end == suite.next
+                    && suite.next <= index(entry.end)?))
         {
             cleanups.insert(unwind, unwind + 3);
             end = suite.next;
-            if at == suite.handler.start && index(entry.end)? == end {
+            if at == normal.start && normal.end == end {
+                // Protection can resume on the normal finalizer copy and
+                // continue into further statements in the enclosing try.
+                end = index(entry.end)?;
                 continue;
             }
             if at == end {
@@ -682,6 +788,10 @@ fn protected_end(
             if index(entry.end)? != expected_end {
                 return None;
             }
+            continue;
+        }
+        if end + 1 == at && loop_exits::break_over_cleanup(ops, flow, end, first).is_some() {
+            end = index(entry.end)?;
             continue;
         }
         if end < at
@@ -705,44 +815,7 @@ fn protected_end(
             end = index(entry.end)?;
             continue;
         }
-        // Once TO_BOOL succeeded, newer targets leave both the conditional
-        // jump and its latch outside the try. The taken edge resumes the
-        // protected suite. 3.13 has no intervening monitoring marker.
-        if matches!(ops.get(end..at), Some([test, markers @ .., back])
-             if test.name.starts_with("POP_JUMP_IF_") && back.name == "JUMP_BACKWARD"
-                && (markers.is_empty() || matches!(markers, [marker] if marker.name == "NOT_TAKEN")))
-            && flow.jump(end) == Some(at)
-            && flow
-                .jump(at - 1)
-                .and_then(|head| flow.handler(head))
-                .is_some_and(|h| {
-                    (h.target, h.depth, h.lasti) == (first.target, first.depth, first.lasti)
-                })
-            && flow
-                .blocks_covering(end..at)
-                .all(|b| flow.handler(b.ops.start).is_none())
-        {
-            end = index(entry.end)?;
-            continue;
-        }
-        // A monitoring marker or a loop latch can sit outside the exception
-        // table between two parts of the same try. For the latch, require the
-        // preceding test to exit to the resumed span and the backedge to land
-        // inside this protection.
-        if at == end + 1
-            && end > 0
-            && flow.handler(end).is_none()
-            && ops[end - 1].name.starts_with("POP_JUMP_IF_")
-            && (ops[end].name == "NOT_TAKEN"
-                || (ops[end].name == "JUMP_BACKWARD"
-                    && flow.jump(end - 1) == Some(at)
-                    && flow
-                        .jump(end)
-                        .and_then(|i| flow.handler(i))
-                        .is_some_and(|h| {
-                            h.target == first.target && h.depth == first.depth && !h.lasti
-                        })))
-        {
+        if super::loops::branch_gap(ops, flow, end..at, first) {
             end = index(entry.end)?;
             continue;
         }
@@ -778,6 +851,53 @@ fn protected_end(
 }
 
 impl Body<'_, '_, '_> {
+    /// A loop may walk over a whole protected suite whose dispatcher lives
+    /// after the latch. The suite lifter owns that exceptional path.
+    pub(super) fn loop_contains_handler(
+        &self,
+        ops: &[Instruction],
+        entry: Handler,
+        body: Range<usize>,
+    ) -> bool {
+        let Ok(start) = ops.binary_search_by_key(&entry.start, |op| op.offset) else {
+            return false;
+        };
+        !entry.lasti
+            && body.contains(&start)
+            && self.handlers.get(&start).is_some_and(|suite| {
+                ops.get(suite.end).is_some_and(|op| op.offset == entry.end)
+                    && start < suite.next
+                    && suite.next <= body.end
+            })
+    }
+
+    /// An out-of-line handler may jump back into the normal layout after
+    /// restoring the saved exception. Attribute that edge to its placed try.
+    pub(super) fn handler_jumps_from(
+        &self,
+        ops: &[Instruction],
+        body: Range<usize>,
+        source: usize,
+        target: usize,
+    ) -> bool {
+        ops.get(source)
+            .is_some_and(|op| matches!(op.name, "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"))
+            && self.flow.jump(source) == Some(target)
+            && self.handlers.iter().any(|(&start, suite)| {
+                let Clause::Except { binding, .. } = suite.clause else {
+                    return false;
+                };
+                body.contains(&start)
+                    && start < suite.end
+                    && suite.end <= target
+                    && suite.next == target
+                    && suite.handler.end + 1 + 3 * usize::from(ops[binding].name != "POP_TOP")
+                        == source
+                    && Self::handler_pop(ops, binding, source + 1)
+                        == Some((suite.handler.end, source))
+            })
+    }
+
     /// A nested try can own the rest of a manager's body. On an exception
     /// its final unwind must transfer control to this manager's exit.
     pub(super) fn managed_child_end(
@@ -791,10 +911,7 @@ impl Body<'_, '_, '_> {
         }
         let child = self.handlers.get(&start)?;
         let entry = self.flow.handler(start)?;
-        let dispatch = ops
-            .binary_search_by_key(&entry.target, |op| op.offset)
-            .ok()?;
-        let (_, unwind) = super::dispatch::unwind(ops, &self.flow, dispatch, entry.depth + 1)?;
+        let unwind = child.unwind(ops, &self.flow, entry)?;
         let parent = self.flow.handler(unwind)?;
         (!entry.lasti
             && entry.depth == manager.depth
@@ -854,7 +971,14 @@ impl Body<'_, '_, '_> {
         let carried = returns
             && !consumes_return
             && next == limit
-            && matches!(entry.clause, Clause::Finally { .. });
+            && matches!(
+                entry.clause,
+                Clause::Finally { .. }
+                    | Clause::Except {
+                        finalizer: Some(_),
+                        ..
+                    }
+            );
         if returns && !carried && !consumes_return {
             if next >= limit || ops[next].name != "RETURN_VALUE" {
                 return Err("unsupported return through suspended handler".into());
@@ -955,7 +1079,8 @@ impl Body<'_, '_, '_> {
             && next < limit
             && self.none_return(&ops[next..limit])
             && self
-                .instruction_lines(ops)
+                .instruction_lines
+                .as_deref()
                 .is_ok_and(|lines| lines[next].is_some() && lines[next] == lines[next - 1])
         {
             next = limit;

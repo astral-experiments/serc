@@ -29,7 +29,6 @@ pub(super) mod synthetic;
 mod type_params;
 mod value_patterns;
 mod warnings;
-use std::cell::OnceCell;
 
 use definitions::{Definition, Import};
 
@@ -111,6 +110,9 @@ pub(super) fn recover(
             result.push('\n');
         }
         if result != text {
+            if let Some(located) = layout::keyword_lines(&text, parsed.suite(), &result) {
+                candidates.push(located);
+            }
             candidates.push(result);
         }
     }
@@ -183,7 +185,7 @@ fn recover_scope<'m>(
         id,
         stack: Vec::new(),
         lines: String::new(),
-        instruction_lines: OnceCell::new(),
+        instruction_lines: instruction_lines(m, code, &bc),
         partial_prefix: 0,
         partial_start: 0,
         flow,
@@ -281,7 +283,7 @@ struct Body<'m, 'data, 'work> {
     id: Id,
     stack: Vec<Value>,
     lines: String,
-    instruction_lines: OnceCell<Result<Vec<Option<usize>>, String>>,
+    instruction_lines: Result<Vec<Option<usize>>, String>,
     // End of the last complete statement while recovering a partial region.
     partial_prefix: usize,
     // First instruction of the statement at that checkpoint.
@@ -305,21 +307,20 @@ struct Body<'m, 'data, 'work> {
     work: &'work mut Recovery<'m>,
 }
 
-impl Body<'_, '_, '_> {
-    fn instruction_lines(&self, ops: &[Instruction]) -> Result<&[Option<usize>], String> {
-        self.instruction_lines
-            .get_or_init(|| {
-                serc_bytecode::locations::instruction_lines(
-                    self.m.bytes(self.code.locations)?,
-                    self.code.first_line,
-                    self.m.bytes(self.code.bytecode)?.len(),
-                    ops,
-                )
-            })
-            .as_deref()
-            .map_err(Clone::clone)
-    }
+fn instruction_lines(
+    m: &Module<'_>,
+    code: &Code,
+    bc: &Bytecode,
+) -> Result<Vec<Option<usize>>, String> {
+    serc_bytecode::locations::instruction_lines(
+        m.bytes(code.locations)?,
+        code.first_line,
+        m.bytes(code.bytecode)?.len(),
+        &bc.ops,
+    )
+}
 
+impl Body<'_, '_, '_> {
     fn charge(&mut self, cost: usize) -> Result<(), String> {
         self.work.budget = self
             .work
@@ -440,10 +441,10 @@ impl Body<'_, '_, '_> {
             return Ok(());
         }
         let args = self.call_args(argc, keys)?;
-        self.emit_call(&args)
+        self.emit_call(&args.join(", "))
     }
 
-    fn emit_call(&mut self, args: &[String]) -> Result<(), String> {
+    fn emit_call(&mut self, args: &str) -> Result<(), String> {
         let callable = if self.m.version == PythonVersion::Py312 {
             let name = self.expr()?;
             if !matches!(self.pop()?, Value::Null) {
@@ -456,7 +457,7 @@ impl Body<'_, '_, '_> {
             }
             self.expr()?
         };
-        self.push(format!("({callable})({})", args.join(", ")))
+        self.push(format!("({callable})({args})"))
     }
 
     fn load_callable(&mut self, name: String, null: bool) -> Result<(), String> {
@@ -624,10 +625,6 @@ impl Body<'_, '_, '_> {
                 }
             }
             "CALL" => self.call(a, &[])?,
-            "CALL_KW" => {
-                let keys = self.expr()?;
-                self.keyword_call(a, &keys)?;
-            }
             "CALL_FUNCTION_EX" => self.expanded_call(a)?,
             "DICT_UPDATE" | "DICT_MERGE" if a == 1 => {
                 let other = self.expr()?;

@@ -269,6 +269,15 @@ impl Body<'_, '_, '_> {
         level: usize,
     ) -> Result<Option<(usize, String)>, String> {
         let mut branch = self.flow.block(start).ops.end - 1;
+        // The operand may raise inside a protected loop while its jump is
+        // outside the table. They still form a single short-circuit test.
+        if branch + 1 < end
+            && ops[branch + 1].name.starts_with("POP_JUMP_IF_")
+            && self.flow.fallthrough(self.flow.block(start)) == Some(branch + 1)
+            && self.flow.entered_from(branch + 1, branch..branch + 1)
+        {
+            branch += 1;
+        }
         if branch <= start || branch >= end || !ops[branch].name.starts_with("POP_JUMP_IF_") {
             return Ok(None);
         }
@@ -324,7 +333,7 @@ impl Body<'_, '_, '_> {
         if av != bv || a == 0 {
             return false;
         }
-        self.instruction_lines(ops).is_ok_and(|lines| {
+        self.instruction_lines.as_deref().is_ok_and(|lines| {
             matches!((lines[a - 1], lines[a], lines[b]),
                 (Some(prev), Some(early), Some(late)) if prev < early && early < late)
         })
@@ -606,13 +615,54 @@ impl Body<'_, '_, '_> {
                 return Ok(join);
             }
         }
+        // The first arm of a terminal if/else can have its own copies of the
+        // implicit return. A bare None exit carrying its incoming guard's
+        // line belongs to that guard. Index it as the end of this arm so the
+        // nested test does not emit a return that merges the original exits.
+        if self.stack.is_empty()
+            && self.loop_edges.is_none()
+            && end == self.terminal_returns.end
+            && fallthrough_end == target
+            && start < tail
+            && target < end
+            && self.flow.handler(tail).is_none()
+            && let last = self.flow.block(tail)
+            && start < last.ops.start
+            && self.none_return(&ops[last.ops.clone()])
+            && let guard = self.flow.block(start).ops.end - 1
+            && ops[guard].name.starts_with("POP_JUMP_IF_")
+            && self.flow.jump(guard) == Some(last.ops.start)
+            && self
+                .instruction_lines
+                .as_deref()
+                .is_ok_and(|lines| lines[guard].is_some() && lines[guard] == lines[last.ops.start])
+            && self.flow.blocks_in(start..target).all(|block| {
+                [
+                    self.flow.jump(block.ops.end - 1),
+                    self.flow.fallthrough(block),
+                ]
+                .into_iter()
+                .flatten()
+                .all(|to| (start..target).contains(&to))
+            })
+        {
+            let outer = self.terminal_returns.clone();
+            self.index_terminal_returns(&ops[..target], None);
+            let left = self.fragment(ops, start, target, level);
+            self.terminal_returns = outer;
+            let left = left?.suite()?;
+            let right = self.fragment(ops, target, end, level)?.suite()?;
+            self.block(&format!("if {test}:"), &left)?;
+            self.block("else:", &right)?;
+            return Ok(end);
+        }
         let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
         if self.implicit_reraise(ops, tail)
             && target < end
-            && !self
-                .flow
-                .incoming(target)
-                .any(|from| (start..fallthrough_end).contains(&from))
+            && !self.flow.incoming(target).any(|from| {
+                (start..fallthrough_end).contains(&from)
+                    || self.handler_jumps_from(ops, start..fallthrough_end, from, target)
+            })
         {
             self.block(&format!("if {test}:"), &suite)?;
             let other = self.fragment(ops, target, end, level)?.suite()?;
@@ -631,7 +681,7 @@ impl Body<'_, '_, '_> {
                     && matches!(ops[end - 1].name, "RAISE_VARARGS" | "RERAISE")))
             // A physical return at the end of the suite can belong to a
             // nested guard. Its other edge still enters the shared tail.
-            && !self.flow.incoming(target).any(|from| (start..fallthrough_end).contains(&from))
+            && !self.flow.incoming(target).any(|from| (start..fallthrough_end).contains(&from) || self.handler_jumps_from(ops, start..fallthrough_end, from, target))
         {
             let other = self.fragment(ops, target, end, level)?.suite()?;
             let split_return = |s: &str| -> Option<(String, String)> {
@@ -719,7 +769,7 @@ impl Body<'_, '_, '_> {
                         && self.none_return(&ops[self.flow.block(tail).ops.clone()])
                         && super::regions::constant_return(ops, end).is_some_and(|(at, _)| {
                             at > target
-                                && self.instruction_lines(ops).is_ok_and(|lines| {
+                                && self.instruction_lines.as_deref().is_ok_and(|lines| {
                                     lines[at].is_some() && lines[at] == lines[at - 1]
                                 })
                         });

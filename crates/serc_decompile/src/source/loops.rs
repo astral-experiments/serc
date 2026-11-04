@@ -1,4 +1,8 @@
 use std::fmt::Write as _;
+use std::ops::Range;
+
+use crate::flow::Graph;
+use serc_bytecode::instructions::Handler;
 
 use super::conditionals::Predicate;
 use super::regions::constant_return;
@@ -29,9 +33,56 @@ fn local_return(ops: &[Instruction], end: usize) -> Option<usize> {
         .then_some(end - 2)
 }
 
+/// Protection can stop after truth conversion and resume in the guarded
+/// suite. The skipped instructions must be a monitoring marker or the test's
+/// other edge back to a header owned by the same try or context manager.
+pub(super) fn branch_gap(
+    ops: &[Instruction],
+    flow: &Graph,
+    gap: Range<usize>,
+    owner: Handler,
+) -> bool {
+    let Some(span) = ops.get(gap.clone()) else {
+        return false;
+    };
+    let test = match span {
+        [marker] if marker.name == "NOT_TAKEN" => {
+            return gap.start > 0
+                && ops[gap.start - 1].name.starts_with("POP_JUMP_IF_")
+                && flow.handler(gap.start).is_none();
+        }
+        [back] if gap.start > 0 && back.name == "JUMP_BACKWARD" => gap.start - 1,
+        [_, markers @ .., back]
+            if back.name == "JUMP_BACKWARD"
+                && matches!(
+                    markers,
+                    [] | [Instruction {
+                        name: "NOT_TAKEN",
+                        ..
+                    }]
+                ) =>
+        {
+            gap.start
+        }
+        _ => return false,
+    };
+    ops[test].name.starts_with("POP_JUMP_IF_")
+        && flow.jump(test) == Some(gap.end)
+        && flow
+            .jump(gap.end - 1)
+            .and_then(|i| flow.handler(i))
+            .is_some_and(|h| {
+                (h.target, h.depth, h.lasti) == (owner.target, owner.depth, owner.lasti)
+            })
+        && flow
+            .blocks_covering(gap)
+            .all(|b| flow.handler(b.ops.start).is_none())
+}
+
 impl Body<'_, '_, '_> {
     /// 3.14+ retains the first constant loop test even after folding it.
-    /// A leading loop can therefore distinguish `while 1` from `while True`.
+    /// A loop can still supply the first constant after a call or assignment
+    /// that needed only names and locals.
     fn constant_loop(
         &mut self,
         ops: &[Instruction],
@@ -39,9 +90,21 @@ impl Body<'_, '_, '_> {
         suite: &str,
     ) -> Result<(), String> {
         if self.m.version >= super::PythonVersion::Py314
-            && ops[..marker]
-                .iter()
-                .all(|op| matches!(op.name, "COPY_FREE_VARS" | "MAKE_CELL" | "RESUME"))
+            && ops[..marker].iter().all(|op| {
+                matches!(
+                    op.name,
+                    "COPY_FREE_VARS"
+                        | "MAKE_CELL"
+                        | "RESUME"
+                        | "LOAD_GLOBAL"
+                        | "LOAD_ATTR"
+                        | "LOAD_FAST"
+                        | "LOAD_FAST_BORROW"
+                        | "PUSH_NULL"
+                        | "CALL"
+                        | "STORE_FAST"
+                )
+            })
             && let Some(&id) = self.m.tuple(self.code.constants)?.first()
             && let super::Object::Int(value) = self.m.objects[id]
             && value != 0
@@ -234,21 +297,24 @@ impl Body<'_, '_, '_> {
         let Some(active) = self.loop_edges else {
             return false;
         };
-        active.body_end == end
+        self.stack.is_empty()
+            && active.body_end == end
             && ops[active.header].name == "FOR_ITER"
             && predicate.suite + 1 == predicate.target
             && predicate.target < end
-            && self.flow.handler(active.header).is_some_and(|h| {
-                h.lasti
-                    || self.flow.handler(predicate.target).is_some_and(|tail| {
-                        (tail.target, tail.depth, tail.lasti) == (h.target, h.depth, h.lasti)
-                    })
-            })
+            && (self.folded_break(ops, predicate.target, end)
+                || self.flow.handler(active.header).is_some_and(|h| {
+                    h.lasti
+                        || self.flow.handler(predicate.target).is_some_and(|tail| {
+                            (tail.target, tail.depth, tail.lasti) == (h.target, h.depth, h.lasti)
+                        })
+                }))
             && self.loop_transfer(ops, predicate.suite) == Some("continue")
             && self.flow.handler(predicate.suite).is_none()
-            && self
-                .flow
-                .entered_from(predicate.target, predicate.branch..predicate.target)
+            && self.flow.entered_from(
+                predicate.target,
+                predicate.header.unwrap_or(predicate.branch)..predicate.target,
+            )
     }
 
     /// Recover a constant-true loop whose paths return, raise, or come back
@@ -295,12 +361,19 @@ impl Body<'_, '_, '_> {
                 let current = self.active_try.is_some_and(|entry| {
                     (entry.target, entry.depth, entry.lasti) == (h.target, h.depth, h.lasti)
                 });
-                !current && !generator_exit && self.delegated_cleanup(ops, start).is_none()
+                !current
+                    && !generator_exit
+                    && self.delegated_cleanup(ops, start).is_none()
+                    && !self.loop_contains_handler(ops, h, nop + 1..latch)
             });
             if protected
                 || (start != header
                     && !self.flow.entered_from(start, nop..after)
-                    && !self.delegation_rejoins_loop(ops, start, nop..after))
+                    && !self.delegation_rejoins_loop(ops, start, nop..after)
+                    && !self.flow.incoming(start).all(|from| {
+                        (nop..after).contains(&from)
+                            || self.handler_jumps_from(ops, nop..after, from, start)
+                    }))
                 || self.flow.jump(last).is_some_and(|to| {
                     !((nop..after).contains(&to)
                         || (to == after
@@ -479,10 +552,14 @@ impl Body<'_, '_, '_> {
             .or_else(|| {
                 // The exhaustion path may contain another loop before the
                 // shared return. Only fold a local load after iterator cleanup.
-                local_return(ops, end).filter(|&at| {
-                    ops[header].name == "FOR_ITER"
-                        && self.flow.block(at).ops.end == end
-                        && self.flow.handler(at).is_none()
+                [end, end + 2].into_iter().find_map(|stop| {
+                    // In a try-else the dispatcher may already own the
+                    // return immediately following this fragment.
+                    local_return(ops, stop).filter(|&at| {
+                        ops[header].name == "FOR_ITER"
+                            && self.flow.block(at).ops.end == stop
+                            && self.flow.handler(at).is_none()
+                    })
                 })
             })
             .filter(|&start| start >= exhausted);
@@ -522,6 +599,20 @@ impl Body<'_, '_, '_> {
         if let Some(after) = active.after
             && after > exhausted
         {
+            // CPython can leave the exhaustion location on a tracing NOP
+            // outside the protected range. A break jumps over this marker.
+            if after == exhausted + 1
+                && ops[exhausted].name == "NOP"
+                && ops[active.header].name == "FOR_ITER"
+                && self.active_try.is_some()
+                && self.flow.handler(exhausted).is_none()
+                && let Some(cleanup) = self.flow.jump(active.header)
+                && self.instruction_lines.as_deref().is_ok_and(|lines| {
+                    lines[cleanup].is_some() && lines[cleanup] == lines[exhausted]
+                })
+            {
+                return Ok(after);
+            }
             let suite = self.fragment(ops, exhausted, after, level)?.suite()?;
             self.block("else:", &suite)?;
             Ok(after)
@@ -538,7 +629,7 @@ impl Body<'_, '_, '_> {
         level: usize,
     ) -> Result<usize, String> {
         let exit = self.flow.target(header)?;
-        if exit > end || exit <= header + 2 || ops[exit].name != "END_FOR" {
+        if exit > end || exit <= header + 2 || ops.get(exit).is_none_or(|op| op.name != "END_FOR") {
             return Err("unsupported for-loop exit".into());
         }
 
@@ -549,22 +640,42 @@ impl Body<'_, '_, '_> {
                 ops.get(exit + 1)
                     .is_some_and(|op| matches!(op.name, "POP_ITER" | "POP_TOP")),
             );
+        // An inner break at the end of an outer iteration can jump directly
+        // to the outer header. Exhaustion takes the same jump after END_FOR.
+        let outer_latch = self.loop_edges.filter(|outer| {
+            ops[exit - 1].name == "JUMP_BACKWARD"
+                && self.flow.jump(exit - 1) == Some(outer.header)
+                && ops
+                    .get(after_cleanup)
+                    .is_some_and(|op| op.name == "JUMP_BACKWARD")
+                && self.flow.jump(after_cleanup) == Some(outer.header)
+                && self
+                    .iterator_slots(ops, header, outer.iterators + 1)
+                    .is_some_and(|slots| {
+                        exit - header > slots + 1
+                            && ops[exit - 1 - slots..exit - 1]
+                                .iter()
+                                .all(|op| op.name == "POP_TOP")
+                    })
+        });
         // A loop whose body always exits has no latch. Its last transfer
         // belongs to the body and must be emitted.
         let body_end = if self.flow.jump(exit - 1) == Some(header) {
             exit - 1
-        } else if matches!(
-            ops[exit - 1].name,
-            "RETURN_VALUE" | "RETURN_CONST" | "RAISE_VARARGS" | "JUMP_FORWARD"
-        ) || (ops[exit - 1].name == "JUMP_BACKWARD"
-            && self
-                .flow
-                .jump(exit - 1)
-                .is_some_and(|to| (header + 1..exit).contains(&to))
-            && self
-                .flow
-                .incoming(header)
-                .any(|from| (header + 1..exit).contains(&from)))
+        } else if outer_latch.is_some()
+            || matches!(
+                ops[exit - 1].name,
+                "RETURN_VALUE" | "RETURN_CONST" | "RAISE_VARARGS" | "JUMP_FORWARD"
+            )
+            || (ops[exit - 1].name == "JUMP_BACKWARD"
+                && self
+                    .flow
+                    .jump(exit - 1)
+                    .is_some_and(|to| (header + 1..exit).contains(&to))
+                && self
+                    .flow
+                    .incoming(header)
+                    .any(|from| (header + 1..exit).contains(&from)))
         {
             // A nested loop may own the last jump while an earlier arm
             // advances the iterator. Keep both transfers in the body.
@@ -573,7 +684,14 @@ impl Body<'_, '_, '_> {
             return Err("unsupported for-loop latch".into());
         };
         let binding = self.binding(ops, header + 1, body_end)?;
-        let active = self.loop_exits(ops, header, binding.next..body_end, after_cleanup, end)?;
+        let mut active =
+            self.loop_exits(ops, header, binding.next..body_end, after_cleanup, end)?;
+        if let Some(outer) = outer_latch {
+            if active.after.is_some() {
+                return Err("multiple loop exit targets".into());
+            }
+            active.after = Some(outer.header);
+        }
         let outer = self.loop_edges.replace(active);
         let suite = self
             .seeded(ops, binding.next, body_end, level, binding.seed)?

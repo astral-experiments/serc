@@ -2232,6 +2232,18 @@ fn failed_final_cases_advance_the_iterator() {
             case Kind.last:
                 if enabled(item):
                     yield -item
+
+def count(items, emit):
+    count = 0
+    for item in items:
+        match item:
+            case 1:
+                emit(item)
+            case 2:
+                continue
+            case _:
+                emit(count)
+        count += 1
 ",
         r"class Kind:
     first, second, last = 1, 2, 3
@@ -2242,7 +2254,10 @@ def read(item):
 def enabled(item):
     events.append(('enabled', item))
     return len(events) % 2 == 0
-result = list(classify([3, 0, 2, 1, 0, 3, 3, 2], read, enabled)), events",
+seen = []
+count([2, 0, 1, 2, 2, 0], seen.append)
+assert seen == [0, 1, 2]
+result = list(classify([3, 0, 2, 1, 0, 3, 3, 2], read, enabled)), events, seen",
     );
 }
 
@@ -4504,5 +4519,498 @@ for x in [False, None, Flag()]:
             return value
         f(x, read, log.append)
 result = log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn mixed_boolean_values_rejoin_at_the_next_operand_discard() {
+    check_fixture(
+        r"def choose(a, b, c, d):
+    selected = a() or b() and (c() and d() or a())
+    return selected
+
+def both(a, b, c):
+    selected = (a() or b()) and c()
+    return selected
+",
+        r"from itertools import product
+result = []
+class Flag:
+    def __init__(self, name, truth): self.name, self.truth = name, truth
+    def __bool__(self):
+        result.append(('test', self.name))
+        return self.truth
+    def __call__(self):
+        result.append(('call', self.name))
+        return self
+for truth in product([False, True], repeat=4):
+    flags = [Flag(n, v) for n, v in zip('abcd', truth)]
+    for selected in (choose(*flags), both(*flags[:3])):
+        assert any(selected is flag for flag in flags)
+        result.append(selected.name)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_terminal_guards_keep_their_separate_implicit_returns() {
+    check_fixture(
+        r"def notify(failed, enabled, cancelled, emit):
+    if failed:
+        if enabled():
+            emit('failed', explicit=True)
+    elif not cancelled():
+        emit('done')
+",
+        r"from itertools import product
+log = []
+def probe(value, label):
+    def read():
+        log.append(label)
+        return value
+    return read
+def emit(label, explicit=False): log.append((label, explicit))
+for failed, enabled, cancelled in product([False, True], repeat=3):
+    notify(failed, probe(enabled, 'enable'), probe(cancelled, 'cancel'), emit)
+result = log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn split_keyword_loads_preserve_the_following_handler_offsets() {
+    check_fixture(
+        r"def connect(lookup, sock, emit):
+    try:
+        cert = lookup()
+    except ValueError as exc:
+        emit(error=str(exc))
+        return
+    emit(cert=cert,
+         cipher=sock.cipher(), sock=sock)
+",
+        r"log = []
+class Socket:
+    def cipher(self):
+        log.append('cipher')
+        return 2
+def emit(**kw):
+    log.append(tuple(kw))
+def fail():
+    raise ValueError('closed')
+sock = Socket()
+connect(fail, sock, emit)
+connect(lambda: 1, sock, emit)
+result = log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_return_shared_by_match_cases_runs_after_their_assignments() {
+    check_fixture(
+        r"def parse(key, lookup, assign):
+    match key:
+        case 'Y' | 'y' | 'G':
+            assign('year')
+        case 'd':
+            assign('day')
+    return lookup[key]
+",
+        r"log = []
+class Lookup:
+    def __getitem__(self, key):
+        log.append(('lookup', key))
+        return key
+for key in ('Y', 'G', 'd', 'x'):
+    assert parse(key, Lookup(), log.append) == key
+result = log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn terminal_handlers_skip_the_success_continuation() {
+    check_fixture(
+        r"def handshake(start, report, ready):
+    try:
+        value = start()
+    except ValueError as exc:
+        report(exc)
+        return
+    if value:
+        ready(value)
+    ready('done')
+
+def tasks(items):
+    try:
+        for item in items:
+            yield item
+    except ValueError as exc:
+        yield str(exc)
+",
+        r"import sys
+events = []
+def report(exc):
+    assert sys.exception() is exc
+    events.append(str(exc))
+def fail():
+    raise ValueError('handshake')
+handshake(fail, report, events.append)
+handshake(lambda: 'ready', report, events.append)
+assert events == ['handshake', 'ready', 'done']
+def broken():
+    yield 1
+    raise ValueError('iterator')
+partial = tasks(broken())
+assert next(partial) == 1 and next(partial) == 'iterator'
+partial.close()
+result = events, list(tasks(broken())), list(tasks([1, 2]))",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn conditional_handler_returns_and_finalizer_copies_restore_exception_state() {
+    check_fixture(
+        r"def send(write, value, parts):
+    try:
+        write(value)
+    except TypeError:
+        if parts is not None:
+            for part in parts:
+                write(part)
+        else:
+            raise ValueError(value)
+
+def check(bad, release):
+    try:
+        if bad:
+            raise LookupError
+    finally:
+        release()
+",
+        r"import sys
+events = []
+def write(value):
+    events.append((value, type(sys.exception()).__name__))
+    if value == 'bad': raise TypeError
+def release():
+    events.append(('close', type(sys.exception()).__name__))
+send(write, 'ok', None)
+send(write, 'bad', [1, 2])
+try: send(write, 'bad', None)
+except ValueError as exc: assert isinstance(exc.__context__, TypeError)
+else: raise AssertionError
+check(False, release)
+try: check(True, release)
+except LookupError: pass
+else: raise AssertionError
+assert events == [('ok', 'NoneType'), ('bad', 'NoneType'), (1, 'TypeError'), (2, 'TypeError'),
+                  ('bad', 'NoneType'), ('close', 'NoneType'), ('close', 'LookupError')]
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn pending_returns_cross_nested_finalizers_and_the_manager_exit() {
+    check_fixture(
+        r"def exchange(manager, work, record):
+    with manager as value:
+        record('open')
+        try:
+            record('start')
+            try:
+                work()
+            except LookupError as exc:
+                record(str(exc))
+                raise
+            finally:
+                record('detach')
+            return value, work()
+        except:
+            record('abort')
+            raise
+        finally:
+            record('close')
+",
+        r"import sys
+events = []
+def record(label): events.append((label, type(sys.exception()).__name__))
+class Manager:
+    def __enter__(self): return 'peer'
+    def __exit__(self, kind, exc, tb):
+        record('exit')
+        return kind is ValueError
+def work():
+    result = next(results)
+    if isinstance(result, Exception): raise result
+    return result
+results = iter([1, 2])
+assert exchange(Manager(), work, record) == ('peer', 2)
+assert events == [(x, 'NoneType') for x in ('open', 'start', 'detach', 'close', 'exit')]
+events.clear()
+results = iter([LookupError('lost')])
+try: exchange(Manager(), work, record)
+except LookupError: pass
+else: raise AssertionError
+assert events[2:] == [(x, 'LookupError') for x in ('lost', 'detach', 'abort', 'close', 'exit')]
+events.clear()
+results = iter([0, ValueError()])
+assert exchange(Manager(), work, record) is None
+assert events[2:] == [('detach', 'NoneType'), ('abort', 'ValueError'), ('close', 'ValueError'), ('exit', 'ValueError')]
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_try_else_arms_rejoin_the_same_unprotected_continuation() {
+    check_fixture(
+        r"def dispatch(read, run, record):
+    try:
+        request = read()
+    except KeyError:
+        reply = record('request failed')
+    else:
+        try:
+            value = run(request)
+        except ValueError:
+            reply = record('call failed')
+        else:
+            reply = record(value)
+    record(reply)
+",
+        r"import sys
+events = []
+def read_bad(): raise KeyError
+def run_bad(request): raise ValueError
+def record(label):
+    events.append((label, type(sys.exception()).__name__))
+    return 'send'
+for read, run in [(read_bad, run_bad), (lambda: 3, run_bad), (lambda: 3, lambda x: x * 2)]:
+    dispatch(read, run, record)
+assert events == [('request failed', 'KeyError'), ('send', 'NoneType'),
+                  ('call failed', 'ValueError'), ('send', 'NoneType'),
+                  (6, 'NoneType'), ('send', 'NoneType')]
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_failed_await_rejoins_the_fallback_after_the_outer_guard() {
+    check_fixture(
+        r"async def transfer(native, allowed, fast, slow):
+    if native:
+        try:
+            return await fast()
+        except LookupError as error:
+            if not allowed:
+                raise
+    if not allowed:
+        raise RuntimeError
+    return await slow()
+",
+        r"import asyncio, sys
+events = []
+async def fast():
+    events.append('fast')
+    if fail: raise KeyError('send')
+    return 1
+async def slow():
+    assert sys.exception() is None
+    events.append('slow')
+    return 2
+for native, allowed, fail, expected in [(True, True, False, 1), (True, True, True, 2), (False, True, False, 2),
+                                        (True, False, True, KeyError), (False, False, False, RuntimeError)]:
+    try: outcome = asyncio.run(transfer(native, allowed, fast, slow))
+    except (KeyError, RuntimeError) as exc: outcome = type(exc)
+    assert outcome == expected
+assert events == ['fast', 'fast', 'slow', 'slow', 'fast']
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn terminal_module_try_keeps_alternative_definitions_exclusive() {
+    for available in [false, true] {
+        let operation = if available { "int('1')" } else { "int('')" };
+        check_fixture(
+            &format!(
+                "try:\n    seed = int('3')\nexcept ValueError:\n    seed = 0\ntry:\n    enabled = {operation}\nexcept ValueError:\n    def value(): return -1\nelse:\n    def value(): return enabled + seed\n"
+            ),
+            if available {
+                "result = value(); assert result == 4"
+            } else {
+                "result = value(); assert result == -1"
+            },
+        );
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn protected_while_iterations_retry_or_stop_before_their_shared_work() {
+    check_fixture(
+        r"def drain(take, accept):
+    while True:
+        try:
+            item = take()
+        except KeyError:
+            break
+        accept(item)
+
+def retry(take, accept):
+    while True:
+        try:
+            item = take()
+        except KeyError:
+            continue
+        accept(item)
+",
+        r"seen = []
+def take():
+    value = next(items)
+    if value is None: raise KeyError
+    return value
+items = iter([1, None, 2])
+drain(take, seen.append)
+assert seen == [1] and list(items) == [2]
+items = iter([1, None, 2])
+try: retry(take, seen.append)
+except StopIteration: pass
+assert seen == [1, 1, 2]
+result = seen",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn out_of_line_handlers_rejoin_their_loop_and_iterator_breaks_skip_exhaustion() {
+    check_fixture(
+        r"def worker(take, store, record, items):
+    while True:
+        try:
+            task = take()
+        except EOFError:
+            return
+        if task is None:
+            break
+        try:
+            store(task)
+        except KeyError:
+            pass
+        record('iteration')
+    try:
+        for item in items:
+            if not item:
+                break
+            store(item)
+    except KeyError:
+        pass
+    record('done')
+",
+        r"import sys
+events = []
+def store(value):
+    events.append(value)
+    if value == 'missing': raise KeyError
+def record(value):
+    assert sys.exception() is None
+    events.append(value)
+def take():
+    value = next(tasks)
+    if value == 'eof': raise EOFError
+    return value
+for inputs, items in [(['a', 'missing', None], [1, 0, 2]), ([None], ['missing', 3]), ([None], []), (['eof'], [4])]:
+    tasks = iter(inputs)
+    worker(take, store, record, items)
+assert events == ['a', 'iteration', 'missing', 'iteration', 1, 'done', 'missing', 'done', 'done']
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_filtered_iterator_stays_inside_its_manager_across_a_yield() {
+    check_fixture(
+        r"def collect(manager, items):
+    with manager as keep:
+        result = []
+        for item in items:
+            if keep(item):
+                result.append(item)
+        yield result
+
+def matching(items, kind, subtype):
+    for item in items:
+        if item[0] == kind:
+            if subtype is None or item[1]() == subtype:
+                yield item[0]
+",
+        r"events = []
+class Manager:
+    def __enter__(self):
+        events.append('enter')
+        return self.keep
+    def keep(self, item):
+        events.append(item)
+        if item is None: raise ValueError
+        return bool(item)
+    def __exit__(self, kind, exc, trace):
+        events.append(kind.__name__ if kind else 'exit')
+        return kind is ValueError
+stream = collect(Manager(), [0, 3, 0])
+assert next(stream) == [3]
+assert events == ['enter', 0, 3, 0]
+stream.close()
+assert list(collect(Manager(), [None, 2])) == []
+assert list(collect(Manager(), [])) == [[]]
+assert events == ['enter', 0, 3, 0, 'GeneratorExit', 'enter', None, 'ValueError', 'enter', 'exit']
+def subtype():
+    events.append('subtype')
+    return 'plain'
+rows = [('image', subtype), ('text', subtype)]
+assert list(matching(rows, 'text', None)) == ['text'] and 'subtype' not in events
+assert list(matching(rows, 'text', 'plain')) == ['text'] and events.count('subtype') == 1
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn iterator_breaks_rejoin_an_outer_latch_or_a_shared_return() {
+    check_fixture(
+        r"def first(groups, emit):
+    for group in groups:
+        for value in group:
+            if value:
+                emit(value)
+                break
+
+def preferred(initial, lookup):
+    value = initial
+    try:
+        items = lookup()
+    except KeyError:
+        pass
+    else:
+        for value in items:
+            if '.' in value:
+                break
+        else:
+            value = initial
+    return value
+",
+        r"log = []
+first([[0, 1, 2], [], [0], [3, 4]], log.append)
+def missing(): raise KeyError
+values = [preferred('host', f) for f in (missing, lambda: [], lambda: ['a', 'b'], lambda: ['a', 'b.c', 'd.e'])]
+assert log == [1, 3] and values == ['host', 'host', 'host', 'b.c']
+result = log, values",
     );
 }

@@ -185,13 +185,17 @@ impl Body<'_, '_, '_> {
             .map(|n| handler + 1 + n)
             .ok_or("unsupported finally exit")?;
         let cleanup = self.fragment(ops, handler + 1, last, 0)?.suite()?;
-        // Find the corresponding normal copy by the number of logical
-        // instructions in the exceptional copy. The whole-module verification
-        // checks both paths, including exception regions and the cleanup code.
-        let next = end + (last - handler - 1);
-        if next > handler {
-            return Err("unsupported copied finally body".into());
-        }
+        // The normal copy can start after a guard's tracing NOP. Local loads
+        // can also be fused differently on success and during unwinding.
+        let start = end + usize::from(ops[end].name == "NOP");
+        let next = self
+            .finally_copy_end(
+                ops,
+                start..handler,
+                handler + 1..last,
+                super::finalizers::CopyExit::Fallthrough,
+            )
+            .ok_or("unsupported copied finally body")?;
         self.block("finally:", &cleanup)?;
         if returns {
             if next + 1 != handler || ops[next].name != "RETURN_VALUE" {
