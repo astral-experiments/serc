@@ -820,6 +820,55 @@ assert log == [('same', 0), ('same', 1), ('allowed', 1), ('accept', 1), ('same',
 
 #[cfg(feature = "decompile")]
 #[test]
+fn sibling_tries_in_a_cache_miss_keep_their_loop_exits() {
+    check_fixture(
+        r"def resolve(cache, key, next_token, compile_token):
+    try:
+        selector = cache[key]
+    except KeyError:
+        try:
+            token = next_token()
+        except StopIteration:
+            return
+        selector = []
+        while True:
+            try:
+                selector.append(compile_token(token))
+            except StopIteration:
+                raise ValueError('invalid token') from None
+            try:
+                token = next_token()
+                if token == '/':
+                    token = next_token()
+            except StopIteration:
+                break
+        cache[key] = selector
+    return selector
+",
+        r"import sys
+cache = {}
+errors = []
+def compile_token(t):
+    assert isinstance(sys.exception(), KeyError)
+    if t == 'bad':
+        raise StopIteration
+    return t.upper()
+def read(key, tokens):
+    return resolve(cache, key, iter(tokens).__next__, compile_token)
+assert read('empty', []) is None and 'empty' not in cache
+assert read('path', ['a', '/', 'b', 'c']) == ['A', 'B', 'C']
+assert read('path', []) is cache['path']
+try:
+    read('invalid', ['bad'])
+except ValueError as e:
+    errors.append((str(e), e.__suppress_context__, type(e.__context__).__name__))
+assert 'invalid' not in cache and errors == [('invalid token', True, 'StopIteration')]
+result = cache, errors",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_successful_match_can_skip_the_remaining_cases() {
     check_fixture(
         r"def resolve(name, ready, log):

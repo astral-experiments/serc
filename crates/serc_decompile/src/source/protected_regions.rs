@@ -660,8 +660,11 @@ fn region(
             body..pop
         }
         _ if !bound
-            && end == dispatch
             && first.depth == 1
+            && (end == dispatch
+                || (end + 1 == dispatch
+                    && next == after_cleanup
+                    && enclosing_exception(ops, flow, end, cleanup)))
             && let Some((expression_end, tail)) =
                 nested_handler_return(ops, flow, body..stop, cleanup) =>
         {
@@ -669,6 +672,21 @@ fn region(
             body..expression_end
         }
         [.., raise] if raise.name == "RAISE_VARARGS" => body..stop,
+        // Both copies load the same return value outside the exception
+        // table. The continuation belongs after the complete try/except.
+        [.., pop, load, _]
+            if !bound
+                && following.is_empty()
+                && next == end
+                && pop.name == "POP_EXCEPT"
+                && super::regions::local_return(ops, dispatch) == Some(end)
+                && super::regions::local_return(ops, stop).is_some()
+                && ops[end].arg == load.arg
+                && flow.handler(stop - 2).is_none()
+                && flow.handler(end).is_none() =>
+        {
+            body..stop - 3
+        }
         _ if let Some((pop, latch)) = owner.manager_continue(ops, binding, stop, cleanup) => {
             handler_tail = Some(latch..latch + 1);
             body..pop
@@ -711,7 +729,7 @@ fn region(
             {
                 retry = true;
                 next = after_break;
-            } else if next == end
+            } else if (next == end || flow.jump(end) == Some(next) && next + 1 == to)
                 && success.is_empty()
                 && following.is_empty()
                 && loop_exits::after_while(ops, flow, start..end, to, first.depth)
@@ -994,6 +1012,33 @@ fn protected_end(
 }
 
 impl Body<'_, '_, '_> {
+    /// A try whose normal paths both meet the loop latch can place its
+    /// handler immediately after it. A break skips the whole dispatcher.
+    pub(super) fn inline_loop_exit(
+        &self,
+        ops: &[Instruction],
+        body: Range<usize>,
+    ) -> Option<usize> {
+        let dispatch = body.end + 1;
+        let op = ops.get(dispatch)?;
+        if op.name != "PUSH_EXC_INFO" {
+            return None;
+        }
+        self.handlers.iter().find_map(|(&start, suite)| {
+            if !body.contains(&start) || suite.next != body.end || suite.try_exits?.end != dispatch
+            {
+                return None;
+            }
+            let entry = self.flow.handler(start)?;
+            let tail = suite.handler_tail.as_ref()?;
+            let target = self.flow.jump(tail.start)?;
+            (entry.target == op.offset
+                && tail.len() == 1
+                && suite.unwind(ops, &self.flow, entry)? + 3 == target)
+                .then_some(target)
+        })
+    }
+
     /// A loop may walk over a whole protected suite whose dispatcher lives
     /// after the latch. The suite lifter owns that exceptional path.
     pub(super) fn loop_contains_handler(
@@ -1005,8 +1050,23 @@ impl Body<'_, '_, '_> {
         let Ok(start) = ops.binary_search_by_key(&entry.start, |op| op.offset) else {
             return false;
         };
-        if entry.lasti || !body.contains(&start) {
+        if !body.contains(&start) {
             return false;
+        }
+        if entry.lasti {
+            // An inline except dispatcher and its reraise can lie before
+            // the normal latch. Their unwind must belong to a placed child.
+            return self.handlers.iter().any(|(&child, region)| {
+                body.contains(&child)
+                    && child < start
+                    && region.next <= body.end
+                    && self.flow.handler(child).is_some_and(|h| {
+                        h.target <= entry.start
+                            && region.unwind(ops, &self.flow, h).is_some_and(|unwind| {
+                                ops[unwind].offset == entry.target && unwind < region.next
+                            })
+                    })
+            });
         }
         let placed = |at| {
             self.handlers
@@ -1018,21 +1078,17 @@ impl Body<'_, '_, '_> {
         {
             return true;
         }
-        // A break can split the try at the head of the loop. Its later
-        // ranges belong to the same placed suite, up to the normal latch.
-        let first = body.start
-            + ops[body.clone()]
-                .iter()
-                .take_while(|op| op.name == "NOP")
-                .count();
-        first <= start
-            && first < body.end
-            && self
-                .flow
-                .handler(first)
-                .is_some_and(|h| (h.target, h.depth, h.lasti) == (entry.target, entry.depth, false))
-            && placed(first)
-                .is_some_and(|suite| ops.get(suite.end).is_some_and(|op| entry.end <= op.offset))
+        // A break or an unprotected NOT_TAKEN splits the table entry.
+        // The loop may contain several tries, each with its own dispatcher.
+        self.handlers.iter().any(|(&first, suite)| {
+            body.contains(&first)
+                && first <= start
+                && suite.next <= body.end
+                && ops.get(suite.end).is_some_and(|op| entry.end <= op.offset)
+                && self.flow.handler(first).is_some_and(|h| {
+                    (h.target, h.depth, h.lasti) == (entry.target, entry.depth, false)
+                })
+        })
     }
 
     /// An out-of-line handler may jump back into the normal layout after
@@ -1191,6 +1247,10 @@ impl Body<'_, '_, '_> {
             }
             _ => None,
         };
+        let outer_protection = self.active_try;
+        if let Clause::Except { binding, .. } = entry.clause {
+            self.active_try = self.flow.handler(binding);
+        }
         let handler = self.protected_fragment(
             ops,
             entry.handler.clone(),
@@ -1198,6 +1258,7 @@ impl Body<'_, '_, '_> {
             entry.handler_exits,
             rejoin,
         );
+        self.active_try = outer_protection;
         self.finally_unwind = outer;
         let handler = handler?;
         let handler = if let Some(tail) = &entry.handler_tail {

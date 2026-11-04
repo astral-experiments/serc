@@ -3,7 +3,7 @@
 //! and the handler's saved exception from the loop's own stack slots.
 use super::{Body, ExitCopies, FxHashSet, Graph, Instruction, Range};
 
-/// A handler at the head of a while loop may break past its last latch.
+/// A handler in a while loop may break past its last latch.
 /// The source walker checks this destination again against its active loop.
 pub(super) fn after_while(
     ops: &[Instruction],
@@ -12,17 +12,47 @@ pub(super) fn after_while(
     target: usize,
     depth: usize,
 ) -> bool {
-    let Some(latch) = target.checked_sub(1) else {
+    let Some(mut latch) = target.checked_sub(1) else {
         return false;
     };
+    // Both outcomes of the try's last guard can loop back before the
+    // dispatcher. Only its matched handler breaks past the unwind.
+    let copied = copied_latch(ops, flow, suite.clone(), suite.end).is_some()
+        && flow.handler(suite.start).is_some_and(|h| {
+            ops.get(suite.end + 2)
+                .is_some_and(|op| op.offset == h.target)
+                && crate::source::dispatch::unwind(ops, flow, suite.end + 2, depth + 1)
+                    .is_some_and(|(_, cleanup)| cleanup + 3 == target)
+        });
+    if copied {
+        latch = suite.end + 1;
+    }
     ops[latch].name == "JUMP_BACKWARD"
         && suite.end <= latch
         && flow.jump(latch).is_some_and(|header| {
             header < suite.start
-                && ops[header..suite.start].iter().all(|op| op.name == "NOP")
+                && (ops[header..suite.start].iter().all(|op| op.name == "NOP")
+                    || ((copied || flow.jump(suite.end) == Some(latch))
+                        && ops[header].name == "NOP"
+                        && straight_path(flow, header..suite.start)))
                 && flow.block(header).height == Some(depth)
         })
         && flow.block(target).height == Some(depth)
+}
+
+/// A preceding sibling try can jump over its inline dispatch on success.
+/// Only follow forward, single-successor blocks to the next protected suite.
+fn straight_path(flow: &Graph, span: Range<usize>) -> bool {
+    let mut at = span.start;
+    while at < span.end {
+        let block = flow.block(at);
+        let next = match (flow.jump(block.ops.end - 1), flow.fallthrough(block)) {
+            (Some(to), None) | (None, Some(to)) if at < to && to <= span.end => to,
+            _ => return false,
+        };
+        at = next;
+    }
+    true
 }
 
 pub(super) fn while_break_gap(

@@ -6,6 +6,14 @@ use std::ops::Range;
 use super::partial::GapKind;
 use super::{Body, Instruction, Object, Value};
 
+pub(super) fn local_return(ops: &[Instruction], end: usize) -> Option<usize> {
+    let [.., load, ret] = ops.get(..end)? else {
+        return None;
+    };
+    (matches!(load.name, "LOAD_FAST" | "LOAD_FAST_BORROW") && ret.name == "RETURN_VALUE")
+        .then_some(end - 2)
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct ConstantReturn(&'static str, u32);
 

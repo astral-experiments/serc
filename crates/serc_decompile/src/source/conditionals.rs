@@ -253,7 +253,10 @@ impl Body<'_, '_, '_> {
     fn filter_latch(&self, ops: &[Instruction], at: usize) -> bool {
         ops.get(at).is_some_and(|op| op.name == "JUMP_BACKWARD")
             && self.loop_transfer(ops, at) == Some("continue")
-            && self.flow.jump(at).is_some_and(|header| self.flow.handler(header).is_some())
+            && self
+                .flow
+                .jump(at)
+                .is_some_and(|header| self.flow.handler(header).is_some())
             && self.flow.handler(at).is_none()
             && self.flow.block(at).ops.end == at + 1
             && ops[self.flow.block(at).ops.start..at]
