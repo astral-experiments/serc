@@ -61,7 +61,7 @@ impl Body<'_, '_, '_> {
             .is_some_and(|op| op.name == "WITH_EXCEPT_START")
         {
             self.handlers = super::protected_regions::collect(bc, self);
-            return self.with_statement(bc, handlers, limit);
+            return self.with_statement(bc, handlers, 0, limit);
         }
         if entry.depth > 0 && !entry.lasti {
             // A protected condition inside a loop keeps the iterator on the
@@ -71,9 +71,9 @@ impl Body<'_, '_, '_> {
         if entry.depth != 0 || entry.lasti {
             return Err(format!("unsupported handler depth at byte {}", entry.start));
         }
-        if self.work.partial
-            && self.depth > 0
+        if self.depth > 0
             && !self.class
+            && (self.work.partial || ops.iter().any(|op| op.name == "WITH_EXCEPT_START"))
             && ops[..start].iter().any(|op| {
                 op.name.starts_with("POP_JUMP")
                     && op.jump.is_some_and(|target| target > entry.start)
@@ -81,15 +81,26 @@ impl Body<'_, '_, '_> {
             && let Some((regions, prefix_end)) =
                 super::protected_regions::guarded_prefix(bc, self, limit)
         {
-            self.handlers = regions;
-            self.region(ops, 0, prefix_end, 0)?;
-            if self.stack.is_empty() {
-                self.partial_start = prefix_end;
+            if let Some(enter) = self.manager_after_prefix(ops, prefix_end) {
+                self.handlers = regions;
+                self.region(ops, 0, enter, 0)?;
+                if !matches!(self.stack.as_slice(), [super::Value::Expr(_)]) {
+                    return Err("unresolved context manager after guarded prefix".into());
+                }
+                let next = handlers.partition_point(|h| h.start < ops[prefix_end].offset);
+                return self.with_statement(bc, &handlers[next..], enter, limit);
             }
-            return Err(format!(
-                "unplaced exception region at byte {}",
-                ops[prefix_end].offset
-            ));
+            if self.work.partial {
+                self.handlers = regions;
+                self.region(ops, 0, prefix_end, 0)?;
+                if self.stack.is_empty() {
+                    self.partial_start = prefix_end;
+                }
+                return Err(format!(
+                    "unplaced exception region at byte {}",
+                    ops[prefix_end].offset
+                ));
+            }
         }
         self.region(ops, 0, start, 0)?;
         let return_exit = end + 1 == normal_end && ops[end].name == "RETURN_VALUE";

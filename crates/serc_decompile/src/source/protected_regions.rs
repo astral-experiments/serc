@@ -439,10 +439,11 @@ fn region(
         && super::dispatch::typed_handler(flow, ops, dispatch + 1).is_none()
         && super::finalizers::owns_cleanup(ops, owner, dispatch..cleanup, unwind);
     if finalizer
-        && group.entries.len() == 1
+        && group.entries.len() <= 2
         && let Some(child) = group.child
         && let Some(suite) = inner.get(&child)
-        && let Some(normal) = finally::after_except(ops, owner, suite, child, dispatch, cleanup)
+        && let Some(normal) =
+            finally::after_except(ops, owner, suite, child, dispatch, cleanup, entries)
     {
         let mut suite = inner.remove(&child)?;
         if let Clause::Except { finalizer, .. } = &mut suite.clause {
@@ -668,6 +669,10 @@ fn region(
             body..expression_end
         }
         [.., raise] if raise.name == "RAISE_VARARGS" => body..stop,
+        _ if let Some((pop, latch)) = owner.manager_continue(ops, binding, stop, cleanup) => {
+            handler_tail = Some(latch..latch + 1);
+            body..pop
+        }
         [.., ret]
             if ret.name == "RETURN_VALUE"
                 && let Some((pop, after)) = Body::handler_pop(ops, binding, stop)
@@ -706,6 +711,12 @@ fn region(
             {
                 retry = true;
                 next = after_break;
+            } else if next == end
+                && success.is_empty()
+                && following.is_empty()
+                && loop_exits::after_while(ops, flow, start..end, to, first.depth)
+            {
+                handler_tail = Some(stop - 1..stop);
             } else if to < start
                 && ops[to..start].iter().all(|op| op.name == "NOP")
                 && flow.block(to).height == Some(first.depth)
@@ -862,6 +873,15 @@ fn protected_end(
         if (entry.depth, entry.lasti) != (first.depth, first.lasti) {
             return None;
         }
+        if end < at
+            && let Some((next, restore)) =
+                super::comprehensions::protected_body(ops, flow, end, first)
+            && next == at
+        {
+            cleanups.insert(restore.start, restore.end);
+            end = entry_end;
+            continue;
+        }
         if super::managers::bridges_try(ops, flow, end..at, first, &mut cleanups).is_some() {
             end = entry_end;
             continue;
@@ -911,7 +931,9 @@ fn protected_end(
             }
             continue;
         }
-        if end + 1 == at && loop_exits::break_over_cleanup(ops, flow, end, first).is_some() {
+        if (end + 1 == at && loop_exits::break_over_cleanup(ops, flow, end, first).is_some())
+            || (end < at && loop_exits::while_break_gap(ops, flow, end..at, first))
+        {
             end = entry_end;
             continue;
         }
@@ -983,13 +1005,34 @@ impl Body<'_, '_, '_> {
         let Ok(start) = ops.binary_search_by_key(&entry.start, |op| op.offset) else {
             return false;
         };
-        !entry.lasti
-            && body.contains(&start)
-            && self.handlers.get(&start).is_some_and(|suite| {
-                ops.get(suite.end).is_some_and(|op| op.offset == entry.end)
-                    && start < suite.next
-                    && suite.next <= body.end
-            })
+        if entry.lasti || !body.contains(&start) {
+            return false;
+        }
+        let placed = |at| {
+            self.handlers
+                .get(&at)
+                .filter(|suite| at < suite.next && suite.next <= body.end)
+        };
+        if placed(start)
+            .is_some_and(|suite| ops.get(suite.end).is_some_and(|op| op.offset == entry.end))
+        {
+            return true;
+        }
+        // A break can split the try at the head of the loop. Its later
+        // ranges belong to the same placed suite, up to the normal latch.
+        let first = body.start
+            + ops[body.clone()]
+                .iter()
+                .take_while(|op| op.name == "NOP")
+                .count();
+        first <= start
+            && first < body.end
+            && self
+                .flow
+                .handler(first)
+                .is_some_and(|h| (h.target, h.depth, h.lasti) == (entry.target, entry.depth, false))
+            && placed(first)
+                .is_some_and(|suite| ops.get(suite.end).is_some_and(|op| entry.end <= op.offset))
     }
 
     /// An out-of-line handler may jump back into the normal layout after
@@ -1008,6 +1051,19 @@ impl Body<'_, '_, '_> {
                 let Clause::Except { binding, .. } = suite.clause else {
                     return false;
                 };
+                if body.contains(&start)
+                    && suite.handler_tail.as_ref() == Some(&(source..source + 1))
+                    && let Some(entry) = self.flow.handler(start)
+                    && loop_exits::after_while(
+                        ops,
+                        &self.flow,
+                        start..suite.end,
+                        target,
+                        entry.depth,
+                    )
+                {
+                    return true;
+                }
                 body.contains(&start)
                     && start < suite.end
                     && suite.end <= target
@@ -1019,13 +1075,13 @@ impl Body<'_, '_, '_> {
             })
     }
 
-    /// A nested try can own the rest of a manager's body. On an exception
-    /// its final unwind must transfer control to this manager's exit.
-    pub(super) fn managed_child_end(
+    /// The normal continuation of a nested try whose final unwind transfers
+    /// control to this exact enclosing handler.
+    pub(super) fn enclosed_try_end(
         &self,
         ops: &[Instruction],
         mut start: usize,
-        manager: Handler,
+        outer: Handler,
     ) -> Option<usize> {
         while ops.get(start)?.name == "NOP" {
             start += 1;
@@ -1035,12 +1091,12 @@ impl Body<'_, '_, '_> {
         let unwind = child.unwind(ops, &self.flow, entry)?;
         let parent = self.flow.handler(unwind)?;
         (!entry.lasti
-            && entry.depth == manager.depth
+            && entry.depth == outer.depth
             && child.next > start
             && parent.start == ops[unwind].offset
             && parent.end == ops.get(unwind + 3)?.offset
             && (parent.target, parent.depth, parent.lasti)
-                == (manager.target, manager.depth, manager.lasti))
+                == (outer.target, outer.depth, outer.lasti))
             .then_some(child.next)
     }
 

@@ -539,6 +539,38 @@ impl Body<'_, '_, '_> {
             .then_some((arms, join))
     }
 
+    /// One matching arm restores the exception (and any binding) and jumps
+    /// back to the retry loop. Leave nested handlers to their own lifter.
+    pub(super) fn retry_arm(
+        &self,
+        ops: &[Instruction],
+        dispatch: usize,
+        unwind: usize,
+    ) -> Option<(Arm, usize)> {
+        let (mut arms, _) = self.handler_arms(ops, dispatch + 1, unwind, &self.handlers)?;
+        let arm = arms.pop()?;
+        let Exit::Jump(target) = arm.exit else {
+            return None;
+        };
+        let pop = arm.body.end;
+        let jump = pop + 1 + 3 * usize::from(ops[arm.binding].name != "POP_TOP");
+        let protection = self.flow.handler(arm.binding + 1);
+        (arms.is_empty()
+            && ops.get(pop)?.name == "POP_EXCEPT"
+            && self.flow.jump(jump) == Some(target)
+            && self.flow.blocks_covering(arm.body.clone()).all(|b| {
+                match self.flow.handler(b.ops.start) {
+                    Some(h) => {
+                        h.lasti
+                            && protection
+                                .is_some_and(|p| (p.target, p.depth) == (h.target, h.depth))
+                    }
+                    None => ops[b.ops.clone()].iter().all(|op| op.name == "NOT_TAKEN"),
+                }
+            }))
+        .then_some((arm, jump))
+    }
+
     /// The try already returned its pending value. Each matched handler may
     /// raise, evaluate its own return, or restore the previous exception and
     /// reach a shared continuation copied after its `POP_EXCEPT`.

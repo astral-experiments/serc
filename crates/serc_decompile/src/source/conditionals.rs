@@ -168,7 +168,16 @@ impl Body<'_, '_, '_> {
         let mut terms = vec![initial];
         for _ in 0..32 {
             let last = terms.last().unwrap();
-            let start = last.suite;
+            // In a protected loop, a failed filter can fall through into an
+            // unprotected backedge while success skips it to the next operand.
+            let mut start = last.suite;
+            if terms.len() > 1
+                && self.filter_latch(ops, start)
+                && (last.yes == start + 1 || last.no == start + 1)
+                && self.flow.entered_from(start, last.start..start)
+            {
+                start += 1;
+            }
             if start >= end || last.yes == last.no || !self.flow.entered_from(start, first..start) {
                 break;
             }
@@ -182,7 +191,7 @@ impl Body<'_, '_, '_> {
             let branch = rhs.branch;
             while let Some(lhs) = terms.last()
                 && self.flow.entered_from(rhs.start, lhs.start..rhs.start)
-                && let Some((op, invert)) = self.shared_exit(lhs, &rhs, end)
+                && let Some((op, invert)) = self.shared_exit(ops, lhs, &rhs, end)
             {
                 self.charge(lhs.value.len() + rhs.value.len() + 16)?;
                 let lhs = terms.pop().unwrap();
@@ -241,9 +250,27 @@ impl Body<'_, '_, '_> {
         )
     }
 
-    fn shared_exit(&self, lhs: &Term, rhs: &Term, end: usize) -> Option<(&'static str, bool)> {
+    fn filter_latch(&self, ops: &[Instruction], at: usize) -> bool {
+        ops.get(at).is_some_and(|op| op.name == "JUMP_BACKWARD")
+            && self.loop_transfer(ops, at) == Some("continue")
+            && self.flow.jump(at).is_some_and(|header| self.flow.handler(header).is_some())
+            && self.flow.handler(at).is_none()
+            && self.flow.block(at).ops.end == at + 1
+            && ops[self.flow.block(at).ops.start..at]
+                .iter()
+                .all(|op| op.name == "NOT_TAKEN")
+    }
+
+    fn shared_exit(
+        &self,
+        ops: &[Instruction],
+        lhs: &Term,
+        rhs: &Term,
+        end: usize,
+    ) -> Option<(&'static str, bool)> {
         let same = |a, b| {
             a == b
+                || (self.filter_latch(ops, a) && self.filter_latch(ops, b))
                 || (end == self.terminal_returns.end
                     && self.terminal_returns.contains(&a)
                     && self.terminal_returns.contains(&b))
@@ -522,6 +549,31 @@ impl Body<'_, '_, '_> {
             let right = self.fragment(ops, target, end, level)?.suite()?;
             self.block(&format!("if {test}:"), &left)?;
             self.block("else:", &right)?;
+            return Ok(end);
+        }
+        // CPython can copy the loop latch onto the final statement of each
+        // arm. Keep the if/else when the first jump inherits that statement's
+        // line. A separately located continue is still visible in the source.
+        if start < tail
+            && fallthrough_end == target
+            && self.at_loop_tail(end)
+            && self.loop_transfer(ops, tail) == Some("continue")
+            && self.flow.jump(tail) == self.flow.jump(end)
+            && !self
+                .flow
+                .incoming(target)
+                .any(|from| (start..tail).contains(&from))
+            && self
+                .instruction_lines
+                .as_deref()
+                .is_ok_and(|lines| lines[tail].is_some() && lines[tail] == lines[tail - 1])
+        {
+            let suite = self.fragment(ops, start, tail, level)?.suite()?;
+            self.block(&format!("if {test}:"), &suite)?;
+            if target < end {
+                let other = self.fragment(ops, target, end, level)?.suite()?;
+                self.block("else:", &other)?;
+            }
             return Ok(end);
         }
         if self.loop_transfer(ops, tail).is_some() {

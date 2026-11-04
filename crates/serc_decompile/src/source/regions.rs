@@ -465,7 +465,9 @@ impl Body<'_, '_, '_> {
                 self.comprehension(ops, i + 1, end, level)
             }
             "LOAD_FAST_AND_CLEAR" => self.comprehension(ops, i, end, level),
-            "JUMP_BACKWARD" | "JUMP_FORWARD" if self.loop_transfer(ops, i).is_some() => {
+            "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT" | "JUMP_FORWARD"
+                if self.loop_transfer(ops, i).is_some() =>
+            {
                 self.line(self.loop_transfer(ops, i).unwrap())?;
                 Ok(i + 1)
             }
@@ -480,6 +482,25 @@ impl Body<'_, '_, '_> {
                     && let Some(next) = self.unconditional_loop(ops, i, end, level)? =>
             {
                 Ok(next)
+            }
+            // CPython 3.12 can leave a separately located NOP for a stripped
+            // docstring. Keep the no-op when the next statement is still in
+            // the entry block, with no loop or protected-suite entry between.
+            "NOP"
+                if self.m.version == super::PythonVersion::Py312
+                    && self.depth > 0
+                    && !self.class
+                    && self.work.mode == super::synthetic::Mode::Ordinary
+                    && i > 0
+                    && (ops[i - 1].name, ops[i - 1].arg) == ("RESUME", 0)
+                    && i + 1 < self.flow.block(i - 1).ops.end
+                    && ops[i + 1].name.starts_with("LOAD_")
+                    && self.instruction_lines.as_deref().is_ok_and(|lines| {
+                        lines[i].zip(lines[i + 1]).is_some_and(|(a, b)| a < b)
+                    }) =>
+            {
+                self.line("pass")?;
+                Ok(i + 1)
             }
             "POP_TOP" | "POP_ITER"
                 if self.stack.is_empty()

@@ -1,9 +1,11 @@
 //! Recover comprehension clauses from synchronous and asynchronous iterator loops.
 use std::fmt::Write as _;
+use std::ops::Range;
 
 use serc_bytecode::instructions::Handler;
 
 use super::{Body, Bytecode, Instruction, Value};
+use crate::flow::Graph;
 
 pub(super) fn is_collection_insert(op: &Instruction) -> bool {
     op.arg > 1
@@ -15,6 +17,88 @@ pub(super) fn is_collection_insert(op: &Instruction) -> bool {
 
 pub(super) fn starts_restore(ops: &[Instruction]) -> bool {
     matches!(ops, [swap, pop, ..] if (swap.name, swap.arg) == ("SWAP", 2) && pop.name == "POP_TOP")
+}
+
+/// The exceptional copy discards the partial collection, restores the
+/// spilled locals in reverse order, and reraises at the enclosing handler.
+pub(super) fn restore_range(ops: &[Instruction], entry: Handler) -> Option<Range<usize>> {
+    if entry.lasti {
+        return None;
+    }
+    let index = |offset| ops.binary_search_by_key(&offset, |op| op.offset).ok();
+    let start = index(entry.start)?;
+    if !matches!(ops[start].name, "BUILD_LIST" | "BUILD_SET" | "BUILD_MAP") {
+        return None;
+    }
+    let target = index(entry.target)?;
+    let [.., swap] = ops.get(..start)? else {
+        return None;
+    };
+    let count = (swap.arg as usize).checked_sub(1)?;
+    let saved = ops.get((start - 1).checked_sub(count)?..start - 1)?;
+    let [copy, pop, order, rest @ ..] = ops.get(target..)? else {
+        return None;
+    };
+    let (stores, tail) = rest.split_at_checked(count)?;
+    (count > 0
+        && swap.name == "SWAP"
+        && (copy.name, copy.arg) == ("SWAP", 2)
+        && pop.name == "POP_TOP"
+        && (order.name, order.arg) == ("SWAP", swap.arg)
+        && saved.iter().rev().zip(stores).all(|(load, store)| {
+            load.name == "LOAD_FAST_AND_CLEAR"
+                && (store.name, store.arg) == ("STORE_FAST", load.arg)
+        })
+        && tail
+            .first()
+            .is_some_and(|op| (op.name, op.arg) == ("RERAISE", 0)))
+    .then_some(target..target + 4 + count)
+}
+
+pub(super) fn restore_under(
+    ops: &[Instruction],
+    flow: &Graph,
+    entry: Handler,
+    parent: Handler,
+) -> Option<Range<usize>> {
+    let restore = restore_range(ops, entry)?;
+    let h = flow.handler(restore.start)?;
+    (h.start == ops[restore.start].offset
+        && h.end == ops.get(restore.end)?.offset
+        && (h.target, h.depth, h.lasti) == (parent.target, parent.depth, parent.lasti))
+        .then_some(restore)
+}
+
+/// A filter can jump back to `FOR_ITER` outside the exception table. Both
+/// sides still belong to the same comprehension and restore the same locals.
+pub(super) fn protected_body(
+    ops: &[Instruction],
+    flow: &Graph,
+    start: usize,
+    parent: Handler,
+) -> Option<(usize, Range<usize>)> {
+    let entry = flow.handler(start)?;
+    if entry.start != ops[start].offset {
+        return None;
+    }
+    let restore = restore_under(ops, flow, entry, parent)?;
+    let mut end = ops.binary_search_by_key(&entry.end, |op| op.offset).ok()?;
+    while ops[end].name == "JUMP_BACKWARD"
+        && flow.handler(end).is_none()
+        && flow
+            .jump(end)
+            .is_some_and(|to| (start..end).contains(&to) && ops[to].name == "FOR_ITER")
+    {
+        let following = ops.get(end + 1)?;
+        let h = flow.handler(end + 1)?;
+        if h.start != following.offset
+            || (h.target, h.depth, h.lasti) != (entry.target, entry.depth, entry.lasti)
+        {
+            return None;
+        }
+        end = ops.binary_search_by_key(&h.end, |op| op.offset).ok()?;
+    }
+    Some((end, restore))
 }
 
 /// Split leading comprehension restores from user handlers. A restore after

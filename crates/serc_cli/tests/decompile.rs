@@ -679,6 +679,147 @@ assert result == [(2, [1, 2]), (None, [1])]
 
 #[cfg(feature = "decompile")]
 #[test]
+fn comprehensions_keep_their_enclosing_loop_and_handler() {
+    check_fixture(
+        r"def poll(selector):
+    while True:
+        ready = [key for key, events in selector()]
+        if ready:
+            break
+    return ready
+
+def checked(selector):
+    key = 'original'
+    try:
+        ready = [key.fileobj for key, events in selector()]
+    except AttributeError:
+        return key
+    return ready
+",
+        r"batches = iter([[], [(42, 0)]])
+result = poll(batches.__next__), checked(lambda: [(None, 0)])
+assert result == ([42], 'original')",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn managed_retries_distinguish_breaks_from_suppression() {
+    check_fixture(
+        r"def consume(manager, step, restart):
+    with manager:
+        while True:
+            try:
+                while True:
+                    ready = [x for x in step()]
+                    if ready:
+                        break
+                restart(ready)
+            except OSError:
+                restart()
+
+def leaves(manager, step, restart):
+    with manager:
+        while True:
+            try:
+                if step():
+                    break
+                restart()
+            except OSError:
+                restart()
+        step('after loop')
+    restart('outside')
+",
+        r"result = []
+class Manager:
+    def __enter__(self): result.append('entered')
+    def __exit__(self, typ, exc, tb):
+        result.append('closed')
+        return typ is StopIteration
+manager = Manager()
+def restart(*args): result.append(args)
+def read():
+    yield []
+    raise OSError
+consume(manager, read().__next__, restart)
+def step(message=None):
+    if message: result.append(message)
+    return True
+leaves(manager, step, restart)
+assert result == ['entered', (), 'closed', 'entered', 'after loop', 'closed', ('outside',)]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn forkserver_recovers_the_poll_loop_and_its_handlers() {
+    let temp = tempfile::tempdir().unwrap();
+    for version in common::PYTHON_VERSIONS {
+        let built = common::python_command(version)
+            .args([
+                "-c",
+                r"
+import pathlib, py_compile, sys, sysconfig
+source = pathlib.Path(sysconfig.get_path('stdlib'), 'multiprocessing', 'forkserver.py')
+for level in range(3):
+    cache = pathlib.Path(sys.argv[1], f'forkserver.{level}.pyc')
+    py_compile.compile(str(source), str(cache), doraise=True, optimize=level)
+",
+            ])
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert!(built.status.success(), "{version}: {built:?}");
+        for level in 0..=2 {
+            let cache = temp.path().join(format!("forkserver.{level}.pyc"));
+            let output = Command::new(env!("CARGO_BIN_EXE_serc"))
+                .args(["decompile", "--strict"])
+                .arg(&cache)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{version} -O{level}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let source = std::str::from_utf8(&output.stdout).unwrap();
+            assert!(
+                source.contains("os.waitpid(") && source.contains("pid = os.fork()"),
+                "{version} -O{level}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn generator_filter_recovers_short_circuit_backedges() {
+    check_output(
+        r"def select(values, same, allowed, accept):
+    for item in values:
+        value = item[0]
+        if same(value) or allowed(value) and accept(value):
+            yield item
+",
+        r"log = []
+def same(x): log.append(('same', x)); return x == 0
+def allowed(x): log.append(('allowed', x)); return x == 1
+def accept(x): log.append(('accept', x)); return True
+result = list(select([(0,), (1,), (2,)], same, allowed, accept)), log
+assert result[0] == [(0,), (1,)]
+assert log == [('same', 0), ('same', 1), ('allowed', 1), ('accept', 1), ('same', 2), ('allowed', 2)]",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert!(
+                source.contains(" or ") && source.contains(" and "),
+                "{source}"
+            );
+        },
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_successful_match_can_skip_the_remaining_cases() {
     check_fixture(
         r"def resolve(name, ready, log):

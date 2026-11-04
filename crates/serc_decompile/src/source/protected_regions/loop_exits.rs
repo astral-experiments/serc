@@ -3,6 +3,56 @@
 //! and the handler's saved exception from the loop's own stack slots.
 use super::{Body, ExitCopies, FxHashSet, Graph, Instruction, Range};
 
+/// A handler at the head of a while loop may break past its last latch.
+/// The source walker checks this destination again against its active loop.
+pub(super) fn after_while(
+    ops: &[Instruction],
+    flow: &Graph,
+    suite: Range<usize>,
+    target: usize,
+    depth: usize,
+) -> bool {
+    let Some(latch) = target.checked_sub(1) else {
+        return false;
+    };
+    ops[latch].name == "JUMP_BACKWARD"
+        && suite.end <= latch
+        && flow.jump(latch).is_some_and(|header| {
+            header < suite.start
+                && ops[header..suite.start].iter().all(|op| op.name == "NOP")
+                && flow.block(header).height == Some(depth)
+        })
+        && flow.block(target).height == Some(depth)
+}
+
+pub(super) fn while_break_gap(
+    ops: &[Instruction],
+    flow: &Graph,
+    gap: Range<usize>,
+    owner: super::Handler,
+) -> bool {
+    let jump = match &ops[gap.clone()] {
+        [jump] if jump.name == "JUMP_FORWARD" => gap.start,
+        [marker, jump] if marker.name == "NOT_TAKEN" && jump.name == "JUMP_FORWARD" => {
+            gap.start + 1
+        }
+        _ => return false,
+    };
+    let Some(test) = gap.start.checked_sub(1) else {
+        return false;
+    };
+    let Some(target) = flow.jump(jump) else {
+        return false;
+    };
+    let Ok(start) = ops.binary_search_by_key(&owner.start, |op| op.offset) else {
+        return false;
+    };
+    flow.jump(test) == Some(gap.end)
+        && ops[test].name.starts_with("POP_JUMP_IF_")
+        && flow.block(jump).height == Some(owner.depth)
+        && after_while(ops, flow, start..gap.end, target, owner.depth)
+}
+
 /// A break can discard the iterator under protection, then jump outside the
 /// table. Check the iterator's own exhaustion path and its protected latch
 /// before including that jump in the try.

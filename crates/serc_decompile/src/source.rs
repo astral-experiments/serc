@@ -112,7 +112,7 @@ pub(super) fn recover(
             result.push('\n');
         }
         if result != text {
-            if let Some(located) = layout::keyword_lines(&text, parsed.suite(), &result) {
+            if let Some(located) = layout::item_lines(&text, parsed.suite(), &result) {
                 candidates.push(located);
             }
             candidates.push(result);

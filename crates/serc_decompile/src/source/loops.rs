@@ -27,6 +27,18 @@ pub(super) struct Loop {
     copied_return: Option<usize>,
 }
 
+impl Loop {
+    pub(super) fn retry(header: usize, body_end: usize, outer: Option<Self>) -> Self {
+        Self {
+            header,
+            body_end,
+            iterators: outer.map_or(0, |outer| outer.iterators),
+            after: None,
+            copied_return: None,
+        }
+    }
+}
+
 fn local_return(ops: &[Instruction], end: usize) -> Option<usize> {
     let [.., load, ret] = ops.get(..end)? else {
         return None;
@@ -229,7 +241,7 @@ impl Body<'_, '_, '_> {
 
     pub(super) fn loop_transfer(&self, ops: &[Instruction], i: usize) -> Option<&'static str> {
         let active = self.loop_edges?;
-        if !matches!(ops[i].name, "JUMP_BACKWARD" | "JUMP_FORWARD") {
+        if !serc_bytecode::target::is_unconditional_jump(ops[i].opcode) {
             return None;
         }
         let dest = self.flow.jump(i)?;
@@ -374,6 +386,7 @@ impl Body<'_, '_, '_> {
                 !current
                     && !generator_exit
                     && self.delegated_cleanup(ops, start).is_none()
+                    && super::comprehensions::restore_range(ops, h).is_none()
                     && !self.loop_contains_handler(ops, h, nop + 1..latch)
             });
             if protected
