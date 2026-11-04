@@ -62,7 +62,11 @@ impl Bytecode {
                 .checked_sub(pop)
                 .and_then(|n| n.checked_add(push))
                 .ok_or_else(|| format!("stack underflow at {} byte {}", op.name, op.offset))?;
-            if let Some(target) = op.jump {
+            // END_ASYNC_FOR points back to the SEND that supplied the
+            // exception. Execution falls through on successful cleanup.
+            if let Some(target) = op.jump
+                && op.opcode != opcodes::END_ASYNC_FOR
+            {
                 pending.push((index(target)?, next));
             }
             if !is_scope_exit_for(version, op.opcode) && !is_unconditional_jump(op.opcode) {

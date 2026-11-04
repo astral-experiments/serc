@@ -1,5 +1,9 @@
 mod definitions;
+mod exceptions;
+mod patterns;
 mod regions;
+mod strings;
+mod suspension;
 use definitions::{Definition, Import};
 
 use ruff_python_ast::str::TripleQuotes;
@@ -18,7 +22,7 @@ use crate::target::operands315::CommonConstant;
 const MAX_SOURCE: usize = 1 << 20;
 const MAX_WORK: usize = 16 << 20;
 
-pub(super) fn recover(m: &Module<'_>) -> Result<String, String> {
+pub(super) fn recover(m: &Module<'_>) -> Result<Vec<String>, String> {
     let mut work = MAX_WORK;
     let text = scope(m, m.root, 0, false, &mut work)?;
     let parsed = ruff_python_parser::parse_module(&text)
@@ -29,7 +33,12 @@ pub(super) fn recover(m: &Module<'_>) -> Result<String, String> {
         result.push_str(&Generator::new(&indent, LineEnding::Lf).stmt(stmt));
         result.push('\n');
     }
-    Ok(result)
+    if text != result {
+        // Suite layout can change tracing NOPs even when the AST is identical.
+        Ok(vec![result, text])
+    } else {
+        Ok(vec![result])
+    }
 }
 
 fn scope(
@@ -59,12 +68,6 @@ fn scope(
     .map_err(|e| format!("{name}: {e}"))?;
     bc.stack_heights(m.version, code.stack_size)
         .map_err(|e| format!("{name}: {e}"))?;
-    if let Some(h) = bc.handlers.first() {
-        return Err(format!(
-            "{name}: unsupported exception region at byte {}",
-            h.start
-        ));
-    }
     let mut body = Body {
         m,
         code,
@@ -76,8 +79,26 @@ fn scope(
         work,
     };
     body.declarations(&bc.ops)?;
-    body.region(&bc.ops, 0, bc.ops.len(), 0)
-        .map_err(|e| format!("{name}: {e}"))?;
+    if body.suspended() {
+        body.suspension_scope(&bc)
+    } else if bc.ops.iter().any(|op| op.name == "LOAD_FAST_AND_CLEAR")
+        && bc
+            .ops
+            .iter()
+            .any(|op| matches!(op.name, "LIST_APPEND" | "SET_ADD" | "MAP_ADD"))
+    {
+        let stop = bc
+            .handlers
+            .first()
+            .and_then(|h| bc.ops.binary_search_by_key(&h.target, |op| op.offset).ok())
+            .unwrap_or(bc.ops.len());
+        body.region(&bc.ops, 0, stop, 0)
+    } else if bc.handlers.is_empty() {
+        body.region(&bc.ops, 0, bc.ops.len(), 0)
+    } else {
+        body.protected(&bc)
+    }
+    .map_err(|e| format!("{name}: {e}"))?;
     if !body.stack.is_empty() {
         return Err(format!("{name}: unused stack values at end"));
     }
@@ -86,6 +107,10 @@ fn scope(
 
 enum Value {
     Expr(String),
+    Converted(String, &'static str),
+    Formatted(String),
+    Interpolation(String),
+    Interpolations(Vec<String>),
     Null,
     Code(Id),
     Function(Definition),
@@ -164,10 +189,10 @@ impl Body<'_, '_, '_> {
     }
 
     fn expr(&mut self) -> Result<String, String> {
-        if let Value::Expr(value) = self.pop()? {
-            Ok(value)
-        } else {
-            Err("expected expression".into())
+        match self.pop()? {
+            Value::Expr(value) => Ok(value),
+            Value::Formatted(field) => Ok(format!("f\"{field}\"")),
+            _ => Err("expected expression".into()),
         }
     }
 
@@ -227,6 +252,10 @@ impl Body<'_, '_, '_> {
     }
 
     fn store(&mut self, name: &str) -> Result<(), String> {
+        if matches!(self.stack.last(), Some(Value::Formatted(_))) {
+            let text = self.expr()?;
+            self.push(text)?;
+        }
         match self.pop()? {
             Value::Expr(_)
                 if self.class
@@ -383,6 +412,19 @@ impl Body<'_, '_, '_> {
                 };
                 self.push(format!("({sign}{value})"))?;
             }
+            "FORMAT_VALUE"
+            | "CONVERT_VALUE"
+            | "FORMAT_SIMPLE"
+            | "FORMAT_WITH_SPEC"
+            | "BUILD_STRING"
+            | "BUILD_INTERPOLATION"
+            | "BUILD_TEMPLATE" => self.string_op(op)?,
+            "BUILD_TUPLE"
+                if matches!(self.stack.last(), Some(Value::Interpolation(_))) && a > 0 =>
+            {
+                let fields = self.interpolations(a)?;
+                self.stack.push(Value::Interpolations(fields));
+            }
             "BUILD_LIST" | "BUILD_TUPLE" | "BUILD_SET" => {
                 let args = self.args(a)?.join(", ");
                 let expr = match op.name {
@@ -399,6 +441,22 @@ impl Body<'_, '_, '_> {
                 };
                 self.push(expr)?;
             }
+            "YIELD_VALUE" => {
+                let value = self.expr()?;
+                self.push(format!("(yield {value})"))?;
+            }
+            "CALL_INTRINSIC_1"
+                if a == crate::target::operands::UnaryIntrinsic::ASYNC_GEN_WRAP.argument() => {}
+            "RAISE_VARARGS" => {
+                let args = self.args(a)?;
+                let line = match args.as_slice() {
+                    [] => "raise".into(),
+                    [err] => format!("raise {err}"),
+                    [err, cause] => format!("raise {err} from {cause}"),
+                    _ => return Err("invalid raise operand".into()),
+                };
+                self.line(&line)?;
+            }
             "RETURN_CONST" | "RETURN_VALUE" => {
                 if op.name == "RETURN_CONST" {
                     self.constant(a)?;
@@ -408,6 +466,8 @@ impl Body<'_, '_, '_> {
                     if expr != "None" {
                         return Err("module returns a value".into());
                     }
+                } else if expr == "None" && self.suspended() {
+                    self.line("return")?;
                 } else {
                     self.line(&format!("return {expr}"))?;
                 }
