@@ -1141,6 +1141,30 @@ assert result == ['left', 'guard'] * 2",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_copied_call_preserves_lookup_and_argument_evaluation_order() {
+    check_fixture(
+        r"def dispatch(owner, first, guard, yes, no):
+    return owner.call(first(), yes() if guard() else no())
+",
+        r"result = []
+class Owner:
+    @property
+    def call(self):
+        result.append('lookup')
+        return lambda a, b: result.append((a, b))
+def record(value):
+    def evaluate():
+        result.append(value)
+        return value
+    return evaluate
+for guard in (True, False):
+    dispatch(Owner(), record(1), record(guard), record(2), record(3))
+assert result == ['lookup', 1, True, 2, (1, 2), 'lookup', 1, False, 3, (1, 3)]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn nested_guards_keep_their_implicit_return_blocks() {
     check_fixture(
         r"def rotate(default, exists, emit):
@@ -1525,6 +1549,29 @@ fn optimized_generator_calls_keep_short_circuiting_and_shadowing() {
     check_fixture(
         "def both(xs, log):\n    a = all(log(x) for x in xs)\n    b = any(log(x) for x in xs)\n    return a, b\ndef first(xs): return any(x for x in xs)\n",
         "seen = []\ndef observe(x): seen.append(x); return x\nresult = [both([1, 0, 2], observe), first([]), seen.copy()]\nall = any = tuple\nresult += [both([0, 2], observe), first([3, 4]), seen.copy()]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn guarded_collection_calls_keep_the_generator_and_shadowed_callable() {
+    check_fixture(
+        r"def collect(items, observe):
+    a = tuple(observe(x) for x in items)
+    b = list(observe(x) for x in items)
+    return a, b, set(observe(x) for x in items)
+",
+        r"seen = []
+def observe(item):
+    seen.append(item)
+    return item
+assert collect([2, 1, 2], observe) == ((2, 1, 2), [2, 1, 2], {1, 2})
+assert seen == [2, 1, 2] * 3
+def take_one(iterator): return next(iterator)
+tuple = list = set = take_one
+assert collect([5, 6], observe) == (5, 5, 5)
+assert seen[-3:] == [5, 5, 5]
+result = seen",
     );
 }
 
@@ -5012,5 +5059,179 @@ def missing(): raise KeyError
 values = [preferred('host', f) for f in (missing, lambda: [], lambda: ['a', 'b'], lambda: ['a', 'b.c', 'd.e'])]
 assert log == [1, 3] and values == ['host', 'host', 'host', 'b.c']
 result = log, values",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn module_finalizer_imports_on_normal_and_exceptional_paths() {
+    check_fixture(
+        r"try:
+    marker = bool(1)
+finally:
+    from math import sqrt
+
+def root(value):
+    return sqrt(value)
+",
+        "assert marker and root(9) == 3\nresult = root(16)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn async_for_continues_breaks_and_exhaustion_rejoin_the_right_iterator() {
+    check_fixture(
+        r"async def select(rows, emit):
+    async for item in rows:
+        if not item:
+            continue
+        if item < 0:
+            break
+        for value in range(item):
+            emit(value)
+    else:
+        emit('end')
+    emit('done')
+
+async def flatten(rows, emit):
+    async for row in rows:
+        async for item in row:
+            emit(item)
+",
+        r"import asyncio
+async def rows(values):
+    for v in values:
+        if isinstance(v, Exception): raise v
+        yield v
+log = []
+for values in ([], [0, 2], [1, -1, 4], [3, KeyError()]):
+    try:
+        asyncio.run(select(rows(values), log.append))
+    except KeyError:
+        log.append('error')
+assert log == ['end', 'done', 0, 1, 'end', 'done', 0, 'done', 0, 1, 2, 'error']
+asyncio.run(flatten(rows([rows([]), rows([4, 5])]), log.append))
+assert log[-2:] == [4, 5]
+result = log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn awaited_calls_rejoin_typed_handlers_with_a_bound_return() {
+    check_fixture(
+        r"async def read(take):
+    try:
+        line = await take()
+    except EOFError as err:
+        return err.args
+    except LookupError as err:
+        raise ValueError(err.args[0])
+    return line
+",
+        r"import asyncio
+async def take():
+    if isinstance(value, Exception): raise value
+    return value
+answers = []
+for value in (27, EOFError('partial'), KeyError('limit'), TypeError('other')):
+    try:
+        answers.append(asyncio.run(read(take)))
+    except ValueError as err:
+        assert err.__context__ is value
+        answers.append(err.args)
+    except TypeError as err:
+        assert err is value
+        answers.append('unmatched')
+assert answers == [27, ('partial',), ('limit',), 'unmatched']
+result = answers",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_terminal_nested_handler_restores_each_exception_before_the_success_exit() {
+    check_fixture(
+        r"def report(lookup, observe):
+    try:
+        callback = lookup()
+    except LookupError:
+        observe()
+        try:
+            raise ValueError from None
+        except ValueError:
+            observe()
+    else:
+        callback()
+
+def bound(lookup, retry, observe):
+    try:
+        lookup()
+    except LookupError as exc:
+        try:
+            retry()
+        except ValueError as exc:
+            observe(exc)
+",
+        r"import sys
+events = []
+def observe(*values):
+    err = sys.exception()
+    if values: assert values == (err,)
+    events.append((type(err).__name__, type(err.__context__).__name__))
+def missing(): raise KeyError
+def retry(): raise ValueError
+report(lambda: lambda: events.append('success'), observe)
+report(missing, observe)
+bound(missing, retry, observe)
+bound(missing, lambda: None, observe)
+assert sys.exception() is None
+assert events == ['success', ('KeyError', 'NoneType'), ('ValueError', 'KeyError'), ('ValueError', 'KeyError')]
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_suspended_inner_handler_reraises_into_its_enclosing_try() {
+    check_fixture(
+        r"async def connect(open_connection, close, report, debug):
+    try:
+        waiter = open_connection()
+        try:
+            await waiter
+        except BaseException:
+            close()
+            waiter = None
+            raise
+    except KeyboardInterrupt:
+        raise
+    except BaseException as err:
+        if debug:
+            report(err)
+",
+        r"import asyncio, sys
+events = []
+async def wait():
+    await asyncio.sleep(0)
+    if error: raise error
+def open_connection():
+    if immediate: raise error
+    return wait()
+def close():
+    assert sys.exception() is error
+    events.append('close')
+def report(err):
+    assert err is sys.exception() is error
+    events.append('report')
+for error, immediate, debug in [(None, False, True), (ValueError(), True, True), (ValueError(), False, True), (ValueError(), False, False), (KeyboardInterrupt(), False, True)]:
+    try:
+        asyncio.run(connect(open_connection, close, report, debug))
+    except KeyboardInterrupt as err:
+        assert err is error
+        events.append('propagated')
+assert events == ['report', 'close', 'report', 'close', 'close', 'propagated']
+result = events",
     );
 }

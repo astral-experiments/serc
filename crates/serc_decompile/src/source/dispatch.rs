@@ -34,6 +34,10 @@ enum Exit {
 }
 
 impl Arm {
+    pub(super) fn has_copied_exit(&self) -> bool {
+        self.copies.is_some_and(ExitCopies::multiple)
+    }
+
     pub(super) fn returns(&self) -> bool {
         matches!(
             self.exit,
@@ -637,9 +641,8 @@ impl Body<'_, '_, '_> {
             return Some((body.start..dispatch, Exit::ParentReturn(Some(tail))));
         }
         if let Some(parent) = super::protected_regions::BoundParent::at_cleanup(self, ops, cleanup)
-            && let Some((pop, ret)) = parent.handler_exit(self, ops, stop)
+            && let Some((pop, ret)) = parent.handler_exit(self, ops, binding, stop)
             && pop >= body.start
-            && ops[binding].name == "POP_TOP"
         {
             let exit = if ret.is_some() {
                 Exit::ReturnValue
@@ -728,11 +731,10 @@ impl Body<'_, '_, '_> {
         } else {
             fragment.suite()?
         };
-        if let Exit::Return(tail) | Exit::ParentReturn(Some(tail)) = &arm.exit {
-            let tail = self.fragment(ops, tail.start, tail.end, level)?.suite()?;
-            if keep_return || suite.is_empty() || tail != "return None\n" {
-                suite.push_str(&tail);
-            }
+        if let Exit::Return(tail) | Exit::ParentReturn(Some(tail)) = &arm.exit
+            && (keep_return || suite.is_empty() || !self.none_return(&ops[tail.clone()]))
+        {
+            suite.push_str(&self.fragment(ops, tail.start, tail.end, level)?.suite()?);
         }
         self.block(&header, &suite)?;
         Ok(())

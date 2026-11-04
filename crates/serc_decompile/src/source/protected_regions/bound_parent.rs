@@ -89,15 +89,24 @@ impl BoundParent {
         self,
         owner: &Body<'_, '_, '_>,
         ops: &[Instruction],
+        binding: usize,
         end: usize,
     ) -> Option<(usize, Option<usize>)> {
+        let bound = ops[binding].name != "POP_TOP";
         let (start, inner_pop, ret) = if let Some((load, _)) = constant_return(ops, end) {
-            let pop = load.checked_sub(5)?;
-            if self.exit(owner, ops, pop + 1)?.end != end {
+            let outer_pop = load.checked_sub(4)?;
+            if self.exit(owner, ops, outer_pop)?.end != end {
+                return None;
+            }
+            let pop = outer_pop.checked_sub(if bound { 4 } else { 1 })?;
+            if bound && !same_instructions(ops.get(pop + 1..outer_pop)?, ops.get(end..end + 3)?) {
                 return None;
             }
             (pop, pop, None)
         } else {
+            if bound {
+                return None;
+            }
             let start = end.checked_sub(8)?;
             let [first, _, second, pop, clear @ .., ret] = ops.get(start..end)? else {
                 return None;
@@ -119,7 +128,8 @@ impl BoundParent {
             (start, start + 1, Some(end - 1))
         };
         let h = owner.flow.handler(inner_pop)?;
-        (ops[inner_pop].name == "POP_EXCEPT"
+        (start > binding
+            && ops[inner_pop].name == "POP_EXCEPT"
             && h.target == self.unwind.target
             && h.lasti
             && h.depth == self.unwind.depth)

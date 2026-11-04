@@ -2,6 +2,7 @@
 use std::ops::Range;
 
 use serc_bytecode::instructions::Handler;
+use serc_bytecode::target::operands315::ImportMode;
 
 use super::{Body, Instruction};
 
@@ -146,13 +147,21 @@ impl Body<'_, '_, '_> {
             }
             if ops[b.index].jump.is_some() {
                 jumps.push((self.flow.jump(a.index)?, self.flow.jump(b.index)?));
-            } else if a.arg != b.arg
-                && !(a.name == "YIELD_VALUE"
-                    && self.m.version == super::PythonVersion::Py312
-                    && self.delegated_cleanup(ops, a.index).is_some()
-                    && self.delegated_cleanup(ops, b.index).is_some())
-            {
-                return None;
+            } else if a.arg != b.arg {
+                match a.name {
+                    "YIELD_VALUE"
+                        if self.m.version == super::PythonVersion::Py312
+                            && self.delegated_cleanup(ops, a.index).is_some()
+                            && self.delegated_cleanup(ops, b.index).is_some() => {}
+                    // A module-level import is eager inside an exception
+                    // handler, even when its normal copy uses the default.
+                    "IMPORT_NAME"
+                        if self.depth == 0
+                            && self.m.version == super::PythonVersion::Py315
+                            && ImportMode::DEFAULT.encode_name(a.arg >> 2) == a.arg
+                            && ImportMode::EAGER.encode_name(a.arg >> 2) == b.arg => {}
+                    _ => return None,
+                }
             }
         }
         let end = match left.next() {
