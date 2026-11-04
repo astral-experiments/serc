@@ -107,13 +107,134 @@ pub(super) fn returning_finally_loop(
         next: end,
         clause: Clause::Finally {
             deferred_return: end..end,
-            terminal_unwind: split.then_some(ops[cleanup].offset),
+            terminal_unwind: split.then_some((ops[cleanup].offset, CopyExit::ReturnNone)),
         },
         handler,
         try_exits: None,
         handler_exits: None,
         handler_tail: None,
     })
+}
+
+/// A try/except with a terminal handler may have just one table entry for
+/// its trailing finally: the dispatcher's exceptional unwind. On success
+/// execution falls directly into the other copy after the protected suite.
+pub(super) fn after_except(
+    ops: &[Instruction],
+    owner: &Body<'_, '_, '_>,
+    child: &Protected,
+    start: usize,
+    dispatch: usize,
+    cleanup: usize,
+) -> Option<Range<usize>> {
+    let Clause::Except {
+        following,
+        success,
+        finalizer: None,
+        ..
+    } = &child.clause
+    else {
+        return None;
+    };
+    if !following.is_empty()
+        || !success.is_empty()
+        || child.handler_tail.is_some()
+        || child.next != child.end
+        || ops[child.end].name != "NOP"
+        || (ops[cleanup - 1].name, ops[cleanup - 1].arg) != ("RERAISE", 0)
+    {
+        return None;
+    }
+    let flow = &owner.flow;
+    let handler = flow.handler(start)?;
+    let match_start = ops
+        .binary_search_by_key(&handler.target, |op| op.offset)
+        .ok()?;
+    let (_, unwind) = super::super::dispatch::unwind(ops, flow, match_start, handler.depth + 1)?;
+    // A returning arm would need its own inline copy of the finally.
+    // All normal paths through this dispatch must end in a raise or reraise.
+    if !flow.blocks_covering(match_start..unwind + 3).all(|block| {
+        let last = block.ops.end - 1;
+        let edges = [flow.jump(last), flow.fallthrough(block)];
+        if edges == [None, None] {
+            return matches!(ops[last].name, "RAISE_VARARGS" | "RERAISE");
+        }
+        edges
+            .into_iter()
+            .flatten()
+            .all(|to| (match_start..unwind + 3).contains(&to))
+    }) || flow.blocks_covering(start..child.end).any(|b| {
+        let last = b.ops.end - 1;
+        matches!(ops[last].name, "RETURN_VALUE" | "RETURN_CONST")
+            || [flow.jump(last), flow.fallthrough(b)]
+                .into_iter()
+                .flatten()
+                .any(|to| !(start..=child.end).contains(&to))
+    }) {
+        return None;
+    }
+    let normal = child.end + 1;
+    let end = owner.finally_copy_end(
+        ops,
+        normal..match_start,
+        dispatch + 1..cleanup - 1,
+        CopyExit::Fallthrough,
+    )?;
+    (normal < end && flow.entered_from(normal, start..normal)).then_some(normal..end)
+}
+
+/// The compiler materializes a constant return after the last cleanup.
+pub(super) fn return_end(ops: &[Instruction], at: usize) -> Option<usize> {
+    match ops.get(at..)? {
+        [ret, ..] if ret.name == "RETURN_CONST" => Some(at + 1),
+        [load, ret, ..]
+            if matches!(
+                load.name,
+                "LOAD_CONST" | "LOAD_COMMON_CONSTANT" | "LOAD_SMALL_INT"
+            ) && ret.name == "RETURN_VALUE" =>
+        {
+            Some(at + 2)
+        }
+        _ => None,
+    }
+}
+
+/// A return site inside the child may still be waiting for its constant.
+pub(super) fn nested_return(
+    ops: &[Instruction],
+    flow: &Graph,
+    suite: Range<usize>,
+    outer: &mut Protected,
+    inner: &mut super::Handlers,
+) {
+    let Some(ret) = return_end(ops, outer.next) else {
+        return;
+    };
+    let mut children = inner.iter_mut().filter(|(at, child)| {
+        suite.contains(at)
+            && child.next == suite.end
+            && child.end + 1 == child.handler.start
+            && ops[child.end].name == "NOP"
+            && !break_marker(ops, flow, **at..child.end)
+            && flow.entered_from(suite.end, child.handler.clone())
+            && matches!(
+                child.clause,
+                Clause::Finally {
+                    terminal_unwind: None,
+                    ..
+                }
+            )
+    });
+    if let Some((_, child)) = children.next()
+        && children.next().is_none()
+        && let Clause::Finally {
+            deferred_return, ..
+        } = &mut child.clause
+        && deferred_return.start == deferred_return.end
+    {
+        *deferred_return = outer.next..ret;
+        outer.next = ret;
+    }
 }
 
 /// Match the normal copy to the exceptional one, up to its final reraise.
@@ -126,6 +247,30 @@ pub(super) fn finally_region(
 ) -> Option<Protected> {
     let flow = &owner.flow;
     let reraise = cleanup.checked_sub(1)?;
+    // A finally that unconditionally raises has no implicit RERAISE.
+    // Both copies execute the same explicit raise with the active exception.
+    if ops[reraise].name == "RAISE_VARARGS" && flow.block(dispatch).ops.end == cleanup {
+        let normal = suite.end
+            ..owner.finally_copy_end(
+                ops,
+                suite.end..dispatch,
+                dispatch + 1..cleanup,
+                CopyExit::Fallthrough,
+            )?;
+        return Some(Protected {
+            return_exits: Vec::new(),
+            end: suite.end,
+            next: normal.end,
+            clause: Clause::Finally {
+                deferred_return: normal.end..normal.end,
+                terminal_unwind: None,
+            },
+            handler: normal,
+            try_exits: None,
+            handler_exits: None,
+            handler_tail: None,
+        });
+    }
     let exceptional = dispatch + 1..reraise;
     if exceptional.is_empty() || (ops[reraise].name, ops[reraise].arg) != ("RERAISE", 0) {
         return None;
@@ -158,7 +303,7 @@ pub(super) fn finally_region(
             next: end,
             clause: Clause::Finally {
                 deferred_return: end..end,
-                terminal_unwind: terminal.then_some(ops[cleanup].offset),
+                terminal_unwind: terminal.then_some((ops[cleanup].offset, CopyExit::ReturnNone)),
             },
             handler: copy,
             try_exits: None,
@@ -167,30 +312,42 @@ pub(super) fn finally_region(
         });
     }
     let marker = ops[end].name == "NOP";
+    let suite_start = suite.start;
     let deferred = marker && !break_marker(ops, flow, suite);
     let start = end + usize::from(marker);
-    let exit = if terminal {
-        CopyExit::ReturnNone
-    } else {
+    let exit = if !terminal {
         CopyExit::Fallthrough
+    } else if flow.handler(suite_start).is_some_and(|h| {
+        flow.block(end).ops.start == end && flow.block(end).height == Some(h.depth + 1)
+    }) {
+        // Every fallthrough arm consumes the value evaluated inside the try.
+        CopyExit::PendingReturn
+    } else {
+        CopyExit::ReturnNone
     };
     let normal = start..owner.finally_copy_end(ops, start..dispatch, copy.clone(), exit)?;
     // A return of a constant can leave a tracing NOP at its original site,
     // with the constant materialized only after the normal cleanup.
     let mut next = normal.end;
     if deferred && !terminal {
-        next += match ops.get(next..)? {
-            [ret, ..] if ret.name == "RETURN_CONST" => 1,
-            [load, ret, ..]
-                if matches!(
-                    load.name,
-                    "LOAD_CONST" | "LOAD_COMMON_CONSTANT" | "LOAD_SMALL_INT"
-                ) && ret.name == "RETURN_VALUE" =>
+        if let Some(ret) = return_end(ops, next) {
+            next = ret;
+        } else {
+            // Another cleanup can intervene before the constant. Leave the
+            // return in its normal position until the enclosing suite is placed.
+            let outer = flow.handler(start)?;
+            let exceptional = flow.handler(cleanup)?;
+            if outer.lasti
+                || outer.start != ops[start].offset
+                || outer.end != ops.get(next)?.offset
+                || (outer.target, outer.depth, outer.lasti)
+                    != (exceptional.target, exceptional.depth, exceptional.lasti)
+                || exceptional.start != ops[cleanup].offset
+                || exceptional.end != ops.get(cleanup + 3)?.offset
             {
-                2
+                return None;
             }
-            _ => return None,
-        };
+        }
     }
     Some(Protected {
         return_exits: Vec::new(),
@@ -198,7 +355,7 @@ pub(super) fn finally_region(
         next,
         clause: Clause::Finally {
             deferred_return: normal.end..next,
-            terminal_unwind: terminal.then_some(ops[cleanup].offset),
+            terminal_unwind: terminal.then_some((ops[cleanup].offset, exit)),
         },
         handler: if terminal { copy } else { normal },
         try_exits: None,

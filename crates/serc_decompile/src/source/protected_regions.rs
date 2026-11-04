@@ -9,12 +9,15 @@ use super::{Body, Bytecode, Instruction};
 use crate::flow::Graph;
 mod bound_parent;
 mod finally;
+mod groups;
 mod handler_rejoin;
 mod handler_returns;
 mod loop_exits;
+mod retry_finally;
 
 pub(super) use bound_parent::BoundParent;
 use finally::{break_marker, finally_region, returning_finally_loop};
+use groups::{HandlerGroup, groups};
 pub(super) use handler_rejoin::HandlerRejoin;
 pub(super) use handler_returns::returning_handler_child;
 use handler_returns::{enclosing_exception, nested_handler_return};
@@ -30,10 +33,12 @@ enum Clause {
         binding: usize,
         success: Range<usize>,
         following: Vec<super::dispatch::Arm>,
+        finalizer: Option<Range<usize>>,
+        retry: bool,
     },
     Finally {
         deferred_return: Range<usize>,
-        terminal_unwind: Option<usize>,
+        terminal_unwind: Option<(usize, super::finalizers::CopyExit)>,
     },
 }
 
@@ -146,23 +151,10 @@ impl ExitCopies {
     }
 }
 
-fn groups(bc: &Bytecode) -> Vec<Vec<Handler>> {
-    let mut groups = FxHashMap::<_, Vec<_>>::default();
-    for entry in &bc.handlers {
-        if !entry.lasti {
-            groups.entry(entry.target).or_default().push(*entry);
-        }
-    }
-    // Recover inner suites before resolving their enclosing unwind edges.
-    let mut ordered: Vec<_> = groups.into_values().collect();
-    ordered.sort_unstable_by_key(|entries| std::cmp::Reverse(entries[0].start));
-    ordered
-}
-
 pub(super) fn collect(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Handlers {
     let mut result = Handlers::default();
-    for entries in groups(bc) {
-        if let Some((start, suite)) = region(&bc.ops, owner, &entries, &result) {
+    for group in groups(bc, &owner.flow) {
+        if let Some((start, suite)) = region(&bc.ops, owner, &group, &mut result) {
             result.insert(start, suite);
         }
     }
@@ -173,18 +165,33 @@ pub(super) fn collect(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Handlers {
 /// A coroutine can also lack a return instruction to delimit its body.
 pub(super) fn handled_end(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<usize> {
     let mut starts = vec![0];
-    for group in groups(bc) {
-        let entry = group.first()?;
+    for group in groups(bc, &owner.flow) {
+        let entry = group.entries.first()?;
         let start = bc
             .ops
             .binary_search_by_key(&entry.start, |op| op.offset)
             .ok()?;
         // An await that never reaches a return still has its delegated
         // throw handler. The normal SEND edge already visits its resumption.
-        if group.len() == 1 && owner.delegated_cleanup(&bc.ops, start).is_some() {
+        if group.entries.len() == 1 && owner.delegated_cleanup(&bc.ops, start).is_some() {
             continue;
         }
-        let suite = owner.handlers.get(&start)?;
+        let suite = owner.handlers.get(&start).or_else(|| {
+            let child = group.child?;
+            if group.entries.len() == 1 {
+                owner.handlers.get(&child).filter(|p| {
+                    matches!(
+                        &p.clause,
+                        Clause::Except {
+                            finalizer: Some(_),
+                            ..
+                        }
+                    )
+                })
+            } else {
+                owner.handlers.get(&(child - 1))
+            }
+        })?;
         if bc.ops.get(suite.end)?.offset == entry.target && suite.next > suite.end {
             bc.ops.get(suite.next)?;
             starts.push(suite.next);
@@ -202,8 +209,8 @@ pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handle
     if first.lasti {
         return None;
     }
-    let groups = groups(bc);
-    let split = groups.last()?.len() > 1;
+    let groups = groups(bc, flow);
+    let split = groups.last()?.entries.len() > 1;
     let single_dispatch = groups.len() == 1;
     let unguarded = single_dispatch
         && !split
@@ -215,13 +222,13 @@ pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handle
     let mut result = Handlers::default();
     let mut unwinds = FxHashSet::default();
     let mut starts = vec![0];
-    for entries in groups {
+    for group in groups {
         let dispatch = bc
             .ops
-            .binary_search_by_key(&entries[0].target, |op| op.offset)
+            .binary_search_by_key(&group.entries[0].target, |op| op.offset)
             .ok()?;
         let h = flow.handler(dispatch)?;
-        let (start, mut suite) = region(&bc.ops, owner, &entries, &result)?;
+        let (start, mut suite) = region(&bc.ops, owner, &group, &mut result)?;
         // A standalone try may have a continuation copied into its terminal
         // arms. Let the complete dispatch compare the copies before placing it.
         if unguarded
@@ -287,9 +294,10 @@ pub(super) fn guarded(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<(Handle
 fn region(
     ops: &[Instruction],
     owner: &Body<'_, '_, '_>,
-    entries: &[Handler],
-    inner: &Handlers,
+    group: &HandlerGroup,
+    inner: &mut Handlers,
 ) -> Option<(usize, Protected)> {
+    let entries = &group.entries;
     let flow = &owner.flow;
     let index = |offset| ops.binary_search_by_key(&offset, |op| op.offset).ok();
     let first = entries[0];
@@ -306,15 +314,43 @@ fn region(
         && super::dispatch::typed_handler(flow, ops, dispatch + 1).is_none()
         && super::finalizers::owns_cleanup(ops, owner, dispatch..cleanup, unwind);
     if finalizer
+        && group.entries.len() == 1
+        && let Some(child) = group.child
+        && let Some(suite) = inner.get(&child)
+        && let Some(normal) = finally::after_except(ops, owner, suite, child, dispatch, cleanup)
+    {
+        let mut suite = inner.remove(&child)?;
+        if let Clause::Except { finalizer, .. } = &mut suite.clause {
+            suite.next = normal.end;
+            *finalizer = Some(normal);
+        }
+        return Some((child, suite));
+    }
+    if finalizer
         && let Some(region) = returning_finally_loop(ops, owner, entries, start, dispatch, cleanup)
     {
         return Some((start, region));
     }
-    let end = protected_end(ops, flow, entries, inner)?;
+    let (start, end) = if let Some(child) = group.child
+        && let Some(suite) = inner.get(&child)
+        && groups::encloses_finalizer(ops, flow, entries, start, child, suite)
+    {
+        // The same outer try catches a raise from the inner suite and either
+        // copy of its finally. Nest at the child's tracing NOP so the inner
+        // suite keeps its own placement at the first protected instruction.
+        (child - 1, suite.next)
+    } else {
+        (start, protected_end(ops, flow, entries, inner)?)
+    };
     if end > dispatch {
         return None;
     }
-    if finalizer && let Some(finally) = finally_region(ops, owner, start..end, dispatch, cleanup) {
+    let placed = finalizer
+        .then(|| finally_region(ops, owner, start..end, dispatch, cleanup))
+        .flatten()
+        .or_else(|| retry_finally::recover(ops, owner, start..end, dispatch, cleanup, inner));
+    if let Some(mut finally) = placed {
+        finally::nested_return(ops, flow, start..end, &mut finally, inner);
         return Some((start, finally));
     }
     let mut following = Vec::new();
@@ -414,6 +450,7 @@ fn region(
             arm.fall_out_of_parent();
         }
     }
+    let mut retry = false;
     let mut handler_tail = None;
     let mut handler_exits = None;
     let handler = match ops.get(body..stop)? {
@@ -456,7 +493,15 @@ fn region(
                 && to < start
                 && flow.jump(next) == Some(to)
                 && flow.block(to).height == Some(first.depth);
-            if to != next
+            if following.is_empty()
+                && (next == end || flow.jump(end) == Some(next))
+                && success.is_empty()
+                && let Some(after_break) =
+                    loop_exits::retry_break(ops, flow, start..end, to, after_cleanup)
+            {
+                retry = true;
+                next = after_break;
+            } else if to != next
                 && Some(to) != for_header
                 && !shared_latch
                 && parent.is_none_or(|parent| parent.exit(owner, ops, to).is_none())
@@ -570,6 +615,8 @@ fn region(
                 binding,
                 success,
                 following,
+                finalizer: None,
+                retry,
             },
             try_exits,
             handler_exits,
@@ -617,10 +664,15 @@ fn protected_end(
             && (parent.target, parent.depth, parent.lasti)
                 == (first.target, first.depth, first.lasti)
             && index(parent.end)? == unwind + 3
-            && (at == unwind || at == suite.next)
+            && (at == unwind
+                || at == suite.next
+                || (suite.handler == (at..index(entry.end)?) && suite.handler.end == suite.next))
         {
             cleanups.insert(unwind, unwind + 3);
             end = suite.next;
+            if at == suite.handler.start && index(entry.end)? == end {
+                continue;
+            }
             if at == end {
                 end = index(entry.end)?;
                 continue;
@@ -638,8 +690,9 @@ fn protected_end(
                     && flow.block(end).ops == (end..at)
                     && flow.block(end).height == Some(0)
                     && flow.handler(end).is_none()
-                    && super::regions::constant_return(ops, at)
-                        .is_some_and(|(load, _)| load == end)))
+                    && super::regions::constant_return(ops, at).is_some_and(|(load, _)| {
+                        load == end + usize::from(ops[end].name == "NOT_TAKEN")
+                    })))
             && flow.incoming(at).any(|i| {
                 i < end
                     && flow.jump(i) == Some(at)
@@ -706,6 +759,15 @@ fn protected_end(
             return None;
         }
         end = index(entry.end)?;
+        // A throw inside an out-of-line handler can resume END_SEND by
+        // fallthrough. Its cleanup already belongs to this protected span.
+        if (at..end).contains(&cleanup)
+            && cleanup + 1 < end
+            && ops[cleanup + 1].name == "END_SEND"
+            && flow.jump(at.checked_sub(2)?) == Some(cleanup + 1)
+        {
+            continue;
+        }
         let resume = flow.jump(cleanup + 1)?;
         if !(at..end).contains(&resume) || ops[resume].name != "END_SEND" {
             return None;
@@ -778,8 +840,22 @@ impl Body<'_, '_, '_> {
         self.active_try = outer;
         let (mut suite, returns) = suite?.pending_return()?;
         let mut next = entry.next;
-        let carried = returns && next == limit && matches!(entry.clause, Clause::Finally { .. });
-        if returns && !carried {
+        let terminal_unwind = match entry.clause {
+            Clause::Finally {
+                terminal_unwind, ..
+            } => terminal_unwind,
+            Clause::Except { .. } => None,
+        };
+        let consumes_return = terminal_unwind
+            .is_some_and(|(_, exit)| exit == super::finalizers::CopyExit::PendingReturn);
+        if consumes_return && !returns {
+            return Err("missing return value across finally".into());
+        }
+        let carried = returns
+            && !consumes_return
+            && next == limit
+            && matches!(entry.clause, Clause::Finally { .. });
+        if returns && !carried && !consumes_return {
             if next >= limit || ops[next].name != "RETURN_VALUE" {
                 return Err("unsupported return through suspended handler".into());
             }
@@ -802,18 +878,15 @@ impl Body<'_, '_, '_> {
                 "finally:".into()
             }
         };
-        let terminal_unwind = match &entry.clause {
-            Clause::Finally {
-                terminal_unwind, ..
-            } => *terminal_unwind,
-            Clause::Except { .. } => None,
-        };
-        let outer = std::mem::replace(&mut self.finally_unwind, terminal_unwind);
+        let outer = std::mem::replace(
+            &mut self.finally_unwind,
+            terminal_unwind.map(|(target, _)| target),
+        );
         let rejoin = match &entry.clause {
             Clause::Except {
                 binding, success, ..
             } if success.is_empty() && entry.handler_tail.is_none() => {
-                HandlerRejoin::new(ops, &self.flow, *binding, entry.next)
+                HandlerRejoin::new(ops, self, *binding, entry.next)
             }
             _ => None,
         };
@@ -831,10 +904,18 @@ impl Body<'_, '_, '_> {
         } else {
             handler.suite()?
         };
+        let retry = matches!(entry.clause, Clause::Except { retry: true, .. });
+        let try_start = self.lines.len();
+        if retry {
+            suite.push_str("break\n");
+        }
         self.try_block(&suite, start > 0 && ops[start - 1].name != "NOP")?;
         self.block(&header, &handler)?;
         if let Clause::Except {
-            success, following, ..
+            success,
+            following,
+            finalizer,
+            ..
         } = &entry.clause
         {
             for arm in following {
@@ -846,8 +927,22 @@ impl Body<'_, '_, '_> {
                     .suite()?;
                 self.block("else:", &suite)?;
             }
+            if let Some(normal) = finalizer {
+                let suite = self
+                    .fragment(ops, normal.start, normal.end, level)?
+                    .suite()?;
+                self.block("finally:", &suite)?;
+            }
         }
-        if terminal_unwind.is_some() && entry.next > entry.end && (level > 0 || next < limit) {
+        if retry {
+            let body = self.lines.split_off(try_start);
+            self.block("while True:", &body)?;
+        }
+        if terminal_unwind.is_some()
+            && !consumes_return
+            && entry.next > entry.end
+            && (level > 0 || next < limit)
+        {
             self.line("return")?;
         }
         if carried {

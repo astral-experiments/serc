@@ -182,7 +182,7 @@ impl Body<'_, '_, '_> {
         pop: usize,
         limit: usize,
     ) -> Option<usize> {
-        let jump = pop + 1;
+        let jump = self.flow.block(pop).ops.end - 1;
         if !self.stack.is_empty() || jump >= limit || self.loop_transfer(ops, jump)? != "continue" {
             return None;
         }
@@ -191,6 +191,11 @@ impl Body<'_, '_, '_> {
             return None;
         }
         let depth = self.flow.for_iter_depth(header)? + 1;
+        if jump != pop + 1 {
+            return self
+                .handler_rejoin?
+                .named_continue(ops, &self.flow, pop, depth);
+        }
         let block = self.flow.block(pop);
         let mut from = pop.checked_sub(1)?;
         if ops[from].name == "NOT_TAKEN" {

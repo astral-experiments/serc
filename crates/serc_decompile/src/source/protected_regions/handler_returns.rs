@@ -61,15 +61,12 @@ pub(in crate::source) fn returning_handler_child(
     let child = inner.get(&start)?;
     let h = flow.handler(start)?;
     let dispatch = child.next;
-    if ops.get(dispatch)?.offset != h.target
-        || h.lasti
-        || h.depth != outer.depth
-        || !matches!(child.clause, Clause::Except { .. })
-    {
+    if ops.get(dispatch)?.offset != h.target || h.lasti || h.depth != outer.depth {
         return None;
     }
     let (_, cleanup) = dispatch::unwind(ops, flow, dispatch, h.depth + 1)?;
-    if let Some(bound) = BoundParent::at_cleanup(owner, ops, cleanup)
+    if matches!(child.clause, Clause::Except { .. })
+        && let Some(bound) = BoundParent::at_cleanup(owner, ops, cleanup)
         && let Some(tail) = bound.success(owner, ops, child.end..dispatch)
         && bound.owns_tail(owner, ops, cleanup + 3, arm.end)
         && flow
@@ -79,7 +76,13 @@ pub(in crate::source) fn returning_handler_child(
         return Some((dispatch, Some(tail)));
     }
     let parent = flow.handler(cleanup)?;
-    (child.end == dispatch
+    let terminal = match child.clause {
+        Clause::Except { .. } => child.end == dispatch,
+        Clause::Finally { .. } => {
+            child.handler.end == dispatch && ops[dispatch - 1].name == "RAISE_VARARGS"
+        }
+    };
+    (terminal
         && cleanup + 3 == arm.end
         && parent.lasti
         && parent.depth == outer.depth
