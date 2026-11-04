@@ -1,5 +1,3 @@
-#![allow(dead_code)] // Consumed by control-flow and source reconstruction.
-
 use crate::PythonVersion;
 use crate::target::{Opcode, opcodes};
 
