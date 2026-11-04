@@ -25,6 +25,8 @@ pub(super) mod synthetic;
 mod type_params;
 mod value_patterns;
 mod warnings;
+use std::cell::OnceCell;
+
 use definitions::{Definition, Import};
 
 use ruff_python_ast::str::TripleQuotes;
@@ -177,6 +179,7 @@ fn recover_scope<'m>(
         id,
         stack: Vec::new(),
         lines: String::new(),
+        instruction_lines: OnceCell::new(),
         partial_prefix: 0,
         partial_start: 0,
         flow,
@@ -195,7 +198,7 @@ fn recover_scope<'m>(
     let result = if body.suspended() {
         body.suspension_scope(&bc)
     } else {
-        let (handlers, end) = comprehensions::protection(&bc)?;
+        let (handlers, end) = comprehensions::protection(&bc, &bc.handlers)?;
         if handlers.is_empty() {
             body.region(&bc.ops, 0, end, 0)
         } else {
@@ -265,6 +268,7 @@ struct Body<'m, 'data, 'work> {
     id: Id,
     stack: Vec<Value>,
     lines: String,
+    instruction_lines: OnceCell<Result<Vec<Option<usize>>, String>>,
     // End of the last complete statement while recovering a partial region.
     partial_prefix: usize,
     // First instruction of the statement at that checkpoint.
@@ -282,6 +286,20 @@ struct Body<'m, 'data, 'work> {
 }
 
 impl Body<'_, '_, '_> {
+    fn instruction_lines(&self, ops: &[Instruction]) -> Result<&[Option<usize>], String> {
+        self.instruction_lines
+            .get_or_init(|| {
+                serc_bytecode::locations::instruction_lines(
+                    self.m.bytes(self.code.locations)?,
+                    self.code.first_line,
+                    self.m.bytes(self.code.bytecode)?.len(),
+                    ops,
+                )
+            })
+            .as_deref()
+            .map_err(Clone::clone)
+    }
+
     fn charge(&mut self, cost: usize) -> Result<(), String> {
         self.work.budget = self
             .work
@@ -762,10 +780,7 @@ impl Body<'_, '_, '_> {
 }
 
 fn identifier(name: &str) -> Result<&str, String> {
-    if name.len() > 1024
-        || name.is_empty()
-        || !name.chars().all(|c| c == '_' || c.is_alphanumeric())
-    {
+    if name.len() > 1024 || !ruff_python_stdlib::identifiers::is_identifier(name) {
         return Err("unsupported identifier".into());
     }
     Ok(name)

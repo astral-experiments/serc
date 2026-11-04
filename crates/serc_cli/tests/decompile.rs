@@ -166,6 +166,66 @@ fn branches_preserve_call_order() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn embedded_operands_keep_their_grouping() {
+    check_fixture(
+        "pairs = {(1, 2): 3, (4,): 5}\ndef f(x=(bound := (1, 2)), *, y=(other := (4,))):\n    return pairs[x], pairs[y]\n",
+        "result = f(), bound, other, f.__defaults__, f.__kwdefaults__",
+    );
+    check_fixture_on(
+        "def f(x: (bound := 1)):\n    return x\ndef outer():\n    def inner(x: (yield 2)):\n        return x\n    yield inner.__annotations__\n",
+        "it = outer()\nresult = bound, f.__annotations__, next(it), it.send(3)",
+        &[serc::PythonVersion::Py312, serc::PythonVersion::Py313],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn identifiers_allow_unicode_continuation_characters() {
+    check_fixture(
+        "Q\u{307} = 1\nx\u{e0100} = 2\n",
+        "result = Q\u{307}, x\u{e0100}",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_returning_try_reaches_its_fallback_only_after_a_handled_exception() {
+    check_fixture(
+        "async def receive(read, retry, record):\n    try:\n        return read()\n    except (BlockingIOError, InterruptedError):\n        record()\n    return await retry()\n",
+        r"
+import asyncio, sys
+log = []
+def record():
+    log.append(type(sys.exception()).__name__)
+async def retry():
+    log.append(sys.exception())
+    return 'retried'
+def fail():
+    raise BlockingIOError
+def unexpected():
+    raise ValueError
+async def exercise():
+    assert await receive(lambda: 'ok', retry, record) == 'ok'
+    assert not log
+    assert await receive(fail, retry, record) == 'retried'
+    try:
+        await receive(unexpected, retry, record)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError('unmatched exception was swallowed')
+    assert log == ['BlockingIOError', None]
+asyncio.run(exercise())
+result = log",
+    );
+    check_fixture(
+        "def receive(read, retry, ready):\n    try:\n        return read()\n    except BlockingIOError:\n        pass\n    if ready():\n        return retry()\n    return None\n",
+        "def fail(): raise BlockingIOError\nresult = receive(fail, lambda: 1, lambda: True), receive(fail, lambda: 2, lambda: False)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn definitions_preserve_bindings() {
     check_fixture(
         "def outer(x=3, *, k=4):\n    def inner(y):\n        return x + y\n    return inner\n",
@@ -447,6 +507,203 @@ for name in 'abcd':
         except KeyError as e:
             result.append(e.args)
 assert result == [1, 1, 'b', ('b',), 'b', 2, ('c',), 3, ('d',), ('d',)]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_raising_try_keeps_the_continuation_after_name_cleanup() {
+    check_fixture(
+        r"try:
+    raise KeyError('key')
+except KeyError as exc:
+    message = exc.args[0]
+
+def keys(items):
+    return [key for key in items]
+
+def recover(error, observe):
+    try:
+        raise error
+    except ValueError as caught:
+        observe(caught.args)
+    return observe('after')
+",
+        r"import sys
+result = []
+def observe(value):
+    result.append((value, type(sys.exception()).__name__))
+    return 'done'
+assert message == 'key' and keys(['a']) == ['a'] and 'exc' not in globals()
+assert recover(ValueError('v'), observe) == 'done'
+try:
+    recover(KeyError('k'), observe)
+except KeyError as err:
+    assert err.args == ('k',)
+else:
+    raise AssertionError('lost unmatched exception')
+assert result == [(('v',), 'ValueError'), ('after', 'NoneType')]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_returning_try_preserves_the_raising_handler() {
+    check_fixture(
+        r"def lookup(operation, key):
+    try:
+        return operation(key)
+    except LookupError:
+        raise ValueError(key)
+",
+        r"def operation(key):
+    if key < 0:
+        raise KeyError(key)
+    if key == 0:
+        raise TypeError(key)
+    return key + 1
+result = []
+for key in [-1, 0, 1]:
+    try:
+        result.append(lookup(operation, key))
+    except ValueError as exc:
+        assert isinstance(exc.__context__, KeyError)
+        result.append('replaced')
+    except TypeError:
+        result.append('propagated')
+assert result == ['replaced', 'propagated', 2]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_terminal_try_guard_can_skip_the_protected_call() {
+    check_fixture(
+        r"def guarded(check, action):
+    try:
+        if check():
+            action()
+    except LookupError:
+        pass
+",
+        r"result = []
+def fail():
+    raise KeyError()
+def action():
+    result.append('called')
+    fail()
+for check in [lambda: False, fail, lambda: True]:
+    assert guarded(check, action) is None
+assert result == ['called']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn distinct_and_shared_constant_returns_keep_their_constant_order() {
+    check_fixture(
+        r"def early(ready, emit):
+    if ready:
+        emit('first')
+        return 'done'
+    emit('last')
+    return 'done'
+
+def common(ready, emit):
+    if ready:
+        emit('first')
+    else:
+        emit('last')
+    return 'done'
+
+def early_none(ready, emit):
+    if ready:
+        emit('first')
+        return
+    emit('last')
+
+def nested(x, y):
+    if x:
+        if y:
+            a = 4
+            return
+        else:
+            b = 2
+    else:
+        c = 3
+    return
+",
+        r"result = []
+for f in [early, common, early_none]:
+    for ready in [True, False]:
+        result.append(f(ready, result.append))
+assert result == ['first', 'done', 'last', 'done'] * 2 + ['first', None, 'last', None]
+assert all(nested(x, y) is None for x in (True, False) for y in (True, False))",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_copied_binary_return_preserves_the_live_left_operand() {
+    check_fixture(
+        "def add(left, guard):\n    return left() + (4 if guard() else 0)\n",
+        r"result = []
+def left():
+    result.append('left')
+    return 8
+def guard(value):
+    result.append('guard')
+    return value
+assert add(left, lambda: guard(False)) == 8
+assert add(left, lambda: guard(True)) == 12
+assert result == ['left', 'guard'] * 2",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_guards_keep_their_implicit_return_blocks() {
+    check_fixture(
+        r"def rotate(default, exists, emit):
+    if default:
+        if exists:
+            emit('default')
+    else:
+        emit('custom')
+",
+        r"result = []
+for default in (False, True):
+    for exists in (False, True):
+        rotate(default, exists, result.append)
+assert result == ['custom', 'custom', 'default']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_copied_local_return_skips_the_for_else_suite() {
+    check_fixture(
+        r"def visit(source, emit):
+    for key, value in source.items():
+        if value > 0:
+            break
+    else:
+        for key in source.keys():
+            emit(key)
+    return source
+",
+        r"result = []
+class Source(dict):
+    def items(self):
+        result.append('items')
+        return super().items()
+    def keys(self):
+        result.append('keys')
+        return super().keys()
+for values in [[], [('a', 1)], [('a', 0), ('b', 1)], [('a', 0), ('b', -1)]]:
+    obj = Source(values)
+    assert visit(obj, result.append) is obj
+assert result == ['items', 'keys', 'items', 'items', 'items', 'keys', 'a', 'b']",
     );
 }
 
@@ -1323,6 +1580,105 @@ class C:
 class Last: pass
 ",
         "result = first.__name__, C.C.__qualname__, C().get(), Last.__name__",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn an_empty_try_keeps_its_finally_definitions_and_continuation() {
+    check_fixture(
+        r"def run(emit):
+    try:
+        pass
+    finally:
+        def inner():
+            return 'inner'
+        emit(inner())
+    emit('after')
+",
+        r"result = []
+run(result.append)
+assert result == ['inner', 'after']
+def fail(value):
+    result.append(value)
+    raise ValueError
+try:
+    run(fail)
+except ValueError:
+    pass
+assert result == ['inner', 'after', 'inner']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn an_elided_exception_group_keeps_its_type_expression_in_the_handler() {
+    check_fixture(
+        r"def run(kind, record):
+    try:
+        pass
+    except* kind():
+        pass
+    record('after')
+",
+        r"result = []
+def kind():
+    raise AssertionError('evaluated handler type')
+run(kind, result.append)
+assert result == ['after']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn an_exception_handler_can_retry_the_entire_try_suite() {
+    check_fixture(
+        r"def retry(work, handled):
+    while True:
+        try:
+            work()
+            break
+        except KeyboardInterrupt:
+            handled()
+",
+        r"import sys
+result = []
+attempts = iter((False, False, True))
+def work():
+    assert sys.exception() is None
+    result.append('attempt')
+    if not next(attempts):
+        raise KeyboardInterrupt
+def handled():
+    assert isinstance(sys.exception(), KeyboardInterrupt)
+    result.append('interrupt')
+retry(work, handled)
+assert result == ['attempt', 'interrupt', 'attempt', 'interrupt', 'attempt']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn only_the_handler_continues_after_a_successful_constant_return() {
+    check_fixture(
+        r"def bind(obj, record):
+    try:
+        obj.bound
+        return
+    except AttributeError:
+        obj.bound = True
+    record(obj)
+",
+        r"import sys
+result = []
+class Box: pass
+box = Box()
+def record(obj):
+    assert sys.exception() is None
+    result.append(obj.bound)
+bind(box, record)
+bind(box, record)
+assert result == [True]",
     );
 }
 

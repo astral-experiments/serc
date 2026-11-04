@@ -135,7 +135,7 @@ impl Body<'_, '_, '_> {
                 ruff_python_parser::parse_expression(&keywords).map_err(|e| e.to_string())?;
             if let ruff_python_ast::Expr::Dict(map) = parsed.expr() {
                 for item in &map.items {
-                    let value = super::definitions::render(&item.value);
+                    let value = super::definitions::operand(&keywords, &item.value);
                     match &item.key {
                         Some(ruff_python_ast::Expr::StringLiteral(key)) => {
                             args.push(format!("{}={value}", identifier(key.value.to_str())?));

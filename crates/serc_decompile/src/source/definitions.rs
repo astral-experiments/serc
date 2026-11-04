@@ -1,7 +1,6 @@
 use ruff_python_ast::{Expr, str::TripleQuotes};
-use ruff_python_codegen::{Generator, Indentation};
 use ruff_python_literal::escape::UnicodeEscape;
-use ruff_source_file::LineEnding;
+use ruff_text_size::Ranged;
 
 use super::{Body, Code, Id, Instruction, Object, Value, identifier, literal, scope};
 use serc_bytecode::PythonVersion;
@@ -50,11 +49,18 @@ pub(super) fn tuple_items(text: &str) -> Result<Vec<String>, String> {
     let Expr::Tuple(tuple) = expression.expr() else {
         return Err("expected tuple operand".into());
     };
-    Ok(tuple.elts.iter().map(render).collect())
+    Ok(tuple.elts.iter().map(|expr| operand(text, expr)).collect())
 }
 
-pub(super) fn render(expr: &Expr) -> String {
-    Generator::new(&Indentation::default(), LineEnding::Lf).expr(expr)
+/// Keep grouping inside the operand (e.g. `x := (1, 2)`). The AST range
+/// can exclude outer parentheses required in a signature, call, or dict.
+pub(super) fn operand(source: &str, expr: &Expr) -> String {
+    let text = &source[expr.range()];
+    match expr {
+        Expr::Tuple(tuple) if !tuple.parenthesized => format!("({text})"),
+        Expr::Named(_) | Expr::Yield(_) | Expr::YieldFrom(_) => format!("({text})"),
+        _ => text.to_owned(),
+    }
 }
 
 pub(super) struct Import {
@@ -255,7 +261,7 @@ impl Body<'_, '_, '_> {
                     };
                     def.keywords.push((
                         identifier(key.value.to_str())?.to_owned(),
-                        render(&item.value),
+                        operand(&text, &item.value),
                     ));
                 }
             }
@@ -551,6 +557,7 @@ impl<'m, 'data> Body<'m, 'data, '_> {
                 id,
                 stack: Vec::new(),
                 lines: String::new(),
+                instruction_lines: std::cell::OnceCell::new(),
                 partial_prefix: 0,
                 partial_start: 0,
                 flow,
@@ -578,7 +585,7 @@ impl<'m, 'data> Body<'m, 'data, '_> {
                 let Some(Expr::StringLiteral(key)) = &item.key else {
                     return Err("expected annotation key".into());
                 };
-                Ok((key.value.to_str().to_owned(), render(&item.value)))
+                Ok((key.value.to_str().to_owned(), operand(&result, &item.value)))
             })
             .collect()
     }

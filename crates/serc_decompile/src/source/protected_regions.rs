@@ -45,39 +45,65 @@ pub(super) fn suspended(bc: &Bytecode, flow: &Graph) -> Handlers {
 /// Use region recovery for ordinary scopes when a branch encloses the first
 /// try, or there are multiple protected entries. Every user handler must have
 /// a known placement before the normal traversal can skip its out-of-line code.
-pub(super) fn guarded(bc: &Bytecode, flow: &Graph) -> Option<Handlers> {
+pub(super) fn guarded(
+    bc: &Bytecode,
+    flow: &Graph,
+    none_return: impl Fn(&[Instruction]) -> bool,
+) -> Option<(Handlers, usize)> {
     let first = bc.handlers.first()?;
     if first.lasti {
         return None;
     }
     let groups = groups(bc);
     let split = groups.get(&first.target)?.len() > 1;
-    if groups.len() == 1
+    let single_dispatch = groups.len() == 1;
+    let unguarded = single_dispatch
         && !split
         && !bc
             .ops
             .iter()
             .take_while(|op| op.offset < first.start)
-            .any(|op| op.jump.is_some_and(|target| target > first.start))
-    {
-        return None;
-    }
+            .any(|op| op.jump.is_some_and(|target| target > first.start));
     let mut result = Handlers::default();
     let mut unwinds = FxHashSet::default();
+    let mut starts = vec![0];
     for entries in groups.into_values() {
         let dispatch = bc
             .ops
             .binary_search_by_key(&entries[0].target, |op| op.offset)
             .ok()?;
         let h = flow.handler(dispatch)?;
-        let (start, suite) = region(&bc.ops, flow, &entries)?;
+        let (start, mut suite) = region(&bc.ops, flow, &entries)?;
+        if suite.end == dispatch && suite.next > dispatch {
+            // The try returned. Only the handled exception reaches this
+            // continuation, so an ordinary walk from offset zero misses it.
+            starts.push(suite.next);
+        } else if single_dispatch
+            && first.depth == 0
+            && suite.next == suite.end
+            && let Some((second, _)) = super::regions::constant_return(&bc.ops, dispatch)
+            && suite.end < second
+            && none_return(&bc.ops[suite.end..second])
+            && none_return(&bc.ops[second..dispatch])
+            && flow.unprotected_suite(suite.end..dispatch)
+            && flow
+                .incoming(second)
+                .any(|i| (start..suite.end).contains(&i))
+            && flow.normal_end([0]) == dispatch
+        {
+            // The final guard has two copies of the implicit return outside
+            // the protected suite. Its successful paths both leave the scope.
+            suite.next = dispatch;
+        } else if unguarded {
+            return None;
+        }
         unwinds.insert((h.target, h.depth));
         result.insert(start, suite);
     }
     bc.handlers
         .iter()
         .all(|h| !h.lasti || unwinds.contains(&(h.target, h.depth)))
-        .then_some(result)
+        .then(|| (result, flow.normal_end(starts)))
 }
 
 fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usize, Protected)> {
@@ -112,15 +138,24 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
         }
         (Some(dispatch + 1..check), pop + 1, failed)
     };
-    // Inline handlers have a jump on the normal path that skips exactly their
-    // dispatch and unwind. Out-of-line handlers rejoin the normal continuation.
-    let next = if end + 1 == dispatch
-        && ops[end].name == "JUMP_FORWARD"
-        && flow.jump(end) == Some(cleanup + 3)
-    {
-        cleanup + 3
-    } else {
-        end
+    // An inline handler rejoins just past its unwind. When the try returns,
+    // that edge comes from POP_EXCEPT in the handler. Include RETURN_VALUE
+    // in the try suite before resuming at the jump target.
+    let after_cleanup = cleanup + 3;
+    let (end, next) = match ops.get(end..dispatch)? {
+        [jump] if jump.name == "JUMP_FORWARD" && flow.jump(end) == Some(after_cleanup) => {
+            (end, after_cleanup)
+        }
+        [ret]
+            if ret.name == "RETURN_VALUE"
+                && matches!(ops.get(body..stop)?, [.., pop, jump]
+                if pop.name == "POP_EXCEPT" && jump.name == "JUMP_FORWARD")
+                && after_cleanup < ops.len()
+                && flow.jump(stop - 1) == Some(after_cleanup) =>
+        {
+            (dispatch, after_cleanup)
+        }
+        _ => (end, end),
     };
     // At the tail of a for loop, a handler can rejoin the iterator directly.
     // The normal path either has a latch or always raises before END_FOR.
@@ -194,25 +229,15 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
     ))
 }
 
-/// Match the normal copy to the exceptional one, up to its final reraise.
-/// CPython can borrow a local on the normal path but load it owned on unwind.
-fn finally_region(
+/// CPython may borrow locals on the normal path and own them on unwind.
+pub(super) fn same_finally_suite(
     ops: &[Instruction],
     flow: &Graph,
-    end: usize,
-    dispatch: usize,
-    cleanup: usize,
-) -> Option<Protected> {
-    let reraise = cleanup.checked_sub(1)?;
-    let exceptional = dispatch + 1..reraise;
-    if exceptional.is_empty() || (ops[reraise].name, ops[reraise].arg) != ("RERAISE", 0) {
-        return None;
-    }
-    let deferred = ops[end].name == "NOP";
-    let start = end + usize::from(deferred);
-    let normal = start..start + exceptional.len();
-    if normal.end > dispatch
-        || !normal.clone().zip(exceptional.clone()).all(|(a, b)| {
+    normal: Range<usize>,
+    exceptional: Range<usize>,
+) -> bool {
+    normal.len() == exceptional.len()
+        && normal.clone().zip(exceptional.clone()).all(|(a, b)| {
             let load = |op: Instruction| match op.name {
                 "LOAD_FAST_BORROW" => "LOAD_FAST",
                 "LOAD_FAST_BORROW_LOAD_FAST_BORROW" => "LOAD_FAST_LOAD_FAST",
@@ -232,7 +257,25 @@ fn finally_region(
                 ops[a].arg == ops[b].arg
             }
         })
-    {
+}
+
+/// Match the normal copy to the exceptional one, up to its final reraise.
+fn finally_region(
+    ops: &[Instruction],
+    flow: &Graph,
+    end: usize,
+    dispatch: usize,
+    cleanup: usize,
+) -> Option<Protected> {
+    let reraise = cleanup.checked_sub(1)?;
+    let exceptional = dispatch + 1..reraise;
+    if exceptional.is_empty() || (ops[reraise].name, ops[reraise].arg) != ("RERAISE", 0) {
+        return None;
+    }
+    let deferred = ops[end].name == "NOP";
+    let start = end + usize::from(deferred);
+    let normal = start..start + exceptional.len();
+    if normal.end > dispatch || !same_finally_suite(ops, flow, normal.clone(), exceptional) {
         return None;
     }
     // A return of a constant can leave a tracing NOP at its original site,

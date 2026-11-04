@@ -1,7 +1,7 @@
 use std::fmt::Write as _;
 
 use super::conditionals::Predicate;
-use super::regions::{ConstantReturn, constant_return};
+use super::regions::constant_return;
 use super::{Body, Instruction, Value};
 
 pub(super) struct WhileLatch {
@@ -15,11 +15,50 @@ pub(super) struct Loop {
     header: usize,
     body_end: usize,
     after: Option<usize>,
-    // CPython may copy the continuation's constant return into a break arm.
-    copied_return: Option<ConstantReturn>,
+    // Index of the return operand CPython copied into a break arm.
+    copied_return: Option<usize>,
+}
+
+fn local_return(ops: &[Instruction], end: usize) -> Option<usize> {
+    let [.., load, ret] = ops.get(..end)? else {
+        return None;
+    };
+    (matches!(load.name, "LOAD_FAST" | "LOAD_FAST_BORROW") && ret.name == "RETURN_VALUE")
+        .then_some(end - 2)
 }
 
 impl Body<'_, '_, '_> {
+    fn copied_return(
+        &self,
+        ops: &[Instruction],
+        header: usize,
+        end: usize,
+        expected: usize,
+    ) -> Option<usize> {
+        let at = if let Some((at, _)) = constant_return(ops, end) {
+            at
+        } else {
+            let at = local_return(ops, end)?;
+            let block = self.flow.block(at);
+            let slots = self.iterator_slots(ops, header)?;
+            // The entire arm discards exactly this iterator before reading
+            // the same local as the continuation. A return from a nested
+            // iterator would have additional slots to unwind.
+            if block.ops.end != end
+                || at - block.ops.start != slots
+                || block.height != Some(slots)
+                || self.flow.handler(at).is_some()
+                || ops[block.ops.start..at]
+                    .iter()
+                    .any(|op| op.name != "POP_TOP")
+            {
+                return None;
+            }
+            at
+        };
+        (ops[at].opcode == ops[expected].opcode && ops[at].arg == ops[expected].arg).then_some(at)
+    }
+
     /// A straight-line `while True` body can end in a conditional exit
     /// followed by an unconditional backedge. Older targets jump over the
     /// backedge on the exit path and leave the leading NOP outside the loop.
@@ -99,21 +138,38 @@ impl Body<'_, '_, '_> {
     }
 
     pub(super) fn folded_break(&self, ops: &[Instruction], i: usize, end: usize) -> bool {
-        let Some(expected) = self.loop_edges.and_then(|active| active.copied_return) else {
+        let Some(active) = self.loop_edges else {
+            return false;
+        };
+        let Some(expected) = active.copied_return else {
             return false;
         };
         let stop = self.flow.block(i).ops.end;
         stop <= end
-            && constant_return(ops, stop).is_some_and(|(start, value)| {
-                start > i
+            && self
+                .copied_return(ops, active.header, stop, expected)
+                .is_some_and(|start| {
+                    start > i
                     // A single iterator uses up to two slots, plus a tracing
                     // NOP. Leave any earlier user statements in the suite.
                     && start - i <= 3
-                    && value == expected
                     && ops[i..start]
                         .iter()
                         .all(|op| matches!(op.name, "NOP" | "POP_ITER" | "POP_TOP"))
-            })
+                })
+    }
+
+    fn iterator_slots(&self, ops: &[Instruction], header: usize) -> Option<usize> {
+        let iter = header.checked_sub(1)?;
+        if ops[header].name != "FOR_ITER" || ops[iter].name != "GET_ITER" {
+            return None;
+        }
+        let (_, slots) = serc_bytecode::target::stack_counts_for(
+            self.m.version,
+            ops[iter].opcode,
+            ops[iter].arg,
+        );
+        (self.flow.for_iter_depth(header) == Some(slots)).then_some(slots)
     }
 
     /// A return inside a for suite discards the iterator that the source
@@ -125,19 +181,7 @@ impl Body<'_, '_, '_> {
         i: usize,
         end: usize,
     ) -> Option<usize> {
-        let header = self.loop_edges?.header;
-        let iter = header.checked_sub(1)?;
-        if ops[header].name != "FOR_ITER" || ops[iter].name != "GET_ITER" {
-            return None;
-        }
-        let (_, slots) = serc_bytecode::target::stack_counts_for(
-            self.m.version,
-            ops[iter].opcode,
-            ops[iter].arg,
-        );
-        if self.flow.for_iter_depth(header) != Some(slots) {
-            return None;
-        }
+        let slots = self.iterator_slots(ops, self.loop_edges?.header)?;
         let computed = match ops[i].name {
             "SWAP" if ops[i].arg as usize == slots + 1 && self.stack.len() == 1 => true,
             "POP_TOP" if self.stack.is_empty() => false,
@@ -175,20 +219,29 @@ impl Body<'_, '_, '_> {
             .then(|| self.flow.block(exhausted).ops.end)
             .filter(|&stop| stop <= end)
             .and_then(|stop| constant_return(ops, stop))
-            .filter(|(start, _)| *start >= exhausted);
+            .map(|(start, _)| start)
+            .or_else(|| {
+                // The exhaustion path may contain another loop before the
+                // shared return. Only fold a local load after iterator cleanup.
+                local_return(ops, end).filter(|&at| {
+                    ops[header].name == "FOR_ITER"
+                        && self.flow.block(at).ops.end == end
+                        && self.flow.handler(at).is_none()
+                })
+            })
+            .filter(|&start| start >= exhausted);
         for block in self.flow.blocks_in(body) {
             let last = block.ops.end - 1;
             let after = if ops[last].name == "JUMP_FORWARD" {
                 self.flow
                     .jump(last)
                     .filter(|&dest| dest >= exhausted && dest <= end)
-            } else if let Some((after, expected)) = continuation
-                && let Some((copy, value)) = constant_return(ops, block.ops.end)
-                && value == expected
+            } else if let Some(after) = continuation
+                && let Some(copy) = self.copied_return(ops, header, block.ops.end, after)
                 && copy > block.ops.start
                 && matches!(ops[copy - 1].name, "NOP" | "POP_ITER" | "POP_TOP")
             {
-                active.copied_return = Some(expected);
+                active.copied_return = Some(after);
                 Some(after)
             } else {
                 None

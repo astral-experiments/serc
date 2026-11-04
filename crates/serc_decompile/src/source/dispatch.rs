@@ -11,6 +11,7 @@ pub(super) struct Dispatch {
     arms: Vec<Arm>,
     success: Range<usize>,
     continuation: Range<usize>,
+    retry: bool,
 }
 
 struct Arm {
@@ -95,15 +96,37 @@ impl Body<'_, '_, '_> {
 
     pub(super) fn exception_dispatch(
         &self,
-        ops: &[Instruction],
+        bc: &super::Bytecode,
         handler: usize,
+        start: usize,
         success: usize,
         limit: usize,
     ) -> Option<Dispatch> {
+        let ops = &bc.ops;
         let (_, cleanup) = unwind(ops, &self.flow, handler, 1)?;
-        if cleanup + 3 != limit {
-            return None;
-        }
+        let after = cleanup + 3;
+        // When the try raises or returns, only a matching handler can reach
+        // the code after its unwind. A constant return lies just outside
+        // the protected interval. Bound handlers clear the exception name first.
+        let handled_tail = if after == limit {
+            None
+        } else {
+            let raises = success == handler && ops[handler - 1].name == "RAISE_VARARGS";
+            let returns = super::regions::constant_return(ops, handler)
+                .is_some_and(|(start, _)| start == success);
+            if after >= limit || !(raises || returns) {
+                return None;
+            }
+            let rest = bc
+                .handlers
+                .partition_point(|entry| entry.start < ops[after].offset);
+            let (remaining, end) =
+                super::comprehensions::protection(bc, &bc.handlers[rest..]).ok()?;
+            if !remaining.is_empty() {
+                return None;
+            }
+            Some(after..self.flow.normal_end([after]).min(end).min(limit))
+        };
         let mut cursor = handler + 1;
         let mut arms = Vec::new();
         let mut join = None;
@@ -119,8 +142,7 @@ impl Body<'_, '_, '_> {
             };
             let (body, exit) = self.handler_body(ops, binding, next)?;
             if let Exit::Jump(dest) = exit
-                && (!(success..handler).contains(&dest)
-                    || join.replace(dest).is_some_and(|old| old != dest))
+                && join.replace(dest).is_some_and(|old| old != dest)
             {
                 return None;
             }
@@ -136,6 +158,40 @@ impl Body<'_, '_, '_> {
             || !(cursor == cleanup
                 || (cursor + 1 == cleanup && (ops[cursor].name, ops[cursor].arg) == ("RERAISE", 0)))
         {
+            return None;
+        }
+        // A retrying handler jumps to the NOP at the try header. Older
+        // targets take that backedge through a jump after the unwind.
+        let retry_header = match (&handled_tail, join) {
+            (None, dest) => dest,
+            (Some(tail), Some(dest))
+                if tail.start == dest && tail.len() == 1 && ops[dest].name == "JUMP_BACKWARD" =>
+            {
+                self.flow.jump(dest)
+            }
+            _ => None,
+        };
+        if self.none_return(&ops[success..handler])
+            && retry_header.is_some_and(|header| {
+                header < start && ops[header..start].iter().all(|op| op.name == "NOP")
+            })
+        {
+            return Some(Dispatch {
+                arms,
+                success: success..handler,
+                continuation: handler..handler,
+                retry: true,
+            });
+        }
+        if let Some(tail) = handled_tail {
+            return (join == Some(tail.start)).then_some(Dispatch {
+                arms,
+                success: success..handler,
+                continuation: tail,
+                retry: false,
+            });
+        }
+        if join.is_some_and(|dest| !(success..handler).contains(&dest)) {
             return None;
         }
         if let [arm] = arms.as_slice()
@@ -156,6 +212,7 @@ impl Body<'_, '_, '_> {
                     arms,
                     success: success..next,
                     continuation: next..handler,
+                    retry: false,
                 });
             }
         }
@@ -196,6 +253,7 @@ impl Body<'_, '_, '_> {
             arms,
             success: success..join,
             continuation,
+            retry: false,
         })
     }
 
@@ -253,6 +311,7 @@ impl Body<'_, '_, '_> {
         &mut self,
         ops: &[Instruction],
         dispatch: Dispatch,
+        try_source_start: usize,
     ) -> Result<(), String> {
         for arm in dispatch.arms {
             let mut header = "except".to_owned();
@@ -282,7 +341,10 @@ impl Body<'_, '_, '_> {
             };
             if let Exit::Return(tail) = arm.exit {
                 let tail = self.fragment(ops, tail.start, tail.end, 0)?.suite()?;
-                if !dispatch.continuation.is_empty() || suite.is_empty() || tail != "return None\n"
+                if dispatch.retry
+                    || !dispatch.continuation.is_empty()
+                    || suite.is_empty()
+                    || tail != "return None\n"
                 {
                     suite.push_str(&tail);
                 }
@@ -296,7 +358,7 @@ impl Body<'_, '_, '_> {
                 .suite()?;
             // CPython can duplicate the implicit return in every terminal arm.
             // Spelling it explicitly can move None ahead of keyword tuples.
-            let suite = if dispatch.continuation.is_empty() {
+            let suite = if dispatch.continuation.is_empty() && !dispatch.retry {
                 suite
                     .strip_suffix("return None\n")
                     .filter(|s| s.is_empty() || s.ends_with('\n'))
@@ -307,6 +369,10 @@ impl Body<'_, '_, '_> {
             if !suite.is_empty() {
                 self.block("else:", suite)?;
             }
+        }
+        if dispatch.retry {
+            let suite = self.lines.split_off(try_source_start);
+            return self.block("while True:", &suite);
         }
         self.region(
             ops,

@@ -161,6 +161,26 @@ impl Body<'_, '_, '_> {
         })
     }
 
+    // A shared return can be copied to both arms. Distinct source lines
+    // distinguish an authored early return, unless the compiler assigned an
+    // implicit None return the line of the preceding statement. The caller
+    // requires that preceding statement to belong to the early arm.
+    fn distinct_constant_returns(&self, ops: &[Instruction], left: usize, right: usize) -> bool {
+        let Some((a, av)) = super::regions::constant_return(ops, left) else {
+            return false;
+        };
+        let Some((b, bv)) = super::regions::constant_return(ops, right) else {
+            return false;
+        };
+        if av != bv || a == 0 {
+            return false;
+        }
+        self.instruction_lines(ops).is_ok_and(|lines| {
+            matches!((lines[a - 1], lines[a], lines[b]),
+                (Some(prev), Some(early), Some(late)) if prev < early && early < late)
+        })
+    }
+
     pub(super) fn conditional(
         &mut self,
         ops: &[Instruction],
@@ -171,6 +191,20 @@ impl Body<'_, '_, '_> {
     ) -> Result<usize, String> {
         let value = self.expr()?;
         let mut predicate = self.predicate(ops, i, value, end, level, header)?;
+        // CPython may copy the return after a terminal try onto both
+        // edges of its final guard. Both exits are outside the protected
+        // suite; the surrounding try owns their common continuation.
+        if predicate.target > end
+            && self.terminal_returns.contains(&end)
+            && self.terminal_returns.contains(&predicate.target)
+            && self.none_return(&ops[end..predicate.target])
+            && self
+                .flow
+                .handler(predicate.branch)
+                .is_some_and(|h| !h.lasti && h.depth == 0)
+        {
+            predicate.target = end;
+        }
         if let Some(latch) = self.enclosing_continue_latch(ops, &predicate, end) {
             predicate.suite = predicate.target;
             predicate.target = end;
@@ -230,6 +264,26 @@ impl Body<'_, '_, '_> {
             return self.finally_break(ops, predicate, handler, level, end);
         }
         let test = predicate.test(true);
+        // A binary expression's left operand is already on the stack. When
+        // CPython copies the final operation and return into both arms, join
+        // the right operands so the left operand still runs before the test.
+        if !self.stack.is_empty()
+            && fallthrough_end >= start + 3
+            && end >= target + 3
+            && ops[end - 2].name == "BINARY_OP"
+            && ops[end - 1].name == "RETURN_VALUE"
+            && super::comparisons::same_instructions(
+                &ops[fallthrough_end - 2..fallthrough_end],
+                &ops[end - 2..end],
+            )
+        {
+            let yes = self
+                .fragment(ops, start, fallthrough_end - 2, level)?
+                .expression()?;
+            let no = self.fragment(ops, target, end - 2, level)?.expression()?;
+            self.push(format!("({yes} if {test} else {no})"))?;
+            return Ok(end - 2);
+        }
         if self.loop_transfer(ops, tail).is_some() {
             let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
             self.block(&format!("if {test}:"), &suite)?;
@@ -363,26 +417,54 @@ impl Body<'_, '_, '_> {
                     // An early constant return can guard a loop with a
                     // different return inside it, followed by the same
                     // constant at exhaustion. Keep the guard's own exit.
-                    if left.is_empty()
-                        && super::regions::constant_return(ops, fallthrough_end)
-                            .is_some_and(|(at, _)| at == start)
-                        && self.flow.blocks_in(target..end).any(|block| {
-                            block.ops.end < end
-                                && matches!(
-                                    ops[block.ops.end - 1].name,
-                                    "RETURN_CONST" | "RETURN_VALUE"
-                                )
-                        })
+                    if (!left.is_empty()
+                        && self.distinct_constant_returns(ops, fallthrough_end, end))
+                        || (left.is_empty()
+                            && super::regions::constant_return(ops, fallthrough_end)
+                                .is_some_and(|(at, _)| at == start)
+                            && self.flow.blocks_in(target..end).any(|block| {
+                                block.ops.end < end
+                                    && matches!(
+                                        ops[block.ops.end - 1].name,
+                                        "RETURN_CONST" | "RETURN_VALUE"
+                                    )
+                            }))
                     {
                         self.block(&format!("if {test}:"), &suite)?;
-                        self.line(other.trim_end_matches('\n'))?;
+                        // A jump out of an else suite can survive as a tracing
+                        // NOP before the copied return. Keep the alternate
+                        // inside the conditional and its continuation outside.
+                        if !right.is_empty()
+                            && super::regions::constant_return(ops, end)
+                                .is_some_and(|(at, _)| at > target && ops[at - 1].name == "NOP")
+                        {
+                            self.block("else:", &right)?;
+                            self.line(&format!("return {b}"))?;
+                        } else {
+                            self.line(other.trim_end_matches('\n'))?;
+                        }
                         return Ok(end);
                     }
                     self.block(&format!("if {test}:"), &left)?;
                     if !right.is_empty() {
                         self.block("else:", &right)?;
                     }
-                    self.line(&format!("return {a}"))?;
+                    // A nested guard can target a block containing only its
+                    // implicit None return. An explicit return after the outer
+                    // else would merge that exit with its sibling.
+                    let implicit = end == ops.len()
+                        && level == 0
+                        && a == "None"
+                        && self.none_return(&ops[self.flow.block(tail).ops.clone()])
+                        && super::regions::constant_return(ops, end).is_some_and(|(at, _)| {
+                            at > target
+                                && self.instruction_lines(ops).is_ok_and(|lines| {
+                                    lines[at].is_some() && lines[at] == lines[at - 1]
+                                })
+                        });
+                    if !implicit {
+                        self.line(&format!("return {a}"))?;
+                    }
                     return Ok(end);
                 }
                 // A bare constant return exits the function. The remaining
