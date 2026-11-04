@@ -1,5 +1,5 @@
 //! Return paths which must unwind both the current and the enclosing except.
-use super::{Clause, Graph, Handler, Handlers, Instruction, Range};
+use super::{Body, BoundParent, Clause, Graph, Handler, Handlers, Instruction, Range};
 use crate::source::{dispatch, regions};
 
 pub(super) fn enclosing_exception(
@@ -49,19 +49,19 @@ pub(super) fn nested_handler_return(
 /// A nested try/except can own the entire matching arm. Its normal return
 /// ends at its own dispatch, and its last unmatched exception unwinds to the
 /// enclosing handler. Neither out-of-line dispatch belongs in the arm's text.
-pub(super) fn returning_handler_child(
+pub(in crate::source) fn returning_handler_child(
     ops: &[Instruction],
-    flow: &Graph,
+    owner: &Body<'_, '_, '_>,
     arm: Range<usize>,
     outer: Handler,
     inner: &Handlers,
-) -> Option<usize> {
+) -> Option<(usize, Option<Range<usize>>)> {
+    let flow = &owner.flow;
     let start = arm.clone().find(|&i| ops[i].name != "NOP")?;
     let child = inner.get(&start)?;
     let h = flow.handler(start)?;
     let dispatch = child.next;
-    if child.end != dispatch
-        || ops.get(dispatch)?.offset != h.target
+    if ops.get(dispatch)?.offset != h.target
         || h.lasti
         || h.depth != outer.depth
         || !matches!(child.clause, Clause::Except { .. })
@@ -69,12 +69,22 @@ pub(super) fn returning_handler_child(
         return None;
     }
     let (_, cleanup) = dispatch::unwind(ops, flow, dispatch, h.depth + 1)?;
+    if let Some(bound) = BoundParent::at_cleanup(owner, ops, cleanup)
+        && let Some(tail) = bound.success(owner, ops, child.end..dispatch)
+        && bound.owns_tail(owner, ops, cleanup + 3, arm.end)
+        && flow
+            .handler(arm.end)
+            .is_some_and(|h| h.lasti && h.target == outer.target && h.depth == outer.depth)
+    {
+        return Some((dispatch, Some(tail)));
+    }
     let parent = flow.handler(cleanup)?;
-    (cleanup + 3 == arm.end
+    (child.end == dispatch
+        && cleanup + 3 == arm.end
         && parent.lasti
         && parent.depth == outer.depth
         && parent.target == outer.target
         && parent.end > ops[arm.end].offset
         && (ops[arm.end].name, ops[arm.end].arg) == ("RERAISE", 0))
-        .then_some(dispatch)
+        .then_some((dispatch, None))
 }

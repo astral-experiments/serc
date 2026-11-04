@@ -158,12 +158,27 @@ impl Body<'_, '_, '_> {
             {
                 self.charge(lhs.value.len() + rhs.value.len() + 16)?;
                 let lhs = terms.pop().unwrap();
-                let right = negate_if(rhs.value, invert);
-                rhs.value = format!("({} {op} {right})", lhs.value);
-                rhs.start = lhs.start;
-                if invert {
-                    std::mem::swap(&mut rhs.yes, &mut rhs.no);
+                if invert
+                    && rhs.start == start
+                    && matches!(ops[branch - 1].name, "CONTAINS_OP" | "IS_OP")
+                    && !matches!(
+                        ops[lhs.branch.saturating_sub(1)].name,
+                        "CONTAINS_OP" | "IS_OP"
+                    )
+                {
+                    // Negating a membership or identity test flips its opcode
+                    // argument. Complement the left term to keep the original
+                    // comparison and the sense of its branch.
+                    let opposite = if op == "and" { "or" } else { "and" };
+                    rhs.value = format!("(not ({}) {opposite} {})", lhs.value, rhs.value);
+                } else {
+                    let right = negate_if(rhs.value, invert);
+                    rhs.value = format!("({} {op} {right})", lhs.value);
+                    if invert {
+                        std::mem::swap(&mut rhs.yes, &mut rhs.no);
+                    }
                 }
+                rhs.start = lhs.start;
             }
             terms.push(rhs);
         }
@@ -422,12 +437,18 @@ impl Body<'_, '_, '_> {
             && let Some(copy) = self
                 .clause_exits
                 .and_then(|exits| exits.before_arm(ops, &self.flow, target, end))
+                .or_else(|| self.handler_rejoin?.restore_before(ops, &self.flow, target))
             && copy >= start
             && self.flow.blocks_covering(start..copy).all(|b| {
                 [self.flow.jump(b.ops.end - 1), self.flow.fallthrough(b)]
                     .into_iter()
                     .flatten()
-                    .all(|to| (start..=copy).contains(&to))
+                    .all(|to| {
+                        (start..=copy).contains(&to)
+                            || self.handler_rejoin.is_some_and(|rejoin| {
+                                rejoin.restore_before(ops, &self.flow, b.ops.end).is_some()
+                            })
+                    })
             })
         {
             let left = self.fragment(ops, start, copy, level)?.suite()?;
@@ -635,7 +656,7 @@ impl Body<'_, '_, '_> {
                     // A nested guard can target a block containing only its
                     // implicit None return. An explicit return after the outer
                     // else would merge that exit with its sibling.
-                    let implicit = end == ops.len()
+                    let implicit = (end == ops.len() || end == self.terminal_returns.end)
                         && level == 0
                         && a == "None"
                         && self.none_return(&ops[self.flow.block(tail).ops.clone()])

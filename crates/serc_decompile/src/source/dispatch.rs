@@ -17,7 +17,7 @@ pub(super) struct Dispatch {
 
 pub(super) struct Arm {
     kind: Option<Range<usize>>,
-    binding: usize,
+    pub(super) binding: usize,
     body: Range<usize>,
     exit: Exit,
     copies: Option<ExitCopies>,
@@ -28,6 +28,24 @@ enum Exit {
     Jump(usize),
     Return(Range<usize>),
     ReturnValue,
+    // A nested try unwinds a named handler. The enclosing arm supplies any
+    // return needed to skip its own continuation.
+    ParentReturn(Option<Range<usize>>),
+}
+
+impl Arm {
+    pub(super) fn returns(&self) -> bool {
+        matches!(
+            self.exit,
+            Exit::Return(_) | Exit::ReturnValue | Exit::ParentReturn(_)
+        )
+    }
+
+    pub(super) fn fall_out_of_parent(&mut self) {
+        if let Exit::ParentReturn(tail) = &mut self.exit {
+            *tail = None;
+        }
+    }
 }
 
 /// The false edge of the match selects the next clause or the final reraise.
@@ -74,14 +92,21 @@ impl Body<'_, '_, '_> {
         failed: usize,
     ) -> Option<usize> {
         let cleanup = failed.checked_sub(4)?;
-        let unwind = self.flow.handler(binding + 1)?;
+        let unwind = self.binding_unwind(ops, binding)?;
         let store = self.cleared_name(ops, cleanup)?;
         ((unwind.target, unwind.depth, unwind.lasti) == (ops[cleanup].offset, 1, true)
             && (store.name, store.arg) == (ops[binding].name, ops[binding].arg))
             .then_some(cleanup)
     }
 
-    fn cleared_name(&self, ops: &[Instruction], cleanup: usize) -> Option<Instruction> {
+    pub(super) fn binding_unwind(&self, ops: &[Instruction], binding: usize) -> Option<Handler> {
+        self.flow
+            .handler(binding + 1)
+            .filter(|h| h.lasti && h.depth == 1)
+            .or_else(|| super::protected_regions::BoundParent::child_unwind(self, ops, binding))
+    }
+
+    pub(super) fn cleared_name(&self, ops: &[Instruction], cleanup: usize) -> Option<Instruction> {
         let reraise = ops.get(cleanup + 3)?;
         if (reraise.name, reraise.arg) != ("RERAISE", 1) {
             return None;
@@ -207,7 +232,7 @@ impl Body<'_, '_, '_> {
             }
             Some(after..self.flow.normal_end([after]).min(end).min(limit))
         };
-        let (mut arms, join) = self.handler_arms(ops, handler + 1, cleanup)?;
+        let (mut arms, join) = self.handler_arms(ops, handler + 1, cleanup, &self.handlers)?;
         // A retrying handler jumps to the NOP at the try header. Older
         // targets take that backedge through a jump after the unwind.
         let retry_header = match (&handled_tail, join) {
@@ -241,6 +266,16 @@ impl Body<'_, '_, '_> {
         }
         if join.is_some_and(|dest| !(success..handler).contains(&dest)) {
             return None;
+        }
+        if matches!(arms.as_slice(), [arm] if matches!(arm.exit, Exit::ReturnValue)) {
+            // The handler evaluated its own return with an active exception.
+            // Only the successful try can reach the remaining statements.
+            return Some(Dispatch {
+                arms,
+                success: success..success,
+                continuation: success..handler,
+                retry: false,
+            });
         }
         if let [arm] = arms.as_slice()
             && matches!(arm.exit, Exit::Raise)
@@ -310,6 +345,7 @@ impl Body<'_, '_, '_> {
         ops: &[Instruction],
         mut cursor: usize,
         cleanup: usize,
+        inner: &super::protected_regions::Handlers,
     ) -> Option<(Vec<Arm>, Option<usize>)> {
         let mut arms = Vec::new();
         let mut join = None;
@@ -323,7 +359,7 @@ impl Body<'_, '_, '_> {
                 }
                 (Some(cursor..check), binding, next)
             };
-            let (mut body, exit) = self.handler_body(ops, binding, next)?;
+            let (mut body, exit) = self.handler_body(ops, binding, next, cleanup, inner)?;
             // A guard in a matching arm can jump to its own copy of POP_EXCEPT,
             // binding cleanup, and constant return. Both exits end the arm.
             let copies = if let Exit::Return(tail) = &exit
@@ -365,11 +401,69 @@ impl Body<'_, '_, '_> {
         ops: &[Instruction],
         start: usize,
         cleanup: usize,
+        inner: &super::protected_regions::Handlers,
     ) -> Option<(Vec<Arm>, Option<usize>)> {
-        let (arms, join) = self.handler_arms(ops, start, cleanup)?;
+        let (arms, join) = self.handler_arms(ops, start, cleanup, inner)?;
         arms.iter()
-            .all(|arm| matches!(arm.exit, Exit::Raise | Exit::Jump(_)))
+            .all(|arm| match &arm.exit {
+                // An expression evaluated after POP_EXCEPT belongs to a
+                // continuation outside the handler. Constants can return here.
+                Exit::Return(tail) => super::regions::constant_return(ops, tail.end)
+                    .is_some_and(|(load, _)| load == tail.start),
+                Exit::Raise | Exit::ReturnValue | Exit::ParentReturn(_) | Exit::Jump(_) => true,
+            })
             .then_some((arms, join))
+    }
+
+    /// The try already returned its pending value. Each matched handler may
+    /// raise, evaluate its own return, or restore the previous exception and
+    /// reach a shared continuation copied after its `POP_EXCEPT`.
+    pub(super) fn returning_handlers(
+        &mut self,
+        ops: &[Instruction],
+        handler: usize,
+    ) -> Result<(), String> {
+        let (_, cleanup) = unwind(ops, &self.flow, handler, 1).ok_or("missing handler unwind")?;
+        let (mut arms, join) = self
+            .handler_arms(ops, handler + 1, cleanup, &self.handlers)
+            .ok_or("unsupported returning exception dispatch")?;
+        if join.is_some() {
+            return Err("unsupported exception continuation".into());
+        }
+        let tails: Vec<_> = arms
+            .iter()
+            .filter_map(|arm| match &arm.exit {
+                Exit::Return(tail) => Some(&ops[tail.clone()]),
+                _ => None,
+            })
+            .collect();
+        let copied = tails.len() > 1
+            && tails
+                .windows(2)
+                .all(|pair| super::comparisons::same_instructions(pair[0], pair[1]));
+        let mut continuation = None;
+        for arm in &mut arms {
+            if let Exit::Return(tail) = &arm.exit
+                && (copied
+                    || super::regions::constant_return(ops, tail.end)
+                        .is_none_or(|(load, _)| load != tail.start))
+            {
+                // This expression runs after the exception binding is cleared.
+                let source = self.fragment(ops, tail.start, tail.end, 0)?.suite()?;
+                if continuation.as_ref().is_some_and(|prior| prior != &source) {
+                    return Err("distinct handler continuations".into());
+                }
+                continuation = Some(source);
+                arm.exit = Exit::Jump(tail.start);
+            }
+            self.emit_arm(ops, arm, 0, true)?;
+        }
+        if let Some(continuation) = continuation {
+            for line in continuation.lines() {
+                self.line(line)?;
+            }
+        }
+        Ok(())
     }
 
     /// Locate `POP_EXCEPT` and the first instruction after normal binding cleanup.
@@ -400,6 +494,8 @@ impl Body<'_, '_, '_> {
         ops: &[Instruction],
         binding: usize,
         next: usize,
+        cleanup: usize,
+        inner: &super::protected_regions::Handlers,
     ) -> Option<(Range<usize>, Exit)> {
         let stop = if ops[binding].name == "POP_TOP" {
             next
@@ -407,6 +503,31 @@ impl Body<'_, '_, '_> {
             self.exception_name_cleanup(ops, binding, next)?
         };
         let body = binding + 1..stop;
+        if ops[binding].name != "POP_TOP"
+            && let Some(outer) = self.flow.handler(binding)
+            && let Some((dispatch, Some(tail))) = super::protected_regions::returning_handler_child(
+                ops,
+                self,
+                body.clone(),
+                outer,
+                inner,
+            )
+        {
+            // All normal exits of the child return through this binding.
+            return Some((body.start..dispatch, Exit::ParentReturn(Some(tail))));
+        }
+        if let Some(parent) = super::protected_regions::BoundParent::at_cleanup(self, ops, cleanup)
+            && let Some((pop, ret)) = parent.handler_exit(self, ops, stop)
+            && pop >= body.start
+            && ops[binding].name == "POP_TOP"
+        {
+            let exit = if ret.is_some() {
+                Exit::ReturnValue
+            } else {
+                Exit::ParentReturn(None)
+            };
+            return Some((body.start..pop, exit));
+        }
         if ops.get(body.clone())?.last()?.name == "RAISE_VARARGS" {
             return Some((body, Exit::Raise));
         }
@@ -471,7 +592,13 @@ impl Body<'_, '_, '_> {
         keep_return: bool,
     ) -> Result<(), String> {
         let header = self.except_header(ops, "except", arm.kind.clone(), arm.binding, level)?;
-        let fragment = self.protected_fragment(ops, arm.body.clone(), level, arm.copies)?;
+        let rejoin = match arm.exit {
+            Exit::Jump(next) => {
+                super::protected_regions::HandlerRejoin::new(ops, &self.flow, arm.binding, next)
+            }
+            _ => None,
+        };
+        let fragment = self.protected_fragment(ops, arm.body.clone(), level, arm.copies, rejoin)?;
         let mut suite = if matches!(arm.exit, Exit::ReturnValue) {
             let (suite, returns) = fragment.pending_return()?;
             if !returns {
@@ -481,7 +608,7 @@ impl Body<'_, '_, '_> {
         } else {
             fragment.suite()?
         };
-        if let Exit::Return(tail) = &arm.exit {
+        if let Exit::Return(tail) | Exit::ParentReturn(Some(tail)) = &arm.exit {
             let tail = self.fragment(ops, tail.start, tail.end, level)?.suite()?;
             if keep_return || suite.is_empty() || tail != "return None\n" {
                 suite.push_str(&tail);

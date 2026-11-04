@@ -190,6 +190,7 @@ fn recover_scope<'m>(
         handlers: protected_regions::Handlers::default(),
         terminal_returns: 0..0,
         clause_exits: None,
+        handler_rejoin: None,
         arm_exit: None,
         finally_unwind: None,
         active_try: None,
@@ -290,6 +291,7 @@ struct Body<'m, 'data, 'work> {
     loop_edges: Option<loops::Loop>,
     handlers: protected_regions::Handlers,
     clause_exits: Option<protected_regions::ExitCopies>,
+    handler_rejoin: Option<protected_regions::HandlerRejoin>,
     // A nested guard can jump past the other arm to the enclosing continuation.
     arm_exit: Option<(usize, usize)>,
     finally_unwind: Option<usize>,

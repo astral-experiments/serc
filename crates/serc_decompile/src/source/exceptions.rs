@@ -228,69 +228,6 @@ impl Body<'_, '_, '_> {
         (end > binding + 1 && ops[end - 1].name == "RAISE_VARARGS").then_some(end)
     }
 
-    /// Follow the failed-match edge to each subsequent handler. When the try
-    /// returns, CPython can duplicate the continuation's return after `POP_EXCEPT`
-    /// in every successful handler, leaving no jump to the original return.
-    fn returning_handlers(&mut self, ops: &[Instruction], handler: usize) -> Result<(), String> {
-        let mut cursor = handler + 1;
-        let mut continuation = None;
-        while ops.get(cursor).is_some_and(|op| op.name != "RERAISE") {
-            let (check, binding, next) = super::dispatch::typed_handler(&self.flow, ops, cursor)
-                .ok_or("unsupported exception dispatch")?;
-            let kind = self.fragment(ops, cursor, check, 0)?.expression()?;
-            if binding >= next || ops[binding].name != "POP_TOP" {
-                return Err("unsupported returning exception binding".into());
-            }
-            if let Some(end) = self.raising_handler_end(ops, check, binding) {
-                let suite = self.fragment(ops, binding + 1, end, 0)?.suite()?;
-                self.block(&format!("except {kind}:"), &suite)?;
-                cursor = next;
-                continue;
-            }
-            let pop = (binding + 1..next)
-                .find(|&i| ops[i].name == "POP_EXCEPT")
-                .ok_or("missing exception cleanup")?;
-            // A computed return is already on the stack when the handler
-            // restores the active exception. The SWAP moves it past that
-            // exception so RETURN_VALUE can consume it after POP_EXCEPT.
-            if pop > binding + 1
-                && (ops[pop - 1].name, ops[pop - 1].arg) == ("SWAP", 2)
-                && pop + 2 == next
-                && ops[pop + 1].name == "RETURN_VALUE"
-            {
-                let (suite, returns) = self
-                    .fragment(ops, binding + 1, pop - 1, 0)?
-                    .pending_return()?;
-                if !returns {
-                    return Err("missing exception return value".into());
-                }
-                self.block(&format!("except {kind}:"), &suite)?;
-                cursor = next;
-                continue;
-            }
-            let suite = self.fragment(ops, binding + 1, pop, 0)?.suite()?;
-            self.block(&format!("except {kind}:"), &suite)?;
-            if !matches!(ops[next - 1].name, "RETURN_CONST" | "RETURN_VALUE") {
-                return Err("unsupported exception continuation".into());
-            }
-            let tail = self.fragment(ops, pop + 1, next, 0)?.suite()?;
-            if continuation
-                .as_ref()
-                .is_some_and(|previous| previous != &tail)
-            {
-                return Err("distinct handler continuations".into());
-            }
-            continuation = Some(tail);
-            cursor = next;
-        }
-        if let Some(continuation) = continuation {
-            for line in continuation.lines() {
-                self.line(line)?;
-            }
-        }
-        Ok(())
-    }
-
     /// A conditional transfer through finally has two normal copies of the
     /// cleanup and an exceptional copy. Match all three before lifting the
     /// break out of the normal copy.
