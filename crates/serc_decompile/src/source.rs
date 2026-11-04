@@ -4,11 +4,14 @@ mod comparisons;
 mod comprehensions;
 mod conditionals;
 mod definitions;
+mod detached;
 mod elided_tries;
 mod exceptions;
 mod layout;
 mod loops;
 mod operands;
+mod partial;
+pub(super) use partial::{comment, partial};
 mod patterns;
 mod regions;
 mod strings;
@@ -41,6 +44,13 @@ struct Recovery<'m> {
     synthetic: Option<&'m synthetic::Hints>,
     mode: synthetic::Mode,
     emitted: bool,
+    partial: bool,
+    definitions: Vec<Id>,
+}
+
+pub(super) struct Candidate {
+    pub source: String,
+    pub definitions: Vec<Id>,
 }
 
 pub(super) fn recover(
@@ -48,7 +58,7 @@ pub(super) fn recover(
     preserve_nops: bool,
     synthetic: Option<&synthetic::Hints>,
     mode: synthetic::Mode,
-) -> Result<(Vec<String>, bool), String> {
+) -> Result<(Vec<String>, bool, Vec<Id>), String> {
     let mut work = Recovery {
         budget: MAX_WORK,
         preserve_nops,
@@ -56,10 +66,12 @@ pub(super) fn recover(
         synthetic,
         mode,
         emitted: false,
+        partial: false,
+        definitions: Vec::new(),
     };
     let text = scope(m, m.root, 0, false, &mut work)?;
     if mode != synthetic::Mode::Ordinary && !work.emitted {
-        return Ok((Vec::new(), work.saw_nop));
+        return Ok((Vec::new(), work.saw_nop, Vec::new()));
     }
     let parsed = ruff_python_parser::parse_module(&text)
         .map_err(|e| format!("invalid reconstructed Python: {e}"))?;
@@ -81,7 +93,7 @@ pub(super) fn recover(
     if m.version >= PythonVersion::Py313 {
         layout::class_candidates(m, &mut candidates)?;
     }
-    Ok((candidates, work.saw_nop))
+    Ok((candidates, work.saw_nop, work.definitions))
 }
 
 fn scope<'m>(
@@ -134,6 +146,7 @@ fn recover_scope<'m>(
     };
     let mut body = Body {
         stubs,
+        omitted_cell_stores: rustc_hash::FxHashSet::default(),
         m,
         code,
         stack: Vec::new(),
@@ -146,7 +159,7 @@ fn recover_scope<'m>(
         work,
     };
     body.declarations(&bc.ops)?;
-    if body.suspended() {
+    let result = if body.suspended() {
         body.suspension_scope(&bc)
     } else if bc.ops.iter().any(|op| op.name == "LOAD_FAST_AND_CLEAR")
         && bc.ops.iter().any(comprehensions::is_collection_insert)
@@ -171,13 +184,30 @@ fn recover_scope<'m>(
     } else {
         body.protected(&bc)
     }
-    .map_err(|e| format!("{name}: {e}"))?;
-    if !body.stack.is_empty() {
-        return Err(format!("{name}: unused stack values at end"));
+    .and_then(|()| {
+        if body.stack.is_empty() {
+            Ok(())
+        } else {
+            Err("unused stack values at end".into())
+        }
+    });
+    if let Err(reason) = result {
+        if body.work.partial {
+            return body.partial_scope(&reason, &bc);
+        }
+        return Err(format!("{name}: {reason}"));
     }
     body.emit_stub(None)?;
+    if body.work.partial || body.work.mode == synthetic::Mode::LexicalBindings {
+        body.lexical_bindings(&bc.ops)?;
+    }
     if let Some(guard) = live_guard {
         body.guard_statement(&guard)?;
+    }
+    if body.work.partial
+        && let Err(error) = ruff_python_parser::parse_module(&body.lines)
+    {
+        return body.partial_scope(&format!("invalid reconstructed scope: {error}"), &bc);
     }
     Ok(body.lines)
 }
@@ -207,6 +237,7 @@ struct Body<'m, 'data, 'work> {
     stack: Vec<Value>,
     lines: String,
     stubs: synthetic::Stubs<'m>,
+    omitted_cell_stores: rustc_hash::FxHashSet<usize>,
     flow: crate::flow::Graph,
     loop_edges: Option<loops::Loop>,
     depth: usize,
@@ -520,7 +551,15 @@ impl Body<'_, '_, '_> {
                 self.keyword_call(a, &keys)?;
             }
             "CALL_FUNCTION_EX" => self.expanded_call(a)?,
-            "DICT_UPDATE" | "DICT_MERGE" if a == 1 => self.merge_map()?,
+            "DICT_UPDATE" | "DICT_MERGE" if a == 1 => {
+                let other = self.expr()?;
+                self.append_dict_item(&format!("**({other})"))?;
+            }
+            "MAP_ADD" if a == 1 => {
+                let value = self.expr()?;
+                let key = self.expr()?;
+                self.append_dict_item(&format!("{key}: {value}"))?;
+            }
             "CALL_INTRINSIC_1"
                 if a == serc_bytecode::target::operands::UnaryIntrinsic::LIST_TO_TUPLE
                     .argument() =>

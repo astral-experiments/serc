@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Measure complete-module decompilation against the pinned Ruff corpus and CPython."""
+"""Check strict verification and best-effort output against Ruff and pinned CPython."""
 
 from __future__ import annotations
 
@@ -17,6 +17,7 @@ import tokenize
 import types
 import warnings
 from collections import Counter
+from functools import cache
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -30,10 +31,10 @@ ROOTS = [
 ]
 # Baseline complete modules recovered from this Ruff revision.
 MINIMUM_VERIFIED = {
-    "3.12.14": 1754,
-    "3.13.15": 1748,
-    "3.14.5": 1752,
-    "3.15.0rc2": 1766,
+    "3.12.14": 1819,
+    "3.13.15": 1821,
+    "3.14.5": 1834,
+    "3.15.0rc2": 1852,
 }
 FIELDS = (
     "co_name",
@@ -81,10 +82,20 @@ def object_count(code):
     )
 
 
+@cache
+def strict_command(binary):
+    # Earlier stack layers always used strict mode.
+    help_text = subprocess.check_output([binary, "decompile", "--help"], timeout=30)
+    return [binary, "decompile", *(["--strict"] if b"--strict" in help_text else [])]
+
+
 def check_cache(binary, cache, filename, code):
     try:
         run = subprocess.run(
-            [binary, "decompile", cache], capture_output=True, timeout=30, check=False
+            [*strict_command(binary), cache],
+            capture_output=True,
+            timeout=30,
+            check=False,
         )
     except subprocess.TimeoutExpired:
         return "error", "decompiler timed out"
@@ -144,6 +155,12 @@ def measure(binary, inputs, baseline=None):
                 reason = detail.rsplit(": ", 1)[-1]
                 refusals[re.sub(r" at byte \d+", "", reason)] += 1
                 counts["refused"] += 1
+                if "--strict" in strict_command(binary):
+                    problem = check_partial(binary, cache, filename)
+                    if problem:
+                        errors[filename] = problem
+                    else:
+                        counts["partial_modules"] += 1
                 if baseline is not None:
                     previous, problem = check_cache(baseline, cache, filename, code)
                     if previous == "verified":
@@ -159,6 +176,24 @@ def measure(binary, inputs, baseline=None):
             counts["synthetic_live_guards"] += live
             counts["verified_code_objects"] += objects
     return dict(counts), refusals, errors, regressions
+
+
+def check_partial(binary, cache, filename):
+    try:
+        run = subprocess.run(
+            [binary, "decompile", cache], capture_output=True, timeout=30, check=False
+        )
+    except subprocess.TimeoutExpired:
+        return "best-effort decompilation timed out"
+    if run.returncode:
+        return f"best-effort exit {run.returncode}: {run.stderr[-500:]!r}"
+    if not run.stdout.startswith(b"# serc: best-effort decompilation\n"):
+        return "missing best-effort header"
+    try:
+        compile(run.stdout, filename, "exec", dont_inherit=True, optimize=0)
+    except (SyntaxError, ValueError) as exc:
+        return f"invalid best-effort source: {exc}"
+    return None
 
 
 def main():

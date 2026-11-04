@@ -26,6 +26,7 @@ pub(crate) enum Mode {
     Ordinary,
     DeadSuites,
     LiveGuards,
+    LexicalBindings,
 }
 
 pub(crate) struct Hint {
@@ -220,22 +221,15 @@ impl Hint {
             {
                 *slot = op.offset;
             }
-            let mut bind = |i: usize| {
+            local_writes(op, |i| {
                 if let Some(slot) = bindings.get_mut(i)
                     && *slot == 0
                 {
                     *slot = op.offset;
                 }
-            };
-            match op.name {
-                "STORE_FAST" | "DELETE_FAST" | "LOAD_FAST_AND_CLEAR" => bind(arg),
-                "STORE_FAST_STORE_FAST" => {
-                    bind(arg >> 4);
-                    bind(arg & 15);
-                }
-                "STORE_FAST_LOAD_FAST" => bind(arg >> 4),
-                "NOP" => nops.push(op.offset),
-                _ => {}
+            });
+            if op.name == "NOP" {
+                nops.push(op.offset);
             }
         }
 
@@ -292,7 +286,70 @@ fn place_names<'a>(
     Ok(())
 }
 
+fn local_writes(op: &Instruction, mut bind: impl FnMut(usize)) {
+    let arg = op.arg as usize;
+    match op.name {
+        "STORE_FAST" | "DELETE_FAST" | "STORE_DEREF" | "DELETE_DEREF" | "LOAD_FAST_AND_CLEAR" => {
+            bind(arg);
+        }
+        "STORE_FAST_STORE_FAST" => {
+            bind(arg >> 4);
+            bind(arg & 15);
+        }
+        "STORE_FAST_LOAD_FAST" => bind(arg >> 4),
+        _ => {}
+    }
+}
+
 impl Body<'_, '_, '_> {
+    // A bare function-local annotation can leave a local or cell slot without
+    // a single store. In particular, an inner nonlocal cannot even compile
+    // without a lexical binding in its enclosing function.
+    pub(super) fn lexical_bindings(&mut self, ops: &[Instruction]) -> Result<(), String> {
+        let code = self.code;
+        if code.flags & code_flags::CO_OPTIMIZED == 0 || self.m.text(code.name)?.starts_with('<') {
+            return Ok(());
+        }
+        let names = self.m.tuple(code.locals)?;
+        let kinds = self.m.bytes(code.local_kinds)?;
+        let parameters = code.args
+            + code.kw_only
+            + usize::from(code.flags & code_flags::CO_VARARGS != 0)
+            + usize::from(code.flags & code_flags::CO_VARKEYWORDS != 0);
+        if names.len() != kinds.len() || parameters > names.len() {
+            return Err("invalid parameter layout".into());
+        }
+        self.charge(names.len() + ops.len())?;
+        let mut written = vec![false; names.len()];
+        for op in ops
+            .iter()
+            .filter(|op| !self.omitted_cell_stores.contains(&op.offset))
+        {
+            local_writes(op, |i| {
+                if let Some(slot) = written.get_mut(i) {
+                    *slot = true;
+                }
+            });
+        }
+        let mut missing = Vec::new();
+        for i in parameters..names.len() {
+            if !written[i]
+                && kinds[i] & (local_kinds::CO_FAST_LOCAL | local_kinds::CO_FAST_CELL) != 0
+                && kinds[i] & (local_kinds::CO_FAST_FREE | local_kinds::CO_FAST_HIDDEN) == 0
+            {
+                missing.push(identifier(self.m.text(names[i])?)?);
+            }
+        }
+        for chunk in missing.chunks(128) {
+            self.line(&format!(
+                "if False: {} = None  # serc: synthetic dead code",
+                chunk.join(" = ")
+            ))?;
+            self.work.emitted = true;
+        }
+        Ok(())
+    }
+
     // Keep the live statement on its original line. Putting it on a new line
     // can cause CPython to insert a tracing NOP before it.
     pub(super) fn guard_statement(&mut self, guard: &str) -> Result<(), String> {

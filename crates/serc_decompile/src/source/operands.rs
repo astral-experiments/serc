@@ -104,15 +104,14 @@ impl Body<'_, '_, '_> {
         Err("missing in-place target store".into())
     }
 
-    pub(super) fn merge_map(&mut self) -> Result<(), String> {
-        let other = self.expr()?;
+    pub(super) fn append_dict_item(&mut self, item: &str) -> Result<(), String> {
         let map = self.expr()?;
         let prefix = map
             .strip_prefix('{')
             .and_then(|s| s.strip_suffix('}'))
             .ok_or("unsupported map update")?;
         let separator = if prefix.is_empty() { "" } else { ", " };
-        self.push(format!("{{{prefix}{separator}**({other})}}"))
+        self.push(format!("{{{prefix}{separator}{item}}}"))
     }
 
     pub(super) fn expanded_call(&mut self, flag: u32) -> Result<(), String> {

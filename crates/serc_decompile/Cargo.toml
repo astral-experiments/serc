@@ -1,7 +1,7 @@
 [package]
 name = "serc_decompile"
 version = "0.1.9"
-description = "Recover verified Python source from CPython bytecode."
+description = "Recover Python source from CPython bytecode."
 edition = { workspace = true }
 rust-version = { workspace = true }
 homepage = { workspace = true }
@@ -18,6 +18,7 @@ ruff_python_codegen = { workspace = true }
 ruff_python_literal = { workspace = true }
 ruff_python_parser = { workspace = true }
 ruff_source_file = { workspace = true }
+ruff_text_size = { workspace = true }
 rustc-hash = { workspace = true }
 serc_bytecode = { path = "../serc_bytecode", version = "0.1.9", features = ["read"] }
 stacker = { workspace = true }

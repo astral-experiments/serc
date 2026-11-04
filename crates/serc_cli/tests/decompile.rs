@@ -20,7 +20,7 @@ fn command_requires_feature() {
 
 #[cfg(feature = "decompile")]
 #[test]
-fn complete_modules_only() {
+fn strict_mode_requires_complete_modules() {
     let temp = tempfile::tempdir().unwrap();
     let source = temp.path().join("original.py");
     let cache = temp.path().join("module.pyc");
@@ -41,6 +41,7 @@ fn complete_modules_only() {
                 fs_err::remove_file(&source).unwrap();
                 let recovered = Command::new(env!("CARGO_BIN_EXE_serc"))
                     .arg("decompile")
+                    .arg("--strict")
                     .arg(&cache)
                     .output()
                     .unwrap();
@@ -459,6 +460,51 @@ result = build(f, spread, lambda *args, **kw: (args, kw)), log",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn raising_handlers_end_before_exception_name_cleanup() {
+    check_output(
+        r"def named(action):
+    try: action()
+    except ValueError as error:
+        raise RuntimeError('wrapped') from error
+    return 42
+def unnamed(action):
+    try: action()
+    except ValueError: raise
+    return 43
+",
+        r"def value(): raise ValueError('v')
+def key(): raise KeyError('k')
+result = []
+for f in [named, unnamed]:
+    for action in [lambda: None, value, key]:
+        try: result.append(f(action))
+        except Exception as exc: result.append((type(exc).__name__, repr(exc.__cause__)))",
+        &common::PYTHON_VERSIONS,
+        |source| assert!(!source.starts_with("# serc: best-effort"), "{source}"),
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn incremental_dictionaries_preserve_order_across_chunks() {
+    // CPython inserts 16- and 17-pair runs individually. Larger displays
+    // merge multiple such runs, and unpackings can also split a run.
+    for size in [15, 16, 17, 18, 35] {
+        let entries = (0..size)
+            .map(|i| format!("key({i}): value({i})"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        check_fixture(
+            &format!(
+                "def f(key, value, extra):\n    return {{{entries}, **extra, key(0): value(42)}}\n"
+            ),
+            "events = []\ndef key(i): events.append(('key', i)); return i % 7\ndef value(i): events.append(('value', i)); return i\nresult = list(f(key, value, {7: 'extra'}).items()), events",
+        );
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn unpacking_comprehensions_use_the_target_iteration_order() {
     check_fixture_on(
         "def f(rows, maps):\n    return [*row for row in rows if row], {*row for row in rows}, {**m for group in maps for m in group}\ndef gen(rows):\n    return (*row for row in rows if row)\n",
@@ -792,12 +838,157 @@ Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12)
         assert!(built.status.success(), "{built:?}");
         let output = Command::new(env!("CARGO_BIN_EXE_serc"))
             .arg("decompile")
+            .arg("--strict")
             .arg(&cache)
             .output()
             .unwrap();
         assert!(!output.status.success(), "{version}");
         assert!(output.stdout.is_empty());
     }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
+    let temp = tempfile::tempdir().unwrap();
+    let original = temp.path().join("original.py");
+    let cache = temp.path().join("module.pyc");
+    let recovered = temp.path().join("recovered.py");
+    let source = format!(
+        r"before = 7
+if before:
+    lost = '{big}'
+else:
+    wrongly_hoisted()
+def large():
+    return '{big}'
+def after(x):
+    return x + before
+if before:
+    lost = '{big}'
+    def repeated(x, /):
+        def inner():
+            return x + 1
+        return inner
+else:
+    async def repeated(*, y):
+        return y + 2
+fake_marker = '# __serc_definition_id__ 7'
+def annotated(x: int): return x
+if before:
+    lost = '{big}'
+    def __annotate__(user_format): return user_format
+def protected(flag, action, events):
+    if flag: prefix = '{big}'
+    else: wrongly_hoisted()
+    try: action()
+    except KeyError: events.append('caught')
+    tail = '{big}'
+    events.append('after')
+    return 7
+def outer(events):
+    def get(): return x
+    def put(value):
+        nonlocal x
+        x = value
+    events.append((get, put))
+    try:
+        x = '{big}'
+        return 0
+    except Exception:
+        return put
+def unfinished():
+    def kept(): return 3
+    try:
+        action()
+        return '{big}'
+    except Exception: return kept
+",
+        big = "x".repeat(200_000)
+    );
+    fs_err::write(&original, source).unwrap();
+    for version in common::PYTHON_VERSIONS {
+        let built = common::python_command(version)
+            .args(["-c", "import py_compile, sys; py_compile.compile(sys.argv[1], sys.argv[2], doraise=True)"])
+            .arg(&original).arg(&cache).output().unwrap();
+        assert!(built.status.success(), "{built:?}");
+        let output = Command::new(env!("CARGO_BIN_EXE_serc"))
+            .arg("decompile")
+            .arg(&cache)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let text = String::from_utf8(output.stdout).unwrap();
+        assert!(text.starts_with("# serc: best-effort decompilation\n"));
+        assert!(text.contains("def large():\n    ...  # serc: unrecovered remainder of large"));
+        assert!(text.contains("def after(x):"));
+        assert!(text.contains("# serc: unrecovered statement in <module>"));
+        assert_eq!(
+            text.matches("# serc: unrecovered statement in protected")
+                .count(),
+            2
+        );
+        assert!(!text.contains("wrongly_hoisted()"));
+        assert!(text.contains("if False: x = None  # serc: synthetic dead code"));
+        assert!(text.contains("def kept():"));
+        assert_eq!(
+            text.matches("# serc: detached function repeated (original line ")
+                .count(),
+            2
+        );
+        assert!(text.contains("# def repeated(x, /):\n#     def inner():"));
+        assert!(text.contains("# async def repeated(*, y):"));
+        assert!(!text.contains("# serc: detached function repeated.<locals>.inner"));
+        assert!(!text.contains("# serc: detached function after"));
+        assert_eq!(
+            text.matches("# serc: detached function __annotate__ ")
+                .count(),
+            1
+        );
+        assert!(text.contains("# def __annotate__(user_format):"));
+        let appendix = text.split_once("\n# serc: detached function ").unwrap().1;
+        assert!(
+            appendix
+                .lines()
+                .skip(1)
+                .all(|line| line.is_empty() || line.starts_with('#'))
+        );
+        fs_err::write(&recovered, text).unwrap();
+        let checked = common::python_command(version)
+            .args([
+                "-c",
+                r"import runpy, sys
+scope = runpy.run_path(sys.argv[1])
+assert scope['after'](5) == 12
+assert 'repeated' not in scope and 'inner' not in scope
+assert scope['fake_marker'] == '# __serc_definition_id__ 7'
+events = []
+def fail(): raise KeyError
+for flag, action in [(True, fail), (False, lambda: None)]:
+    assert scope['protected'](flag, action, events) == 7
+assert events == ['caught', 'after', 'after']
+events.clear()
+scope['outer'](events)
+get, put = events[0]
+try: get()
+except NameError: pass
+else: raise AssertionError('the omitted assignment initialized the cell')
+put(42)
+assert get() == 42",
+            ])
+            .arg(&recovered)
+            .output()
+            .unwrap();
+        assert!(checked.status.success(), "{checked:?}");
+    }
+    fs_err::write(&cache, b"not a cache").unwrap();
+    let rejected = Command::new(env!("CARGO_BIN_EXE_serc"))
+        .arg("decompile")
+        .arg(&cache)
+        .output()
+        .unwrap();
+    assert!(!rejected.status.success());
+    assert!(rejected.stdout.is_empty());
 }
 
 #[cfg(feature = "decompile")]
@@ -821,6 +1012,21 @@ fn synthetic_yields_and_captures_preserve_function_kinds() {
     check_fixture(
         "def stream(stop):\n    yield 1\n    if stop: return\n    raise LookupError\n",
         "a, b = stream(True), stream(False)\nresult = [next(a), next(b), next(a, 2)]\ntry: next(b)\nexcept LookupError: result.append(3)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn erased_local_annotation_still_binds_nonlocal_writes() {
+    check_output(
+        "def outer(*args, **kwargs):\n    slot: int\n    def get(): return slot\n    def put(value):\n        nonlocal slot\n        slot = value\n    return get, put\n",
+        "get, put = outer()\ntry: get()\nexcept NameError: empty = True\nput(42)\nresult = empty, get()",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert!(!source.starts_with("# serc: best-effort"), "{source}");
+            assert!(source.contains("if False: slot = None  # serc: synthetic dead code"));
+            assert_eq!(source.matches("# serc: synthetic dead code").count(), 1);
+        },
     );
 }
 
