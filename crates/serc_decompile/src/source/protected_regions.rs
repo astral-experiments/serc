@@ -7,6 +7,15 @@ use serc_bytecode::instructions::Handler;
 
 use super::{Body, Bytecode, Instruction};
 use crate::flow::Graph;
+mod finally;
+mod handler_returns;
+mod loop_exits;
+
+use finally::{break_marker, finally_region, returning_finally_loop};
+use handler_returns::{enclosing_exception, nested_handler_return, returning_handler_child};
+
+pub(super) use loop_exits::iterator_return_block;
+use loop_exits::{guarded_return_end, iterator_success_latch};
 
 pub(super) type Handlers = FxHashMap<usize, Protected>;
 
@@ -24,6 +33,7 @@ enum Clause {
 }
 
 pub(super) struct Protected {
+    return_exits: Vec<super::regions::ReturnExit>,
     end: usize,
     next: usize,
     clause: Clause,
@@ -39,15 +49,20 @@ pub(super) struct Protected {
 /// enter any copy at its first instruction, including past the lifted suite.
 #[derive(Clone, Copy)]
 pub(super) struct ExitCopies {
-    first: usize,
+    pub(super) first: usize,
     end: usize,
     width: usize,
 }
 
 impl ExitCopies {
-    fn suffix(ops: &[Instruction], flow: &Graph, body: Range<usize>, width: usize) -> Option<Self> {
+    pub(super) fn suffix(
+        ops: &[Instruction],
+        flow: &Graph,
+        body: Range<usize>,
+        width: usize,
+    ) -> Option<Self> {
         let mut first = body.end.checked_sub(width)?;
-        if first < body.start {
+        if width == 0 || first < body.start {
             return None;
         }
         let exit = &ops[first..body.end];
@@ -70,6 +85,49 @@ impl ExitCopies {
             end: body.end,
             width,
         })
+    }
+
+    pub(super) fn handler(
+        ops: &[Instruction],
+        flow: &Graph,
+        body: Range<usize>,
+        end: usize,
+    ) -> Option<Self> {
+        let width = end.checked_sub(body.end)?;
+        Self::suffix(ops, flow, body.start..end, width).or_else(|| {
+            let block = flow.block(body.end);
+            (ops[body.end].name == "POP_EXCEPT"
+                && block.ops == (body.end..end)
+                && block.height == Some(1)
+                && flow.handler(body.end).is_none())
+            .then_some(Self {
+                first: body.end,
+                end,
+                width,
+            })
+        })
+    }
+
+    /// The first arm of a terminal if/else can end with a separate copy of
+    /// the final handler cleanup, with the second arm's statements in between.
+    pub(super) fn before_arm(
+        self,
+        ops: &[Instruction],
+        flow: &Graph,
+        target: usize,
+        end: usize,
+    ) -> Option<usize> {
+        let copy = target.checked_sub(self.width)?;
+        (end == self.first
+            && flow.block(copy).ops == (copy..target)
+            && flow.handler(copy).is_none()
+            && flow.block(copy).height == Some(1)
+            && ops[copy].name == "POP_EXCEPT"
+            && super::comparisons::same_instructions(
+                &ops[copy..target],
+                &ops[end..end + self.width],
+            ))
+        .then_some(copy)
     }
 
     pub(super) fn destination(self, target: usize) -> usize {
@@ -106,9 +164,9 @@ pub(super) fn collect(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Handlers {
     result
 }
 
-/// If a coroutine only raises, there is no return instruction to delimit
-/// its body. Include continuations reachable solely through an except clause.
-pub(super) fn returnless_end(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<usize> {
+/// Include normal continuations reachable solely through an except clause.
+/// A coroutine can also lack a return instruction to delimit its body.
+pub(super) fn handled_end(bc: &Bytecode, owner: &Body<'_, '_, '_>) -> Option<usize> {
     let mut starts = vec![0];
     for group in groups(bc) {
         let entry = group.first()?;
@@ -223,29 +281,34 @@ fn region(
         return None;
     }
 
+    let (unwind, cleanup) = super::dispatch::unwind(ops, flow, dispatch, first.depth + 1)?;
+    let finalizer = unwind.start == ops[dispatch].offset
+        && ops[dispatch + 1].name != "POP_TOP"
+        && ops[dispatch + 1].name != "BUILD_LIST"
+        && super::dispatch::typed_handler(flow, ops, dispatch + 1).is_none()
+        && super::finalizers::owns_cleanup(ops, owner, dispatch..cleanup, unwind);
+    if finalizer
+        && let Some(region) = returning_finally_loop(ops, owner, entries, start, dispatch, cleanup)
+    {
+        return Some((start, region));
+    }
     let end = protected_end(ops, flow, entries, inner)?;
     if end > dispatch {
         return None;
     }
-    let (unwind, cleanup) = super::dispatch::unwind(ops, flow, dispatch, first.depth + 1)?;
-    if unwind.start == ops[dispatch].offset
-        && super::finalizers::owns_cleanup(ops, flow, dispatch..cleanup, unwind)
-        && ops[dispatch + 1].name != "POP_TOP"
-        && ops[dispatch + 1].name != "BUILD_LIST"
-        && super::dispatch::typed_handler(flow, ops, dispatch + 1).is_none()
-        && let Some(finally) = finally_region(ops, owner, start..end, dispatch, cleanup)
-    {
+    if finalizer && let Some(finally) = finally_region(ops, owner, start..end, dispatch, cleanup) {
         return Some((start, finally));
     }
     let mut following = Vec::new();
+    let mut following_join = None;
     let (kind, binding, stop) = if ops.get(dispatch + 1)?.name == "POP_TOP" {
         (None, dispatch + 1, cleanup)
     } else {
         let (check, pop, failed) = super::dispatch::typed_handler(flow, ops, dispatch + 1)?;
         if failed + 1 != cleanup || (ops[failed].name, ops[failed].arg) != ("RERAISE", 0) {
-            // Further matches that only raise have no normal continuation
-            // to reconcile with the first arm or the successful try.
-            following = owner.raising_arms(ops, failed, cleanup)?;
+            // Any later matches that fall through must rejoin the same
+            // iterator as the first arm. Check that after placing its else.
+            (following, following_join) = owner.following_arms(ops, failed, cleanup)?;
         }
         let stop = if ops[pop].name == "POP_TOP" {
             failed
@@ -260,9 +323,47 @@ fn region(
     // An inline handler rejoins just past its unwind. When the try returns,
     // that edge comes from POP_EXCEPT in the handler. Include RETURN_VALUE
     // in the try suite before resuming at the jump target.
+    // A successful try returns immediately. An exception in the try can
+    // reach a separate raise *after* POP_EXCEPT, with the caller's exception
+    // restored. It must not run under the matching except.
+    let after_handler = if end + 1 == dispatch
+        && ops[end].name == "RETURN_VALUE"
+        && kind.is_some()
+        && following.is_empty()
+        && ops[stop - 1].name == "RAISE_VARARGS"
+        && let Some((pop, after)) = Body::handler_pop(ops, binding, stop)
+        && after < stop
+        && flow.block(pop).ops == (pop..stop)
+        && flow.handler(pop).is_none_or(|h| h.target != unwind.target)
+    {
+        Some((pop, after))
+    } else {
+        None
+    };
     let after_cleanup = cleanup + 3;
+    let mut success = end..end;
     let (end, mut next) = match ops.get(end..dispatch)? {
-        [jump] if jump.name == "JUMP_FORWARD" && flow.jump(end) == Some(after_cleanup) => {
+        _ if let Some((_, after)) = after_handler => (dispatch, after),
+        [swap, pop, ret]
+            if (swap.name, swap.arg) == ("SWAP", 2)
+                && pop.name == "POP_EXCEPT"
+                && ret.name == "RETURN_VALUE"
+                && first.depth == 1
+                && enclosing_exception(ops, flow, end, cleanup)
+                && flow.handler(end + 1).is_none() =>
+        {
+            // Returning the inner try's value also exits an enclosing except.
+            // The value was evaluated with that exception still active.
+            (dispatch, dispatch)
+        }
+        [.., jump]
+            if jump.name == "JUMP_FORWARD"
+                && flow.jump(dispatch - 1) == Some(after_cleanup)
+                && (end + 1 == dispatch || flow.block(end).ops == (end..dispatch)) =>
+        {
+            // A straight-line else runs outside the inner protection. Both
+            // the successful try and a handled exception skip the unwind.
+            success = end..dispatch - 1;
             (end, after_cleanup)
         }
         [ret]
@@ -284,10 +385,24 @@ fn region(
         _ => None,
     }
     .filter(|&i| i < start && flow.for_iter_depth(i) == Some(first.depth));
-    let mut success = next..next;
     let mut handler_tail = None;
     let mut handler_exits = None;
     let handler = match ops.get(body..stop)? {
+        _ if let Some((pop, _)) = after_handler => body..pop,
+        _ if let Some(child_end) =
+            returning_handler_child(ops, flow, body..stop, unwind, inner) =>
+        {
+            body..child_end
+        }
+        _ if !bound
+            && end == dispatch
+            && first.depth == 1
+            && let Some((expression_end, tail)) =
+                nested_handler_return(ops, flow, body..stop, cleanup) =>
+        {
+            handler_tail = Some(tail..stop);
+            body..expression_end
+        }
         [.., raise] if raise.name == "RAISE_VARARGS" => body..stop,
         [.., jump]
             if matches!(
@@ -297,7 +412,13 @@ fn region(
                 && after == stop - 1
                 && let Some(to) = flow.jump(stop - 1) =>
         {
-            if to != next && Some(to) != for_header {
+            // A while loop's normal latch and handler can both jump straight
+            // to the header. Falling out of this try reaches the same latch.
+            let shared_latch = ops[next].name == "JUMP_BACKWARD"
+                && to < start
+                && flow.jump(next) == Some(to)
+                && flow.block(to).height == Some(first.depth);
+            if to != next && Some(to) != for_header && !shared_latch {
                 // The handler skips the rest of this iteration. Only a jump
                 // to the enclosing iterator at its saved depth is a continue.
                 if ops[to].name != "FOR_ITER"
@@ -307,7 +428,16 @@ fn region(
                 {
                     return None;
                 }
-                handler_tail = Some(stop - 1..stop);
+                // A handler consisting only of the backedge can be a source
+                // continue followed by ordinary statements in the loop.
+                if body < pop
+                    && let Some(latch) = iterator_success_latch(owner, ops, start..next, to)
+                {
+                    success = next..latch;
+                    next = latch;
+                } else {
+                    handler_tail = Some(stop - 1..stop);
+                }
             }
             body..pop
         }
@@ -370,9 +500,22 @@ fn region(
             body..handler_exits.map_or(pop, |copies| copies.first)
         }
     };
+    let try_exits = loop_exits::copied_latch(ops, flow, start..end, next);
+    if try_exits.is_some() {
+        next += 1;
+    }
+    if let Some(header) = following_join
+        && (ops[header].name != "FOR_ITER"
+            || flow.for_iter_depth(header) != Some(first.depth)
+            || ops[next].name != "JUMP_BACKWARD"
+            || flow.jump(next) != Some(header))
+    {
+        return None;
+    }
     Some((
         start,
         Protected {
+            return_exits: Vec::new(),
             end,
             next,
             clause: Clause::Except {
@@ -381,149 +524,12 @@ fn region(
                 success,
                 following,
             },
-            try_exits: None,
+            try_exits,
             handler_exits,
             handler,
             handler_tail,
         },
     ))
-}
-
-/// A guarded return evaluates its value under protection but returns it
-/// outside the table. In a for loop the same block first drops the iterator.
-/// The other arm skips the whole epilogue and continues after the try.
-fn guarded_return_end(
-    ops: &[Instruction],
-    flow: &Graph,
-    suite: Range<usize>,
-    dispatch: usize,
-    depth: usize,
-) -> Option<usize> {
-    let block = flow.block(suite.end);
-    let next = block.ops.end;
-    if block.ops.start != suite.end
-        || next >= dispatch
-        || flow.handler(suite.end).is_some()
-        || block.height != Some(depth + 1)
-        || !flow
-            .incoming(next)
-            .any(|i| suite.contains(&i) && ops[i].name.starts_with("POP_JUMP_IF_"))
-    {
-        return None;
-    }
-    let (ret, cleanup) = ops[block.ops.clone()].split_last()?;
-    if ret.name != "RETURN_VALUE" {
-        return None;
-    }
-    match cleanup {
-        [] if depth == 0 => Some(next),
-        [swap, pops @ ..]
-            if depth > 0
-                && swap.name == "SWAP"
-                && swap.arg as usize == depth + 1
-                && pops.len() == depth
-                && pops.iter().all(|op| op.name == "POP_TOP")
-                && flow.jump(next).is_some_and(|header| {
-                    ops[header].name == "FOR_ITER" && flow.for_iter_depth(header) == Some(depth)
-                }) =>
-        {
-            Some(next)
-        }
-        _ => None,
-    }
-}
-
-/// Match the normal copy to the exceptional one, up to its final reraise.
-fn finally_region(
-    ops: &[Instruction],
-    owner: &Body<'_, '_, '_>,
-    suite: Range<usize>,
-    dispatch: usize,
-    cleanup: usize,
-) -> Option<Protected> {
-    let flow = &owner.flow;
-    let reraise = cleanup.checked_sub(1)?;
-    let exceptional = dispatch + 1..reraise;
-    if exceptional.is_empty() || (ops[reraise].name, ops[reraise].arg) != ("RERAISE", 0) {
-        return None;
-    }
-    let terminal = ops[exceptional.clone()]
-        .iter()
-        .any(|op| (op.name, op.arg) == ("RERAISE", 0));
-    let copy = if terminal {
-        dispatch + 1..cleanup
-    } else {
-        exceptional
-    };
-    let end = suite.end;
-    // If every normal path raises, CPython emits only the exceptional copy.
-    if ops[end - 1].name == "RAISE_VARARGS"
-        && flow.blocks_in(suite.clone()).all(|block| {
-            let last = block.ops.end - 1;
-            let jump = flow.jump(last);
-            let fallthrough = flow.fallthrough(block);
-            [jump, fallthrough]
-                .into_iter()
-                .flatten()
-                .all(|dest| suite.contains(&dest))
-                && (jump.is_some() || fallthrough.is_some() || ops[last].name == "RAISE_VARARGS")
-        })
-    {
-        return Some(Protected {
-            end,
-            next: end,
-            clause: Clause::Finally {
-                deferred_return: end..end,
-                terminal_unwind: terminal.then_some(ops[cleanup].offset),
-            },
-            handler: copy,
-            try_exits: None,
-            handler_exits: None,
-            handler_tail: None,
-        });
-    }
-    let marker = ops[end].name == "NOP";
-    let deferred = marker && !break_marker(ops, flow, suite);
-    let start = end + usize::from(marker);
-    let normal = start..owner.finally_copy_end(ops, start..dispatch, copy.clone(), terminal)?;
-    // A return of a constant can leave a tracing NOP at its original site,
-    // with the constant materialized only after the normal cleanup.
-    let mut next = normal.end;
-    if deferred && !terminal {
-        next += match ops.get(next..)? {
-            [ret, ..] if ret.name == "RETURN_CONST" => 1,
-            [load, ret, ..]
-                if matches!(
-                    load.name,
-                    "LOAD_CONST" | "LOAD_COMMON_CONSTANT" | "LOAD_SMALL_INT"
-                ) && ret.name == "RETURN_VALUE" =>
-            {
-                2
-            }
-            _ => return None,
-        };
-    }
-    Some(Protected {
-        end,
-        next,
-        clause: Clause::Finally {
-            deferred_return: normal.end..next,
-            terminal_unwind: terminal.then_some(ops[cleanup].offset),
-        },
-        handler: if terminal { copy } else { normal },
-        try_exits: None,
-        handler_exits: None,
-        handler_tail: None,
-    })
-}
-
-/// A break can jump to a tracing NOP before the finalizer. Its operand
-/// stack is empty there and execution continues after cleanup.
-fn break_marker(ops: &[Instruction], flow: &Graph, suite: Range<usize>) -> bool {
-    ops[suite.end].name == "NOP"
-        && flow.incoming(suite.end).any(|i| {
-            suite.contains(&i) && ops[i].name == "JUMP_FORWARD" && flow.jump(i) == Some(suite.end)
-        })
 }
 
 fn protected_end(
@@ -577,6 +583,20 @@ fn protected_end(
             if index(entry.end)? != expected_end {
                 return None;
             }
+            continue;
+        }
+        if end < at
+            && iterator_return_block(ops, flow, end..at, first.depth)
+            && flow.incoming(at).any(|i| {
+                i < end
+                    && flow.jump(i) == Some(at)
+                    && ops[i].name.starts_with("POP_JUMP_IF_")
+                    && flow.handler(i).is_some_and(|h| {
+                        (h.target, h.depth, h.lasti) == (first.target, first.depth, false)
+                    })
+            })
+        {
+            end = index(entry.end)?;
             continue;
         }
         // Once TO_BOOL succeeded, newer targets leave both the conditional
@@ -670,7 +690,7 @@ impl Body<'_, '_, '_> {
             .then_some(child.next)
     }
 
-    fn protected_fragment(
+    pub(super) fn protected_fragment(
         &mut self,
         ops: &[Instruction],
         body: Range<usize>,
@@ -689,14 +709,17 @@ impl Body<'_, '_, '_> {
         start: usize,
         limit: usize,
         level: usize,
-        entry: &Protected,
+        entry: &mut Protected,
     ) -> Result<Option<usize>, String> {
         if entry.next > limit || !self.stack.is_empty() {
             return Ok(None);
         }
-        let (mut suite, returns) = self
-            .protected_fragment(ops, start..entry.end, level, entry.try_exits)?
-            .pending_return()?;
+        let outer = std::mem::replace(&mut self.active_try, self.flow.handler(start));
+        std::mem::swap(&mut self.return_exits, &mut entry.return_exits);
+        let suite = self.protected_fragment(ops, start..entry.end, level, entry.try_exits);
+        std::mem::swap(&mut self.return_exits, &mut entry.return_exits);
+        self.active_try = outer;
+        let (mut suite, returns) = suite?.pending_return()?;
         let mut next = entry.next;
         let carried = returns && next == limit && matches!(entry.clause, Clause::Finally { .. });
         if returns && !carried {
@@ -707,7 +730,7 @@ impl Body<'_, '_, '_> {
         }
         let header = match &entry.clause {
             Clause::Except { kind, binding, .. } => {
-                self.except_header(ops, kind.clone(), *binding, level)?
+                self.except_header(ops, "except", kind.clone(), *binding, level)?
             }
             Clause::Finally {
                 deferred_return, ..

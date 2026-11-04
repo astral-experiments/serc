@@ -23,6 +23,12 @@ pub(super) fn constant_return(ops: &[Instruction], end: usize) -> Option<(usize,
     }
 }
 
+pub(super) struct ReturnExit {
+    pub(super) start: usize,
+    pub(super) ret: usize,
+    pub(super) pending: bool,
+}
+
 pub(super) struct Fragment {
     lines: String,
     pub(super) stack: Vec<Value>,
@@ -225,19 +231,19 @@ impl Body<'_, '_, '_> {
         operand_start: Option<usize>,
     ) -> Result<usize, String> {
         if let Ok(n) = self
-            .manager_exits
+            .return_exits
             .binary_search_by_key(&i, |exit| exit.start)
         {
-            let exit = &self.manager_exits[n];
+            let exit = &self.return_exits[n];
             if self.stack.len() != usize::from(exit.pending) || exit.ret >= end {
-                return Err("unsupported early return through with".into());
+                return Err("unsupported return through cleanup".into());
             }
             return Ok(exit.ret);
         }
-        if let Some(handler) = self.handlers.remove(&i) {
+        if let Some(mut handler) = self.handlers.remove(&i) {
             // The protected fragment re-enters this same instruction. Leave other
             // entries available, including nested tries in the exception suite.
-            let result = self.protected_region(ops, i, end, level, &handler);
+            let result = self.protected_region(ops, i, end, level, &mut handler);
             self.handlers.insert(i, handler);
             if let Some(next) = result? {
                 return Ok(next);
@@ -346,6 +352,7 @@ impl Body<'_, '_, '_> {
                 self.line("break")?;
                 Ok(self.flow.block(i).ops.end)
             }
+            "POP_EXCEPT" if let Some(jump) = self.handler_continue(ops, i, end) => Ok(jump),
             "SWAP" | "POP_TOP" if let Some(next) = self.iterator_return(ops, i, end) => Ok(next),
             "SWAP" if let Some(ret) = self.handler_value_return(ops, i, end) => Ok(ret),
             "SWAP" if super::comparisons::is_link(&ops[i..end]) => {

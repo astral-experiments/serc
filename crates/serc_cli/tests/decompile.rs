@@ -3136,6 +3136,439 @@ result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is 
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_suspended_cleanups_final_guard_rejoins_the_while_test() {
+    check_fixture(
+        r"async def drain(tasks, errors):
+    seen = []
+    while tasks:
+        task = tasks.pop()
+        try:
+            if await task():
+                seen.append(1)
+        except ValueError as exc:
+            errors.append(exc.args)
+    return seen
+
+def first_loop(step):
+    while 1:
+        value = step()
+        if value is None:
+            return
+        if value:
+            break
+    return value
+",
+        r"import asyncio
+result = []
+def task(value):
+    async def run():
+        if value < 0: raise ValueError(value)
+        return value
+    return run
+errors = []
+result.append((asyncio.run(drain(list(map(task, [1, 0, -1, 1])), errors)), errors))
+result.append(tuple(type(c).__name__ for c in first_loop.__code__.co_consts))
+for seq in ([0, 2], [None]):
+    result.append(first_loop(iter(seq).__next__))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn only_the_successful_iteration_enters_the_delegating_else_suite() {
+    check_fixture(
+        r"def walk(items, visit, fail):
+    for item in items:
+        yield item
+        if item:
+            try:
+                visit(item)
+            except KeyError:
+                if fail is not None:
+                    fail(item)
+            except ValueError:
+                if fail is not None:
+                    fail(item)
+                else:
+                    raise
+            else:
+                yield from children(item)
+",
+        r"import sys
+result = []
+def visit(item):
+    if item == 1: raise KeyError()
+    if item == 2: raise ValueError()
+def children(item):
+    yield item * 10
+    if item == 4: raise KeyError('during else')
+def record(item): result.append((item, type(sys.exception()).__name__))
+for callback in (record, None):
+    try: result.extend(walk(range(5), visit, callback))
+    except Exception as exc: result.append((type(exc).__name__, exc.args))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_later_handler_can_continue_the_iterator_or_reraise() {
+    check_fixture(
+        r"def reserve(items, attempt, retry):
+    for item in items:
+        try:
+            value = attempt(item)
+        except FileExistsError:
+            continue
+        except PermissionError:
+            if retry(item):
+                continue
+            else:
+                raise
+        return value, item
+    raise FileExistsError()
+",
+        r"import sys
+result = []
+def attempt(item):
+    result.append(('attempt', item, sys.exception() is None))
+    if item == 0: raise FileExistsError()
+    if item < 0: raise PermissionError(item)
+    return 7
+def retry(item):
+    result.append(('retry', sys.exception().args))
+    return item == -1
+for items in ([0, -1, 4], [-2, 7], [0]):
+    try: result.append(reserve(items, attempt, retry))
+    except OSError as exc: result.append((type(exc).__name__, exc.args))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn separate_bound_handler_arms_reach_their_own_cleanup() {
+    check_fixture(
+        r"def send(work, first, record):
+    try:
+        work()
+    except BlockingIOError:
+        pass
+    except OSError as exc:
+        if first:
+            msg = str(exc)
+            record(msg)
+        else:
+            record(exc.args)
+    except KeyboardInterrupt:
+        raise
+    else:
+        record('sent')
+",
+        r"import sys
+result = []
+for kind in (None, OSError, BlockingIOError, KeyboardInterrupt):
+    for first in (True, False):
+        def work():
+            if kind: raise kind('failed')
+        def record(value):
+            result.append((value, type(sys.exception()).__name__))
+        try: send(work, first, record)
+        except KeyboardInterrupt: result.append('interrupted')
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn cleanup_handlers_and_folded_breaks_rejoin_their_own_loop() {
+    check_fixture(
+        r"def drain(items, run, errors):
+    while items:
+        task = items.pop()
+        try:
+            run(task)
+        except ValueError as exc:
+            errors.append(exc.args)
+    if errors:
+        return errors[0]
+
+def run_all(items, state):
+    for i, item in enumerate(items):
+        if state:
+            break
+        item(state)
+    return state
+",
+        r"result = []
+def work(task):
+    result.append(task)
+    if task % 2: raise ValueError(task)
+result.append(drain([1, 2, 3], work, []))
+for state in ([], [7]):
+    out = run_all([lambda s: s.append(1), lambda s: s.append(2)], state)
+    result.append((out is state, list(out)))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_raise_after_a_handled_return_runs_with_the_caller_exception() {
+    check_fixture(
+        r"async def advance(read, failure):
+    try:
+        return read()
+    except StopIteration:
+        pass
+    raise failure()
+",
+        r"import asyncio, sys
+result = []
+async def check(items):
+    try:
+        raise LookupError('caller')
+    except LookupError:
+        def failure():
+            result.append(sys.exception().args)
+            return StopAsyncIteration()
+        try: result.append(await advance(iter(items).__next__, failure))
+        except StopAsyncIteration as error: result.append(error.__context__.args)
+asyncio.run(check([1]))
+asyncio.run(check([]))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn exception_groups_offer_the_remainder_to_each_handler() {
+    check_fixture(
+        r"def dispatch(work, observe, fail):
+    try:
+        work()
+    except* ValueError as values:
+        observe(values)
+        if fail:
+            raise RuntimeError('new') from values
+    except* OSError as errors:
+        observe(errors)
+    else:
+        observe(None)
+    observe('after')
+",
+        r"import sys
+result = []
+def shape(e):
+    if isinstance(e, BaseExceptionGroup): return (e.message, tuple(map(shape, e.exceptions)))
+    if isinstance(e, BaseException): return (type(e).__name__, e.args)
+    return e
+def observe(e): result.append((shape(e), shape(sys.exception())))
+for children in ([], [ValueError('v')], [OSError('io')], [ValueError(1), OSError(2)], [ExceptionGroup('nested', [OSError(1), KeyError(2)]), ValueError(3)]):
+    for fail in (True, False):
+        def work():
+            if children: raise ExceptionGroup('original', children)
+        try: dispatch(work, observe, fail)
+        except BaseException as exc: result.append(('raised', shape(exc)))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_nested_try_else_rejoins_the_outer_exception_handler() {
+    check_fixture(
+        r"def probe(work, record):
+    try:
+        work(0)
+    except KeyError:
+        record('caught')
+        try:
+            work(1)
+        except LookupError:
+            pass
+        else:
+            work(2)
+        record('joined')
+        raise TypeError() from None
+    return 7
+",
+        r"import sys
+result = []
+for outcomes in ([], [KeyError], [KeyError, IndexError], [KeyError, ValueError], [KeyError, None, IndexError]):
+    def record(tag):
+        exc = sys.exception()
+        result.append((tag, type(exc).__name__))
+    def work(i):
+        record(i)
+        if i < len(outcomes) and outcomes[i]: raise outcomes[i]()
+    try: result.append(probe(work, record))
+    except Exception as exc: result.append((type(exc).__name__, type(exc.__context__).__name__))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn guarded_handler_exits_restore_a_bound_exception_in_each_dispatch_arm() {
+    check_fixture(
+        r"def handle(work, record, notify):
+    try:
+        work()
+    except BlockingIOError:
+        pass
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:
+        record(exc)
+        if notify:
+            record(exc)
+    else:
+        record(None)
+",
+        r"import sys
+result = []
+def record(exc):
+    result.append((getattr(exc, 'args', ()), exc is sys.exception()))
+for kind in (None, BlockingIOError, KeyboardInterrupt, ValueError):
+    def work():
+        if kind: raise kind('work')
+    for notify in (False, True):
+        try: handle(work, record, notify)
+        except KeyboardInterrupt: result.append('interrupted')
+        record(None)
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_except_returns_restore_the_active_exceptions_in_order() {
+    for fallback in ["False", "read(2)"] {
+        let source = format!(
+            "def lookup(read):\n    try:\n        return read(0)\n    except KeyError:\n        try:\n            return read(1)\n        except KeyError:\n            return {fallback}\n"
+        );
+        check_fixture(
+            &source,
+            r"import sys
+result = []
+def run(errors):
+    def read(i):
+        current = sys.exception()
+        result.append((i, current.args if current else ()))
+        if i < len(errors): raise errors[i](i)
+        return i
+    try: result.append(lookup(read))
+    except Exception as exc: result.append((type(exc).__name__, exc.args))
+for failures in ([], [KeyError], [ValueError], [KeyError, KeyError], [KeyError, ValueError], [KeyError, KeyError, RuntimeError]):
+    try: raise OSError('caller')
+    except OSError:
+        run(failures)
+        result.append(sys.exception().args)
+",
+        );
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn either_return_can_consume_the_iterator_after_a_protected_call() {
+    check_fixture(
+        r"def choose(items, select, build):
+    for item in items:
+        try:
+            if select(item):
+                return build(item, 1)
+            else:
+                return build(item, 2)
+        except KeyError:
+            pass
+    return None
+",
+        r"import sys
+result = []
+def select(item):
+    result.append(('select', item, sys.exception() is None))
+    if item == 'skip': raise KeyError()
+    return item != 'second'
+def build(item, arm):
+    result.append(('build', item, arm))
+    if item == 'bad': raise KeyError()
+    return arm
+for items in ([], ['bad', 'skip'], ['bad', 'first'], ['skip', 'second', 'unused']):
+    result.append(choose(items, select, build))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn returning_loops_await_the_finalizer_on_every_exit() {
+    check_fixture(
+        r"async def transfer(limit, read, write, record, restore):
+    sent = 0
+    try:
+        while True:
+            if limit:
+                if sent >= limit:
+                    return sent
+            item = await read()
+            if not item:
+                return sent
+            await write(item)
+            sent += item
+    finally:
+        if sent:
+            record(sent)
+        await restore()
+
+async def count(read, seek):
+    total = 0
+    try:
+        while True:
+            n = await read()
+            if n <= 0:
+                return total
+            total += n
+    finally:
+        if total > 0:
+            seek(total)
+",
+        r"import asyncio, sys
+result = []
+async def run(limit, failure, replace):
+    pieces = iter([1, 2, 0])
+    def record(event): result.append((event, type(sys.exception()).__name__))
+    async def read():
+        value = next(pieces)
+        record(('read', value))
+        await asyncio.sleep(0)
+        if value == 2 and failure == 'read': raise asyncio.CancelledError()
+        return value
+    async def write(value):
+        record(('write', value))
+        await asyncio.sleep(0)
+        if value == 2 and failure == 'write': raise OSError()
+    async def restore():
+        record('restore')
+        await asyncio.sleep(0)
+        if replace: raise LookupError()
+    try: result.append(await transfer(limit, read, write, record, restore))
+    except BaseException as exc: result.append(type(exc).__name__)
+    pieces = iter([1, 2, 0] if limit else [0])
+    try: result.append(await count(read, record))
+    except BaseException as exc: result.append(type(exc).__name__)
+for limit in (0, 1, 3):
+    for failure in (None, 'write', 'read'):
+        for replace in (False, True):
+            asyncio.run(run(limit, failure, replace))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn finalizers_protect_loop_predicates_and_pending_managed_returns() {
     check_fixture(
         r"def run(step, ready, cleanup):

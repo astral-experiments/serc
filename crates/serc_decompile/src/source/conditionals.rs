@@ -302,6 +302,9 @@ impl Body<'_, '_, '_> {
     // CPython can thread a nested arm directly to the enclosing join.
     // Falling off this fragment runs the caller's jump to the same place.
     fn local_join(&self, ops: &[Instruction], destination: usize, end: usize) -> usize {
+        let destination = self
+            .clause_exits
+            .map_or(destination, |copies| copies.destination(destination));
         if self.arm_exit == Some((end, destination))
             || (destination > end
                 && ops.get(end).is_some_and(|op| op.name == "JUMP_FORWARD")
@@ -380,6 +383,9 @@ impl Body<'_, '_, '_> {
         }
         if self.loop_edges.is_some()
             && let Some(handler) = self.flow.handler(i)
+            && self
+                .active_try
+                .is_none_or(|active| active.target != handler.target)
             && !handler.lasti
             && handler.depth > 0
             && ops
@@ -409,6 +415,26 @@ impl Body<'_, '_, '_> {
             let no = self.fragment(ops, target, end - 2, level)?.expression()?;
             self.push(format!("({yes} if {test} else {no})"))?;
             return Ok(end - 2);
+        }
+        if fallthrough_end == target
+            && target < end
+            && self.stack.is_empty()
+            && let Some(copy) = self
+                .clause_exits
+                .and_then(|exits| exits.before_arm(ops, &self.flow, target, end))
+            && copy >= start
+            && self.flow.blocks_covering(start..copy).all(|b| {
+                [self.flow.jump(b.ops.end - 1), self.flow.fallthrough(b)]
+                    .into_iter()
+                    .flatten()
+                    .all(|to| (start..=copy).contains(&to))
+            })
+        {
+            let left = self.fragment(ops, start, copy, level)?.suite()?;
+            let right = self.fragment(ops, target, end, level)?.suite()?;
+            self.block(&format!("if {test}:"), &left)?;
+            self.block("else:", &right)?;
+            return Ok(end);
         }
         if self.loop_transfer(ops, tail).is_some() {
             let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
@@ -553,6 +579,13 @@ impl Body<'_, '_, '_> {
                     if ops[tail].name == "RETURN_CONST"
                         || ops[end - 1].name == "RETURN_CONST"
                         || (target + 2 == end && ops[target].name == "LOAD_FAST_BORROW")
+                        // Two unprotected iterator cleanups are separate
+                        // returns. A conditional expression shares its cleanup.
+                        || self.active_try.is_some_and(|h| {
+                            [tail, end - 1].into_iter().all(|ret|
+                                super::protected_regions::iterator_return_block(
+                                    ops, &self.flow, self.flow.block(ret).ops.clone(), h.depth))
+                        })
                     {
                         self.block(&format!("if {test}:"), &suite)?;
                         self.line(&format!("return {b}"))?;

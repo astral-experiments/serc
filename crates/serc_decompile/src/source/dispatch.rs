@@ -4,6 +4,7 @@ use std::ops::Range;
 
 use serc_bytecode::instructions::Handler;
 
+use super::protected_regions::ExitCopies;
 use super::{Body, Instruction};
 use crate::flow::Graph;
 
@@ -19,6 +20,7 @@ pub(super) struct Arm {
     binding: usize,
     body: Range<usize>,
     exit: Exit,
+    copies: Option<ExitCopies>,
 }
 
 enum Exit {
@@ -80,15 +82,26 @@ impl Body<'_, '_, '_> {
     }
 
     fn cleared_name(&self, ops: &[Instruction], cleanup: usize) -> Option<Instruction> {
-        let [none, store, delete, reraise] = ops.get(cleanup..cleanup + 4)? else {
+        let reraise = ops.get(cleanup + 3)?;
+        if (reraise.name, reraise.arg) != ("RERAISE", 1) {
+            return None;
+        }
+        self.cleared_binding(ops, cleanup)
+    }
+
+    pub(super) fn cleared_binding(
+        &self,
+        ops: &[Instruction],
+        cleanup: usize,
+    ) -> Option<Instruction> {
+        let [none, store, delete] = ops.get(cleanup..cleanup + 3)? else {
             return None;
         };
         let name = store.name.strip_prefix("STORE_")?;
         (matches!(none.name, "LOAD_CONST" | "LOAD_COMMON_CONSTANT")
             && self.none_constant(*none)
             && delete.name.strip_prefix("DELETE_") == Some(name)
-            && delete.arg == store.arg
-            && (reraise.name, reraise.arg) == ("RERAISE", 1))
+            && delete.arg == store.arg)
             .then_some(*store)
     }
 
@@ -310,7 +323,20 @@ impl Body<'_, '_, '_> {
                 }
                 (Some(cursor..check), binding, next)
             };
-            let (body, exit) = self.handler_body(ops, binding, next)?;
+            let (mut body, exit) = self.handler_body(ops, binding, next)?;
+            // A guard in a matching arm can jump to its own copy of POP_EXCEPT,
+            // binding cleanup, and constant return. Both exits end the arm.
+            let copies = if let Exit::Return(tail) = &exit
+                && super::regions::constant_return(ops, tail.end)
+                    .is_some_and(|(load, _)| load == tail.start)
+            {
+                ExitCopies::handler(ops, &self.flow, body.clone(), tail.end)
+            } else {
+                None
+            };
+            if let Some(copies) = copies {
+                body.end = copies.first;
+            }
             if let Exit::Jump(dest) = exit
                 && join.replace(dest).is_some_and(|old| old != dest)
             {
@@ -321,6 +347,7 @@ impl Body<'_, '_, '_> {
                 binding,
                 body,
                 exit,
+                copies,
             });
             cursor = next;
         }
@@ -333,16 +360,16 @@ impl Body<'_, '_, '_> {
         Some((arms, join))
     }
 
-    pub(super) fn raising_arms(
+    pub(super) fn following_arms(
         &self,
         ops: &[Instruction],
         start: usize,
         cleanup: usize,
-    ) -> Option<Vec<Arm>> {
-        let (arms, _) = self.handler_arms(ops, start, cleanup)?;
+    ) -> Option<(Vec<Arm>, Option<usize>)> {
+        let (arms, join) = self.handler_arms(ops, start, cleanup)?;
         arms.iter()
-            .all(|arm| matches!(arm.exit, Exit::Raise))
-            .then_some(arms)
+            .all(|arm| matches!(arm.exit, Exit::Raise | Exit::Jump(_)))
+            .then_some((arms, join))
     }
 
     /// Locate `POP_EXCEPT` and the first instruction after normal binding cleanup.
@@ -408,11 +435,12 @@ impl Body<'_, '_, '_> {
     pub(super) fn except_header(
         &mut self,
         ops: &[Instruction],
+        keyword: &str,
         kind: Option<Range<usize>>,
         binding: usize,
         level: usize,
     ) -> Result<String, String> {
-        let mut header = "except".to_owned();
+        let mut header = keyword.to_owned();
         if let Some(kind) = kind {
             header.push(' ');
             header.push_str(
@@ -442,8 +470,8 @@ impl Body<'_, '_, '_> {
         level: usize,
         keep_return: bool,
     ) -> Result<(), String> {
-        let header = self.except_header(ops, arm.kind.clone(), arm.binding, level)?;
-        let fragment = self.fragment(ops, arm.body.start, arm.body.end, level)?;
+        let header = self.except_header(ops, "except", arm.kind.clone(), arm.binding, level)?;
+        let fragment = self.protected_fragment(ops, arm.body.clone(), level, arm.copies)?;
         let mut suite = if matches!(arm.exit, Exit::ReturnValue) {
             let (suite, returns) = fragment.pending_return()?;
             if !returns {

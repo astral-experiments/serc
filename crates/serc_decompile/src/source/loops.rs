@@ -28,6 +28,28 @@ fn local_return(ops: &[Instruction], end: usize) -> Option<usize> {
 }
 
 impl Body<'_, '_, '_> {
+    /// 3.14+ retains the first constant loop test even after folding it.
+    /// A leading loop can therefore distinguish `while 1` from `while True`.
+    fn constant_loop(
+        &mut self,
+        ops: &[Instruction],
+        marker: usize,
+        suite: &str,
+    ) -> Result<(), String> {
+        if self.m.version >= super::PythonVersion::Py314
+            && ops[..marker]
+                .iter()
+                .all(|op| matches!(op.name, "COPY_FREE_VARS" | "MAKE_CELL" | "RESUME"))
+            && let Some(&id) = self.m.tuple(self.code.constants)?.first()
+            && let super::Object::Int(value) = self.m.objects[id]
+            && value != 0
+        {
+            self.block(&format!("while {value}:"), suite)
+        } else {
+            self.block("while True:", suite)
+        }
+    }
+
     fn copied_return(
         &self,
         ops: &[Instruction],
@@ -44,13 +66,12 @@ impl Body<'_, '_, '_> {
             // The entire arm discards exactly this iterator before reading
             // the same local as the continuation. A return from a nested
             // iterator would have additional slots to unwind.
+            let cleanup = block.ops.start + usize::from(ops[block.ops.start].name == "NOT_TAKEN");
             if block.ops.end != end
-                || at - block.ops.start != slots
+                || at.checked_sub(cleanup) != Some(slots)
                 || block.height != Some(slots)
                 || self.flow.handler(at).is_some()
-                || ops[block.ops.start..at]
-                    .iter()
-                    .any(|op| op.name != "POP_TOP")
+                || ops[cleanup..at].iter().any(|op| op.name != "POP_TOP")
             {
                 return None;
             }
@@ -131,7 +152,7 @@ impl Body<'_, '_, '_> {
         };
         let mut suite = body.suite()?;
         writeln!(suite, "if {test}:\n    break").unwrap();
-        self.block("while True:", &suite)?;
+        self.constant_loop(ops, nop, &suite)?;
         Ok(Some(jump + 1))
     }
 
@@ -148,6 +169,46 @@ impl Body<'_, '_, '_> {
         } else {
             None
         }
+    }
+
+    /// A continue inside a handler restores the saved exception before it
+    /// jumps. Only drop that slot when the destination is the active iterator
+    /// and the preceding instructions belong to its handler's unwind range.
+    pub(super) fn handler_continue(
+        &self,
+        ops: &[Instruction],
+        pop: usize,
+        limit: usize,
+    ) -> Option<usize> {
+        let jump = pop + 1;
+        if !self.stack.is_empty() || jump >= limit || self.loop_transfer(ops, jump)? != "continue" {
+            return None;
+        }
+        let header = self.flow.jump(jump)?;
+        if ops[header].name != "FOR_ITER" {
+            return None;
+        }
+        let depth = self.flow.for_iter_depth(header)? + 1;
+        let block = self.flow.block(pop);
+        let mut from = pop.checked_sub(1)?;
+        if ops[from].name == "NOT_TAKEN" {
+            from = from.checked_sub(1)?;
+        }
+        let (handler, _) = super::dispatch::unwind(ops, &self.flow, from, depth)?;
+        (block.ops.end == jump + 1
+            && matches!(
+                &ops[block.ops.start..pop],
+                [] | [Instruction {
+                    name: "NOT_TAKEN",
+                    ..
+                }]
+            )
+            && block.height == Some(depth)
+            && self
+                .flow
+                .handler(pop)
+                .is_none_or(|outer| outer.target != handler.target))
+        .then_some(jump)
     }
 
     /// At the end of an except suite's loop, a failed test can go straight
@@ -216,7 +277,10 @@ impl Body<'_, '_, '_> {
             }
             let protected = self.flow.handler(start).is_some_and(|h| {
                 let generator_exit = Some(h.target) == stop && h.depth == 0 && h.lasti;
-                !generator_exit && self.delegated_cleanup(ops, start).is_none()
+                let current = self.active_try.is_some_and(|entry| {
+                    (entry.target, entry.depth, entry.lasti) == (h.target, h.depth, h.lasti)
+                });
+                !current && !generator_exit && self.delegated_cleanup(ops, start).is_none()
             });
             if protected
                 || (start != header
@@ -241,7 +305,7 @@ impl Body<'_, '_, '_> {
         });
         let body = self.fragment(ops, nop + 1, latch, level);
         self.loop_edges = outer;
-        self.block("while True:", &body?.suite()?)?;
+        self.constant_loop(ops, nop, &body?.suite()?)?;
         if let Some(at) = copied_return {
             self.region(ops, at, self.flow.block(at).ops.end, level)?;
         }
@@ -250,7 +314,7 @@ impl Body<'_, '_, '_> {
 
     /// The out-of-line `CLEANUP_THROW` rejoins the same `END_SEND` as the
     /// in-loop `SEND`. Only accept that edge from outside the loop.
-    fn delegation_rejoins_loop(
+    pub(super) fn delegation_rejoins_loop(
         &self,
         ops: &[Instruction],
         start: usize,

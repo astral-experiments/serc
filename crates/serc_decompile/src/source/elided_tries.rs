@@ -43,9 +43,14 @@ impl Body<'_, '_, '_> {
             // paths. Its exceptional copy ends by reraising the exception.
             let copy = start + 1..cleanup - 1;
             if (ops[cleanup - 1].name, ops[cleanup - 1].arg) == ("RERAISE", 0)
-                && finalizers::owns_cleanup(ops, &self.flow, start..cleanup, handler)
+                && finalizers::owns_cleanup(ops, self, start..cleanup, handler)
                 && !copy.is_empty()
-                && let Some(after) = self.finally_copy_end(ops, cursor..normal_end, copy, false)
+                && let Some(after) = self.finally_copy_end(
+                    ops,
+                    cursor..normal_end,
+                    copy,
+                    finalizers::CopyExit::Fallthrough,
+                )
             {
                 let suite = self.fragment(ops, cursor, after, 0)?.suite()?;
                 self.block("finally:", &suite)?;
@@ -132,28 +137,19 @@ impl Body<'_, '_, '_> {
         // With a single empty clause, both paths discard the subgroup and
         // append the remainder before the same PREP_RERAISE_STAR. A handler
         // body or another type test cannot be skipped on either path.
-        let merge = |mut i: usize| {
+        let merge = |i: usize| {
             if i >= cleanup || ops[i].name != "POP_TOP" {
                 return None;
             }
-            i += 1;
-            let mut appended = false;
-            while i < cleanup {
-                match (ops[i].name, ops[i].arg) {
-                    ("LIST_APPEND", 1) if !appended => {
-                        appended = true;
-                        i += 1;
-                    }
-                    ("JUMP_FORWARD", _) => i = self.flow.jump(i).filter(|&next| next > i)?,
-                    ("CALL_INTRINSIC_2", arg)
-                        if appended && arg == BinaryIntrinsic::PREP_RERAISE_STAR.argument() =>
-                    {
-                        return Some(i);
-                    }
-                    _ => return None,
-                }
-            }
-            None
+            let (join, appended) =
+                super::exception_groups::next_match(ops, &self.flow, i + 1, cleanup)?;
+            (appended
+                && (ops[join].name, ops[join].arg)
+                    == (
+                        "CALL_INTRINSIC_2",
+                        BinaryIntrinsic::PREP_RERAISE_STAR.argument(),
+                    ))
+                .then_some(join)
         };
         if merge(taken).is_none_or(|join| merge(fall) != Some(join)) {
             return Err("unsupported elided exception group suite".into());

@@ -29,7 +29,7 @@ impl Body<'_, '_, '_> {
     }
 
     /// Resolve the exception edge of a delegated yield and verify that
-    /// its cleanup jump returns to the delegation's own `END_SEND`.
+    /// its cleanup returns to the delegation's own `END_SEND`.
     pub(super) fn delegated_cleanup(&self, ops: &[Instruction], at: usize) -> Option<usize> {
         if !self.suspended() || ops.get(at)?.name != "YIELD_VALUE" {
             return None;
@@ -44,11 +44,11 @@ impl Body<'_, '_, '_> {
             && h.end == ops.get(at + 1)?.offset
             && !h.lasti
             && ops[cleanup].name == "CLEANUP_THROW"
-            && matches!(
-                ops.get(cleanup + 1)?.name,
-                "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
-            )
-            && self.flow.jump(cleanup + 1) == Some(resume))
+            && (cleanup + 1 == resume
+                || (matches!(
+                    ops.get(cleanup + 1)?.name,
+                    "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
+                ) && self.flow.jump(cleanup + 1) == Some(resume))))
         .then_some(cleanup)
     }
 
@@ -75,11 +75,14 @@ impl Body<'_, '_, '_> {
             ops.len() - 2
         } else {
             self.handlers = super::protected_regions::collect(bc, self);
+            let handled_end = super::protected_regions::handled_end(bc, self);
             ops.iter()
                 .rposition(|op| matches!(op.name, "RETURN_VALUE" | "RETURN_CONST"))
                 // A copied return in a break arm can precede the loop latch.
-                .map(|last| (last + 1).max(self.flow.normal_end([0])))
-                .or_else(|| super::protected_regions::returnless_end(bc, self))
+                .map(|last| {
+                    (last + 1).max(handled_end.unwrap_or_else(|| self.flow.normal_end([0])))
+                })
+                .or(handled_end)
                 .ok_or("unsupported returnless suspension scope")?
         };
         if self.depth > 0 && !self.class {

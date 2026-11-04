@@ -78,6 +78,9 @@ impl Body<'_, '_, '_> {
         let star = ops
             .get(handler + 1)
             .is_some_and(|op| op.name == "BUILD_LIST");
+        if star && self.exception_group(ops, end..handler, returns)? {
+            return Ok(());
+        }
         if !star
             && returns
             && end + 1 == handler
