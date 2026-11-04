@@ -122,6 +122,7 @@ def render_legacy_target(sources: dict[str, str], g) -> str:
             f"pub(crate) const SMALL_INT_MIN: i64 = -{small_ints['_PY_NSMALLNEGINTS']};",
             f"pub(crate) const SMALL_INT_MAX: i64 = {small_ints['_PY_NSMALLPOSINTS'] - 1};",
             "",
+            *g.decoder_opcodes(opcodes),
             "pub(crate) const fn code(opcode: Opcode) -> u8 {",
             "    match opcode {",
         ]

@@ -16,6 +16,9 @@ doctest = false
 [lints]
 workspace = true
 
+[features]
+decompile = []
+
 [dependencies]
 dashu-int = { workspace = true }
 encoding_rs = { workspace = true }
