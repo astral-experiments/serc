@@ -170,7 +170,13 @@ impl Body<'_, '_, '_> {
         header: Option<usize>,
     ) -> Result<usize, String> {
         let value = self.expr()?;
-        let predicate = self.predicate(ops, i, value, end, level, header)?;
+        let mut predicate = self.predicate(ops, i, value, end, level, header)?;
+        if let Some(latch) = self.enclosing_continue_latch(ops, &predicate, end) {
+            predicate.suite = predicate.target;
+            predicate.target = end;
+            predicate.fallthrough_true = !predicate.fallthrough_true;
+            return self.while_loop(ops, &predicate, &latch, end, level);
+        }
         let fallthrough_end = predicate.target;
         self.conditional_suites(ops, &predicate, fallthrough_end, end, level)
     }
@@ -275,10 +281,14 @@ impl Body<'_, '_, '_> {
             }
             return Ok(join);
         }
-        if self.loop_edges.is_none() && end == self.terminal_returns.end {
+        // An enclosing guard can trim later copies of the very same exit.
+        // Its nested suite still reaches the end of the function on fallthrough.
+        if self.loop_edges.is_none()
+            && (self.terminal_returns.start..=self.terminal_returns.end).contains(&end)
+        {
             // A guard can return immediately, leaving the rest of the function
             // on its other edge. Keep it separate from any branches in the tail.
-            if self.none_return(&ops[start..fallthrough_end])
+            if end == self.terminal_returns.end && self.none_return(&ops[start..fallthrough_end])
                 && !self.terminal_returns.contains(&target)
                 // A conditional expression can return an owned alternate
                 // local where a separate return statement borrows it.
@@ -310,7 +320,15 @@ impl Body<'_, '_, '_> {
         let suite = self.fragment(ops, start, fallthrough_end, level)?.suite()?;
         if matches!(ops[tail].name, "RETURN_CONST" | "RETURN_VALUE")
             && end > target
-            && matches!(ops[end - 1].name, "RETURN_CONST" | "RETURN_VALUE")
+            && (matches!(ops[end - 1].name, "RETURN_CONST" | "RETURN_VALUE")
+                // A module or class return has no source statement. Its
+                // other arm must remain under an else or the raise runs on
+                // import even when the first arm completed successfully.
+                || ((self.depth == 0 || self.class)
+                    && matches!(ops[end - 1].name, "RAISE_VARARGS" | "RERAISE")))
+            // A physical return at the end of the suite can belong to a
+            // nested guard. Its other edge still enters the shared tail.
+            && !self.flow.incoming(target).any(|from| (start..fallthrough_end).contains(&from))
         {
             let other = self.fragment(ops, target, end, level)?.suite()?;
             let split_return = |s: &str| -> Option<(String, String)> {
@@ -332,10 +350,30 @@ impl Body<'_, '_, '_> {
                         self.line(&format!("return {b}"))?;
                         return Ok(end);
                     }
-                    self.line(&format!("return {a} if {test} else {b}"))?;
+                    // An enclosing return can reuse this expression as its true
+                    // arm. Python otherwise associates the outer test to the right.
+                    self.line(&format!("return ({a} if {test} else {b})"))?;
                     return Ok(end);
                 }
                 if a == b {
+                    // An early constant return can guard a loop with a
+                    // different return inside it, followed by the same
+                    // constant at exhaustion. Keep the guard's own exit.
+                    if left.is_empty()
+                        && super::regions::constant_return(ops, fallthrough_end)
+                            .is_some_and(|(at, _)| at == start)
+                        && self.flow.blocks_in(target..end).any(|block| {
+                            block.ops.end < end
+                                && matches!(
+                                    ops[block.ops.end - 1].name,
+                                    "RETURN_CONST" | "RETURN_VALUE"
+                                )
+                        })
+                    {
+                        self.block(&format!("if {test}:"), &suite)?;
+                        self.line(other.trim_end_matches('\n'))?;
+                        return Ok(end);
+                    }
                     self.block(&format!("if {test}:"), &left)?;
                     if !right.is_empty() {
                         self.block("else:", &right)?;

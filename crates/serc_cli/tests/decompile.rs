@@ -316,6 +316,33 @@ assert result == [0, True, True, 0, True, False, 'woke', 1]",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn the_last_while_arm_can_fall_out_after_earlier_backedges() {
+    check_fixture(
+        r"def walk(node, edge):
+    while node is not None:
+        if edge(node, 'left'):
+            node = node.left
+        elif edge(node, 'right'):
+            node = node.right
+        else:
+            break
+    return node
+",
+        r"class Node: pass
+a, b, leaf = Node(), Node(), Node()
+a.left, b.right = b, leaf
+calls = []
+def edge(node, name):
+    calls.append(name)
+    assert len(calls) <= 5, 'revisited the terminal node'
+    return hasattr(node, name)
+result = walk(a, edge) is leaf, calls
+assert result == (True, ['left', 'left', 'right', 'left', 'right'])",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn while_predicate_can_span_the_inlined_any_call() {
     check_fixture_on(
         r"def drain(rows):
@@ -357,6 +384,188 @@ assert result == ['ok', 'ok', 'poll', 'poll', 'poll', 'zero', 'zero']",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_nested_while_exhausts_into_the_enclosing_for() {
+    check_fixture(
+        r"def drain(counts, emit):
+    for n in counts:
+        while n > 0:
+            emit(n)
+            n -= 1
+",
+        r"result = []
+def emit(n):
+    result.append(n)
+    assert len(result) <= 3
+drain([2, 0, 1], emit)
+assert result == [2, 1, 1]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_trailing_break_test_repeats_the_whole_loop_body() {
+    check_fixture(
+        r"def drain(step, log):
+    while True:
+        n = step()
+        if not n:
+            break
+    log.append(n)
+    return n
+",
+        r"items = iter([2, 1, 0, 'unused'])
+log = []
+result = drain(items.__next__, log), next(items), log
+assert result == (0, 'unused', [0])",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_successful_match_can_skip_the_remaining_cases() {
+    check_fixture(
+        r"def resolve(name, ready, log):
+    match name:
+        case 'a':
+            return 1
+        case 'b':
+            log.append('b')
+            if ready:
+                return 2
+        case 'b':
+            return 'retried'
+        case 'c':
+            if ready:
+                return 3
+    raise KeyError(name)
+",
+        r"result = []
+for name in 'abcd':
+    for ready in [False, True]:
+        try:
+            result.append(resolve(name, ready, result))
+        except KeyError as e:
+            result.append(e.args)
+assert result == [1, 1, 'b', ('b',), 'b', 2, ('c',), 3, ('d',), ('d',)]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn an_early_return_cleans_up_the_iterator_after_evaluating_its_value() {
+    check_fixture(
+        r"def ready(items, accept):
+    for item in items:
+        if accept(item):
+            return True
+    return False
+
+def first(items, accept, convert):
+    for item in items:
+        if accept(item):
+            return convert(item)
+    return False
+",
+        r"result = []
+class Items:
+    def __iter__(self):
+        try:
+            for value in range(3):
+                result.append(value)
+                yield value
+        finally:
+            result.append('closed')
+def convert(value):
+    result.append('convert')
+    return value + 10
+assert first(Items(), lambda v: v == 1, convert) == 11
+assert ready(Items(), lambda v: v == 0)
+assert not ready([], bool)
+assert result == [0, 1, 'convert', 'closed', 0, 'closed']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_terminal_module_guard_keeps_the_raise_in_the_else() {
+    for side in ["little", "big"] {
+        let source = format!(
+            "side = '{side}'\nif side == 'little':\n    value = 1\nelif side == 'big':\n    value = 2\nelse:\n    raise RuntimeError(side)\n"
+        );
+        check_fixture(
+            &source,
+            "result = value\nassert value == (1 if side == 'little' else 2)",
+        );
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn handlers_at_the_end_of_a_for_loop_can_advance_or_return() {
+    check_fixture(
+        r"def visit(items, trigger, effect):
+    for item in items:
+        try:
+            if trigger(item):
+                raise ValueError
+        except ValueError:
+            effect(item)
+
+def first(items, compute):
+    for item in items:
+        try:
+            raise ValueError(item)
+        except ValueError:
+            return compute(item)
+
+def constant(items):
+    for item in items:
+        try:
+            raise ValueError
+        except ValueError:
+            return 7
+",
+        r"import sys
+result = []
+visit(range(4), lambda n: n % 2, result.append)
+def compute(item):
+    result.append(sys.exception().args)
+    return item + 10
+for items in ([], [3, 4]):
+    result.append((first(items, compute), constant(items)))
+def fail(_):
+    raise TypeError
+try:
+    visit([0], fail, result.append)
+except TypeError:
+    result.append('propagated')
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_guard_and_loop_exhaustion_can_return_the_same_constant() {
+    check_fixture(
+        r"def wake(waiters, emit):
+    if not waiters:
+        return False
+    for waiter in waiters:
+        if not waiter:
+            emit(waiter)
+            return True
+    return False
+",
+        r"result = []
+assert not wake([], result.append)
+assert not wake([1], result.append)
+assert wake([1, 0, 0], result.append)
+assert result == [0]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn conditional_none_value_is_distinct_from_a_guard_return() {
     check_fixture(
         r"def keep(reset, value):
@@ -368,6 +577,72 @@ fn conditional_none_value_is_distinct_from_a_guard_return() {
         "def pair(a, b):\n    return None if a is None else (a, b)\n",
         "result = [pair(None, 2), pair(1, 2)]",
         &[serc::PythonVersion::Py312, serc::PythonVersion::Py313],
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_conditional_returns_test_the_outer_predicate_first() {
+    check_fixture(
+        r"def choose(test, value):
+    return (value(1) if test(2) else value(2)) if test(1) else (value(3) if test(3) else value(4))
+",
+        r"result = []
+for mask in range(8):
+    log = []
+    def test(n):
+        log.append(('test', n))
+        return mask & (1 << (n - 1))
+    def value(n):
+        log.append(('value', n))
+        return n
+    result.append((choose(test, value), log))
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn a_nested_guard_can_return_before_a_shared_continuation() {
+    check_fixture(
+        r"def finish(future):
+    if not future.cancelled():
+        exc = future.exception()
+        if isinstance(exc, (SystemExit, KeyboardInterrupt)):
+            return
+    future.stop()
+",
+        r"result = []
+class Future:
+    def __init__(self, cancelled, exc):
+        self.cancel = cancelled
+        self.exc = exc
+    def cancelled(self): return self.cancel
+    def exception(self):
+        assert not self.cancel
+        result.append('checked')
+        return self.exc
+    def stop(self): result.append('stopped')
+for cancelled, exc in [(True, None), (False, None), (False, SystemExit())]:
+    finish(Future(cancelled, exc))
+assert result == ['stopped', 'checked', 'stopped', 'checked']",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_guards_can_each_own_a_copy_of_the_function_exit() {
+    check_fixture(
+        r"def wake(waiter, events):
+    if waiter is not None:
+        events.append('waiting')
+        if not waiter():
+            events.append('woke')
+",
+        r"result = []
+for waiter in [None, lambda: True, lambda: False]:
+    wake(waiter, result)
+assert result == ['waiting', 'waiting', 'woke']",
     );
 }
 
@@ -1032,6 +1307,40 @@ Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12)
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_single_handler_keeps_its_return_separate_from_the_success_path() {
+    check_fixture(
+        r"def lookup(obj):
+    try:
+        method = obj.method
+    except AttributeError:
+        pass
+    else:
+        return method()
+    return obj.fallback
+
+def present(mapping, key):
+    try:
+        value = mapping[key]
+    except KeyError:
+        return False
+    else:
+        return bool(value)
+",
+        r"import sys
+class WithMethod:
+    def method(self): return 'method'
+class WithoutMethod:
+    @property
+    def fallback(self):
+        assert sys.exception() is None
+        return 'fallback'
+result = [lookup(WithMethod()), lookup(WithoutMethod()), present({}, 1), present({1: 5}, 1)]
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn comprehensions_inside_returning_exception_handlers() {
     check_fixture(
         "def exports(module):\n    try:\n        return list(module.__all__)\n    except AttributeError:\n        return [n for n in dir(module) if n[0] != '_']\n",
@@ -1334,6 +1643,65 @@ assert asyncio.run(scope['first'](ok, [])) == 7 and scope['reader'](3) == 4
 
 #[cfg(feature = "decompile")]
 #[test]
+fn normal_flow_warnings_list_the_original_successors() {
+    let temp = tempfile::tempdir().unwrap();
+    let cache = temp.path().join("guard.pyc");
+    let recovered = temp.path().join("guard.py");
+    for version in common::PYTHON_VERSIONS {
+        let built = common::python_command(version).args(["-c", r"import dis, importlib.util, marshal, sys, types
+from pathlib import Path
+code = compile('def keep(x): return x\ndef route(a, b, effect):\n    if a and b: effect()\n', 'guard.py', 'exec')
+constants = list(code.co_consts)
+index = next(i for i, c in enumerate(constants) if isinstance(c, types.CodeType) and c.co_name == 'route')
+route = constants[index]
+# Share the two false exits, leaving the second copy of the return in place.
+first, second = [op for op in dis.get_instructions(route) if op.opname == 'POP_JUMP_IF_FALSE']
+assert first.argval != second.argval
+ops = bytearray(route.co_code)
+ops[first.offset + 1] += (second.argval - first.argval) // 2
+constants[index] = route.replace(co_code=bytes(ops))
+Path(sys.argv[1]).write_bytes(importlib.util.MAGIC_NUMBER + bytes(12) + marshal.dumps(code.replace(co_consts=tuple(constants))))"])
+            .arg(&cache).output().unwrap();
+        assert!(built.status.success(), "{built:?}");
+        let output = Command::new(env!("CARGO_BIN_EXE_serc"))
+            .arg("decompile")
+            .arg(&cache)
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{output:?}");
+        let source = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            source.contains("def route(a, b, effect):  # serc: normal control flow differs"),
+            "{source}"
+        );
+        assert_eq!(
+            source
+                .matches("# serc: normal control flow differs")
+                .count(),
+            1
+        );
+        assert_eq!(source.matches("# serc: original blocks").count(), 1);
+        fs_err::write(&recovered, source).unwrap();
+        let checked = common::python_command(version).args(["-c", r"import dis, marshal, re, runpy, sys, types
+from pathlib import Path
+route = next(c for c in marshal.loads(Path(sys.argv[1]).read_bytes()[16:]).co_consts if isinstance(c, types.CodeType) and c.co_name == 'route')
+listing = Path(sys.argv[2]).read_text().split('# serc: original blocks (normal control flow differs) in route ')[1]
+ops = list(dis.get_instructions(route))
+assert [(int(m[1]), m[2]) for m in re.finditer(r'^# +(\d+)  (\w+) ', listing, re.M)] == [(op.offset, op.opname) for op in ops]
+assert [int(n) for n in re.findall(r'^# block .* jump (\d+)$', listing, re.M)] == [op.argval for op in ops if op.opname == 'POP_JUMP_IF_FALSE']
+scope = runpy.run_path(sys.argv[2])
+calls = []
+for a in [False, True]:
+    for b in [False, True]:
+        scope['route'](a, b, lambda: calls.append((a, b)))
+assert calls == [(True, True)] and scope['keep'](42) == 42"])
+            .arg(&cache).arg(&recovered).output().unwrap();
+        assert!(checked.status.success(), "{checked:?}");
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn partial_modules_keep_siblings_and_mark_unrecovered_bodies() {
     let temp = tempfile::tempdir().unwrap();
     let original = temp.path().join("original.py");
@@ -1427,6 +1795,12 @@ def guarded(flag, events):
         assert!(output.status.success(), "{output:?}");
         let text = String::from_utf8(output.stdout).unwrap();
         assert!(text.starts_with("# serc: best-effort decompilation\n"));
+        assert_eq!(
+            text.lines().nth(1),
+            Some(
+                "# serc: module normal control flow differs after recompilation (see original blocks)"
+            )
+        );
         assert!(text.contains("def large():\n    ...  # serc: unrecovered remainder of large"));
         assert!(text.contains("def after(x):"));
         assert!(!text.contains("# serc: unplaced blocks in after ("));
@@ -1476,11 +1850,11 @@ with open(sys.argv[2], 'rb') as cache:
     cache.read(16)
     module = marshal.load(cache)
 sections = {}
-for section in open(sys.argv[1], encoding='utf8').read().split('\n# serc: unplaced blocks in ')[1:]:
+for section in re.split(r'\n# serc: (?:unplaced blocks|original blocks \([^)]+\)) in ', open(sys.argv[1], encoding='utf8').read())[1:]:
     name, _, _ = section.partition(' (original line ')
     sections.setdefault(name, []).append(section)
-for name in ['Lost', '<lambda>']:
-    code, = (c for c in module.co_consts if isinstance(c, types.CodeType) and c.co_name == name)
+for name in ['<module>', 'Lost', '<lambda>']:
+    code, = (c for c in (module, *module.co_consts) if isinstance(c, types.CodeType) and c.co_name == name)
     section, = sections[name]
     lines = section.splitlines()
     rows = [(int(row.split()[1]), row.split()[2]) for row in lines if re.match(r'^# +[0-9]+  ', row)]

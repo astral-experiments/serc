@@ -27,7 +27,7 @@ pub(crate) fn partial(
     m: &Module<'_>,
     candidate: Option<Candidate>,
     compile: impl FnMut(&str, serc_bytecode::OptimizationLevel) -> Option<Vec<u8>>,
-) -> Result<String, String> {
+) -> Result<(String, String), String> {
     // A malformed graph is still an input error. Validate even scopes the source
     // pass may skip when their parent contains an unsupported statement.
     if m.text(m.code(m.root)?.name)? != "<module>" {
@@ -70,7 +70,11 @@ pub(crate) fn partial(
     };
     work.definitions.extend(implicit);
     let warned = super::warnings::annotate(m, &mut candidate, compile);
-    detached::append(m, candidate, &mut work, warned)
+    let note = warned
+        .get(&m.root)
+        .map(|d| d.module_note())
+        .unwrap_or_default();
+    Ok((detached::append(m, candidate, &mut work, &warned)?, note))
 }
 
 impl Body<'_, '_, '_> {

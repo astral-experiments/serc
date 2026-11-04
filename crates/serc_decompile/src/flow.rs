@@ -30,6 +30,27 @@ impl Graph {
         version: PythonVersion,
         stack_size: usize,
     ) -> Result<Self, String> {
+        let (mut blocks, owner) = Self::layout(code, version)?;
+        for id in 0..blocks.len() {
+            for target in [blocks[id].jump, blocks[id].fallthrough]
+                .into_iter()
+                .flatten()
+            {
+                if let Some(successor) = blocks.get_mut(target) {
+                    successor.predecessors.push(id);
+                }
+            }
+        }
+        check_stack_heights(&mut blocks, code, version, stack_size)?;
+        let forward_postdom = forward_postdominators(&blocks)?;
+        Ok(Self {
+            blocks,
+            owner,
+            forward_postdom,
+        })
+    }
+
+    fn layout(code: &Bytecode, version: PythonVersion) -> Result<(Vec<Block>, Vec<usize>), String> {
         if code
             .handlers
             .windows(2)
@@ -101,23 +122,7 @@ impl Graph {
             }
         }
 
-        for id in 0..blocks.len() {
-            for target in [blocks[id].jump, blocks[id].fallthrough]
-                .into_iter()
-                .flatten()
-            {
-                if let Some(successor) = blocks.get_mut(target) {
-                    successor.predecessors.push(id);
-                }
-            }
-        }
-        check_stack_heights(&mut blocks, code, version, stack_size)?;
-        let forward_postdom = forward_postdominators(&blocks)?;
-        Ok(Self {
-            blocks,
-            owner,
-            forward_postdom,
-        })
+        Ok((blocks, owner))
     }
 
     pub(super) fn block(&self, i: usize) -> &Block {
@@ -152,6 +157,13 @@ impl Graph {
 
     pub(super) fn reachable(&self, i: usize) -> bool {
         self.block(i).height.is_some()
+    }
+
+    /// `FOR_ITER` pushes one item on fallthrough. A loop without a backedge
+    /// can share its header block with the instructions that build the iterator.
+    pub(super) fn for_iter_depth(&self, header: usize) -> Option<usize> {
+        let body = self.block(header).fallthrough?;
+        self.blocks[body].height?.checked_sub(1)
     }
 
     pub(super) fn jump(&self, i: usize) -> Option<usize> {
@@ -218,6 +230,37 @@ impl Graph {
             && (range.end == self.owner.len() || self.block(range.end).ops.start == range.end)
             && self.blocks_in(range).all(|block| block.handler.is_none())
     }
+}
+
+/// Compare normal edges in instruction order. Block numbers omit byte offsets,
+/// inline caches, and splits introduced solely by exception-table boundaries.
+pub(super) fn same_normal_flow(
+    version: PythonVersion,
+    left: &[u8],
+    right: &[u8],
+) -> Result<bool, String> {
+    #[derive(PartialEq)]
+    struct Edges {
+        fallthrough: Option<usize>,
+        jump: Option<usize>,
+        raises: bool,
+    }
+    fn shape(version: PythonVersion, bytes: &[u8]) -> Result<Vec<Edges>, String> {
+        let code = Bytecode::decode(version, bytes, &[])?;
+        let (blocks, _) = Graph::layout(&code, version)?;
+        Ok(blocks
+            .iter()
+            .map(|block| {
+                let last = code.ops[block.ops.end - 1];
+                Edges {
+                    fallthrough: block.fallthrough,
+                    jump: block.jump,
+                    raises: matches!(last.opcode, opcodes::RAISE_VARARGS | opcodes::RERAISE),
+                }
+            })
+            .collect())
+    }
+    Ok(shape(version, left)? == shape(version, right)?)
 }
 
 fn check_stack_heights(

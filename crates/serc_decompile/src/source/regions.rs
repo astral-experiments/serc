@@ -29,6 +29,22 @@ pub(super) struct Fragment {
 }
 
 impl Fragment {
+    pub(super) fn resume(
+        self,
+        body: &mut Body<'_, '_, '_>,
+        ops: &[Instruction],
+        tail: std::ops::Range<usize>,
+        level: usize,
+    ) -> Result<String, String> {
+        let mut lines = self.lines;
+        lines.push_str(
+            &body
+                .seeded(ops, tail.start, tail.end, level, self.stack)?
+                .suite()?,
+        );
+        Ok(lines)
+    }
+
     pub(super) fn operands(self) -> Result<Vec<Value>, String> {
         if !self.lines.is_empty() {
             return Err("statement in assignment target".into());
@@ -310,6 +326,13 @@ impl Body<'_, '_, '_> {
                 self.annotation_site()?;
                 Ok(i + 2)
             }
+            "NOP" | "POP_TOP" | "POP_ITER"
+                if self.stack.is_empty() && self.folded_break(ops, i, end) =>
+            {
+                self.line("break")?;
+                Ok(self.flow.block(i).ops.end)
+            }
+            "SWAP" | "POP_TOP" if let Some(next) = self.iterator_return(ops, i, end) => Ok(next),
             "SWAP" if super::comparisons::is_link(&ops[i..end]) => {
                 self.comparison_chain(ops, i, end, level, operand_start)
             }
@@ -374,11 +397,11 @@ impl Body<'_, '_, '_> {
                 self.line(self.loop_transfer(ops, i).unwrap())?;
                 Ok(i + 1)
             }
-            "NOP" | "POP_TOP" | "POP_ITER"
-                if self.stack.is_empty() && self.folded_break(ops, i, end) =>
+            "NOP"
+                if self.stack.is_empty()
+                    && let Some(next) = self.bottom_tested_loop(ops, i, end, level)? =>
             {
-                self.line("break")?;
-                Ok(self.flow.block(i).ops.end)
+                Ok(next)
             }
             "POP_TOP" | "POP_ITER"
                 if self.stack.is_empty()

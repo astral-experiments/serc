@@ -20,6 +20,9 @@ pub(super) struct Protected {
     next: usize,
     clause: Clause,
     handler: Range<usize>,
+    // An early return may keep its value across POP_EXCEPT, then discard the
+    // iterator. Resume with the same expression stack after the exception pop.
+    return_tail: Option<Range<usize>>,
 }
 
 fn groups(bc: &Bytecode) -> FxHashMap<usize, Vec<Handler>> {
@@ -119,6 +122,15 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
     } else {
         end
     };
+    // At the tail of a for loop, a handler can rejoin the iterator directly.
+    // The normal path either has a latch or always raises before END_FOR.
+    let for_header = match ops[end].name {
+        "END_FOR" => flow.incoming(end).find(|&i| ops[i].name == "FOR_ITER"),
+        "JUMP_BACKWARD" => flow.jump(end).filter(|&i| ops[i].name == "FOR_ITER"),
+        _ => None,
+    }
+    .filter(|&i| i < start && flow.for_iter_depth(i) == Some(first.depth));
+    let mut return_tail = None;
     let handler = match ops.get(body..stop)? {
         [.., raise] if raise.name == "RAISE_VARARGS" => body..stop,
         [.., pop, jump]
@@ -127,9 +139,24 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
                     jump.name,
                     "JUMP_FORWARD" | "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT"
                 )
-                && flow.jump(stop - 1) == Some(next) =>
+                && flow
+                    .jump(stop - 1)
+                    .is_some_and(|to| to == next || Some(to) == for_header) =>
         {
             body..stop - 2
+        }
+        [.., ret]
+            if for_header.is_some()
+                && matches!(ret.name, "RETURN_VALUE" | "RETURN_CONST")
+                && let Some(pop) = (body..stop).rfind(|&i| ops[i].name == "POP_EXCEPT")
+                && matches!(ops[pop + 1].name, "SWAP" | "POP_TOP") =>
+        {
+            let computed = ops[pop + 1].name == "SWAP";
+            if computed && (pop == body || (ops[pop - 1].name, ops[pop - 1].arg) != ("SWAP", 2)) {
+                return None;
+            }
+            return_tail = Some(pop + 1..stop);
+            body..pop - usize::from(computed)
         }
         _ => {
             // A handler can fall through to the same constant return as the
@@ -152,6 +179,7 @@ fn region(ops: &[Instruction], flow: &Graph, entries: &[Handler]) -> Option<(usi
             next,
             clause: Clause::Except(kind),
             handler,
+            return_tail,
         },
     ))
 }
@@ -221,6 +249,7 @@ fn finally_region(
             deferred_return: normal.end..next,
         },
         handler: normal,
+        return_tail: None,
     })
 }
 
@@ -326,9 +355,12 @@ impl Body<'_, '_, '_> {
                 "finally:".into()
             }
         };
-        let handler = self
-            .fragment(ops, entry.handler.start, entry.handler.end, level)?
-            .suite()?;
+        let handler = self.fragment(ops, entry.handler.start, entry.handler.end, level)?;
+        let handler = if let Some(tail) = &entry.return_tail {
+            handler.resume(self, ops, tail.clone(), level)?
+        } else {
+            handler.suite()?
+        };
         self.try_block(&suite, start > 0 && ops[start - 1].name != "NOP")?;
         self.block(&header, &handler)?;
         Ok(Some(next))

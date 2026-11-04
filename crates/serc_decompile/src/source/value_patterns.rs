@@ -3,7 +3,10 @@
 use std::fmt::Write as _;
 
 use super::{
-    Body, Instruction, PythonVersion, comparisons::operator, definitions::render, patterns::case,
+    Body, Instruction, PythonVersion, Value,
+    comparisons::operator,
+    definitions::render,
+    patterns::{case, write_suite},
 };
 
 pub(super) struct Header {
@@ -274,6 +277,7 @@ impl Body<'_, '_, '_> {
                 if guard < fail
                     && ops[guard].name == "POP_JUMP_IF_FALSE"
                     && self.flow.jump(guard) == Some(next)
+                    && join != Some(next)
                 {
                     let stop =
                         guard - usize::from(guard > body && ops[guard - 1].name == "TO_BOOL");
@@ -303,11 +307,41 @@ impl Body<'_, '_, '_> {
             } else {
                 body_end
             };
-            case(
-                &mut cases,
-                &pattern,
-                &self.seeded(ops, body, stop, level, seed)?.suite()?,
-            );
+            // After a successful pattern has discarded its subject, a test
+            // can skip the remaining cases and go straight to the shared
+            // continuation. A failed match guard would try the next case.
+            let suite = if let Some(branch) =
+                (body < stop).then(|| self.flow.block(body).ops.end - 1)
+                && branch < stop
+                && ops[branch].name == "POP_JUMP_IF_FALSE"
+                && matches!(
+                    ops[tail].name,
+                    "RETURN_VALUE" | "RETURN_CONST" | "RAISE_VARARGS"
+                )
+                && let Some(after) = self.flow.jump(branch)
+                && after > next
+                && after <= end
+            {
+                if join.is_some_and(|previous| previous != after) {
+                    return Err("inconsistent match continuation".into());
+                }
+                join = Some(after);
+                let mut prefix = self.seeded(ops, body, branch, level, seed)?;
+                let test = prefix
+                    .stack
+                    .pop()
+                    .and_then(Value::expression_text)
+                    .ok_or("missing case condition")?;
+                let mut suite = prefix.suite()?;
+                let yes = self
+                    .fragment(ops, after_test(ops, branch), stop, level)?
+                    .suite()?;
+                write_suite(&mut suite, format_args!("if {test}"), &yes);
+                suite
+            } else {
+                self.seeded(ops, body, stop, level, seed)?.suite()?
+            };
+            case(&mut cases, &pattern, &suite);
             if let Some(range) = fallback {
                 let suite = self.fragment(ops, range.start, range.end, level)?.suite()?;
                 if !suite.is_empty() {
