@@ -57,10 +57,10 @@ impl Body<'_, '_, '_> {
         if ops.iter().any(|op| op.name == "WITH_EXCEPT_START") {
             self.handlers = super::protected_regions::collect(bc, self);
             if !self.handlers.is_empty() {
-                let end = self.flow.normal_end([0]);
+                let end = self.flow.iteration_end(ops, [0]);
                 return self.region(ops, 0, end, 0);
             }
-            return self.with_statement(bc, &bc.handlers, ops.len());
+            return self.with_statement(bc, &bc.handlers, 0, ops.len());
         }
         // A suspended body can end with a raise, even when another path
         // returns. The StopIteration handler marks the end of the normal CFG.

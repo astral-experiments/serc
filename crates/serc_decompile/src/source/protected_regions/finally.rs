@@ -116,9 +116,8 @@ pub(super) fn returning_finally_loop(
     })
 }
 
-/// A try/except with a terminal handler may have just one table entry for
-/// its trailing finally: the dispatcher's exceptional unwind. On success
-/// execution falls directly into the other copy after the protected suite.
+/// Both an exceptional unwind and a successful handler cleanup can enter
+/// the trailing finally. Compare the normal copy with the exceptional one.
 pub(super) fn after_except(
     ops: &[Instruction],
     owner: &Body<'_, '_, '_>,
@@ -126,6 +125,7 @@ pub(super) fn after_except(
     start: usize,
     dispatch: usize,
     cleanup: usize,
+    entries: &[super::Handler],
 ) -> Option<Range<usize>> {
     let Clause::Except {
         following,
@@ -150,18 +150,36 @@ pub(super) fn after_except(
         .binary_search_by_key(&handler.target, |op| op.offset)
         .ok()?;
     let (_, unwind) = super::super::dispatch::unwind(ops, flow, match_start, handler.depth + 1)?;
-    // A returning arm would need its own inline copy of the finally.
-    // All normal paths through this dispatch must end in a raise or reraise.
+    let rejoin = match entries {
+        [_] => None,
+        [exit, _] => {
+            let pop = child.handler.end;
+            let jump = ops
+                .binary_search_by_key(&exit.end, |op| op.offset)
+                .ok()?
+                .checked_sub(1)?;
+            if ops.get(pop)?.offset != exit.start
+                || ops[pop].name != "POP_EXCEPT"
+                || flow.jump(jump) != Some(child.end)
+                || !serc_bytecode::target::is_unconditional_jump(ops[jump].opcode)
+            {
+                return None;
+            }
+            Some(jump)
+        }
+        _ => return None,
+    };
+    // A returning arm would need its own inline copy. The only normal exit
+    // we can join is the checked jump back to the shared finalizer.
     if !flow.blocks_covering(match_start..unwind + 3).all(|block| {
         let last = block.ops.end - 1;
         let edges = [flow.jump(last), flow.fallthrough(block)];
         if edges == [None, None] {
             return matches!(ops[last].name, "RAISE_VARARGS" | "RERAISE");
         }
-        edges
-            .into_iter()
-            .flatten()
-            .all(|to| (match_start..unwind + 3).contains(&to))
+        edges.into_iter().flatten().all(|to| {
+            (match_start..unwind + 3).contains(&to) || (Some(last) == rejoin && to == child.end)
+        })
     }) || flow.blocks_covering(start..child.end).any(|b| {
         let last = b.ops.end - 1;
         matches!(ops[last].name, "RETURN_VALUE" | "RETURN_CONST")
@@ -175,7 +193,8 @@ pub(super) fn after_except(
     let normal = if ops[child.end].name == "NOP" {
         child.end + 1
     } else if flow.block(child.end).ops.start == child.end
-        && flow.block(child.end).height == Some(handler.depth + 1)
+        && (flow.block(child.end).height == Some(handler.depth + 1)
+            || rejoin.is_some() && flow.block(child.end).height == Some(handler.depth))
     {
         // A computed return is already on the stack as the finalizer starts.
         child.end
@@ -188,7 +207,11 @@ pub(super) fn after_except(
         dispatch + 1..cleanup - 1,
         CopyExit::Fallthrough,
     )?;
-    (normal < end && flow.entered_from(normal, start..normal)).then_some(normal..end)
+    (normal < end
+        && flow
+            .incoming(normal)
+            .all(|from| (start..normal).contains(&from) || Some(from) == rejoin))
+    .then_some(normal..end)
 }
 
 /// The compiler materializes a constant return after the last cleanup.
@@ -337,7 +360,18 @@ pub(super) fn finally_region(
     // A return of a constant can leave a tracing NOP at its original site,
     // with the constant materialized only after the normal cleanup.
     let mut next = normal.end;
-    if deferred && !terminal {
+    // A successful assertion may jump to the NOP before cleanup. Its
+    // ordinary continuation jumps over the else arm of an enclosing if.
+    let joins_after_raise = ops.get(next)?.name == "JUMP_FORWARD"
+        && ops[end - 1].name == "RAISE_VARARGS"
+        && flow.handler(start).is_none()
+        && flow.handler(cleanup).is_none()
+        && flow.incoming(end).any(|i| {
+            (suite_start..end).contains(&i)
+                && ops[i].name.starts_with("POP_JUMP_IF_")
+                && flow.jump(i) == Some(end)
+        });
+    if deferred && !terminal && !joins_after_raise {
         if let Some(ret) = return_end(ops, next) {
             next = ret;
         } else {

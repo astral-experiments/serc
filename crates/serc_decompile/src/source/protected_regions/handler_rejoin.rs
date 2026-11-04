@@ -1,6 +1,67 @@
 //! A branch of a handler can restore the prior exception and jump directly
 //! to the continuation, leaving its sibling branch out of line.
-use super::{Body, Graph, Instruction};
+use super::{Body, Clause, Graph, Handler, Handlers, Instruction};
+use std::ops::Range;
+
+/// A retry at the tail of an except can succeed and jump straight to the
+/// original try's continuation. On failure its own except raises or reraises
+/// through the outer unwind. Only the retry reaches the saved-exception pop.
+pub(super) fn after_retry(
+    ops: &[Instruction],
+    owner: &Body<'_, '_, '_>,
+    arm: Range<usize>,
+    join: usize,
+    unwind: Handler,
+    inner: &Handlers,
+) -> Option<usize> {
+    let flow = &owner.flow;
+    let mut exits = flow.incoming(join).filter(|i| arm.contains(i));
+    let jump = exits.next()?;
+    let pop = jump.checked_sub(1)?;
+    if exits.next().is_some()
+        || flow.jump(jump) != Some(join)
+        || ops[pop].name != "POP_EXCEPT"
+        || flow.block(pop).ops != (pop..jump + 1)
+        || flow.block(pop).height != Some(unwind.depth)
+    {
+        return None;
+    }
+    let protected = flow.handler(pop.checked_sub(1)?)?;
+    let start = ops
+        .binary_search_by_key(&protected.start, |op| op.offset)
+        .ok()?;
+    let child = inner.get(&start)?;
+    let cleanup = child.unwind(ops, flow, protected)?;
+    let parent = flow.handler(cleanup)?;
+    if !arm.contains(&start)
+        || protected.lasti
+        || protected.depth != unwind.depth
+        || child.end != pop
+        || child.next != pop
+        || cleanup + 3 != arm.end
+        || !flow.incoming(pop).all(|i| (start..pop).contains(&i))
+        || !matches!(&child.clause, Clause::Except { following, finalizer: None, .. } if following.is_empty())
+        || ops[child.handler.end.checked_sub(1)?].name != "RAISE_VARARGS"
+        || (parent.target, parent.depth, parent.lasti) != (unwind.target, unwind.depth, true)
+    {
+        return None;
+    }
+    flow.blocks_covering(arm.start..start)
+        .all(|b| {
+            let span = b.ops.start.max(arm.start)..b.ops.end.min(start);
+            (ops[span.clone()]
+                .iter()
+                .all(|op| matches!(op.name, "NOP" | "NOT_TAKEN"))
+                || flow.handler(span.start).is_some_and(|h| {
+                    (h.target, h.depth, h.lasti) == (unwind.target, unwind.depth, true)
+                }))
+                && [flow.jump(b.ops.end - 1), flow.fallthrough(b)]
+                    .into_iter()
+                    .flatten()
+                    .all(|to| (arm.start..=start).contains(&to))
+        })
+        .then_some(pop)
+}
 
 #[derive(Clone, Copy)]
 pub(in crate::source) struct HandlerRejoin {

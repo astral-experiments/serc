@@ -679,6 +679,196 @@ assert result == [(2, [1, 2]), (None, [1])]
 
 #[cfg(feature = "decompile")]
 #[test]
+fn comprehensions_keep_their_enclosing_loop_and_handler() {
+    check_fixture(
+        r"def poll(selector):
+    while True:
+        ready = [key for key, events in selector()]
+        if ready:
+            break
+    return ready
+
+def checked(selector):
+    key = 'original'
+    try:
+        ready = [key.fileobj for key, events in selector()]
+    except AttributeError:
+        return key
+    return ready
+",
+        r"batches = iter([[], [(42, 0)]])
+result = poll(batches.__next__), checked(lambda: [(None, 0)])
+assert result == ([42], 'original')",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn managed_retries_distinguish_breaks_from_suppression() {
+    check_fixture(
+        r"def consume(manager, step, restart):
+    with manager:
+        while True:
+            try:
+                while True:
+                    ready = [x for x in step()]
+                    if ready:
+                        break
+                restart(ready)
+            except OSError:
+                restart()
+
+def leaves(manager, step, restart):
+    with manager:
+        while True:
+            try:
+                if step():
+                    break
+                restart()
+            except OSError:
+                restart()
+        step('after loop')
+    restart('outside')
+",
+        r"result = []
+class Manager:
+    def __enter__(self): result.append('entered')
+    def __exit__(self, typ, exc, tb):
+        result.append('closed')
+        return typ is StopIteration
+manager = Manager()
+def restart(*args): result.append(args)
+def read():
+    yield []
+    raise OSError
+consume(manager, read().__next__, restart)
+def step(message=None):
+    if message: result.append(message)
+    return True
+leaves(manager, step, restart)
+assert result == ['entered', (), 'closed', 'entered', 'after loop', 'closed', ('outside',)]",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn forkserver_recovers_the_poll_loop_and_its_handlers() {
+    let temp = tempfile::tempdir().unwrap();
+    for version in common::PYTHON_VERSIONS {
+        let built = common::python_command(version)
+            .args([
+                "-c",
+                r"
+import pathlib, py_compile, sys, sysconfig
+source = pathlib.Path(sysconfig.get_path('stdlib'), 'multiprocessing', 'forkserver.py')
+for level in range(3):
+    cache = pathlib.Path(sys.argv[1], f'forkserver.{level}.pyc')
+    py_compile.compile(str(source), str(cache), doraise=True, optimize=level)
+",
+            ])
+            .arg(temp.path())
+            .output()
+            .unwrap();
+        assert!(built.status.success(), "{version}: {built:?}");
+        for level in 0..=2 {
+            let cache = temp.path().join(format!("forkserver.{level}.pyc"));
+            let output = Command::new(env!("CARGO_BIN_EXE_serc"))
+                .args(["decompile", "--strict"])
+                .arg(&cache)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{version} -O{level}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let source = std::str::from_utf8(&output.stdout).unwrap();
+            assert!(
+                source.contains("os.waitpid(") && source.contains("pid = os.fork()"),
+                "{version} -O{level}"
+            );
+        }
+    }
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn generator_filter_recovers_short_circuit_backedges() {
+    check_output(
+        r"def select(values, same, allowed, accept):
+    for item in values:
+        value = item[0]
+        if same(value) or allowed(value) and accept(value):
+            yield item
+",
+        r"log = []
+def same(x): log.append(('same', x)); return x == 0
+def allowed(x): log.append(('allowed', x)); return x == 1
+def accept(x): log.append(('accept', x)); return True
+result = list(select([(0,), (1,), (2,)], same, allowed, accept)), log
+assert result[0] == [(0,), (1,)]
+assert log == [('same', 0), ('same', 1), ('allowed', 1), ('accept', 1), ('same', 2), ('allowed', 2)]",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert!(
+                source.contains(" or ") && source.contains(" and "),
+                "{source}"
+            );
+        },
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn sibling_tries_in_a_cache_miss_keep_their_loop_exits() {
+    check_fixture(
+        r"def resolve(cache, key, next_token, compile_token):
+    try:
+        selector = cache[key]
+    except KeyError:
+        try:
+            token = next_token()
+        except StopIteration:
+            return
+        selector = []
+        while True:
+            try:
+                selector.append(compile_token(token))
+            except StopIteration:
+                raise ValueError('invalid token') from None
+            try:
+                token = next_token()
+                if token == '/':
+                    token = next_token()
+            except StopIteration:
+                break
+        cache[key] = selector
+    return selector
+",
+        r"import sys
+cache = {}
+errors = []
+def compile_token(t):
+    assert isinstance(sys.exception(), KeyError)
+    if t == 'bad':
+        raise StopIteration
+    return t.upper()
+def read(key, tokens):
+    return resolve(cache, key, iter(tokens).__next__, compile_token)
+assert read('empty', []) is None and 'empty' not in cache
+assert read('path', ['a', '/', 'b', 'c']) == ['A', 'B', 'C']
+assert read('path', []) is cache['path']
+try:
+    read('invalid', ['bad'])
+except ValueError as e:
+    errors.append((str(e), e.__suppress_context__, type(e.__context__).__name__))
+assert 'invalid' not in cache and errors == [('invalid token', True, 'StopIteration')]
+result = cache, errors",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn a_successful_match_can_skip_the_remaining_cases() {
     check_fixture(
         r"def resolve(name, ready, log):
@@ -3523,10 +3713,30 @@ if before:
     lost = '{big}'
 else:
     wrongly_hoisted()
-def large():
+def large(stop=False, NotImplementedError=None):
+    if stop:
+        return 'early'
+    return '{big}'
+def one_arm(flag, work):
+    if flag:
+        return '{big}'
+    return work()
+def lazy():
+    yield '{big}'
+async def async_lazy():
+    yield '{big}'
+async def delayed():
+    return '{big}'
+_serc_builtins = 'global'
+def shadow(observe):
+    def existing(): return _serc_builtins
+    observe(existing)
     return '{big}'
 def after(x):
     return x + before
+class PartialClass:
+    kept = before
+    missing = '{big}'
 if before:
     lost = '{big}'
     def repeated(x, /):
@@ -3582,6 +3792,37 @@ def unfinished():
         action()
         return '{big}'
     except Exception: return kept
+def guarded_return(log, transform):
+    try:
+        log.append('before return')
+        return transform('{big}')
+    except Exception:
+        log.append('caught')
+        return 17
+def managed_return(manager, log, transform):
+    with manager:
+        log.append('before return')
+        return transform('{big}')
+    log.append('suppressed')
+    return 17
+def managed_statement(manager, log, transform):
+    with manager:
+        transform('{big}')
+        log.append('after gap')
+        return transform(11)
+def authenticate(key, manager, log, transform):
+    if key is not None:
+        try:
+            value = transform(key)
+            assert value, 'missing key'
+        finally:
+            log.append('closed')
+    else:
+        value = 'anonymous'
+    log.append(value)
+    sizes = {{item: len(item) for item in log}}
+    with manager:
+        transform('{big}')
 def guarded(flag, events):
     if flag:
         normal = 1
@@ -3615,8 +3856,41 @@ def guarded(flag, events):
                 "# serc: module normal control flow differs after recompilation (see original blocks)"
             )
         );
-        assert!(text.contains("def large():\n    ...  # serc: unrecovered remainder of large"));
+        assert!(text.contains("NotImplementedError('serc: unrecovered function tail')  # serc: unrecovered remainder of large"));
         assert!(text.contains("def after(x):"));
+        for (header, owner) in [
+            ("try:", "guarded_return"),
+            ("with manager:", "managed_return"),
+        ] {
+            assert!(text.contains(&format!(
+                "    {header}\n        log.append('before return')\n        raise NotImplementedError('serc: unrecovered function tail')  # serc: unrecovered tail of protected suite in {owner}"
+            )), "{version}: missing protected return in {owner}");
+        }
+        assert!(
+            text.contains("    except Exception:\n        log.append('caught')\n        return 17")
+        );
+        assert!(text.contains("    log.append('suppressed')\n    return 17"));
+        assert!(text.contains(
+            "    with manager:\n        ...  # serc: unrecovered statement in managed_statement"
+        ));
+        assert!(text.contains("        log.append('after gap')\n        return transform(11)"));
+        for name in ["guarded_return", "managed_return", "managed_statement"] {
+            assert!(text.contains(&format!("# serc: unplaced blocks in {name} (")));
+        }
+        let auth = text
+            .split_once("def authenticate(")
+            .unwrap()
+            .1
+            .split_once("\ndef ")
+            .unwrap()
+            .0;
+        assert!(
+            auth.contains("        try:\n            value = transform(key)"),
+            "{version}: {auth}"
+        );
+        assert!(auth.contains("        finally:\n            log.append('closed')"));
+        assert!(auth.contains("    else:\n        value = 'anonymous'\n    log.append(value)"));
+        assert!(auth.contains("    sizes = {item: len(item) for item in"));
         assert!(!text.contains("# serc: unplaced blocks in after ("));
         assert!(!text.contains("# serc: unplaced blocks in Labels ("));
         assert!(text.contains("# serc: detached function incomplete ("));
@@ -3691,6 +3965,31 @@ for name in ['<module>', 'Lost', '<lambda>']:
                 header = blocks[max(b for b in blocks if b <= op.offset)]
                 assert f'  jump {op.argval}' in header and f'  fallthrough {ops[i+1].offset}' in header
 assert scope['after'](5) == 12
+assert scope['PartialClass'].kept == 7
+assert scope['large'](True) == 'early'
+import asyncio, inspect
+def missing(call):
+    try: call()
+    except NotImplementedError as err: assert err.args == ('serc: unrecovered function tail',)
+    else: raise AssertionError('missing tail returned')
+missing(scope['large'])
+ran = []
+assert scope['one_arm'](False, lambda: ran.append('good') or 11) == 11
+missing(lambda: scope['one_arm'](True, lambda: ran.append('wrong')))
+assert ran == ['good']
+callbacks = []
+missing(lambda: scope['shadow'](callbacks.append))
+assert callbacks[0]() == 'global'
+stream = scope['lazy']()
+assert inspect.isgenerator(stream)
+missing(lambda: next(stream))
+async_stream = scope['async_lazy']()
+assert inspect.isasyncgen(async_stream)
+async def advance(): return await anext(async_stream)
+missing(lambda: asyncio.run(advance()))
+coroutine = scope['delayed']()
+assert inspect.iscoroutine(coroutine)
+missing(lambda: asyncio.run(coroutine))
 assert 'repeated' not in scope and 'inner' not in scope
 assert scope['fake_marker'] == '# __serc_definition_id__ 7'
 annotations = scope['__annotate__'](1) if '__annotate__' in scope else scope['__annotations__']
@@ -3703,7 +4002,7 @@ for flag, action in [(True, fail), (False, lambda: None)]:
     assert scope['protected'](flag, action, events) == 7
 assert events == ['caught', 'after', 'after']
 events.clear()
-scope['outer'](events)
+missing(lambda: scope['outer'](events))
 get, put = events[0]
 try: get()
 except NameError: pass
@@ -5232,6 +5531,175 @@ for error, immediate, debug in [(None, False, True), (ValueError(), True, True),
         assert err is error
         events.append('propagated')
 assert events == ['report', 'close', 'report', 'close', 'close', 'propagated']
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn managed_retries_restore_the_outer_exception_before_leaving_the_manager() {
+    check_fixture(
+        r"def next_item(manager, take, wait, finished):
+    with manager:
+        try:
+            item = take()
+        except IndexError:
+            if finished():
+                raise StopIteration from None
+            wait()
+            try:
+                item = take()
+            except IndexError:
+                if finished():
+                    raise StopIteration from None
+                raise TimeoutError from None
+    return item
+",
+        r"import sys
+events = []
+class Manager:
+    def __enter__(self): events.append('enter')
+    def __exit__(self, kind, err, tb):
+        assert err is sys.exception()
+        events.append(kind.__name__ if kind else 'exit')
+def take():
+    value = next(items)
+    if isinstance(value, Exception): raise value
+    return value
+def wait():
+    assert isinstance(sys.exception(), IndexError)
+    events.append('wait')
+for inputs, checks in [([11], []), ([IndexError(), 12], [False]), ([IndexError()], [True]), ([IndexError(), IndexError()], [False, False]), ([IndexError(), IndexError()], [False, True])]:
+    items, done = iter(inputs), iter(checks)
+    try: events.append(next_item(Manager(), take, wait, lambda: next(done)))
+    except (TimeoutError, StopIteration) as err: assert err.__suppress_context__
+assert events == ['enter', 'exit', 11, 'enter', 'wait', 'exit', 12, 'enter', 'StopIteration', 'enter', 'wait', 'TimeoutError', 'enter', 'wait', 'StopIteration']
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn nested_managers_keep_intervening_statements_in_the_outer_suite() {
+    check_output(
+        r"def send(outer, inner, log, stop):
+    with outer:
+        log.append('entered')
+        if stop:
+            return
+        with inner as writer:
+            writer.send()
+        log.append('sent')
+    return log
+
+def start(outer, inner, log):
+    with outer:
+        log.append('entered')
+        with inner as writer:
+            try:
+                writer.send()
+            finally:
+                log.append('cleanup')
+            log.append('done')
+    return log
+",
+        r"from contextlib import nullcontext
+log = []
+class Writer:
+    def send(self): log.append('write')
+outer, inner = nullcontext(), nullcontext(Writer())
+assert send(outer, inner, log, True) is None
+assert send(outer, inner, log, False) is log
+assert start(outer, inner, log) is log
+result = log
+assert result == ['entered', 'entered', 'write', 'sent', 'entered', 'write', 'cleanup', 'done']",
+        &common::PYTHON_VERSIONS,
+        |source| {
+            assert_eq!(source.matches("        with inner as writer:").count(), 2);
+        },
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn terminal_returns_and_managed_raises_have_no_missing_tail() {
+    check_fixture(
+        r"def first(items):
+    values = [item * 2 for item in items]
+    try:
+        return values[0]
+    except IndexError:
+        raise ValueError('empty')
+
+def optional(read, recover):
+    try:
+        return read()
+    except:
+        recover()
+
+def raise_only(manager, take):
+    with manager:
+        raise take()
+",
+        r"import contextlib, sys
+assert first([11]) == 22
+try: first([])
+except ValueError as err: assert isinstance(err.__context__, IndexError)
+else: raise AssertionError
+def interrupted(): raise KeyboardInterrupt
+events = []
+assert optional(lambda: 12, events.clear) == 12
+assert optional(interrupted, lambda: events.append(type(sys.exception()).__name__)) is None
+assert events == ['KeyboardInterrupt']
+assert raise_only(contextlib.suppress(ValueError), ValueError) is None
+try: raise_only(contextlib.suppress(ValueError), RuntimeError)
+except RuntimeError: pass
+else: raise AssertionError
+result = events",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn managed_async_iterators_exhaust_close_and_unwind_through_each_exit() {
+    check_fixture(
+        r"async def stream(outer, inner, rows):
+    async with outer, inner:
+        async for item in rows:
+            yield item
+
+async def mixed(manager, rows):
+    with manager:
+        async for item in rows:
+            yield item
+",
+        r"import asyncio
+events = []
+class Manager:
+    def __init__(self, name, suppress=False):
+        self.name, self.suppress = name, suppress
+    def __enter__(self): events.append((self.name, 'enter'))
+    def __exit__(self, kind, err, tb):
+        events.append((self.name, kind.__name__ if kind else 'normal'))
+        return self.suppress and kind is ValueError
+    async def __aenter__(self): return self.__enter__()
+    async def __aexit__(self, *exc): return self.__exit__(*exc)
+async def rows(*values):
+    for v in values:
+        await asyncio.sleep(0)
+        if isinstance(v, Exception): raise v
+        yield v
+async def exercise():
+    a, b = Manager('a'), Manager('b', True)
+    assert [v async for v in stream(a, b, rows(1, 2))] == [1, 2]
+    assert [v async for v in stream(a, b, rows(ValueError()))] == []
+    g = stream(a, b, rows(3, 4))
+    assert await anext(g) == 3
+    await g.aclose()
+    assert [v async for v in mixed(a, rows(5))] == [5]
+asyncio.run(exercise())
+start = [('a', 'enter'), ('b', 'enter')]
+assert events == start + [('b', 'normal'), ('a', 'normal')] + start + [('b', 'ValueError'), ('a', 'normal')] + start + [('b', 'GeneratorExit'), ('a', 'GeneratorExit'), ('a', 'enter'), ('a', 'normal')]
 result = events",
     );
 }

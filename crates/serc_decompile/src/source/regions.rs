@@ -1,8 +1,18 @@
 //! Structure a slice of the instruction graph. Each arm gets a fresh operand
 //! stack; values that survive a join must be expressible as a Python expression.
 use std::fmt::Write as _;
+use std::ops::Range;
 
+use super::partial::GapKind;
 use super::{Body, Instruction, Object, Value};
+
+pub(super) fn local_return(ops: &[Instruction], end: usize) -> Option<usize> {
+    let [.., load, ret] = ops.get(..end)? else {
+        return None;
+    };
+    (matches!(load.name, "LOAD_FAST" | "LOAD_FAST_BORROW") && ret.name == "RETURN_VALUE")
+        .then_some(end - 2)
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) struct ConstantReturn(&'static str, u32);
@@ -119,11 +129,33 @@ impl Body<'_, '_, '_> {
         level: usize,
         stack: Vec<Value>,
     ) -> Result<Fragment, String> {
+        self.suite_fragment(ops, start..end, level, stack, false)
+    }
+
+    /// A proven return through cleanup lets us keep the surrounding suite
+    /// even if its final expression cannot be rendered.
+    pub(super) fn suite_fragment(
+        &mut self,
+        ops: &[Instruction],
+        range: Range<usize>,
+        level: usize,
+        stack: Vec<Value>,
+        returns: bool,
+    ) -> Result<Fragment, String> {
+        let partial_return = returns
+            && self.work.partial
+            && self.depth > 0
+            && !self.class
+            && stack.is_empty()
+            && !range.is_empty()
+            && range.end <= self.flow.block(range.start).ops.end;
         let outer_stack = std::mem::replace(&mut self.stack, stack);
         let outer_lines = std::mem::take(&mut self.lines);
         let outer_prefix = std::mem::take(&mut self.partial_prefix);
         let outer_loop = self.loop_edges;
-        let result = self.region(ops, start, end, level + 1);
+        let result = stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
+            self.recover_region(ops, range.start, range.end, level + 1, partial_return)
+        });
         self.loop_edges = outer_loop;
         self.partial_prefix = outer_prefix;
         let fragment = Fragment {
@@ -152,7 +184,7 @@ impl Body<'_, '_, '_> {
         level: usize,
     ) -> Result<(), String> {
         stacker::maybe_grow(256 * 1024, 2 * 1024 * 1024, || {
-            self.recover_region(ops, start, end, level)
+            self.recover_region(ops, start, end, level, false)
         })
     }
 
@@ -162,6 +194,7 @@ impl Body<'_, '_, '_> {
         start: usize,
         end: usize,
         level: usize,
+        partial_return: bool,
     ) -> Result<(), String> {
         if level > 32 || end > ops.len() || start > end {
             return Err("unsupported region bounds or nesting".into());
@@ -173,9 +206,11 @@ impl Body<'_, '_, '_> {
             && self.flow.unprotected_suite(start..end);
         let mut i = start;
         let mut operand_start = None;
+        let mut prefix_len = 0;
         while i < end {
             if self.stack.is_empty() {
                 operand_start = Some(i);
+                prefix_len = self.lines.len();
             }
             if partial && self.stack.is_empty() {
                 self.partial_start = i;
@@ -184,6 +219,19 @@ impl Body<'_, '_, '_> {
             let op = ops[i];
             let next = match self.region_step(ops, i, end, level, operand_start) {
                 Ok(next) => next,
+                Err(reason) if partial_return => {
+                    self.lines.truncate(prefix_len);
+                    self.stack.clear();
+                    let failed = operand_start.unwrap_or(start);
+                    if let Some(next) = self.empty_stack_after(ops, failed..end, i, 0)? {
+                        self.gap(&reason, ops, failed..next, GapKind::Statement)?;
+                        next
+                    } else {
+                        self.gap(&reason, ops, failed..end, GapKind::ProtectedTail)?;
+                        self.stack.push(Value::PendingReturn);
+                        return Ok(());
+                    }
+                }
                 Err(reason) if partial => {
                     self.lines.truncate(self.partial_prefix);
                     self.stack.clear();
@@ -195,7 +243,12 @@ impl Body<'_, '_, '_> {
                         // branch can jump across that suite.
                         _ => return Err(format!("byte {} ({}): {reason}", op.offset, op.name)),
                     };
-                    self.gap(&reason, ops, self.partial_start..next, next == ops.len())?;
+                    let kind = if next == ops.len() {
+                        GapKind::Remainder
+                    } else {
+                        GapKind::Statement
+                    };
+                    self.gap(&reason, ops, self.partial_start..next, kind)?;
                     next
                 }
                 Err(reason) => return Err(format!("byte {} ({}): {reason}", op.offset, op.name)),
@@ -213,7 +266,7 @@ impl Body<'_, '_, '_> {
                         &format!("invalid reconstructed statement: {error}"),
                         ops,
                         self.partial_start..next,
-                        false,
+                        GapKind::Statement,
                     )?;
                 }
             }
@@ -420,7 +473,9 @@ impl Body<'_, '_, '_> {
                 self.comprehension(ops, i + 1, end, level)
             }
             "LOAD_FAST_AND_CLEAR" => self.comprehension(ops, i, end, level),
-            "JUMP_BACKWARD" | "JUMP_FORWARD" if self.loop_transfer(ops, i).is_some() => {
+            "JUMP_BACKWARD" | "JUMP_BACKWARD_NO_INTERRUPT" | "JUMP_FORWARD"
+                if self.loop_transfer(ops, i).is_some() =>
+            {
                 self.line(self.loop_transfer(ops, i).unwrap())?;
                 Ok(i + 1)
             }
@@ -435,6 +490,25 @@ impl Body<'_, '_, '_> {
                     && let Some(next) = self.unconditional_loop(ops, i, end, level)? =>
             {
                 Ok(next)
+            }
+            // CPython 3.12 can leave a separately located NOP for a stripped
+            // docstring. Keep the no-op when the next statement is still in
+            // the entry block, with no loop or protected-suite entry between.
+            "NOP"
+                if self.m.version == super::PythonVersion::Py312
+                    && self.depth > 0
+                    && !self.class
+                    && self.work.mode == super::synthetic::Mode::Ordinary
+                    && i > 0
+                    && (ops[i - 1].name, ops[i - 1].arg) == ("RESUME", 0)
+                    && i + 1 < self.flow.block(i - 1).ops.end
+                    && ops[i + 1].name.starts_with("LOAD_")
+                    && self.instruction_lines.as_deref().is_ok_and(|lines| {
+                        lines[i].zip(lines[i + 1]).is_some_and(|(a, b)| a < b)
+                    }) =>
+            {
+                self.line("pass")?;
+                Ok(i + 1)
             }
             "POP_TOP" | "POP_ITER"
                 if self.stack.is_empty()

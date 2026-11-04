@@ -101,8 +101,9 @@ cargo run --locked -p serc-cli --features decompile -- decompile __pycache__/hel
 ```
 
 The command first tries to verify the entire module by recompiling it. If that
-fails, it prints best-effort source with a warning and marks gaps with an
-ellipsis. It appends detached functions and lists the basic blocks that cover
+fails, it prints best-effort source with a warning. Reaching a missing function
+tail raises a marked `NotImplementedError`. Other gaps have a marked ellipsis.
+It appends detached functions and lists the basic blocks that cover
 each gap as comments. Use `serc decompile --strict FILE.pyc` to require
 verification. A strict refusal leaves stdout empty and exits with status 2. See
 the [coverage and limitations](docs/decompilation.md).

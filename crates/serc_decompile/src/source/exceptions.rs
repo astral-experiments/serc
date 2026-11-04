@@ -61,7 +61,7 @@ impl Body<'_, '_, '_> {
             .is_some_and(|op| op.name == "WITH_EXCEPT_START")
         {
             self.handlers = super::protected_regions::collect(bc, self);
-            return self.with_statement(bc, handlers, limit);
+            return self.with_statement(bc, handlers, 0, limit);
         }
         if entry.depth > 0 && !entry.lasti {
             // A protected condition inside a loop keeps the iterator on the
@@ -71,8 +71,42 @@ impl Body<'_, '_, '_> {
         if entry.depth != 0 || entry.lasti {
             return Err(format!("unsupported handler depth at byte {}", entry.start));
         }
+        if self.depth > 0
+            && !self.class
+            && (self.work.partial || ops.iter().any(|op| op.name == "WITH_EXCEPT_START"))
+            && ops[..start].iter().any(|op| {
+                op.name.starts_with("POP_JUMP")
+                    && op.jump.is_some_and(|target| target > entry.start)
+            })
+            && let Some((regions, prefix_end)) =
+                super::protected_regions::guarded_prefix(bc, self, limit)
+        {
+            if let Some(enter) = self.manager_after_prefix(ops, prefix_end) {
+                self.handlers = regions;
+                self.region(ops, 0, enter, 0)?;
+                if !matches!(self.stack.as_slice(), [super::Value::Expr(_)]) {
+                    return Err("unresolved context manager after guarded prefix".into());
+                }
+                let next = handlers.partition_point(|h| h.start < ops[prefix_end].offset);
+                return self.with_statement(bc, &handlers[next..], enter, limit);
+            }
+            if self.work.partial {
+                self.handlers = regions;
+                self.region(ops, 0, prefix_end, 0)?;
+                if self.stack.is_empty() {
+                    self.partial_start = prefix_end;
+                }
+                return Err(format!(
+                    "unplaced exception region at byte {}",
+                    ops[prefix_end].offset
+                ));
+            }
+        }
         self.region(ops, 0, start, 0)?;
-        let (suite, returns) = self.fragment(ops, start, end, 0)?.pending_return()?;
+        let return_exit = end + 1 == normal_end && ops[end].name == "RETURN_VALUE";
+        let (suite, returns) = self
+            .suite_fragment(ops, start..end, 0, Vec::new(), return_exit)?
+            .pending_return()?;
         let try_source_start = self.lines.len();
         self.try_block(&suite, start > 0 && ops[start - 1].name != "NOP")?;
         let star = ops
@@ -83,10 +117,11 @@ impl Body<'_, '_, '_> {
         }
         if !star
             && returns
-            && end + 1 == handler
-            && ops[end].name == "RETURN_VALUE"
-            && ops.get(handler + 1).is_some_and(|_| {
-                self.flow
+            // Inlined comprehension cleanups may follow the normal return
+            // before the user's dispatcher. They own no normal continuation.
+            && return_exit
+            && ops.get(handler + 1).is_some_and(|op| {
+                op.name == "POP_TOP" || self.flow
                     .block(handler + 1)
                     .ops
                     .clone()

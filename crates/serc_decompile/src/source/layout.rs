@@ -1,46 +1,139 @@
 //! Preserve source lines that affect instructions or executable constants.
 use ruff_python_ast::{
-    Expr, Keyword, Stmt,
+    Expr, Keyword, MatchCase, Stmt, WithItem,
     token::TokenKind,
-    visitor::{Visitor, walk_expr, walk_stmt},
+    visitor::{Visitor, walk_expr, walk_match_case, walk_stmt},
 };
 use ruff_source_file::LineIndex;
-use ruff_text_size::Ranged;
+use ruff_text_size::{Ranged, TextRange, TextSize};
 use std::collections::BTreeMap;
 
 use super::{MAX_SOURCE, Module, Object};
 use serc_bytecode::target::code_flags::CO_NEWLOCALS;
 
-#[derive(Default)]
-struct KeywordCalls<'a>(Vec<&'a [Keyword]>);
+/// The lifter groups operands until precedence is known. For best-effort
+/// source, remove redundant grouping without reformatting diagnostic comments
+/// or changing physical lines.
+pub(super) fn readable_primaries(source: String) -> String {
+    if ![")(", ").", ")["]
+        .iter()
+        .any(|suffix| source.contains(suffix))
+    {
+        return source;
+    }
+    let Ok(parsed) = ruff_python_parser::parse_module(&source) else {
+        return source;
+    };
+    let mut visitor = PrimaryGroups {
+        source: &source,
+        parens: Vec::new(),
+    };
+    visitor.visit_body(parsed.suite());
+    if visitor.parens.is_empty() {
+        return source;
+    }
+    visitor.parens.sort_unstable();
+    let mut result = String::with_capacity(source.len() - visitor.parens.len());
+    let mut from = 0;
+    for at in visitor.parens {
+        result.push_str(&source[from..at]);
+        from = at + 1;
+    }
+    result.push_str(&source[from..]);
+    result
+}
 
-impl<'a> Visitor<'a> for KeywordCalls<'a> {
+struct PrimaryGroups<'a> {
+    source: &'a str,
+    parens: Vec<usize>,
+}
+
+impl<'a> Visitor<'a> for PrimaryGroups<'_> {
     fn visit_expr(&mut self, expr: &'a Expr) {
-        if let Expr::Call(call) = expr
-            && call.arguments.keywords.len() > 1
+        let primary = match expr {
+            Expr::Call(call) => Some(call.func.as_ref()),
+            Expr::Attribute(attr) => Some(attr.value.as_ref()),
+            Expr::Subscript(index) => Some(index.value.as_ref()),
+            // Debug fields can include their original spelling in the value.
+            Expr::FString(_) | Expr::TString(_) => return,
+            _ => None,
+        };
+        if let Some(
+            base @ (Expr::Name(_) | Expr::Call(_) | Expr::Attribute(_) | Expr::Subscript(_)),
+        ) = primary
         {
-            self.0.push(&call.arguments.keywords);
+            let open = expr.start().to_usize();
+            let close = base.end().to_usize();
+            if self.source.get(open..base.start().to_usize()) == Some("(")
+                && self.source.as_bytes().get(close) == Some(&b')')
+                && !self.source[base.range()].contains(['\r', '\n'])
+                && self.source[..open]
+                    .chars()
+                    .next_back()
+                    .is_none_or(|c| c.is_ascii_punctuation() && c != '_' || c.is_whitespace())
+            {
+                self.parens.extend([open, close]);
+            }
         }
         walk_expr(self, expr);
     }
 }
 
-/// The AST generator normally puts a call on one line. Keep the argument
-/// boundaries that the instruction lifter split to preserve local-load packing.
-pub(super) fn keyword_lines(raw: &str, suite: &[Stmt], formatted: &str) -> Option<String> {
-    if !raw.contains(",\n") {
+#[derive(Default)]
+struct SplitItems<'a> {
+    keywords: Vec<&'a [Keyword]>,
+    managers: Vec<&'a [WithItem]>,
+    case_suites: Vec<TextRange>,
+}
+
+impl<'a> Visitor<'a> for SplitItems<'a> {
+    fn visit_match_case(&mut self, case: &'a MatchCase) {
+        if case.guard.is_none()
+            && let [body] = case.body.as_slice()
+        {
+            self.case_suites
+                .push(TextRange::new(case.pattern.end(), body.start()));
+        }
+        walk_match_case(self, case);
+    }
+
+    fn visit_stmt(&mut self, stmt: &'a Stmt) {
+        if let Stmt::With(manager) = stmt
+            && manager.items.len() > 1
+        {
+            self.managers.push(&manager.items);
+        }
+        walk_stmt(self, stmt);
+    }
+
+    fn visit_expr(&mut self, expr: &'a Expr) {
+        if let Expr::Call(call) = expr
+            && call.arguments.keywords.len() > 1
+        {
+            self.keywords.push(&call.arguments.keywords);
+        }
+        walk_expr(self, expr);
+    }
+}
+
+/// Preserve line boundaries that affect packed loads or tracing instructions.
+pub(super) fn item_lines(raw: &str, suite: &[Stmt], formatted: &str) -> Option<String> {
+    if !raw.contains(",\n") && !raw.contains("case _: ") {
         return None;
     }
-    let mut before = KeywordCalls::default();
+    let mut before = SplitItems::default();
     before.visit_body(suite);
     let parsed = ruff_python_parser::parse_module(formatted).ok()?;
-    let mut after = KeywordCalls::default();
+    let mut after = SplitItems::default();
     after.visit_body(parsed.suite());
-    if before.0.len() != after.0.len() {
+    if before.keywords.len() != after.keywords.len()
+        || before.managers.len() != after.managers.len()
+        || before.case_suites.len() != after.case_suites.len()
+    {
         return None;
     }
-    let mut starts = Vec::new();
-    for (a, b) in before.0.into_iter().zip(after.0) {
+    let mut edits = Vec::new();
+    for (a, b) in before.keywords.into_iter().zip(after.keywords) {
         if a.len() != b.len()
             || !a
                 .iter()
@@ -49,39 +142,69 @@ pub(super) fn keyword_lines(raw: &str, suite: &[Stmt], formatted: &str) -> Optio
         {
             return None;
         }
-        for (original, target) in a.windows(2).zip(b.windows(2)) {
-            let sep = &raw[original[0].end().to_usize()..original[1].start().to_usize()];
-            if sep.contains('\n') && formatted[..target[1].start().to_usize()].ends_with(", ") {
-                starts.push(target[1].start());
-            }
+        edits.extend(
+            split_offsets(raw, a, formatted, b).map(|at| (at - TextSize::new(1), at, "\n")),
+        );
+    }
+    for (a, b) in before.managers.into_iter().zip(after.managers) {
+        if a.len() != b.len() {
+            return None;
+        }
+        edits.extend(
+            split_offsets(raw, a, formatted, b).map(|at| (at - TextSize::new(1), at, " \\\n")),
+        );
+    }
+    // Moving a one-line wildcard arm to a new line introduces a tracing NOP.
+    for (a, b) in before.case_suites.into_iter().zip(after.case_suites) {
+        if &raw[a] == ": " && formatted[b].starts_with(":\n") {
+            edits.push((b.start(), b.end(), ": "));
         }
     }
-    if starts.is_empty() {
+    if edits.is_empty() {
         return None;
     }
-    starts.sort_unstable();
+    edits.sort_unstable();
     let lines = LineIndex::from_source_text(formatted);
     let mut result = String::new();
     let mut from = 0;
-    for offset in starts {
-        let at = offset.to_usize();
-        result.push_str(&formatted[from..at - 1]);
-        let line = lines
-            .line_start(lines.line_index(offset), formatted)
-            .to_usize();
-        let indent = formatted[line..at]
-            .bytes()
-            .take_while(|&b| b == b' ')
-            .count();
-        result.push('\n');
-        result.extend(std::iter::repeat_n(' ', indent + 4));
-        from = at;
+    for (start, end, replacement) in edits {
+        let at = start.to_usize();
+        result.push_str(formatted.get(from..at)?);
+        result.push_str(replacement);
+        if replacement.ends_with('\n') {
+            let line = lines
+                .line_start(lines.line_index(start), formatted)
+                .to_usize();
+            let indent = formatted[line..at]
+                .bytes()
+                .take_while(|&b| b == b' ')
+                .count();
+            result.extend(std::iter::repeat_n(' ', indent + 4));
+        }
+        from = end.to_usize();
         if result.len() > MAX_SOURCE {
             return None;
         }
     }
     result.push_str(&formatted[from..]);
     (result.len() <= MAX_SOURCE).then_some(result)
+}
+
+fn split_offsets<'a, T: Ranged>(
+    raw: &'a str,
+    before: &'a [T],
+    formatted: &'a str,
+    after: &'a [T],
+) -> impl Iterator<Item = TextSize> + 'a {
+    before
+        .windows(2)
+        .zip(after.windows(2))
+        .filter_map(|(a, b)| {
+            let separator = &raw[a[0].end().to_usize()..a[1].start().to_usize()];
+            let offset = b[1].start();
+            (separator.contains('\n') && formatted[..offset.to_usize()].ends_with(", "))
+                .then_some(offset)
+        })
 }
 
 pub(super) fn class_candidates(m: &Module<'_>, candidates: &mut Vec<String>) -> Result<(), String> {
@@ -286,4 +409,26 @@ pub(super) fn partial(m: &Module<'_>, candidate: &Module<'_>, source: &str) -> O
     }
     result.push_str(&source[copied..]);
     (result != source).then_some(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::readable_primaries;
+
+    #[test]
+    fn removes_only_redundant_groups_around_primaries() {
+        let source = "((log).append)((items)[0])  # (log).append\n\
+                      (left + right).read()\n\
+                      if(flag).value: pass\n\
+                      ((log)\n .append)(1)\n\
+                      debug = f'{(log).name=}'\n";
+        assert_eq!(
+            readable_primaries(source.into()),
+            "log.append(items[0])  # (log).append\n\
+             (left + right).read()\n\
+             if(flag).value: pass\n\
+             (log\n .append)(1)\n\
+             debug = f'{(log).name=}'\n"
+        );
+    }
 }

@@ -7,7 +7,7 @@ use crate::flow::Graph;
 use serc_bytecode::instructions::Handler;
 
 use super::conditionals::Predicate;
-use super::regions::constant_return;
+use super::regions::{constant_return, local_return};
 use super::{Body, Instruction, Value};
 
 pub(super) struct WhileLatch {
@@ -27,12 +27,16 @@ pub(super) struct Loop {
     copied_return: Option<usize>,
 }
 
-fn local_return(ops: &[Instruction], end: usize) -> Option<usize> {
-    let [.., load, ret] = ops.get(..end)? else {
-        return None;
-    };
-    (matches!(load.name, "LOAD_FAST" | "LOAD_FAST_BORROW") && ret.name == "RETURN_VALUE")
-        .then_some(end - 2)
+impl Loop {
+    pub(super) fn retry(header: usize, body_end: usize, outer: Option<Self>) -> Self {
+        Self {
+            header,
+            body_end,
+            iterators: outer.map_or(0, |outer| outer.iterators),
+            after: None,
+            copied_return: None,
+        }
+    }
 }
 
 /// Protection can stop after truth conversion and resume in the guarded
@@ -229,7 +233,7 @@ impl Body<'_, '_, '_> {
 
     pub(super) fn loop_transfer(&self, ops: &[Instruction], i: usize) -> Option<&'static str> {
         let active = self.loop_edges?;
-        if !matches!(ops[i].name, "JUMP_BACKWARD" | "JUMP_FORWARD") {
+        if !serc_bytecode::target::is_unconditional_jump(ops[i].opcode) {
             return None;
         }
         let dest = self.flow.jump(i)?;
@@ -349,6 +353,10 @@ impl Body<'_, '_, '_> {
             return Ok(None);
         };
         let after = latch + 1;
+        let exit = self.inline_loop_exit(ops, header..latch).unwrap_or(after);
+        if exit > end {
+            return Ok(None);
+        }
         let stop = super::suspension::stop_iteration_handler(ops);
         let mut return_arm = None;
         let mut exits_to_after = false;
@@ -374,6 +382,7 @@ impl Body<'_, '_, '_> {
                 !current
                     && !generator_exit
                     && self.delegated_cleanup(ops, start).is_none()
+                    && super::comprehensions::restore_range(ops, h).is_none()
                     && !self.loop_contains_handler(ops, h, nop + 1..latch)
             });
             if protected
@@ -399,7 +408,7 @@ impl Body<'_, '_, '_> {
             header: nop,
             body_end: latch,
             iterators: self.loop_edges.map_or(0, |outer| outer.iterators),
-            after: Some(after),
+            after: Some(exit),
             copied_return,
         });
         let body = self.fragment(ops, nop + 1, latch, level);
@@ -408,7 +417,7 @@ impl Body<'_, '_, '_> {
         if let Some(at) = copied_return {
             self.region(ops, at, self.flow.block(at).ops.end, level)?;
         }
-        Ok(Some(after))
+        Ok(Some(exit))
     }
 
     /// The out-of-line `CLEANUP_THROW` rejoins the same `END_SEND` as the

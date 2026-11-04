@@ -1,5 +1,6 @@
 //! Place nested exception suites in dependency order.
 use super::{Bytecode, Clause, Graph, Handler, Instruction, Protected};
+use crate::source::comprehensions;
 use rustc_hash::{FxHashMap, FxHashSet};
 
 pub(super) struct HandlerGroup {
@@ -17,6 +18,7 @@ pub(super) fn groups(bc: &Bytecode, flow: &Graph) -> Vec<HandlerGroup> {
         }
     }
     let ops = &bc.ops;
+    groups.retain(|_, entries| comprehensions::restore_range(ops, entries[0]).is_none());
     let index = |offset| ops.binary_search_by_key(&offset, |op| op.offset).ok();
     let enclosing = |entries: &[Handler]| {
         let first = entries[0];
@@ -28,6 +30,14 @@ pub(super) fn groups(bc: &Bytecode, flow: &Graph) -> Vec<HandlerGroup> {
         let (_, unwind) = crate::source::dispatch::unwind(ops, flow, dispatch, first.depth + 1)?;
         let outer = flow.handler(unwind)?;
         let exceptional = match groups.get(&outer.target)?.as_slice() {
+            [normal, exceptional]
+                if normal.start >= first.target
+                    && normal.end <= ops[unwind].offset
+                    && ops[index(normal.start)?].name == "POP_EXCEPT"
+                    && ops[index(normal.end)?.checked_sub(1)?].jump == Some(first.end) =>
+            {
+                exceptional
+            }
             [normal, .., exceptional]
                 if first.start < normal.start && normal.end <= first.target =>
             {
