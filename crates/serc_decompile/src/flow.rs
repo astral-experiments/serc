@@ -1,6 +1,10 @@
 //! The normal edges use CPython's logical targets through `END_FOR` and `END_SEND`.
 //! Protection boundaries split blocks so an exceptional edge always restores
 //! the same handler stack throughout its block.
+mod packing;
+
+pub(super) use packing::same_packed_flow;
+
 use std::ops::Range;
 
 use serc_bytecode::PythonVersion;

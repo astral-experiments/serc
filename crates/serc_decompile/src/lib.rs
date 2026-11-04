@@ -75,7 +75,11 @@ pub fn decompile_pyc_with_mode(
         Err(error) if mode == DecompileMode::BestEffort => {
             let code = module.code(module.root).map_err(DecompileError::Read)?;
             let filename = module.text(code.filename).map_err(DecompileError::Read)?;
-            let result = source::partial(&module, fallback, &error.to_string(), |source, level| {
+            let reason = match error {
+                DecompileError::Verify(..) => format!("strict verification: {error}"),
+                _ => error.to_string(),
+            };
+            let result = source::partial(&module, fallback, &reason, |source, level| {
                 compile(source, filename, module.version, level)
             })
             .map_err(|reason| DecompileError::Reconstruct(module.version, reason))?;

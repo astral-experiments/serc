@@ -82,17 +82,24 @@ fn differences(
             } else {
                 &mut function_flow_budget
             };
-            let flow = if let Some(rest) = flow_budget.checked_sub(original.len() + compiled.len())
+            let mut exceptions = left != right;
+            let mut flow = false;
+            if original != compiled
+                && let Some(rest) = flow_budget.checked_sub(original.len() + compiled.len())
             {
                 *flow_budget = rest;
-                original != compiled
-                    && crate::flow::same_normal_flow(m.version, original, compiled) == Ok(false)
-            } else {
-                false
-            };
+                if exceptions
+                    && crate::flow::same_packed_flow(m.version, original, left, compiled, right)
+                {
+                    exceptions = false;
+                } else {
+                    flow =
+                        crate::flow::same_normal_flow(m.version, original, compiled) == Ok(false);
+                }
+            }
             let difference = Difference {
                 line: (id != m.root).then_some(recovered.first_line),
-                exceptions: left != right,
+                exceptions,
                 flow,
             };
             if difference.confirmed() {
