@@ -74,8 +74,21 @@ impl Body<'_, '_, '_> {
         }
         let block = self.flow.block(nop + 1);
         let header = block.ops.start;
-        let branch = block.ops.end - 1;
-        if header < nop || branch + 1 >= end {
+        // A protected predicate can end just before its conditional jump.
+        // The table boundary splits the block without changing normal flow.
+        let branch = if block.ops.end < end
+            && ops[block.ops.end].name.starts_with("POP_JUMP_IF_")
+            && self.flow.fallthrough(block) == Some(block.ops.end)
+            && self.flow.entered_from(block.ops.end, block.ops.clone())
+        {
+            block.ops.end
+        } else {
+            block.ops.end - 1
+        };
+        if header < nop
+            || (header > nop && self.handlers.contains_key(&header))
+            || branch + 1 >= end
+        {
             return Ok(None);
         }
         let fall = branch + 1 + usize::from(ops[branch + 1].name == "NOT_TAKEN");
@@ -184,29 +197,94 @@ impl Body<'_, '_, '_> {
             return Ok(None);
         };
         let after = latch + 1;
+        let stop = super::suspension::stop_iteration_handler(ops);
+        let mut return_arm = None;
+        let mut exits_to_after = false;
         for block in self.flow.blocks_in(header..after) {
             let start = block.ops.start;
             let last = block.ops.end - 1;
-            if self.flow.handler(start).is_some()
-                || (start != header && !self.flow.entered_from(start, nop..after))
+            exits_to_after |= self.flow.jump(last) == Some(after);
+            // A break followed by a return can be threaded into one arm,
+            // leaving its tracing NOP before the copied load and return.
+            if after == end
+                && ops[start].name == "NOP"
+                && block.height == self.flow.block(header).height
+                && (local_return(ops, block.ops.end) == Some(start + 1)
+                    || constant_return(ops, block.ops.end).is_some_and(|(at, _)| at == start + 1))
+            {
+                return_arm = Some(start + 1);
+            }
+            let protected = self.flow.handler(start).is_some_and(|h| {
+                let generator_exit = Some(h.target) == stop && h.depth == 0 && h.lasti;
+                !generator_exit && self.delegated_cleanup(ops, start).is_none()
+            });
+            if protected
+                || (start != header
+                    && !self.flow.entered_from(start, nop..after)
+                    && !self.delegation_rejoins_loop(ops, start, nop..after))
                 || self.flow.jump(last).is_some_and(|to| {
                     !((nop..after).contains(&to)
-                        || (to == after && ops[last].name == "JUMP_FORWARD"))
+                        || (to == after
+                            && (ops[last].name == "JUMP_FORWARD"
+                                || ops[last].name.starts_with("POP_JUMP_IF_"))))
                 })
             {
                 return Ok(None);
             }
         }
+        let copied_return = return_arm.filter(|_| !exits_to_after);
         let outer = self.loop_edges.replace(Loop {
             header: nop,
             body_end: latch,
             after: Some(after),
-            copied_return: None,
+            copied_return,
         });
         let body = self.fragment(ops, nop + 1, latch, level);
         self.loop_edges = outer;
         self.block("while True:", &body?.suite()?)?;
+        if let Some(at) = copied_return {
+            self.region(ops, at, self.flow.block(at).ops.end, level)?;
+        }
         Ok(Some(after))
+    }
+
+    /// The out-of-line `CLEANUP_THROW` rejoins the same `END_SEND` as the
+    /// in-loop `SEND`. Only accept that edge from outside the loop.
+    fn delegation_rejoins_loop(
+        &self,
+        ops: &[Instruction],
+        start: usize,
+        body: std::ops::Range<usize>,
+    ) -> bool {
+        if ops[start].name != "END_SEND" {
+            return false;
+        }
+        let Some(send) = self
+            .flow
+            .incoming(start)
+            .find(|&i| body.contains(&i) && ops[i].name == "SEND")
+        else {
+            return false;
+        };
+        let Some(cleanup) = self.delegated_cleanup(ops, send + 1) else {
+            return false;
+        };
+        self.flow
+            .incoming(start)
+            .all(|i| body.contains(&i) || i == cleanup + 1)
+    }
+
+    pub(super) fn conditional_break(
+        &self,
+        ops: &[Instruction],
+        destination: usize,
+        end: usize,
+    ) -> bool {
+        self.loop_edges.is_some_and(|active| {
+            ops[active.header].name == "NOP"
+                && active.body_end == end
+                && active.after == Some(destination)
+        })
     }
 
     pub(super) fn folded_break(&self, ops: &[Instruction], i: usize, end: usize) -> bool {
@@ -217,6 +295,9 @@ impl Body<'_, '_, '_> {
             return false;
         };
         let stop = self.flow.block(i).ops.end;
+        if ops[active.header].name == "NOP" {
+            return i + 1 == expected && ops[i].name == "NOP" && stop <= end;
+        }
         stop <= end
             && self
                 .copied_return(ops, active.header, stop, expected)

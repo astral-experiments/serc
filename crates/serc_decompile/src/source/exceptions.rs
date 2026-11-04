@@ -60,6 +60,7 @@ impl Body<'_, '_, '_> {
             .get(handler + 1)
             .is_some_and(|op| op.name == "WITH_EXCEPT_START")
         {
+            self.handlers = super::protected_regions::collect(bc, self);
             return self.with_statement(bc, handlers, limit);
         }
         if entry.depth > 0 && !entry.lasti {
@@ -95,7 +96,7 @@ impl Body<'_, '_, '_> {
             && !returns
             && let Some(dispatch) = self.exception_dispatch(bc, handler, start, end, limit)
         {
-            return self.emit_dispatch(ops, dispatch, try_source_start);
+            return self.emit_dispatch(ops, &dispatch, try_source_start);
         }
         let match_kind = if star {
             "CHECK_EG_MATCH"
@@ -159,7 +160,12 @@ impl Body<'_, '_, '_> {
         if ops.get(handler + 1).is_some_and(|op| op.name == "POP_TOP") {
             let (_, cleanup) = super::dispatch::unwind(ops, &self.flow, handler, entry.depth + 1)
                 .ok_or("missing bare exception cleanup")?;
-            let stop = if ops[cleanup - 1].name == "RAISE_VARARGS" {
+            let stop = if ops[cleanup - 1].name == "RAISE_VARARGS"
+                && self
+                    .flow
+                    .handler(cleanup - 1)
+                    .is_some_and(|h| h.target == ops[cleanup].offset && h.lasti)
+            {
                 cleanup
             } else {
                 (handler + 2..cleanup)

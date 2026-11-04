@@ -166,6 +166,57 @@ fn branches_preserve_call_order() {
 
 #[cfg(feature = "decompile")]
 #[test]
+fn a_terminal_arm_can_jump_over_its_alternate() {
+    check_fixture(
+        r"def check(first, read, other, done):
+    if first:
+        value = read()
+        if value is not None and value:
+            raise ValueError(value)
+    elif other():
+        raise LookupError()
+    done()
+
+def handled(read, recover, emit):
+    try:
+        read()
+    except ValueError as error:
+        if error.args:
+            return recover(error)
+        emit('empty')
+    emit('after')
+
+def quit(clean, code):
+    try:
+        clean()
+    except:
+        pass
+    raise SystemExit(code)
+",
+        r"import sys
+result = []
+def record(value):
+    result.append(value)
+    return value
+for first in (False, True):
+    for value in (None, 0, 2):
+        for other in (False, True):
+            try: check(first, lambda: record(value), lambda: record(other), lambda: record('done'))
+            except Exception as exc: result.append((type(exc).__name__, exc.args))
+for err in (None, ValueError(), ValueError('bound')):
+    def read():
+        if err is not None: raise err
+    def recover(value):
+        result.append(sys.exception() is value)
+        return value.args
+    result.append(handled(read, recover, record))
+    try: quit(read, 9)
+    except SystemExit as exc: result.append((exc.code, exc.__context__ is None))",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn mixed_guards_short_circuit_before_entering_a_generator() {
     check_fixture(
         r"def choose(first, second, items, visit, emit):
@@ -539,6 +590,64 @@ fn a_trailing_break_test_repeats_the_whole_loop_body() {
 log = []
 result = drain(items.__next__, log), next(items), log
 assert result == (0, 'unused', [0])",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn unconditional_loops_follow_their_own_resumption_and_break_edges() {
+    check_fixture(
+        r"def parse(read, limit):
+    lines = []
+    while True:
+        line = read()
+        if len(line) > limit:
+            raise ValueError(line)
+        lines.append(line)
+        if len(lines) > limit:
+            raise OverflowError
+        if not line:
+            break
+    return lines
+
+def widths(first, more):
+    yield first
+    while True:
+        yield more()
+
+async def drain(read):
+    values = []
+    while True:
+        value = await read()
+        if not value:
+            break
+        values.append(value)
+    return values
+",
+        r"import asyncio
+result = []
+for lines, limit in [(['x', ''], 3), (['xxxx'], 2), (['x', 'y', ''], 2)]:
+    try: result.append(parse(iter(lines).__next__, limit))
+    except Exception as exc: result.append((type(exc).__name__, exc.args))
+for stop in ('close', 'throw', 'next'):
+    it = widths(4, iter([3, 2]).__next__)
+    result.append([next(it), next(it), next(it)])
+    try:
+        if stop == 'close': it.close()
+        elif stop == 'throw': it.throw(LookupError('thrown'))
+        else: next(it)
+    except Exception as exc: result.append((type(exc).__name__, exc.args))
+async def consume(values):
+    async def read():
+        await asyncio.sleep(0)
+        value = next(values)
+        if isinstance(value, Exception): raise value
+        return value
+    try: return await drain(read)
+    except ValueError as exc: return exc.args
+for values in ([1, 2, 0], [3, ValueError('failed')]):
+    result.append(asyncio.run(consume(iter(values))))
+",
     );
 }
 
@@ -1566,6 +1675,69 @@ result = log",
 
 #[cfg(feature = "decompile")]
 #[test]
+fn managers_follow_guards_loops_and_early_returns() {
+    check_fixture(
+        r"def guarded(active, lock, call):
+    if active:
+        with lock:
+            return call()
+    return 7
+
+def repeat(items, lock, call):
+    for item in items:
+        with lock:
+            call(item)
+    call('after')
+
+async def nested(outer, inner, call, emit):
+    with outer:
+        async with inner:
+            emit(await call())
+    emit('after')
+
+async def choose(lock, call, flag, emit):
+    async with lock:
+        if flag:
+            return await call()
+        emit('other')
+    emit('after')
+",
+        r"import asyncio
+result = []
+class Lock:
+    def __init__(self, name, suppress):
+        self.name, self.suppress = name, suppress
+    def __enter__(self): result.append(('enter', self.name))
+    def __exit__(self, kind, value, tb):
+        result.append(('exit', self.name, kind.__name__ if kind else None))
+        return self.suppress
+    async def __aenter__(self): return self.__enter__()
+    async def __aexit__(self, *exc): return self.__exit__(*exc)
+for fails in (False, True):
+    def call(*args):
+        result.append(('call', args))
+        if fails: raise ValueError()
+        return 42
+    async def read(): return call()
+    for outer in (False, True):
+        lock = Lock('outer', outer)
+        for inner in (False, True):
+            other = Lock('inner', inner)
+            try: result.append(asyncio.run(nested(lock, other, read, result.append)))
+            except ValueError: result.append('failed')
+        for flag in (False, True):
+            try: result.append(guarded(flag, lock, call))
+            except ValueError: result.append('failed')
+            try: result.append(asyncio.run(choose(lock, read, flag, result.append)))
+            except ValueError: result.append('failed')
+        try: repeat([1, 2], lock, call)
+        except ValueError: result.append('failed')
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
 fn consecutive_managers_keep_separate_exception_paths() {
     check_fixture(
         "def run(manager, emit):\n    with manager(1) as a, manager(2) as b:\n        emit(a, b)\n    emit('between')\n    with manager(3) as c:\n        emit(c)\n    emit('done')\n    return 17\n",
@@ -2175,6 +2347,57 @@ def restore(): result.append(sys.exception().args)
 try: prepare(fail, restore)
 except KeyboardInterrupt as exc: result.append(exc.args)
 prepare(lambda: result.append('read'), restore)",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn branching_finalizers_propagate_the_active_exception() {
+    check_fixture(
+        r"def hold(box, overwrite, observe):
+    try:
+        saved = box[:]
+        del box[:]
+        yield
+    finally:
+        if overwrite:
+            observe('restore')
+            box[:] = saved
+        else:
+            observe('append')
+            box.append(saved)
+
+async def fail(error, flag, observe):
+    try:
+        raise error
+    finally:
+        if flag:
+            observe('left')
+        else:
+            observe('right')
+",
+        r"import asyncio, sys
+result = []
+def observe(label):
+    active = sys.exception()
+    result.append((label, type(active).__name__))
+    if replace:
+        raise LookupError(label)
+for replace in (True, False):
+    for flag in (True, False):
+        for exit in ('close', 'throw', 'finish'):
+            box = [1, 2]
+            it = hold(box, flag, observe)
+            next(it)
+            try:
+                if exit == 'close': it.close()
+                elif exit == 'throw': it.throw(ValueError())
+                else: next(it)
+            except BaseException as exc: result.append(type(exc).__name__)
+            result.append(box)
+        try: asyncio.run(fail(KeyError(), flag, observe))
+        except Exception as exc: result.append(type(exc).__name__)
+",
     );
 }
 
@@ -2908,6 +3131,114 @@ fn truth_tests_preserve_user_conversions_and_short_circuit_returns() {
 log = []
 a, b = Flag('a', False), Flag('b', True)
 result = truth(a), truth(b), choose(lambda: a, b) is b, choose(lambda: b, a) is a, log",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn finalizers_protect_loop_predicates_and_pending_managed_returns() {
+    check_fixture(
+        r"def run(step, ready, cleanup):
+    try:
+        while True:
+            step()
+            if ready():
+                break
+    finally:
+        cleanup()
+
+async def acquire(lock, work, cleanup):
+    async with lock:
+        try:
+            return await work()
+        finally:
+            cleanup()
+",
+        r"import asyncio, sys
+result = []
+for failure in ('step', 'ready', 'cleanup', None):
+    calls = iter([False, True])
+    def record(label):
+        result.append((label, type(sys.exception()).__name__))
+        if label == failure: raise LookupError(label)
+    def ready():
+        record('ready')
+        return next(calls)
+    try: run(lambda: record('step'), ready, lambda: record('cleanup'))
+    except LookupError as exc: result.append(exc.args)
+class Lock:
+    async def __aenter__(self): pass
+    async def __aexit__(self, kind, value, tb):
+        result.append(('exit', kind.__name__ if kind else None))
+        return suppress
+async def work():
+    if fail: raise ValueError('work')
+    return 42
+def cleanup():
+    result.append(('cleanup', type(sys.exception()).__name__))
+    if replace: raise KeyError('cleanup')
+for fail in (False, True):
+    for replace in (False, True):
+        for suppress in (False, True):
+            try: result.append(asyncio.run(acquire(Lock(), work, cleanup)))
+            except Exception as exc: result.append(exc.args)
+",
+    );
+}
+
+#[cfg(feature = "decompile")]
+#[test]
+fn managed_await_preserves_ordered_handlers_and_suppression() {
+    check_fixture(
+        r"async def run(lock, wait, clean, emit):
+    with lock:
+        emit('start')
+        try:
+            await wait()
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except BaseException:
+            await clean()
+            raise
+    emit('after')
+
+async def forever(read, emit):
+    while True:
+        emit(await read())
+",
+        r"import asyncio, sys
+result = []
+async def scenario(error, replace, suppress):
+    def emit(value): result.append((value, type(sys.exception()).__name__))
+    class Lock:
+        def __enter__(self): emit('enter')
+        def __exit__(self, *exc):
+            emit('exit')
+            return suppress
+    async def wait():
+        await asyncio.sleep(0)
+        if error: raise error
+    async def clean():
+        emit('clean')
+        await asyncio.sleep(0)
+        if replace: raise LookupError()
+    try: await run(Lock(), wait, clean, emit)
+    except BaseException as exc: emit(type(exc).__name__)
+for error in (None, SystemExit(), ValueError(), asyncio.CancelledError()):
+    for replace in (True, False):
+        for suppress in (True, False):
+            asyncio.run(scenario(error, replace, suppress))
+async def consume():
+    values = iter([1, 2, 3])
+    async def read():
+        await asyncio.sleep(0)
+        v = next(values)
+        if v == 3: raise LookupError()
+        return v
+    try: await forever(read, result.append)
+    except LookupError: result.append('done')
+asyncio.run(consume())
+",
     );
 }
 

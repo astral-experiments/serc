@@ -45,7 +45,7 @@ impl Body<'_, '_, '_> {
             if (ops[cleanup - 1].name, ops[cleanup - 1].arg) == ("RERAISE", 0)
                 && finalizers::owns_cleanup(ops, &self.flow, start..cleanup, handler)
                 && !copy.is_empty()
-                && let Some(after) = finalizers::copy_end(ops, &self.flow, cursor..normal_end, copy)
+                && let Some(after) = self.finally_copy_end(ops, cursor..normal_end, copy, false)
             {
                 let suite = self.fragment(ops, cursor, after, 0)?.suite()?;
                 self.block("finally:", &suite)?;

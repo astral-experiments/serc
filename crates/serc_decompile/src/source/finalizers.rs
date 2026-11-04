@@ -3,7 +3,7 @@ use std::ops::Range;
 
 use serc_bytecode::instructions::Handler;
 
-use super::Instruction;
+use super::{Body, Instruction};
 use crate::flow::Graph;
 
 /// Monitoring markers can split a single finalizer's unwind range.
@@ -64,43 +64,71 @@ fn steps(ops: &[Instruction], indices: Range<usize>) -> impl Iterator<Item = Ste
     })
 }
 
-/// Return the first normal instruction after the copy. Corresponding jumps
-/// must still land at corresponding instruction boundaries after expansion.
-pub(super) fn copy_end(
-    ops: &[Instruction],
-    flow: &Graph,
-    normal: Range<usize>,
-    exceptional: Range<usize>,
-) -> Option<usize> {
-    let branching = ops[exceptional.clone()].iter().any(|op| op.jump.is_some());
-    let mut boundaries = Vec::new();
-    let mut jumps = Vec::new();
-    let mut left = steps(ops, normal.clone());
-    for b in steps(ops, exceptional.clone()) {
-        let a = left.next()?;
-        if a.name != b.name {
-            return None;
-        }
-        if branching && a.first && b.first {
-            boundaries.push((a.index, b.index));
-        }
-        if ops[b.index].jump.is_some() {
-            jumps.push((flow.jump(a.index)?, flow.jump(b.index)?));
-        } else if a.arg != b.arg {
-            return None;
-        }
+impl Body<'_, '_, '_> {
+    pub(super) fn implicit_reraise(&self, ops: &[Instruction], i: usize) -> bool {
+        (ops[i].name, ops[i].arg) == ("RERAISE", 0)
+            && self.finally_unwind.is_some_and(|target| {
+                self.flow
+                    .handler(i)
+                    .is_some_and(|h| h.target == target && h.lasti)
+            })
     }
-    let end = match left.next() {
-        None => normal.end,
-        Some(step) if step.first => step.index,
-        Some(_) => return None,
-    };
-    if jumps.is_empty() {
-        return Some(end);
+
+    /// Return the first normal instruction after the copy. Corresponding jumps
+    /// must still land at corresponding instruction boundaries after expansion.
+    pub(super) fn finally_copy_end(
+        &self,
+        ops: &[Instruction],
+        normal: Range<usize>,
+        exceptional: Range<usize>,
+        terminal: bool,
+    ) -> Option<usize> {
+        let branching = ops[exceptional.clone()].iter().any(|op| op.jump.is_some());
+        let mut boundaries = Vec::new();
+        let mut jumps = Vec::new();
+        let mut left = steps(ops, normal.clone());
+        for b in steps(ops, exceptional.clone()) {
+            let a = left.next()?;
+            if branching && a.first && b.first {
+                boundaries.push((a.index, b.index));
+            }
+            // At function exit the same arm returns None on success and resumes
+            // the active exception on unwind. Explicit source returns still
+            // have to match on both paths.
+            if terminal && (b.name, b.arg) == ("RERAISE", 0) {
+                let width = if a.name == "RETURN_CONST" { 1 } else { 2 };
+                if !a.first
+                    || a.index + width > normal.end
+                    || !self.none_return(&ops[a.index..a.index + width])
+                {
+                    return None;
+                }
+                if width == 2 {
+                    left.next()?;
+                }
+                continue;
+            }
+            if a.name != b.name {
+                return None;
+            }
+            if ops[b.index].jump.is_some() {
+                jumps.push((self.flow.jump(a.index)?, self.flow.jump(b.index)?));
+            } else if a.arg != b.arg {
+                return None;
+            }
+        }
+        let end = match left.next() {
+            None => normal.end,
+            Some(step) if step.first => step.index,
+            Some(_) => return None,
+        };
+        if jumps.is_empty() {
+            return Some(end);
+        }
+        boundaries.push((end, exceptional.end));
+        jumps
+            .iter()
+            .all(|jump| boundaries.binary_search(jump).is_ok())
+            .then_some(end)
     }
-    boundaries.push((end, exceptional.end));
-    jumps
-        .iter()
-        .all(|jump| boundaries.binary_search(jump).is_ok())
-        .then_some(end)
 }

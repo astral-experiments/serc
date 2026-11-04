@@ -6,19 +6,29 @@ use serc_bytecode::instructions::Handler;
 use serc_bytecode::target::operands::SpecialMethod;
 use std::ops::Range;
 
+pub(super) struct ReturnExit {
+    pub(super) start: usize,
+    pub(super) ret: usize,
+    pub(super) pending: bool,
+}
+
 pub(super) fn body_end(ops: &[Instruction], flow: &Graph, entry: Handler) -> Result<usize, String> {
     let mut end = boundary(ops, entry.end)?;
-    while ops[end].name == "YIELD_VALUE"
-        && let Some(suspend) = flow.handler(end)
-        && suspend.start == ops[end].offset
-        && !suspend.lasti
-        && ops[boundary(ops, suspend.target)?].name == "CLEANUP_THROW"
-        && ops.get(end + 1).is_some_and(|op| op.name == "RESUME")
+    while let Some(next) = ops.get(end + 1)
         && let Some(resume) = flow.handler(end + 1)
-        && suspend.end == ops[end + 1].offset
-        && resume.start == suspend.end
+        && resume.start == next.offset
         && (resume.target, resume.depth, resume.lasti) == (entry.target, entry.depth, entry.lasti)
     {
+        match (ops[end].name, flow.handler(end)) {
+            ("NOT_TAKEN", None) if end > 0 && ops[end - 1].name.starts_with("POP_JUMP_IF_") => {}
+            ("YIELD_VALUE", Some(suspend))
+                if suspend.start == ops[end].offset
+                    && suspend.end == next.offset
+                    && !suspend.lasti
+                    && next.name == "RESUME"
+                    && ops[boundary(ops, suspend.target)?].name == "CLEANUP_THROW" => {}
+            _ => break,
+        }
         end = boundary(ops, resume.end)?;
     }
     Ok(end)
@@ -171,6 +181,15 @@ impl Body<'_, '_, '_> {
             if *depth.get_or_insert(entry.depth) != entry.depth {
                 break;
             }
+            // A guard or loop can skip the entire with statement. Let its
+            // enclosing region place the manager on the edge that enters it.
+            let binding = boundary(ops, entry.start)?;
+            if ops[cursor..binding]
+                .iter()
+                .any(|op| op.jump.is_some_and(|target| target >= entry.start))
+            {
+                break;
+            }
             if let Some(next) = self.manager_group(ops, cursor, *entry, 0, &mut normal_end)? {
                 cursor = next;
             } else {
@@ -235,17 +254,28 @@ impl Body<'_, '_, '_> {
             return Err("invalid manager protection".into());
         }
         let mut normal_end = end;
-        let next = match self.manager_group(ops, enter, entry, level, &mut normal_end)? {
-            Some(next) => next,
-            None => {
-                let next = self.after_with_suppression(ops, &entry)?;
-                if next > end && self.none_return(&ops[next..self.flow.normal_end([next])]) {
-                    end
-                } else {
-                    next
-                }
+        if let Some(next) = self.manager_group(ops, enter, entry, level, &mut normal_end)? {
+            return Ok(Some(next));
+        }
+        let next = self.after_with_suppression(ops, &entry)?;
+        if next <= enter || next >= ops.len() {
+            return Err("unsupported continuation after with".into());
+        }
+        if next > end {
+            // CPython can copy a terminal block to the suppression
+            // path. Emit that return after the with, where it runs
+            // only if the pending return expression raised.
+            let stop = self.flow.block(next).ops.end;
+            if matches!(ops[stop - 1].name, "RETURN_CONST" | "RETURN_VALUE")
+                && self
+                    .flow
+                    .handler(next)
+                    .is_none_or(|h| self.suspended() && h.depth == 0 && h.lasti)
+            {
+                self.region(ops, next, stop, level + 1)?;
+                return Ok(Some(end));
             }
-        };
+        }
         Ok(Some(next))
     }
 
@@ -328,11 +358,11 @@ impl Body<'_, '_, '_> {
                 .get(handler + 2)
                 .is_some_and(|op| (op.name, op.arg) == ("GET_AWAITABLE", 2)))
         };
-        let asynchronous = awaited(&entry)?;
         let mut managers = Vec::new();
         let mut previous_body = None;
         let mut seed = Vec::new();
-        let (start, end) = loop {
+        let (start, mut end) = loop {
+            let asynchronous = awaited(&entry)?;
             let start = boundary(ops, entry.start)?;
             // A delegated yield briefly transfers protection to CLEANUP_THROW.
             // Its resume belongs to the same manager at the same stack depth.
@@ -361,7 +391,7 @@ impl Body<'_, '_, '_> {
                 self.expr()?
             };
             let (item, body_start, loaded) = self.manager_item(manager, ops, start, end)?;
-            managers.push(item);
+            managers.push((asynchronous, item));
             seed = loaded;
 
             // Each additional item starts where the enclosing protected range
@@ -371,7 +401,6 @@ impl Body<'_, '_, '_> {
                 && inner.depth > entry.depth
                 && inner.lasti
                 && is_manager_handler(ops, &inner)?
-                && awaited(&inner)? == asynchronous
             {
                 previous_body = Some(body_start);
                 entry = inner;
@@ -379,28 +408,59 @@ impl Body<'_, '_, '_> {
                 break (body_start, end);
             }
         };
-        let (body, returns) = self
-            .seeded(ops, start, end, level, seed)?
-            .pending_return()?;
-        let header = if asynchronous { "async with" } else { "with" };
-        self.block(&format!("{header} {}:", managers.join(", ")), &body)?;
+        // An early return splits the protected body around its normal
+        // __exit__ call. The next arm is still inside the same manager.
+        while let Some(next) = self.managed_child_end(ops, end, entry) {
+            if next > *normal_end {
+                return Err("nested try escapes manager body".into());
+            }
+            end = if let Some(resume) = self.flow.handler(next)
+                && resume.start == ops[next].offset
+                && (resume.target, resume.depth, resume.lasti)
+                    == (entry.target, entry.depth, entry.lasti)
+            {
+                body_end(ops, &self.flow, resume)?
+            } else {
+                next
+            };
+        }
+        let mut exits = Vec::new();
+        if let [(asynchronous, _)] = managers.as_slice() {
+            while let Some((exit, next)) =
+                self.manager_return_exit(ops, end..*normal_end, entry, *asynchronous)
+            {
+                exits.push(exit);
+                end = body_end(ops, &self.flow, next)?;
+            }
+        }
+        let outer = std::mem::replace(&mut self.manager_exits, exits);
+        let body = self.seeded(ops, start, end, level, seed);
+        self.manager_exits = outer;
+        let (body, returns) = body?.pending_return()?;
+        // Adjacent managers of the same kind share a header. A switch
+        // between with and async with requires a nested suite.
+        let mut indent = String::new();
+        for group in managers.chunk_by(|a, b| a.0 == b.0) {
+            let header = if group[0].0 { "async with" } else { "with" };
+            let items = group
+                .iter()
+                .map(|(_, item)| item.as_str())
+                .collect::<Vec<_>>();
+            self.line(&format!("{indent}{header} {}:", items.join(", ")))?;
+            indent.push_str("    ");
+        }
+        if body.is_empty() {
+            self.line(&format!("{indent}pass"))?;
+        }
+        for line in body.lines() {
+            self.line(&format!("{indent}{line}"))?;
+        }
 
         let mut next = end;
-        for _ in &managers {
-            let exit = ops[next..*normal_end]
-                .iter()
-                .position(|op| op.name == "CALL")
-                .map(|n| next + n)
+        for (asynchronous, _) in managers.iter().rev() {
+            next = self
+                .manager_exit(ops, next..*normal_end, *asynchronous, returns)
                 .ok_or("unsupported manager exit")?;
-            let exit = if asynchronous {
-                self.manager_await_end(ops, exit + 1, 2)?
-            } else {
-                exit
-            };
-            if exit + 1 >= *normal_end || ops[exit + 1].name != "POP_TOP" {
-                return Err("unsupported manager result".into());
-            }
-            next = exit + 2;
         }
         if returns {
             if ops.get(next).is_none_or(|op| op.name != "RETURN_VALUE") {
@@ -410,5 +470,99 @@ impl Body<'_, '_, '_> {
         } else {
             Ok(Some(next))
         }
+    }
+
+    /// Match the implicit __exit__(None, None, None). Only a pending
+    /// return value needs to be moved below the call's operands.
+    fn manager_exit(
+        &self,
+        ops: &[Instruction],
+        span: Range<usize>,
+        asynchronous: bool,
+        returns: bool,
+    ) -> Option<usize> {
+        let mut tail = ops.get(span.clone())?;
+        while let [op, rest @ ..] = tail
+            && op.name == "NOP"
+        {
+            tail = rest;
+        }
+        let modern = self.m.version >= super::PythonVersion::Py314;
+        if returns {
+            if modern {
+                let [swap, rest @ ..] = tail else { return None };
+                if (swap.name, swap.arg) != ("SWAP", 3) {
+                    return None;
+                }
+                tail = rest;
+            }
+            let [swap, rest @ ..] = tail else { return None };
+            if (swap.name, swap.arg) != ("SWAP", 2) {
+                return None;
+            }
+            tail = rest;
+        }
+        let [a, b, c, call, rest @ ..] = tail else {
+            return None;
+        };
+        if ![a, b, c].into_iter().all(|op| {
+            matches!(op.name, "LOAD_CONST" | "LOAD_COMMON_CONSTANT") && self.none_constant(*op)
+        }) || (call.name, call.arg) != ("CALL", if modern { 3 } else { 2 })
+        {
+            return None;
+        }
+        let after = span.end - rest.len();
+        let pop = if asynchronous {
+            self.manager_await_end(ops, after, 2).ok()? + 1
+        } else {
+            after
+        };
+        (pop < span.end && ops[pop].name == "POP_TOP").then_some(pop + 1)
+    }
+
+    fn manager_return_exit(
+        &self,
+        ops: &[Instruction],
+        span: Range<usize>,
+        entry: Handler,
+        asynchronous: bool,
+    ) -> Option<(ReturnExit, Handler)> {
+        let (pending, ret) = [true, false].into_iter().find_map(|pending| {
+            self.manager_exit(ops, span.clone(), asynchronous, pending)
+                .map(|ret| (pending, ret))
+        })?;
+        let next = match ops.get(ret..span.end)? {
+            [op, ..]
+                if pending && op.name == "RETURN_VALUE"
+                    || !pending && op.name == "RETURN_CONST" =>
+            {
+                ret + 1
+            }
+            [load, ret_op, ..]
+                if !pending
+                    && matches!(
+                        load.name,
+                        "LOAD_CONST" | "LOAD_COMMON_CONSTANT" | "LOAD_SMALL_INT"
+                    )
+                    && ret_op.name == "RETURN_VALUE" =>
+            {
+                ret + 2
+            }
+            _ => return None,
+        };
+        if next >= span.end {
+            return None;
+        }
+        let h = self.flow.handler(next)?;
+        (ops[next].offset == h.start
+            && (h.target, h.depth, h.lasti) == (entry.target, entry.depth, entry.lasti))
+            .then_some((
+                ReturnExit {
+                    start: span.start,
+                    ret,
+                    pending,
+                },
+                h,
+            ))
     }
 }

@@ -74,6 +74,7 @@ impl Fragment {
     pub(super) fn pending_return(mut self) -> Result<(String, bool), String> {
         match self.stack.pop() {
             None => Ok((self.lines, false)),
+            Some(Value::PendingReturn) if self.stack.is_empty() => Ok((self.lines, true)),
             Some(value) if self.stack.is_empty() => {
                 let value = value
                     .expression_text()
@@ -223,6 +224,16 @@ impl Body<'_, '_, '_> {
         level: usize,
         operand_start: Option<usize>,
     ) -> Result<usize, String> {
+        if let Ok(n) = self
+            .manager_exits
+            .binary_search_by_key(&i, |exit| exit.start)
+        {
+            let exit = &self.manager_exits[n];
+            if self.stack.len() != usize::from(exit.pending) || exit.ret >= end {
+                return Err("unsupported early return through with".into());
+            }
+            return Ok(exit.ret);
+        }
         if let Some(handler) = self.handlers.remove(&i) {
             // The protected fragment re-enters this same instruction. Leave other
             // entries available, including nested tries in the exception suite.
@@ -239,6 +250,7 @@ impl Body<'_, '_, '_> {
             return Ok(next);
         }
         match op.name {
+            "RERAISE" if self.implicit_reraise(ops, i) => Ok(i + 1),
             // CPython builds a constant set display by updating an empty
             // set from a frozenset constant. Its elements belong directly
             // in the display, including when that display is itself starred.
@@ -335,6 +347,7 @@ impl Body<'_, '_, '_> {
                 Ok(self.flow.block(i).ops.end)
             }
             "SWAP" | "POP_TOP" if let Some(next) = self.iterator_return(ops, i, end) => Ok(next),
+            "SWAP" if let Some(ret) = self.handler_value_return(ops, i, end) => Ok(ret),
             "SWAP" if super::comparisons::is_link(&ops[i..end]) => {
                 self.comparison_chain(ops, i, end, level, operand_start)
             }

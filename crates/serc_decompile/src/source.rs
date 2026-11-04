@@ -189,6 +189,9 @@ fn recover_scope<'m>(
         handlers: protected_regions::Handlers::default(),
         terminal_returns: 0..0,
         clause_exits: None,
+        arm_exit: None,
+        finally_unwind: None,
+        manager_exits: Vec::new(),
         class,
         annotations: Vec::new(),
         depth,
@@ -245,6 +248,9 @@ enum Value {
     Slice(String),
     InPlace(String, &'static str, String),
     Null,
+    // A nested try emitted the return at its evaluation site. Its value
+    // is still on the bytecode stack until enclosing cleanups complete.
+    PendingReturn,
     Code(Id),
     Function(Definition),
     BuildClass,
@@ -282,6 +288,10 @@ struct Body<'m, 'data, 'work> {
     loop_edges: Option<loops::Loop>,
     handlers: protected_regions::Handlers,
     clause_exits: Option<protected_regions::ExitCopies>,
+    // A nested guard can jump past the other arm to the enclosing continuation.
+    arm_exit: Option<(usize, usize)>,
+    finally_unwind: Option<usize>,
+    manager_exits: Vec<managers::ReturnExit>,
     terminal_returns: std::ops::Range<usize>,
     depth: usize,
     class: bool,
