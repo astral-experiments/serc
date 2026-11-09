@@ -17,7 +17,6 @@ compiling [3-4x faster](BENCHMARKS.md#project-compilation) than CPython’s
 
 But Serc is also experimental! And so may emit incorrect bytecode in some cases.
 
-
 > [!WARNING]
 >
 > Serc is experimental. This README is human-edited, but all code changes, PR
