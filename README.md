@@ -55,38 +55,22 @@ serc compile path/to/package
 serc compile --check path/to/package
 ```
 
-Compilation uses the available CPUs by default. Use `--jobs` (or `-j`) to set a
-limit, including `--jobs 1` for serial compilation. You can also set the default
-with `RAYON_NUM_THREADS`:
+Compilation uses the available CPUs by default. Use `--jobs` (or `-j`) on the
+command line or the `RAYON_NUM_THREADS` environment variable to set a limit,
+including `--jobs 1` for serial compilation.
 
 ```console
 serc compile --jobs 4 path/to/package
 ```
 
-Use `--files-from -` to read a list of files from standard input. Paths are
-newline-delimited by default; `--null` accepts NUL-delimited paths, including
-filenames that contain newlines:
+By default, Serc skips files whose `.pyc` is up to date. It checks the bytecode
+format and invalidation mode, then compares the source file's timestamp and size
+(for timestamp-based caches) or its content hash (for hash-based caches).
 
-```console
-find path/to/package -type f -name '*.py' -print0 | serc compile --files-from - --null
-```
-
-The list selects individual files without scanning directories. On Unix, paths
-retain their original bytes; on Windows, the list must use UTF-8.
-
-Current `.pyc` files are left untouched by default. We compare the target
-bytecode format and invalidation mode, then the source's timestamp and size or
-its content hash. Pass `-f` or `--force` to rebuild every file, including after
-changing the compiler or native build profile. `--check` always compiles the
-sources without writing bytecode. Existing bytecode destinations must be regular
-files; compilation rejects symlinks and special files, including with `--force`.
-
-For integrations, `--output-format json` reports the numbers of compiled and
-skipped files:
-
-```console
-serc compile --files-from - --null --output-format json
-```
+Pass `--force` (or `-f`) to recompile every file, for example after switching
+compilers or native build profiles. Even with `--force`, Serc refuses to
+overwrite symlinks or special files. With `--check`, Serc compiles every file
+without writing bytecode.
 
 ### Python version
 
@@ -125,7 +109,7 @@ You can also select the level explicitly with `--optimize 0`, `--optimize 1`, or
 convention, such as `__pycache__/hello.cpython-314.opt-1.pyc` and
 `__pycache__/hello.cpython-314.opt-2.pyc`, so all three levels can coexist.
 
-## Rust library
+## Library integration
 
 Add Serc to your `Cargo.toml`:
 
@@ -141,10 +125,6 @@ marshal format:
 let module = serc::compile("print('Hello, world!')\n", "hello.py").unwrap();
 let marshaled = module.marshal();
 ```
-
-Compilation defaults to Python 3.14. See the
-[library guide](crates/serc#library-source-api) for selecting another Python
-version and generating `.pyc` files.
 
 ## License
 
