@@ -2,24 +2,13 @@
 
 An experimental CPython bytecode compiler, written in Rust.
 
-> [!WARNING]
->
-> Serc is experimental. All code changes, PR summaries, and additional
-> documentation were authored entirely by GPT-6 Astra in Codex. Use at your own
-> risk.
-
-## Highlights
-
-- Compile Python source to CPython `.pyc` files without a CPython installation.
-- Target Python 3.12, 3.13, 3.14, and 3.15 with a single executable.
-- Check source files and recursively compile packages from the command line.
-- Embed the compiler via the [Rust library](crates/serc).
-
-Serc produces byte-for-byte identical output on an extensive corpus of
-real-world Python code, including [Django](https://github.com/django/django),
+Serc produces byte-for-byte identical output (as compared to CPython) on an
+extensive corpus of real-world Python code, including
+[Django](https://github.com/django/django),
 [Airflow](https://github.com/apache/airflow), and
-[Transformers](https://github.com/huggingface/transformers), while compiling
-[**2.9-4.1× faster**](BENCHMARKS.md#project-compilation) than CPython’s
+[Transformers](https://github.com/huggingface/transformers), across CPython
+3.12, 3.13, 3.14, and 3.15, and optimization levels 0, 1, and 2, all while
+compiling [3-4x faster](BENCHMARKS.md#project-compilation) than CPython’s
 `compileall`.
 
 <p align="center">
@@ -28,9 +17,16 @@ real-world Python code, including [Django](https://github.com/django/django),
 
 But Serc is also experimental! And so may emit incorrect bytecode in some cases.
 
+> [!WARNING]
+>
+> Serc is experimental. This README is human-edited, but all code changes, PR
+> summaries, and additional documentation were authored entirely by GPT in
+> Codex.
+
 ## Installation
 
-Install from crates.io with Rust 1.96 or later:
+Install from [crates.io](https://crates.io/crates/serc-cli) with Rust 1.96 or
+later:
 
 ```console
 cargo install serc-cli --locked
@@ -45,7 +41,7 @@ def greet(name):
     return f"Hello, {name}!"
 ```
 
-Compile it to bytecode, emitted at `__pycache__/hello.cpython-314.pyc`:
+Compile to bytecode, emitted at `__pycache__/hello.cpython-314.pyc`:
 
 ```console
 serc compile hello.py
@@ -59,38 +55,21 @@ serc compile path/to/package
 serc compile --check path/to/package
 ```
 
-Compilation uses the available CPUs by default. Use `--jobs` (or `-j`) to set a
-limit, including `--jobs 1` for serial compilation. You can also set the default
-with `RAYON_NUM_THREADS`:
+Compilation uses the available CPUs by default. Use `--jobs` (or `-j`) on the
+command line or the `RAYON_NUM_THREADS` environment variable to set a limit,
+including `--jobs 1` for serial compilation.
 
 ```console
 serc compile --jobs 4 path/to/package
 ```
 
-Use `--files-from -` to read a list of files from standard input. Paths are
-newline-delimited by default; `--null` accepts NUL-delimited paths, including
-filenames that contain newlines:
+By default, Serc skips files whose `.pyc` is up to date by checking the bytecode
+format and invalidation mode, then comparing the source file's timestamp and
+size (for timestamp-based caches) or its content hash (for hash-based caches).
 
-```console
-find path/to/package -type f -name '*.py' -print0 | serc compile --files-from - --null
-```
-
-The list selects individual files without scanning directories. On Unix, paths
-retain their original bytes; on Windows, the list must use UTF-8.
-
-Current `.pyc` files are left untouched by default. We compare the target
-bytecode format and invalidation mode, then the source's timestamp and size or
-its content hash. Pass `-f` or `--force` to rebuild every file, including after
-changing the compiler or native build profile. `--check` always compiles the
-sources without writing bytecode. Existing bytecode destinations must be regular
-files; compilation rejects symlinks and special files, including with `--force`.
-
-For integrations, `--output-format json` reports the numbers of compiled and
-skipped files:
-
-```console
-serc compile --files-from - --null --output-format json
-```
+Pass `--force` (or `-f`) to recompile every file, for example after switching
+compilers or native build profiles. (Even with `--force`, Serc refuses to
+overwrite symlinks or special files.)
 
 ### Python version
 
@@ -129,7 +108,7 @@ You can also select the level explicitly with `--optimize 0`, `--optimize 1`, or
 convention, such as `__pycache__/hello.cpython-314.opt-1.pyc` and
 `__pycache__/hello.cpython-314.opt-2.pyc`, so all three levels can coexist.
 
-## Rust library
+## Library integration
 
 Add Serc to your `Cargo.toml`:
 
@@ -145,10 +124,6 @@ marshal format:
 let module = serc::compile("print('Hello, world!')\n", "hello.py").unwrap();
 let marshaled = module.marshal();
 ```
-
-Compilation defaults to Python 3.14. See the
-[library guide](crates/serc#library-source-api) for selecting another Python
-version and generating `.pyc` files.
 
 ## License
 
