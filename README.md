@@ -4,23 +4,18 @@ An experimental CPython bytecode compiler, written in Rust.
 
 > [!WARNING]
 >
-> Serc is experimental. All code changes, PR summaries, and additional
-> documentation were authored entirely by GPT-6 Astra in Codex. Use at your own
-> risk.
+> Serc is experimental. This README is human-edited, but all code changes, PR
+> summaries, and additional documentation were authored entirely by GPT in
+> Codex.
 
-## Highlights
-
-- Compile Python source to CPython `.pyc` files without a CPython installation.
-- Target Python 3.12, 3.13, 3.14, and 3.15 with a single executable.
-- Check source files and recursively compile packages from the command line.
-- Embed the compiler via the [Rust library](crates/serc).
-
-Serc produces byte-for-byte identical output on an extensive corpus of
-real-world Python code, including [Django](https://github.com/django/django),
+Serc produces byte-for-byte identical output (as compared to CPython) on an
+extensive corpus of real-world Python code, including
+[Django](https://github.com/django/django),
 [Airflow](https://github.com/apache/airflow), and
-[Transformers](https://github.com/huggingface/transformers), while compiling
-[**2.9-4.1× faster**](BENCHMARKS.md#project-compilation) than CPython’s
-`compileall`.
+[Transformers](https://github.com/huggingface/transformers), across CPython
+3.12, 3.13, 3.14, and 3.15, and optimization levels 0, 1, and 2, all while
+compiling [**2.9-4.1× faster**](BENCHMARKS.md#project-compilation) than
+CPython’s `compileall`.
 
 <p align="center">
   <img src="docs/assets/benchmarks/project-compilation.svg" width="100%" alt="Median compile times for CPython and Serc. Airflow took 324 vs. 79 ms (4.1× faster with Serc), Django 358 vs. 94 ms (3.8×), NumPy 432 vs. 131 ms (3.3×), and Transformers 832 vs. 288 ms (2.9×).">
@@ -30,7 +25,8 @@ But Serc is also experimental! And so may emit incorrect bytecode in some cases.
 
 ## Installation
 
-Install from crates.io with Rust 1.96 or later:
+Install from [crates.io](https://crates.io/crates/serc-cli) with Rust 1.96 or
+later:
 
 ```console
 cargo install serc-cli --locked
@@ -45,7 +41,7 @@ def greet(name):
     return f"Hello, {name}!"
 ```
 
-Compile it to bytecode, emitted at `__pycache__/hello.cpython-314.pyc`:
+Compile to bytecode, emitted at `__pycache__/hello.cpython-314.pyc`:
 
 ```console
 serc compile hello.py
