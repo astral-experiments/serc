@@ -63,14 +63,13 @@ including `--jobs 1` for serial compilation.
 serc compile --jobs 4 path/to/package
 ```
 
-By default, Serc skips files whose `.pyc` is up to date. It checks the bytecode
-format and invalidation mode, then compares the source file's timestamp and size
-(for timestamp-based caches) or its content hash (for hash-based caches).
+By default, Serc skips files whose `.pyc` is up to date by checking the bytecode
+format and invalidation mode, then comparing the source file's timestamp and
+size (for timestamp-based caches) or its content hash (for hash-based caches).
 
 Pass `--force` (or `-f`) to recompile every file, for example after switching
-compilers or native build profiles. Even with `--force`, Serc refuses to
-overwrite symlinks or special files. With `--check`, Serc compiles every file
-without writing bytecode.
+compilers or native build profiles. (Even with `--force`, Serc refuses to
+overwrite symlinks or special files.)
 
 ### Python version
 
