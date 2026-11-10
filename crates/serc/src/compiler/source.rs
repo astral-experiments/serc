@@ -197,7 +197,7 @@ impl ConstantOrigins {
     }
 }
 
-/// A block records the line at its first byte and the physical newlines within it.
+/// A physical line's one-based number and inclusive byte range.
 #[derive(Clone, Copy, Debug)]
 struct SourceLine {
     number: u32,
@@ -215,6 +215,8 @@ struct SourceLines {
 }
 
 impl SourceLines {
+    const MIN_PAGE_WIDTH: usize = 32;
+
     /// Record the line at each page boundary. Wider pages bound the index on long literals.
     fn new(source: &str) -> Self {
         let length = u32::try_from(source.len()).expect("parsed source fits in TextSize");
@@ -228,7 +230,7 @@ impl SourceLines {
             .len()
             .div_ceil(starts.len())
             .div_ceil(4)
-            .max(32)
+            .max(Self::MIN_PAGE_WIDTH)
             .next_power_of_two();
         let page_shift = page_width.trailing_zeros();
         let mut pages = Vec::with_capacity(source.len() / page_width + 1);
@@ -261,14 +263,15 @@ impl SourceLines {
         if offset <= page.last {
             return page;
         }
-        let mut index = page.number as usize;
-        while self
-            .starts
-            .get(index + 1)
-            .is_some_and(|&next| next <= offset)
-        {
-            index += 1;
-        }
+        let first = page.number as usize;
+        let following = &self.starts[first + 1..];
+        let index = first
+            + if self.page_shift == Self::MIN_PAGE_WIDTH.trailing_zeros() {
+                following.iter().take_while(|&&next| next <= offset).count()
+            } else {
+                // A long literal can put thousands of nearby short lines in one wide page.
+                following.partition_point(|&next| next <= offset)
+            };
         SourceLine {
             number: u32::try_from(index + 1).unwrap_or(u32::MAX),
             start: self.starts[index],
@@ -3338,7 +3341,8 @@ mod tests {
             "\n".repeat(64),
             "x".repeat(4096)
         );
-        for source in ["", "\n", "π\n", text.as_str()] {
+        let wide = format!("{}{}", "\n".repeat(96), "x".repeat(64 * 1024));
+        for source in ["", "\n", "π\n", text.as_str(), wide.as_str()] {
             let lines = SourceLines::new(source);
             let length = u32::try_from(source.len()).unwrap();
             let reference = |offset: u32| {
