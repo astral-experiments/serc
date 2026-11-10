@@ -33,6 +33,11 @@ def main():
     corpus = Path(training["corpus"])
     if training["status"] != "complete" or not corpus.is_dir():
         parser.error("the completed PGO training corpus is required")
+    executable = shutil.which(args.bolt)
+    if executable is None:
+        parser.error(f"BOLT executable not found: {args.bolt}")
+    # BOLT locates its instrumentation runtime relative to its executable.
+    bolt = Path(executable).resolve()
     args.out_dir.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(dir=args.out_dir) as temp:
         work = Path(temp).resolve()
@@ -42,7 +47,7 @@ def main():
         counters = work / "layout.fdata"
         instrumented = work / "serc-instrumented"
         run(
-            args.bolt,
+            bolt,
             binary,
             "--instrument",
             f"--instrumentation-file={counters}",
@@ -65,7 +70,7 @@ def main():
         optimized = work / "serc-optimized"
         # Reuse the original text segment and make obsolete function bodies compressible.
         run(
-            args.bolt,
+            bolt,
             binary,
             f"--data={counters}",
             "--use-old-text",
