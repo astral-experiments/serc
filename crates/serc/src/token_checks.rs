@@ -37,7 +37,7 @@ impl ParsedTokenChecks {
                 TokenKind::Yield => checks.has_yield = true,
                 TokenKind::Int => {
                     checks.longest_integer =
-                        checks.longest_integer.max(usize::from(token.range().len()))
+                        checks.longest_integer.max(usize::from(token.range().len()));
                 }
                 _ => {}
             }

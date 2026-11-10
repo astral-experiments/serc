@@ -20,6 +20,63 @@ use crate::target::opcodes::{
 };
 use crate::target::operands::ComparisonOperation;
 
+/// One byte per physical item for a jump-removal pass. Block starts remain valid
+/// until the pass finishes marking jumps and compacts the affected blocks.
+struct JumpMarks {
+    block_starts: Vec<usize>,
+    flags: Vec<u8>,
+}
+
+impl JumpMarks {
+    const MAY_PROMOTE: u8 = 1;
+    const REDUNDANT: u8 = 2;
+    const LINE_EVENT: u8 = 4;
+    const REVISIT: u8 = 8;
+
+    fn new(graph: &BlockGraph) -> Self {
+        let block_count = graph
+            .order()
+            .iter()
+            .map(|id| id.index() + 1)
+            .max()
+            .unwrap_or(0);
+        let mut block_starts = vec![0; block_count];
+        let mut item_count = 0;
+        for (id, block) in graph.iter() {
+            block_starts[id.index()] = item_count;
+            item_count += block.items().len();
+        }
+        Self {
+            block_starts,
+            flags: vec![0; item_count],
+        }
+    }
+
+    fn index(&self, position: ItemPosition) -> usize {
+        self.block_starts[position.block().index()] + position.offset()
+    }
+
+    fn has(&self, position: ItemPosition, flag: u8) -> bool {
+        self.flags[self.index(position)] & flag != 0
+    }
+
+    /// Returns whether the position acquired this flag.
+    fn insert(&mut self, position: ItemPosition, flag: u8) -> bool {
+        let index = self.index(position);
+        let old = self.flags[index];
+        self.flags[index] = old | flag;
+        old & flag == 0
+    }
+
+    /// Returns whether the position previously had this flag.
+    fn remove(&mut self, position: ItemPosition, flag: u8) -> bool {
+        let index = self.index(position);
+        let old = self.flags[index];
+        self.flags[index] = old & !flag;
+        old & flag != 0
+    }
+}
+
 /// The late consumers that can observe a scoped NOP cleanup.
 pub(in crate::assembler) struct NopCleanup {
     pub(super) has_forward_jump: bool,
@@ -5749,35 +5806,39 @@ impl OptimizationPipeline {
                     || instruction.no_location_policy.borrow_fallthrough()
                         == BorrowFallthrough::BarrierIfRemoved)
         };
-        let mut target = None;
-        let mut has_work = false;
-        for item in self.graph.iter_items() {
-            match item {
-                Item::Label(label) if target == Some(*label) => {
-                    has_work = true;
-                    break;
-                }
-                Item::Label(_) => {}
-                Item::Instruction(instruction) if is_removable_borrow_marker(instruction) => {}
-                Item::Instruction(instruction) => {
-                    target = None;
-                    if instruction.opcode != JUMP_FORWARD {
-                        continue;
-                    }
-                    let Some(jump_target) = instruction.forward_target() else {
-                        continue;
-                    };
-                    if instruction.jump_policy.defers_redundant_removal() {
-                        has_work = true;
-                        break;
-                    }
-                    if !instruction.jump_policy.borrow_empty_block() || finalize_borrow_empty_blocks
-                    {
-                        target = Some(jump_target);
+        let has_work = 'scan: {
+            let mut target = None;
+            for (_, block) in self.graph.iter() {
+                for item in block.items() {
+                    match item {
+                        Item::Label(label) => {
+                            if target == Some(*label) {
+                                break 'scan true;
+                            }
+                        }
+                        Item::Instruction(instruction) if instruction.opcode == JUMP_FORWARD => {
+                            target = instruction.forward_target();
+                            if target.is_some() {
+                                if instruction.jump_policy.defers_redundant_removal() {
+                                    break 'scan true;
+                                }
+                                if !finalize_borrow_empty_blocks
+                                    && instruction.jump_policy.borrow_empty_block()
+                                {
+                                    target = None;
+                                }
+                            }
+                        }
+                        Item::Instruction(instruction) => {
+                            if target.is_some() && !is_removable_borrow_marker(instruction) {
+                                target = None;
+                            }
+                        }
                     }
                 }
             }
-        }
+            false
+        };
         if !has_work {
             return;
         }
@@ -5943,19 +6004,32 @@ impl OptimizationPipeline {
         // A later removed forward jump may acquire and transfer a barrier to the
         // preceding marker on a retry. Refuse to skip that marker when a forward
         // jump is its next instruction; labels do not separate these records.
-        let mut maybe_promoted = FxHashSet::default();
-        if finalize_borrow_empty_blocks {
-            let mut follows_forward_jump = false;
-            for block in graph.order().iter().copied().rev() {
-                for (offset, item) in graph[block].items().iter().enumerate().rev() {
-                    if let Item::Instruction(instruction) = item {
-                        if follows_forward_jump {
-                            maybe_promoted.insert(ItemPosition::new(block, offset));
-                        }
-                        follows_forward_jump = instruction.opcode == JUMP_FORWARD;
+        let mut marks = JumpMarks::new(graph);
+        // Rewrites can turn a jump into a NOP, but never create a forward jump.
+        // Remember the last ordinary instruction in each intervening run so retries
+        // can recover the predecessor without walking the run again.
+        let mut jump_candidates = Vec::new();
+        let mut block_ends = Vec::with_capacity(graph.len());
+        let mut previous_item = None;
+        for (block, contents) in graph.iter() {
+            let mut last_ordinary = None;
+            for (offset, item) in contents.items().iter().enumerate() {
+                let Item::Instruction(instruction) = item else {
+                    continue;
+                };
+                let previous = previous_item.replace(ItemPosition::new(block, offset));
+                if instruction.opcode == JUMP_FORWARD {
+                    if finalize_borrow_empty_blocks && let Some(previous) = previous {
+                        marks.insert(previous, JumpMarks::MAY_PROMOTE);
+                    }
+                    if instruction.forward_target().is_some() {
+                        jump_candidates.push((offset, last_ordinary.take()));
+                        continue;
                     }
                 }
+                last_ordinary = Some(offset);
             }
+            block_ends.push((jump_candidates.len(), last_ordinary));
         }
         let exception_boundaries = self
             .exception_regions
@@ -5963,26 +6037,30 @@ impl OptimizationPipeline {
             .flat_map(|region| [region.start, region.end])
             .collect::<FxHashSet<_>>();
         let order = graph.order().to_vec();
-        let mut redundant = FxHashSet::default();
-        let mut removed_cross_block_line_events = FxHashSet::default();
-        let mut revisit = FxHashSet::default();
+        let mut removals = Vec::new();
+        let mut revisit_count = 0_usize;
         // On the first scan, only previously visited positions can be redundant.
         let mut first_scan = true;
         loop {
-            let removed_before = redundant.len();
+            let removed_before = removals.len();
             let mut unlocated_borrow_marker_created = false;
             let mut previous = None;
+            let mut candidate_start = 0;
             for (block_index, block) in order.iter().copied().enumerate() {
                 let previous_at_block_entry = previous;
-                for offset in 0..graph[block].items().len() {
+                let (candidate_end, trailing) = block_ends[block_index];
+                for &(offset, intervening) in &jump_candidates[candidate_start..candidate_end] {
+                    if let Some(ordinary) = intervening {
+                        previous = Some(ItemPosition::new(block, ordinary));
+                    }
                     let position = ItemPosition::new(block, offset);
                     let Item::Instruction(instruction) = graph.item(position) else {
                         continue;
                     };
-                    if !first_scan && redundant.contains(&position) {
+                    if !first_scan && marks.has(position, JumpMarks::REDUNDANT) {
                         continue;
                     }
-                    if !first_scan && !revisit.contains(&position) {
+                    if !first_scan && !marks.has(position, JumpMarks::REVISIT) {
                         previous = Some(position);
                         continue;
                     }
@@ -6125,10 +6203,10 @@ impl OptimizationPipeline {
                                     if is_removable_borrow_marker(removed)
                                         && !(removed.location.line >= 0
                                             && removed.jump_policy.always_retains_nop()
-                                            && maybe_promoted.contains(&ItemPosition::new(
-                                                next_block,
-                                                next_offset,
-                                            )))
+                                            && marks.has(
+                                                ItemPosition::new(next_block, next_offset),
+                                                JumpMarks::MAY_PROMOTE,
+                                            ))
                                     {
                                         if removed.location.line >= 0 {
                                             if removed.location.line == instruction.location.line
@@ -6143,11 +6221,11 @@ impl OptimizationPipeline {
                                         continue;
                                     }
                                     let position = ItemPosition::new(next_block, next_offset);
-                                    if first_scan || !redundant.contains(&position) {
+                                    if first_scan || !marks.has(position, JumpMarks::REDUNDANT) {
                                         next = Some(position);
                                         break 'next;
                                     }
-                                    if removed_cross_block_line_events.contains(&position) {
+                                    if marks.has(position, JumpMarks::LINE_EVENT) {
                                         crosses_removed_line_event = true;
                                         removed_line_events_are_unlocated &= removed.location.line
                                             < 0
@@ -6189,12 +6267,13 @@ impl OptimizationPipeline {
                     }
                     if !target_is_next {
                         if finalize_borrow_empty_blocks {
-                            revisit.insert(position);
+                            revisit_count +=
+                                usize::from(marks.insert(position, JumpMarks::REVISIT));
                         }
                         previous = Some(position);
                         continue;
                     }
-                    revisit.remove(&position);
+                    revisit_count -= usize::from(marks.remove(position, JumpMarks::REVISIT));
                     if !first_scan && crosses_removed_line_event {
                         // An emptied original array can carry a separate line event.
                         // Ordinary jumps wait for that event to be represented.
@@ -6558,7 +6637,9 @@ impl OptimizationPipeline {
                                 && previous_line == Some(instruction.location.line))
                             || next_line == Some(instruction.location.line))
                     {
-                        redundant.insert(position);
+                        if marks.insert(position, JumpMarks::REDUNDANT) {
+                            removals.push(position);
+                        }
                         if (instruction.location.line >= 0
                             && previous_line == Some(instruction.location.line)
                             && next_line != Some(instruction.location.line)
@@ -6573,7 +6654,7 @@ impl OptimizationPipeline {
                                                 .is_some_and(|count| *count >= 2))
                                     })))
                         {
-                            removed_cross_block_line_events.insert(position);
+                            marks.insert(position, JumpMarks::LINE_EVENT);
                         }
                         if instruction.exception_policy().exclusion()
                             == ExceptionExclusion::IfExtended
@@ -6709,31 +6790,28 @@ impl OptimizationPipeline {
                         previous = Some(position);
                     }
                 }
+                if let Some(ordinary) = trailing {
+                    previous = Some(ItemPosition::new(block, ordinary));
+                }
+                candidate_start = candidate_end;
             }
             // CPython repeats jump and NOP removal when an emptied block exposes an
             // earlier jump. Retry only late jumps whose targets were not adjacent:
             // deferred jumps and retained NOPs must keep their one-scan behavior.
-            if revisit.is_empty()
-                || (redundant.len() == removed_before && !unlocated_borrow_marker_created)
+            if revisit_count == 0
+                || (removals.len() == removed_before && !unlocated_borrow_marker_created)
             {
                 break;
             }
             first_scan = false;
         }
 
-        if redundant.is_empty() {
-            return;
+        // Retries may discover an earlier offset after a later one. Compact each
+        // block once with its removals in ascending order.
+        if !first_scan {
+            removals.sort_unstable_by_key(|pos| (pos.block().index(), pos.offset()));
         }
-        // Positions stay stable during retries. Remove in physical reverse order,
-        // since a later retry can enqueue a jump before an earlier deletion.
-        for block in order.into_iter().rev() {
-            for offset in (0..graph[block].items().len()).rev() {
-                let position = ItemPosition::new(block, offset);
-                if redundant.contains(&position) {
-                    graph.remove_item(position);
-                }
-            }
-        }
+        graph.remove_ordered_instructions(&removals);
     }
 
     /// Gives an unchanged normal-finally POP its sole surviving original jump's line.
