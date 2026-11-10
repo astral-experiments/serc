@@ -21,6 +21,7 @@ use crate::code_object::{
     CodeFilename, CodeInterningSummary, CodeObject, CompilationInterningEvent, Constant,
 };
 
+use super::Compiler;
 use super::constant::{
     constant_slice_with_literals, explicit_surrogate_string, fold_constant,
     fold_constant_for_version, fold_constant_with_profile, is_literal_constant, literal_constant,
@@ -30,7 +31,6 @@ use super::scope::{
 };
 use super::statement::function_body_contains_yield;
 use super::symbol::mangle_name;
-use super::{CachedSourceLine, Compiler};
 
 /// Finds assertion expressions that give a function coroutine flags in CPython 3.12–3.13,
 /// even when `-O` or `-OO` removes the assertion. Nested bodies do not contribute, but
@@ -197,6 +197,122 @@ impl ConstantOrigins {
     }
 }
 
+/// A physical line's one-based number and inclusive byte range.
+#[derive(Clone, Copy, Debug)]
+struct SourceLine {
+    number: u32,
+    start: u32,
+    /// Inclusive, so the final line also contains the end-of-file offset.
+    last: u32,
+}
+
+#[derive(Debug)]
+struct SourceLines {
+    starts: Vec<u32>,
+    pages: Vec<SourceLine>,
+    page_shift: u32,
+    length: u32,
+}
+
+impl SourceLines {
+    const MIN_PAGE_WIDTH: usize = 32;
+
+    /// Record the line at each page boundary. Wider pages bound the index on long literals.
+    fn new(source: &str) -> Self {
+        let length = u32::try_from(source.len()).expect("parsed source fits in TextSize");
+        let mut starts = Vec::with_capacity(source.len() / 88 + 1);
+        starts.push(0);
+        starts.extend(
+            memchr::memchr_iter(b'\n', source.as_bytes())
+                .map(|newline| u32::try_from(newline + 1).expect("newline fits in TextSize")),
+        );
+        let page_width = source
+            .len()
+            .div_ceil(starts.len())
+            .div_ceil(4)
+            .max(Self::MIN_PAGE_WIDTH)
+            .next_power_of_two();
+        let page_shift = page_width.trailing_zeros();
+        let mut pages = Vec::with_capacity(source.len() / page_width + 1);
+        for (index, &start) in starts.iter().enumerate() {
+            let next = starts.get(index + 1);
+            let count = next.map_or(source.len() / page_width + 1, |&end| {
+                (end as usize).div_ceil(page_width)
+            });
+            let last = next.map_or(length, |next| next - 1);
+            pages.resize(
+                count,
+                SourceLine {
+                    number: u32::try_from(index + 1).unwrap_or(u32::MAX),
+                    start,
+                    last,
+                },
+            );
+        }
+        Self {
+            starts,
+            pages,
+            page_shift,
+            length,
+        }
+    }
+
+    #[inline]
+    fn line(&self, offset: u32) -> SourceLine {
+        let page = self.pages[(offset >> self.page_shift) as usize];
+        if offset <= page.last {
+            return page;
+        }
+        let first = page.number as usize;
+        let following = &self.starts[first + 1..];
+        let index = first
+            + if self.page_shift == Self::MIN_PAGE_WIDTH.trailing_zeros() {
+                following.iter().take_while(|&&next| next <= offset).count()
+            } else {
+                // A long literal can put thousands of nearby short lines in one wide page.
+                following.partition_point(|&next| next <= offset)
+            };
+        SourceLine {
+            number: u32::try_from(index + 1).unwrap_or(u32::MAX),
+            start: self.starts[index],
+            last: self
+                .starts
+                .get(index + 1)
+                .map_or(self.length, |next| next - 1),
+        }
+    }
+
+    #[inline]
+    fn position(&self, offset: u32) -> (i32, i32) {
+        let offset = offset.min(self.length);
+        let line = self.line(offset);
+        (
+            i32::try_from(line.number).unwrap_or(i32::MAX),
+            i32::try_from(offset - line.start).unwrap_or(i32::MAX),
+        )
+    }
+
+    #[inline]
+    fn range(&self, range: TextRange) -> SourceLocation {
+        let start = u32::from(range.start()).min(self.length);
+        let end = u32::from(range.end()).min(self.length);
+        let first = self.line(start);
+        let line = i32::try_from(first.number).unwrap_or(i32::MAX);
+        let column = i32::try_from(start - first.start).unwrap_or(i32::MAX);
+        if end <= first.last {
+            let end_column = i32::try_from(end - first.start).unwrap_or(i32::MAX);
+            return SourceLocation::new(line, line, column, end_column);
+        }
+        let last = self.line(end);
+        SourceLocation::new(
+            line,
+            i32::try_from(last.number).unwrap_or(i32::MAX),
+            column,
+            i32::try_from(end - last.start).unwrap_or(i32::MAX),
+        )
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct CompilationContext<'source> {
     pub(super) python_version: crate::PythonVersion,
@@ -204,7 +320,7 @@ pub(super) struct CompilationContext<'source> {
     pub(super) filename: CodeFilename,
     pub(super) source: &'source str,
     pub(super) tokens: &'source Tokens,
-    line_starts: Vec<TextSize>,
+    lines: SourceLines,
     pub(super) optimized_locations: FxHashMap<TextRange, super::optimization::OptimizedLocation>,
     pub(super) scopes: ScopeArena,
     original_generator_functions: Option<FxHashSet<TextRange>>,
@@ -421,6 +537,8 @@ impl<'source> CompilationContext<'source> {
                     lowered.has_nested_class_scopes(),
                 )
             } else {
+                // The lowered-scope collector has its own interner. Only bind IDs from the arena used by emission.
+                source_analysis.next_operand = Some(0);
                 let scopes =
                     ScopeArena::analyze_with_source(body, python_version, &mut source_analysis);
                 let has_classes = scopes.has_class_scopes();
@@ -462,20 +580,13 @@ impl<'source> CompilationContext<'source> {
             .keys()
             .any(|name| !name.is_ascii())
             .then(RefCell::default);
-        // Source decoding has already normalized line endings. Locations need only byte offsets.
-        let mut line_starts = Vec::with_capacity(source.len() / 88 + 1);
-        line_starts.push(TextSize::new(0));
-        line_starts.extend(
-            memchr::memchr_iter(b'\n', source.as_bytes())
-                .map(|newline| TextSize::try_from(newline + 1).expect("source length fits in u32")),
-        );
         let mut context = Self {
             python_version,
             native_build_profile,
             filename,
             source,
             tokens,
-            line_starts,
+            lines: SourceLines::new(source),
             optimized_locations: FxHashMap::default(),
             scopes,
             original_generator_functions: None,
@@ -1005,6 +1116,8 @@ fn can_fold_bytes(expression: &Expr) -> bool {
 
 #[derive(Default)]
 pub(super) struct SourceAnalysis<'ast> {
+    // Only the final scope arena can attach symbol IDs to the private parsed AST.
+    next_operand: Option<u32>,
     python_version: crate::PythonVersion,
     finally_bodies: FxHashMap<TextRange, &'ast [Stmt]>,
     origins: FxHashMap<Cow<'ast, str>, Cell<StringConstantOrigin>>,
@@ -1038,6 +1151,7 @@ impl<'ast> SourceAnalysis<'ast> {
     pub(super) fn new(python_version: crate::PythonVersion, name_capacity: usize) -> Self {
         Self {
             python_version,
+            next_operand: None,
             origins: FxHashMap::with_capacity_and_hasher(name_capacity, rustc_hash::FxBuildHasher),
             ..Self::default()
         }
@@ -1276,12 +1390,26 @@ impl<'ast> SourceAnalysis<'ast> {
         }
     }
 
+    /// Attach the symbol ID to a unique top-level node index. Larger modules use spelling lookup.
+    fn bind_operand(&mut self, node: &ruff_python_ast::AtomicNodeIndex, id: NameId) {
+        if let Some(next) = &mut self.next_operand
+            && id.as_u32() < 1 << NameId::OPERAND_BITS
+            && *next <= ruff_python_ast::MAX_REAL_INDEX >> NameId::OPERAND_BITS
+        {
+            node.set(ruff_python_ast::NodeIndex::from(
+                (*next << NameId::OPERAND_BITS) | id.as_u32(),
+            ));
+            *next += 1;
+        }
+    }
+
     #[inline]
     pub(super) fn observe_name_with_id(
         &mut self,
         name: &'ast ruff_python_ast::ExprName,
         id: NameId,
     ) {
+        self.bind_operand(&name.node_index, id);
         self.record_raw_name_with_id(name.id.as_str(), id);
     }
 
@@ -1291,6 +1419,7 @@ impl<'ast> SourceAnalysis<'ast> {
         attribute: &'ast ruff_python_ast::ExprAttribute,
         id: NameId,
     ) {
+        self.bind_operand(&attribute.node_index, id);
         self.record_raw_name_with_id(attribute.attr.as_str(), id);
         self.record_attribute_effects(attribute);
     }
@@ -1494,7 +1623,10 @@ fn analyze_source<'ast>(
 
 impl Compiler<'_> {
     pub(super) fn line_number(&self, offset: u32) -> u32 {
-        self.source_line(self.source_offset(offset)).number
+        self.context
+            .lines
+            .line(offset.min(self.context.lines.length))
+            .number
     }
 
     pub(super) fn source_location(&self, range: ruff_text_size::TextRange) -> SourceLocation {
@@ -1523,26 +1655,14 @@ impl Compiler<'_> {
     /// Locate setup instructions that precede the elision of their opening statement.
     #[expect(
         clippy::inline_always,
-        reason = "avoid call overhead for the common cached source-location path"
+        reason = "inline the common single-line span at emission sites"
     )]
     #[inline(always)]
     pub(super) fn physical_source_location(
         &self,
         range: ruff_text_size::TextRange,
     ) -> SourceLocation {
-        let start = self.source_offset(u32::from(range.start()));
-        let end = self.source_offset(u32::from(range.end()));
-        let source_line = self.source_line(start);
-        let line = i32::try_from(source_line.number).unwrap_or(i32::MAX);
-        let column = i32::try_from(u32::from(start - source_line.start)).unwrap_or(i32::MAX);
-
-        if source_line.contains(end) {
-            let end_column = i32::try_from(u32::from(end - source_line.start)).unwrap_or(i32::MAX);
-            return SourceLocation::new(line, line, column, end_column);
-        }
-
-        let (end_line, end_column) = self.source_position(u32::from(end));
-        SourceLocation::new(line, end_line, column, end_column)
+        self.context.lines.range(range)
     }
 
     pub(super) fn source_location_including_trailing_semicolon(
@@ -1636,75 +1756,7 @@ impl Compiler<'_> {
     }
 
     pub(super) fn source_position(&self, offset: u32) -> (i32, i32) {
-        let offset = self.source_offset(offset);
-        let line = self.source_line(offset);
-        (
-            i32::try_from(line.number).unwrap_or(i32::MAX),
-            i32::try_from(u32::from(offset - line.start)).unwrap_or(i32::MAX),
-        )
-    }
-
-    #[inline]
-    fn source_line(&self, offset: TextSize) -> CachedSourceLine {
-        let [recent, previous] = self.cached_source_lines.get();
-        if let Some(line) = recent
-            && line.contains(offset)
-        {
-            return line;
-        }
-        if let Some(line) = previous
-            && line.contains(offset)
-        {
-            self.cached_source_lines.set([previous, recent]);
-            return line;
-        }
-
-        self.uncached_source_line(offset, recent)
-    }
-
-    #[inline(never)]
-    fn uncached_source_line(
-        &self,
-        offset: TextSize,
-        recent: Option<CachedSourceLine>,
-    ) -> CachedSourceLine {
-        let line_starts = &self.context.line_starts;
-        let adjacent = recent.and_then(|line| {
-            let current = usize::try_from(line.number).ok()?.checked_sub(1)?;
-            if offset >= line.end && !line.is_last {
-                let next = current + 1;
-                if line_starts.get(next + 1).is_none_or(|end| offset < *end) {
-                    return Some(next);
-                }
-            } else if offset < line.start {
-                let previous = current.checked_sub(1)?;
-                if offset >= line_starts[previous] {
-                    return Some(previous);
-                }
-            }
-            None
-        });
-        let line_index =
-            adjacent.unwrap_or_else(|| line_starts.partition_point(|&start| start <= offset) - 1);
-        let start = line_starts[line_index];
-        let end = line_starts
-            .get(line_index + 1)
-            .copied()
-            .unwrap_or_else(|| self.source_offset(u32::MAX));
-        let cached = CachedSourceLine {
-            number: u32::try_from(line_index + 1).unwrap_or(u32::MAX),
-            start,
-            end,
-            is_last: line_index + 1 == line_starts.len(),
-        };
-        // A multiline range visits its start and end, then often returns to the start while
-        // lowering its children. Retain both ends rather than replacing one with the other.
-        self.cached_source_lines.set([Some(cached), recent]);
-        cached
-    }
-
-    fn source_offset(&self, offset: u32) -> TextSize {
-        TextSize::new(offset.min(u32::try_from(self.context.source.len()).unwrap_or(u32::MAX)))
+        self.context.lines.position(offset)
     }
 
     fn source_text(&self, range: ruff_text_size::TextRange) -> &str {
@@ -3280,6 +3332,39 @@ mod tests {
     use std::fmt::Write;
 
     use super::*;
+
+    #[test]
+    fn source_positions_at_line_and_page_boundaries() {
+        let text = format!(
+            "{}\n\n{}π\tend\n{}",
+            "a".repeat(31),
+            "\n".repeat(64),
+            "x".repeat(4096)
+        );
+        let wide = format!("{}{}", "\n".repeat(96), "x".repeat(64 * 1024));
+        for source in ["", "\n", "π\n", text.as_str(), wide.as_str()] {
+            let lines = SourceLines::new(source);
+            let length = u32::try_from(source.len()).unwrap();
+            let reference = |offset: u32| {
+                let prefix = &source.as_bytes()[..offset.min(length) as usize];
+                let mut parts = prefix.split(|&byte| byte == b'\n');
+                let column = parts.next_back().unwrap().len();
+                let line = parts.count() + 1;
+                (i32::try_from(line).unwrap(), i32::try_from(column).unwrap())
+            };
+            for start in [0, 1, 31, 32, 33, 63, 64, 95, 96, length, length + 1] {
+                for end in [start, start + 1, start + 32, start.max(length)] {
+                    let (line, column) = reference(start);
+                    let (end_line, end_column) = reference(end);
+                    assert_eq!(
+                        lines.range(TextRange::new(start.into(), end.into())),
+                        SourceLocation::new(line, end_line, column, end_column)
+                    );
+                }
+            }
+            assert!(lines.pages.len() <= 4 * lines.starts.len() + 1);
+        }
+    }
 
     #[test]
     fn dotted_name_prefix_index_respects_component_boundaries() {

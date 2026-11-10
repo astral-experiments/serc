@@ -27919,20 +27919,20 @@ impl<'source> Compiler<'source> {
             Expr::Name(target) => {
                 let target_location = self.source_location(target.range);
                 self.assembler.set_location(target_location);
-                self.load_name(target.id.as_str())?;
+                self.load_ast_name(target)?;
                 self.compile_expression(&assignment.value)?;
                 self.assembler
                     .set_location(self.source_location(assignment.range));
                 self.emit_binary_operation(binary_operator(assignment.op, true))?;
                 self.assembler.set_location(target_location);
-                self.store_name(target.id.as_str())?;
+                self.store_ast_name(target)?;
             }
             Expr::Attribute(target) => {
                 self.compile_expression(&target.value)?;
                 self.assembler
                     .set_location(self.source_location(target.range));
                 self.emit(COPY, 1, 1)?;
-                let index = self.name_index(target.attr.as_str())?;
+                let index = self.attribute_operand(target)?;
                 let attribute_location = self.attribute_opcode_location(target);
                 self.assembler.set_location(attribute_location);
                 self.emit(LOAD_ATTR, index << 1, 0)?;
