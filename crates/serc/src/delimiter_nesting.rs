@@ -4,7 +4,7 @@ use ruff_text_size::TextRange;
 
 use crate::{CompileError, PythonVersion, indentation, yield_syntax};
 
-const MAX_NESTING: usize = 200;
+pub(crate) const MAX_NESTING: usize = 200;
 
 /// Reuse a successfully parsed token stream to prove the nesting limit was not exceeded.
 /// Malformed input and legacy template strings retain the independent tokenizer's
@@ -14,31 +14,13 @@ pub(crate) fn validate_parsed(
     options: &ParseOptions,
     version: PythonVersion,
     parsed: &ruff_python_parser::Parsed<ruff_python_ast::ModModule>,
+    checks: &crate::token_checks::ParsedTokenChecks,
 ) -> Result<(), CompileError> {
     if parsed.errors().is_empty()
-        && (version >= PythonVersion::Py314
-            || !parsed
-                .tokens()
-                .iter()
-                .any(|token| token.kind() == TokenKind::TStringStart))
+        && (version >= PythonVersion::Py314 || !checks.has_template)
+        && !checks.deep_delimiters
     {
-        if parsed.tokens().len() <= MAX_NESTING {
-            return Ok(());
-        }
-        let mut depth = 0_usize;
-        let exceeds_limit = parsed.tokens().iter().any(|token| {
-            match token.kind() {
-                TokenKind::Lpar | TokenKind::Lsqb | TokenKind::Lbrace => depth += 1,
-                TokenKind::Rpar | TokenKind::Rsqb | TokenKind::Rbrace => {
-                    depth = depth.saturating_sub(1);
-                }
-                _ => {}
-            }
-            depth > MAX_NESTING
-        });
-        if !exceeds_limit {
-            return Ok(());
-        }
+        return Ok(());
     }
     validate(source, options, version)
 }
@@ -532,7 +514,13 @@ mod tests {
                 let expected = validate_with_fast_scan::<false>(&source, &options, version);
                 assert_eq!(
                     expected,
-                    validate_parsed(&source, &options, version, &parsed),
+                    validate_parsed(
+                        &source,
+                        &options,
+                        version,
+                        &parsed,
+                        &crate::token_checks::ParsedTokenChecks::collect(parsed.tokens())
+                    ),
                     "{version:?}: {source}"
                 );
                 if let Err(expected) = expected {
@@ -591,7 +579,13 @@ mod tests {
                             .try_into_module()
                             .unwrap();
                         assert_eq!(
-                            validate_parsed(&source, &options, version, &parsed),
+                            validate_parsed(
+                                &source,
+                                &options,
+                                version,
+                                &parsed,
+                                &crate::token_checks::ParsedTokenChecks::collect(parsed.tokens())
+                            ),
                             validate_with_fast_scan::<false>(&source, &options, version),
                             "{version}: {source:?}",
                         );

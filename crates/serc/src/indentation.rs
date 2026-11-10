@@ -3,6 +3,8 @@ use ruff_text_size::{Ranged, TextRange};
 
 use crate::CompileError;
 
+pub(crate) const MAX_DEPTH: i32 = 100;
+
 /// CPython's tokenizer has 100 indentation slots, including the module-level slot.
 /// Count logical INDENT/DEDENT tokens so strings, comments, continuation lines and
 /// indentation width do not consume extra slots. Run before semantic validation or
@@ -13,7 +15,7 @@ pub(crate) fn first_excess(tokens: &Tokens) -> Option<TextRange> {
         match token.kind() {
             TokenKind::Indent => {
                 depth += 1;
-                if depth == 100 {
+                if depth == MAX_DEPTH {
                     return Some(token.range());
                 }
             }
