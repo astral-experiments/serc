@@ -202,6 +202,7 @@ jobs:
               manylinux: "2_17",
               test: true,
               pgo: true,
+              bolt: true,
             }
           - { target: i686-unknown-linux-gnu, manylinux: "2_17" }
           - {
@@ -246,7 +247,10 @@ jobs:
           target: ${{ matrix.target }}
           rust-toolchain: ${{ steps.pgo.outputs.toolchain }}
           manylinux: ${{ matrix.manylinux }}
-          args: --release --locked --out dist --compatibility pypi
+          args: >-
+            --release --locked --compatibility pypi
+            --out ${{ matrix.bolt && 'target/layout-wheel' || 'dist' }}
+            ${{ matrix.bolt && '--strip=false -- -Cstrip=none -Clink-arg=-Wl,--emit-relocs' || '' }}
           before-script-linux: |
             # These images bundle GCC versions too old for mimalloc. Keep their
             # glibc sysroots and linkers, but use a current cross C compiler.
@@ -269,6 +273,17 @@ jobs:
               # psm uses long-displacement instructions; match Rust's z10 baseline.
               export CFLAGS_s390x_unknown_linux_gnu="-march=z10"
             fi
+      - name: Optimize native code layout
+        if: matrix.bolt
+        shell: bash
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y bolt-18
+          python -m pip install wheel==0.45.1
+          python scripts/optimize-linux-wheel.py target/layout-wheel/*.whl \
+            --training-manifest target/pgo-release/training.json \
+            --objcopy "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-gnu/bin/llvm-objcopy" \
+            --out-dir dist --standalone target/x86_64-unknown-linux-gnu/release/serc
       - name: Verify PGO executable
         if: matrix.pgo
         env:
