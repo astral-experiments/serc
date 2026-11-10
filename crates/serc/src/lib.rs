@@ -19,6 +19,7 @@ mod semicolon_syntax;
 mod source;
 mod stack;
 mod target;
+mod token_checks;
 mod type_alias_syntax;
 mod yield_from_syntax;
 mod yield_syntax;
@@ -936,9 +937,14 @@ fn compile_normalized(
         .expect("parsed module is present");
     // Ruff grows its parser stack for deeply nested expressions. Successful parses can
     // reuse its tokens; malformed input still uses the independent tokenizer before diagnostics.
-    if let Err(error) =
-        delimiter_nesting::validate_parsed(source, &parse_options, options.python_version, parsed)
-    {
+    let checks = token_checks::ParsedTokenChecks::collect(parsed.tokens());
+    if let Err(error) = delimiter_nesting::validate_parsed(
+        source,
+        &parse_options,
+        options.python_version,
+        parsed,
+        &checks,
+    ) {
         return Err(if may_depend_on_decimal_parse() {
             unknown_decimal_parse()
         } else {
@@ -947,7 +953,7 @@ fn compile_normalized(
     }
     let (errors, bare_raises) = semicolon_syntax::recover(source, &parse_options, parsed);
     let parse_error = errors.first();
-    if let Some(range) = indentation::first_excess(parsed.tokens())
+    if let Some(range) = checks.excess_indent
         && parse_error.is_none_or(|error| range.start() <= error.location.start())
     {
         if let Some(error) = yield_syntax::before_indentation_error(
@@ -1018,16 +1024,21 @@ fn compile_normalized(
     ) {
         return Err(prefer_type_alias_error(error));
     }
-    if let Err(error) = yield_syntax::validate(source, parsed.tokens(), options.python_version) {
+    if checks.has_yield
+        && let Err(error) = yield_syntax::validate(source, parsed.tokens(), options.python_version)
+    {
         return Err(prefer_type_alias_error(error));
     }
-    decimal_literals::validate(
-        source,
-        parsed.tokens(),
-        parsed.suite(),
-        parsed.unsupported_syntax_errors(),
-        parse_int_max_str_digits.unwrap_or(4300),
-    )?;
+    let decimal_limit = parse_int_max_str_digits.unwrap_or(4300);
+    if decimal_limit != 0 && checks.longest_integer > decimal_limit as usize {
+        decimal_literals::validate(
+            source,
+            parsed.tokens(),
+            parsed.suite(),
+            parsed.unsupported_syntax_errors(),
+            decimal_limit,
+        )?;
+    }
     if options.python_version == PythonVersion::Py312 {
         // Both validators can find errors in one module; CPython reports the first.
         let starred = python_312_starred_defaults::validate(parsed);
@@ -1065,7 +1076,7 @@ fn compile_normalized(
     }
     parsed_module.recover_bare_raises(&bare_raises);
     let parsed = &parsed_module;
-    if source.len() > 640
+    if checks.longest_integer > 640
         && parse_int_max_str_digits.is_none()
         && has_large_decimal_token(source, parsed.tokens())
         && compiler::syntax::may_have_duplicate_mapping_key(parsed.suite())
