@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Optimize a native Linux x86-64 wheel and its standalone executable with LLVM BOLT."""
+
+from __future__ import annotations
+
 import argparse
 import json
-from pathlib import Path
 import shutil
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
 
 
 def run(*args):
@@ -15,12 +18,16 @@ def run(*args):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("wheel", type=Path, help="unstripped wheel linked with --emit-relocs")
+    parser.add_argument(
+        "wheel", type=Path, help="unstripped wheel linked with --emit-relocs"
+    )
     parser.add_argument("--training-manifest", required=True, type=Path)
     parser.add_argument("--out-dir", required=True, type=Path)
     parser.add_argument("--standalone", required=True, type=Path)
     parser.add_argument("--bolt", default="llvm-bolt-18")
-    parser.add_argument("--objcopy", required=True, help="llvm-objcopy from the release Rust toolchain")
+    parser.add_argument(
+        "--objcopy", required=True, help="llvm-objcopy from the release Rust toolchain"
+    )
     args = parser.parse_args()
     training = json.loads(args.training_manifest.read_text())
     corpus = Path(training["corpus"])
@@ -34,14 +41,47 @@ def main():
         (binary,) = package.glob("*.data/scripts/serc")
         counters = work / "layout.fdata"
         instrumented = work / "serc-instrumented"
-        run(args.bolt, binary, "--instrument", f"--instrumentation-file={counters}",
-            "-o", instrumented)
-        run(instrumented, "compile", "--force", "--quiet", "--jobs", "1",
-            "--python-version", "3.14", "--optimize", "0", corpus)
+        run(
+            args.bolt,
+            binary,
+            "--instrument",
+            f"--instrumentation-file={counters}",
+            "-o",
+            instrumented,
+        )
+        run(
+            instrumented,
+            "compile",
+            "--force",
+            "--quiet",
+            "--jobs",
+            "1",
+            "--python-version",
+            "3.14",
+            "--optimize",
+            "0",
+            corpus,
+        )
         optimized = work / "serc-optimized"
-        run(args.bolt, binary, f"--data={counters}", "--reorder-blocks=ext-tsp",
-            "--reorder-functions=cdsort", "--split-functions", "--split-all-cold",
-            "--split-eh", "-o", optimized)
+        # Reuse the original text segment and make obsolete function bodies compressible.
+        run(
+            args.bolt,
+            binary,
+            f"--data={counters}",
+            "--use-old-text",
+            "--align-text=4096",
+            "--align-functions=8",
+            "--align-functions-max-bytes=7",
+            "--trap-old-code",
+            "--reorder-blocks=ext-tsp",
+            "--reorder-functions=cdsort",
+            "--split-functions",
+            "--split-all-cold",
+            "--split-eh",
+            "-o",
+            optimized,
+        )
+        # The release toolchain preserves BOLT's relocated ELF program headers.
         run(args.objcopy, "--strip-all", optimized, binary)
         run(binary, "--version")
         run(sys.executable, "-m", "wheel", "pack", "-d", work, package)
