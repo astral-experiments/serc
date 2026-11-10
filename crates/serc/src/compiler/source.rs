@@ -3343,12 +3343,9 @@ mod tests {
             let length = u32::try_from(source.len()).unwrap();
             let reference = |offset: u32| {
                 let prefix = &source.as_bytes()[..offset.min(length) as usize];
-                let line = prefix.iter().filter(|&&byte| byte == b'\n').count() + 1;
-                let column = prefix
-                    .iter()
-                    .rev()
-                    .take_while(|&&byte| byte != b'\n')
-                    .count();
+                let mut parts = prefix.split(|&byte| byte == b'\n');
+                let column = parts.next_back().unwrap().len();
+                let line = parts.count() + 1;
                 (i32::try_from(line).unwrap(), i32::try_from(column).unwrap())
             };
             for start in [0, 1, 31, 32, 33, 63, 64, 95, 96, length, length + 1] {
