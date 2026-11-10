@@ -1,9 +1,7 @@
-use std::cell::Cell;
 use std::rc::Rc;
 
 use ruff_python_ast::visitor::Visitor;
 use ruff_python_ast::{Comprehension, Expr};
-use ruff_text_size::TextSize;
 use rustc_hash::FxHashMap;
 
 use crate::assembler::Assembler;
@@ -69,7 +67,6 @@ enum Scope {
 #[derive(Debug)]
 pub(crate) struct Compiler<'source> {
     context: Rc<CompilationContext<'source>>,
-    cached_source_lines: Cell<[Option<CachedSourceLine>; 2]>,
     unit: CodeUnit,
     output: OutputState,
     symbols: SymbolState,
@@ -77,14 +74,6 @@ pub(crate) struct Compiler<'source> {
     assembler: Assembler,
     native_label_plan: Option<Box<legacy_native_labels::NativeLabelPlan>>,
     legacy_short_label_prefix: legacy_native_seed_bound::SourcePrefix,
-}
-
-#[derive(Clone, Copy, Debug)]
-struct CachedSourceLine {
-    number: u32,
-    start: TextSize,
-    end: TextSize,
-    is_last: bool,
 }
 
 impl Compiler<'_> {
@@ -129,12 +118,6 @@ impl Compiler<'_> {
 
     fn iterator_slots(&self) -> i32 {
         1 + self.iterator_extra_slots()
-    }
-}
-
-impl CachedSourceLine {
-    fn contains(self, offset: TextSize) -> bool {
-        self.start <= offset && (offset < self.end || self.is_last && offset == self.end)
     }
 }
 

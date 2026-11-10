@@ -288,8 +288,68 @@ impl Compiler<'_> {
         true
     }
 
+    /// Read the scope-bound symbol or look up a synthesized or rewritten spelling.
+    #[inline]
+    fn operand_id(&self, node: &ruff_python_ast::AtomicNodeIndex, spelling: &str) -> NameId {
+        if let Some(index) = node.load().as_u32() {
+            let id = NameId::from_u32(index & ((1 << NameId::OPERAND_BITS) - 1));
+            debug_assert_eq!(self.resolve_name(id), spelling);
+            return id;
+        }
+        self.required_name_id(spelling)
+    }
+
     pub(super) fn load_name(&mut self, name: &str) -> Result<(), CompileError> {
-        let raw_name_id = self.required_name_id(name);
+        self.load_name_with_id(name, self.required_name_id(name))
+    }
+
+    /// Load a parsed name using its raw scope symbol.
+    pub(super) fn load_ast_name(
+        &mut self,
+        name: &ruff_python_ast::ExprName,
+    ) -> Result<(), CompileError> {
+        self.load_name_with_id(
+            name.id.as_str(),
+            self.operand_id(&name.node_index, name.id.as_str()),
+        )
+    }
+
+    /// Store to a parsed name using its raw scope symbol.
+    pub(super) fn store_ast_name(
+        &mut self,
+        name: &ruff_python_ast::ExprName,
+    ) -> Result<(), CompileError> {
+        self.mutate_name_with_id(
+            name.id.as_str(),
+            self.operand_id(&name.node_index, name.id.as_str()),
+            NameMutation::Store,
+        )
+    }
+
+    /// Delete a parsed name using its raw scope symbol.
+    pub(super) fn delete_ast_name(
+        &mut self,
+        name: &ruff_python_ast::ExprName,
+    ) -> Result<(), CompileError> {
+        self.mutate_name_with_id(
+            name.id.as_str(),
+            self.operand_id(&name.node_index, name.id.as_str()),
+            NameMutation::Delete,
+        )
+    }
+
+    /// Resolve the instruction operand for a parsed attribute label.
+    pub(super) fn attribute_operand(
+        &mut self,
+        node: &ruff_python_ast::ExprAttribute,
+    ) -> Result<u32, CompileError> {
+        self.name_index_with_id(
+            node.attr.as_str(),
+            self.operand_id(&node.node_index, node.attr.as_str()),
+        )
+    }
+
+    fn load_name_with_id(&mut self, name: &str, raw_name_id: NameId) -> Result<(), CompileError> {
         let name_id = self.instruction_name_id(name, raw_name_id);
         if self.active_temporary_binds_name(name_id) {
             let index = self.active_temporary_index(name_id);

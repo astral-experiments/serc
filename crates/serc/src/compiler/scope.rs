@@ -246,6 +246,11 @@ impl Compiler<'_> {
 #[newtype_index]
 pub(super) struct NameId;
 
+impl NameId {
+    // Leave 18 of Ruff's 30 real-index bits for distinct occurrences within the module.
+    pub(super) const OPERAND_BITS: u32 = 12;
+}
+
 impl From<NameId> for crate::code_object::MetadataId {
     fn from(id: NameId) -> Self {
         Self::from_u32(id.as_u32())
@@ -6138,6 +6143,8 @@ impl<M: Fn(&str) -> String> ruff_python_ast::visitor::transformer::Transformer
         }
 
         if let Expr::Name(name) = expression {
+            // A cloned node retains its index, but the rewritten spelling needs a new symbol.
+            name.node_index = ruff_python_ast::AtomicNodeIndex::NONE;
             name.id = Name::new((self.mangle)(name.id.as_str()));
         }
         // Attribute labels and call keyword labels are deliberately unchanged.

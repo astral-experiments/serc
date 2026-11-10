@@ -1,4 +1,3 @@
-use std::cell::Cell;
 use std::rc::Rc;
 
 use ruff_python_ast::token::Tokens;
@@ -249,7 +248,6 @@ impl<'source> Compiler<'source> {
             allocation,
             Self {
                 context,
-                cached_source_lines: Cell::new([None; 2]),
                 unit,
                 output: OutputState::default(),
                 symbols,

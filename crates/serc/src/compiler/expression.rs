@@ -2703,7 +2703,7 @@ impl Compiler<'_> {
             self.assembler
                 .set_location(self.source_location(expression.range()));
             let result = match expression {
-                Expr::Name(name) => self.load_name(name.id.as_str()),
+                Expr::Name(name) => self.load_ast_name(name),
                 _ => self.compile_literal_expression(expression),
             }
             .and_then(|()| {
@@ -2871,7 +2871,7 @@ impl Compiler<'_> {
         }
         match expression {
             Expr::Name(name) if name.ctx == ExprContext::Load => {
-                self.load_name(name.id.as_str())?;
+                self.load_ast_name(name)?;
             }
             Expr::NoneLiteral(_)
             | Expr::BooleanLiteral(_)
@@ -2922,7 +2922,7 @@ impl Compiler<'_> {
                     == SpecializedLowering::NotApplicable
                 {
                     self.compile_expression(&attribute.value)?;
-                    let index = self.name_index(attribute.attr.as_str())?;
+                    let index = self.attribute_operand(attribute)?;
                     self.assembler
                         .set_location(self.attribute_opcode_location(attribute));
                     self.emit(LOAD_ATTR, index << 1, 0)?;
@@ -3674,7 +3674,7 @@ impl Compiler<'_> {
                 == SpecializedLowering::NotApplicable
             {
                 self.compile_simple_expression_operand(&attribute.value)?;
-                let index = self.name_index(attribute.attr.as_str())?;
+                let index = self.attribute_operand(attribute)?;
                 self.assembler
                     .set_location(self.attribute_opcode_location(attribute));
                 self.emit(LOAD_ATTR, (index << 1) | 1, 1)?;
@@ -3685,7 +3685,7 @@ impl Compiler<'_> {
         };
         if !direct_method && let Some(attribute) = shape.imported_module_callable {
             self.compile_simple_expression_operand(&attribute.value)?;
-            let index = self.name_index(attribute.attr.as_str())?;
+            let index = self.attribute_operand(attribute)?;
             self.assembler
                 .set_location(self.attribute_opcode_location(attribute));
             self.emit(LOAD_ATTR, index << 1, 0)?;
@@ -3811,7 +3811,7 @@ impl Compiler<'_> {
                 == SpecializedLowering::NotApplicable
             {
                 self.compile_expression(&attribute.value)?;
-                let index = self.name_index(attribute.attr.as_str())?;
+                let index = self.attribute_operand(attribute)?;
                 self.assembler
                     .set_location(self.attribute_opcode_location(attribute));
                 self.emit(LOAD_ATTR, (index << 1) | 1, 1)?;
@@ -3831,7 +3831,7 @@ impl Compiler<'_> {
             }
             if let Some(attribute) = shape.imported_module_callable {
                 self.compile_expression(&attribute.value)?;
-                let index = self.name_index(attribute.attr.as_str())?;
+                let index = self.attribute_operand(attribute)?;
                 self.assembler
                     .set_location(self.attribute_opcode_location(attribute));
                 self.emit(LOAD_ATTR, index << 1, 0)?;
@@ -4239,7 +4239,7 @@ impl Compiler<'_> {
             self.compile_expression(&call.arguments.args[1])?;
             self.assembler
                 .set_location(self.source_location(attribute.range));
-            let attribute_index = self.name_index(attribute.attr.as_str())?;
+            let attribute_index = self.attribute_operand(attribute)?;
             self.emit(
                 LOAD_SUPER_ATTR,
                 (attribute_index << 2) | 2 | kind.method_flag(),
@@ -4300,7 +4300,7 @@ impl Compiler<'_> {
         self.emit(receiver_opcode, first_parameter, 1)?;
         self.assembler
             .set_location(self.source_location(attribute.range));
-        let attribute_index = self.name_index(attribute.attr.as_str())?;
+        let attribute_index = self.attribute_operand(attribute)?;
         self.emit(
             LOAD_SUPER_ATTR,
             (attribute_index << 2) | kind.method_flag(),
@@ -9627,9 +9627,9 @@ impl Compiler<'_> {
         self.assembler
             .set_location(self.source_location(name.range()));
         let result = (|| {
-            self.load_name(name.id.as_str())?;
+            self.load_ast_name(name)?;
             if let Some(attribute) = attribute {
-                let index = self.name_index(attribute.attr.as_str())?;
+                let index = self.attribute_operand(attribute)?;
                 self.assembler
                     .set_location(self.attribute_opcode_location(attribute));
                 self.emit(LOAD_ATTR, index << 1, 0)?;
@@ -9670,9 +9670,9 @@ impl Compiler<'_> {
         self.assembler
             .set_location(self.source_location(name.range()));
         let result = (|| {
-            self.load_name(name.id.as_str())?;
+            self.load_ast_name(name)?;
             for attribute in attributes.into_iter().rev() {
-                let index = self.name_index(attribute.attr.as_str())?;
+                let index = self.attribute_operand(attribute)?;
                 self.assembler
                     .set_location(self.attribute_opcode_location(attribute));
                 self.emit(LOAD_ATTR, index << 1, 0)?;
@@ -10470,7 +10470,7 @@ impl Compiler<'_> {
 
     fn compile_store_target_inner(&mut self, expression: &Expr) -> Result<(), CompileError> {
         match expression {
-            Expr::Name(name) => self.store_name(name.id.as_str()),
+            Expr::Name(name) => self.store_ast_name(name),
             Expr::Attribute(attribute) => {
                 if matches!(attribute.value.as_ref(), Expr::Name(name) if name.id.as_str() == "self")
                 {
@@ -10480,7 +10480,7 @@ impl Compiler<'_> {
                     );
                 }
                 self.compile_expression(&attribute.value)?;
-                let index = self.name_index(attribute.attr.as_str())?;
+                let index = self.attribute_operand(attribute)?;
                 self.assembler
                     .set_location(self.attribute_opcode_location(attribute));
                 self.emit(STORE_ATTR, index, -2)
@@ -10557,10 +10557,10 @@ impl Compiler<'_> {
         self.assembler
             .set_location(self.source_location(expression.range()));
         match expression {
-            Expr::Name(name) => self.delete_name(name.id.as_str()),
+            Expr::Name(name) => self.delete_ast_name(name),
             Expr::Attribute(attribute) => {
                 self.compile_expression(&attribute.value)?;
-                let index = self.name_index(attribute.attr.as_str())?;
+                let index = self.attribute_operand(attribute)?;
                 self.emit(DELETE_ATTR, index, -1)
             }
             Expr::Subscript(subscript) => {
