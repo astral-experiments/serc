@@ -1,6 +1,8 @@
 mod graph;
 mod key;
 mod plan;
+#[cfg(feature = "decompile")]
+pub(crate) mod reader;
 mod v4;
 mod v5;
 mod v6;
