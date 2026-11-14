@@ -82,6 +82,20 @@ that timestamp and raw byte length to `to_timestamp_pyc`. This prevents a
 concurrent edit from receiving a cache header that incorrectly marks the new
 source as fresh.
 
+## Decompilation
+
+Enable the `decompile` Cargo feature to recover a complete module from cache
+bytes. The library selects the target from the cache magic and performs no file
+I/O.
+
+```rust
+let cache = serc::compile("answer = 42\n", "module.py")?.to_timestamp_pyc(0, 0);
+let source = serc::decompile_pyc(&cache)?;
+```
+
+`DecompileError` distinguishes reading the cache, reconstructing its scopes and
+verifying the source. See the [coverage report](../../docs/decompilation.md).
+
 ## CPython corpus comparison
 
 The [compatibility guide](../../docs/compatibility.md) documents the frozen

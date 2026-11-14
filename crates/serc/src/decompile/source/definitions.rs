@@ -8,7 +8,7 @@ use crate::PythonVersion;
 use crate::target::{code_flags, local_kinds};
 
 pub(super) struct Definition {
-    id: Id,
+    pub(super) id: Id,
     defaults: Vec<String>,
     keywords: Vec<(String, String)>,
     decorators: Vec<String>,
@@ -32,7 +32,7 @@ pub(super) fn tuple_items(text: &str) -> Result<Vec<String>, String> {
     Ok(tuple.elts.iter().map(render).collect())
 }
 
-fn render(expr: &Expr) -> String {
+pub(super) fn render(expr: &Expr) -> String {
     Generator::new(&Indentation::default(), LineEnding::Lf).expr(expr)
 }
 
@@ -40,10 +40,12 @@ pub(super) struct Import {
     path: String,
     pub(super) members: Vec<(String, String)>,
     from: bool,
+    lazy: bool,
 }
 
 impl Import {
     pub(super) fn statement(&self, binding: &str) -> Result<String, String> {
+        let prefix = if self.lazy { "lazy " } else { "" };
         if self.from {
             if self.members.is_empty() {
                 return Err("unsupported from-import".into());
@@ -59,11 +61,20 @@ impl Import {
                     }
                 })
                 .collect();
-            Ok(format!("from {} import {}", self.path, members.join(", ")))
+            Ok(format!(
+                "{prefix}from {} import {}",
+                self.path,
+                members.join(", ")
+            ))
+        } else if let Some((member, alias)) = self.members.last() {
+            if self.path.split('.').next_back() != Some(member) {
+                return Err("unsupported dotted import binding".into());
+            }
+            Ok(format!("{prefix}import {} as {alias}", self.path))
         } else if self.path.split('.').next() == Some(binding) {
-            Ok(format!("import {}", self.path))
+            Ok(format!("{prefix}import {}", self.path))
         } else {
-            Ok(format!("import {} as {binding}", self.path))
+            Ok(format!("{prefix}import {} as {binding}", self.path))
         }
     }
 }
@@ -75,7 +86,15 @@ impl Body<'_, '_, '_> {
         if level > 255 {
             return Err("relative import too deep".into());
         }
-        let path = self.m.text(self.item(self.code.names, arg)?)?;
+        let (index, lazy) = if self.m.version == PythonVersion::Py315 {
+            (
+                arg >> 2,
+                arg & 3 == crate::target::operands315::ImportMode::LAZY.argument(),
+            )
+        } else {
+            (arg, false)
+        };
+        let path = self.m.text(self.item(self.code.names, index)?)?;
         if !path.is_empty() {
             for part in path.split('.') {
                 identifier(part)?;
@@ -84,6 +103,7 @@ impl Body<'_, '_, '_> {
         self.stack.push(Value::Import(Import {
             path: format!("{}{path}", ".".repeat(level)),
             from,
+            lazy,
             members: Vec::new(),
         }));
         Ok(())
@@ -96,10 +116,10 @@ impl Body<'_, '_, '_> {
         if !self.class
             && let Some(&id) = self.m.tuple(self.code.constants)?.first()
             && matches!(self.m.objects[id], Object::Text { .. })
-            && (self.m.version <= PythonVersion::Py312
+            && (self.m.version <= PythonVersion::Py313
                 || self.code.flags & code_flags::CO_HAS_DOCSTRING != 0)
         {
-            let doc = literal(self.m, id, 0, self.work)?;
+            let doc = literal(self.m, id, 0, &mut self.work.budget)?;
             self.line(&doc)?;
         }
         let kinds = self.m.bytes(self.code.local_kinds)?;
@@ -184,6 +204,7 @@ impl Body<'_, '_, '_> {
                 return Err("expected annotation function".into());
             };
             def.annotations = self.lazy_annotations(annotation.id)?;
+            self.annotation_spellings(def)?;
             return Ok(());
         }
         let text = self.expr()?;
@@ -202,6 +223,7 @@ impl Body<'_, '_, '_> {
                     def.annotations
                         .push((key.value.to_str().to_owned(), pair[1].clone()));
                 }
+                self.annotation_spellings(def)?;
             }
             8 => {
                 tuple_items(&text)?;
@@ -224,6 +246,15 @@ impl Body<'_, '_, '_> {
                 }
             }
             _ => return Err(format!("unsupported function attribute {flag}")),
+        }
+        Ok(())
+    }
+
+    fn annotation_spellings(&self, def: &mut Definition) -> Result<(), String> {
+        if self.code.flags & code_flags::CO_FUTURE_ANNOTATIONS != 0 {
+            for (_, annotation) in &mut def.annotations {
+                *annotation = string_value(annotation)?;
+            }
         }
         Ok(())
     }
@@ -312,6 +343,10 @@ impl Body<'_, '_, '_> {
 
     pub(super) fn definition(&mut self, name: &str, def: &Definition) -> Result<(), String> {
         let code = self.m.code(def.id)?;
+        if self.m.text(code.name)? == "<lambda>" {
+            let expr = self.lambda(def)?;
+            return self.line(&format!("{name} = {expr}"));
+        }
         if self.m.text(code.name)? != name {
             return Err("function binding differs from code name".into());
         }
@@ -329,7 +364,7 @@ impl Body<'_, '_, '_> {
             .annotations
             .iter()
             .find(|(k, _)| k == "return")
-            .map_or_else(String::new, |(_, v)| format!(" -> {v}"));
+            .map_or_else(String::new, |(_, v)| format!(" -> ({v})"));
         let prefix =
             if code.flags & (code_flags::CO_COROUTINE | code_flags::CO_ASYNC_GENERATOR) == 0 {
                 ""
@@ -340,6 +375,29 @@ impl Body<'_, '_, '_> {
             &format!("{prefix}def {name}{generics}({params}){result}:"),
             &body,
         )
+    }
+
+    pub(super) fn lambda(&mut self, def: &Definition) -> Result<String, String> {
+        let code = self.m.code(def.id)?;
+        if self.m.text(code.name)? != "<lambda>" {
+            return Err("expected expression".into());
+        }
+        let params = self.parameters(code, def)?;
+        let body = scope(self.m, def.id, self.depth + 1, false, self.work)?;
+        let expr = body
+            .trim_end()
+            .strip_prefix("return ")
+            .filter(|s| !s.contains('\n'))
+            .ok_or("unsupported lambda body")?;
+        Ok(format!("(lambda {params}: {expr})"))
+    }
+
+    pub(super) fn import_star(&mut self) -> Result<(), String> {
+        let Value::Import(mut import) = self.pop()? else {
+            return Err("expected star import".into());
+        };
+        import.members.push(("*".into(), "*".into()));
+        self.line(&import.statement("")?)
     }
 
     fn parameters(&self, code: &Code, def: &Definition) -> Result<String, String> {
@@ -400,7 +458,10 @@ impl Body<'_, '_, '_> {
 }
 
 impl Body<'_, '_, '_> {
-    fn wrapper(&mut self, id: Id) -> Result<(Body<'_, '_, '_>, super::Bytecode), String> {
+    pub(super) fn wrapper(
+        &mut self,
+        id: Id,
+    ) -> Result<(Body<'_, '_, '_>, super::Bytecode), String> {
         if self.depth >= 32 {
             return Err("wrapper nesting limit exceeded".into());
         }
@@ -422,6 +483,7 @@ impl Body<'_, '_, '_> {
                 lines: String::new(),
                 loop_edges: None,
                 class: false,
+                annotations: Vec::new(),
                 depth: self.depth + 1,
                 work: self.work,
             },
