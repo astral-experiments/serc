@@ -199,7 +199,7 @@ class RenderPreinternedLookupTest(unittest.TestCase):
         self.assertIn("        0x6265 => (3, 4),", rendered)
         self.assertIn("        0x6dc3 => (4, 5),", rendered)
         self.assertIn(
-            "    LINUX_PREINTERNED_STRINGS[start..end].binary_search(&value).is_ok()",
+            "    super::interned_contains(&packed::LINUX_PREINTERNED_STRINGS[start..end], value)",
             rendered,
         )
 
@@ -255,7 +255,7 @@ class RenderPreinternedLookupTest(unittest.TestCase):
                 "        0x6265 => (4, 5),",
                 "        _ => return false,",
                 "    };",
-                "    PREINTERNED_STRINGS[start..end].binary_search(&value).is_ok()",
+                "    super::interned_contains(&packed::PREINTERNED_STRINGS[start..end], value)",
                 "}",
             ],
         )

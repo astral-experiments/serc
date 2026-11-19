@@ -20,6 +20,7 @@
 // Include/internal/pycore_runtime_structs.h: sha256:3d109737636b7a14a6bf786901c55d402715e671adf8f10af3b0dac8b88b7286
 // scripts/target_metadata/cpython_3_15_0rc2_startup.json: sha256:57c1d606a70991d3034184aae59352d3f3810194785b76a7e16b9adb9d066d63
 
+use super::packed_interns::cpython_3_15_0rc2 as packed;
 use super::{Opcode, opcodes};
 
 pub(crate) const TARGET_TAG: &str = "v3.15.0rc2";
@@ -189,6 +190,7 @@ pub(crate) const END_SEND_OFFSET: u32 = 6;
 pub(crate) const SMALL_INT_MIN: i64 = -5;
 pub(crate) const SMALL_INT_MAX: i64 = 1024;
 
+#[cfg(test)]
 pub(crate) static PREINTERNED_STRINGS: &[&str] = &[
     "",
     "%%",
@@ -1156,6 +1158,7 @@ pub(crate) static COMPILER_INTERNED_STRINGS: &[&str] = &[
 
 // Captured before the isolated minimal C reference parses any source.
 // Installation paths are supplied only through an explicit InitialInternState.
+#[cfg(test)]
 pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     ".0",
     "037",
@@ -3813,7 +3816,12 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
 
 pub(crate) fn is_preinterned_string(value: &str) -> bool {
     static STARTUP: std::sync::LazyLock<rustc_hash::FxHashSet<&'static str>> =
-        std::sync::LazyLock::new(|| STARTUP_INTERNED_STRINGS.iter().copied().collect());
+        std::sync::LazyLock::new(|| {
+            packed::STARTUP_INTERNED_STRINGS
+                .iter()
+                .map(|&offset| super::interned_string(offset))
+                .collect()
+        });
     is_preinterned_static_string(value) || (cfg!(target_os = "linux") && STARTUP.contains(value))
 }
 
@@ -4241,9 +4249,7 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x7d7d => (867, 868),
         _ => return false,
     };
-    PREINTERNED_STRINGS[start..end]
-        .binary_search(&value)
-        .is_ok()
+    super::interned_contains(&packed::PREINTERNED_STRINGS[start..end], value)
 }
 pub(crate) const fn has_jump(opcode: Opcode) -> bool {
     matches!(

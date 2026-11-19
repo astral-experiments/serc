@@ -161,6 +161,8 @@ jobs:
         run: python crates/serc/scripts/generate_cpython_target.py --cpython target/cpython --target-version 3.14 --check
       - name: "Check generated Python 3.15 target"
         run: python crates/serc/scripts/generate_cpython_target.py --cpython target/cpython-3.15 --target-version 3.15 --check
+      - name: "Check packed interned strings"
+        run: python crates/serc/scripts/generate_packed_interns.py --check
 
   check-lint:
     name: "clippy on linux"

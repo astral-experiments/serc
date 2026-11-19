@@ -575,14 +575,14 @@ fn compile_byte_source(
         .initial_intern_state
         .models_standard_source_codec_effects()
     {
-        let strings = decoded.codec.map_or(&[][..], |codec| {
-            target::source_codec_strings(options.python_version, codec)
+        let offsets = decoded.codec.map_or(&[][..], |codec| {
+            target::source_codec_string_offsets(options.python_version, codec)
         });
-        if !strings.is_empty() || decoded.registry_name.is_some() {
+        if !offsets.is_empty() || decoded.registry_name.is_some() {
             let state = options.initial_intern_state.with_additional_strings(
-                strings
+                offsets
                     .iter()
-                    .copied()
+                    .map(|&offset| target::interned_string(offset))
                     .chain(decoded.registry_name.as_deref()),
             );
             options.to_mut().initial_intern_state = state;
