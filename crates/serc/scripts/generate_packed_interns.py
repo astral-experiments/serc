@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import argparse
 import ast
+import json
 import re
 import sys
 
 from generate_cpython_target import CRATE_ROOT, TARGETS, format_rust
-from generate_source_codec_interns import MODULES
+from generate_source_codec_interns import MODULES, metadata_path
 
 TARGET_DIR = CRATE_ROOT / "src/target"
 
@@ -43,10 +44,12 @@ def pack_strings(strings: set[str]) -> tuple[bytes, dict[str, int]]:
 
 def generate() -> tuple[bytes, str]:
     tables = {}
-    for version, (tag, *_) in TARGETS.items():
+    for version, (tag, commit, *_) in TARGETS.items():
         module = "cpython_" + tag[1:].replace(".", "_")
         source = (TARGET_DIR / f"{module}.rs").read_text()
-        codec_source = (TARGET_DIR / f"{module}_source_codecs.rs").read_text()
+        metadata = json.loads(metadata_path(tag).read_text())
+        if (metadata["target_tag"], metadata["target_commit"]) != (tag, commit):
+            raise ValueError(f"source-codec metadata does not match {tag} ({commit})")
         profile = (
             "LINUX_PREINTERNED_STRINGS"
             if version == "3.14"
@@ -55,10 +58,7 @@ def generate() -> tuple[bytes, str]:
         tables[module] = {
             "PREINTERNED_STRINGS": string_table(source, "PREINTERNED_STRINGS"),
             profile: string_table(source, profile),
-            **{
-                codec.upper(): string_table(codec_source, codec.upper())
-                for codec in MODULES
-            },
+            **{codec.upper(): metadata["codecs"][codec] for codec in MODULES},
         }
 
     pool, offsets = pack_strings(
