@@ -1,42 +1,53 @@
 //! Metadata for the exact CPython bytecode target.
 
 pub(crate) mod cpython_3_12_14;
-mod cpython_3_12_14_source_codecs;
 pub(crate) mod cpython_3_13_15;
-mod cpython_3_13_15_source_codecs;
 mod cpython_3_14_5;
-mod cpython_3_14_5_source_codecs;
 pub(crate) mod cpython_3_15_0rc2;
-mod cpython_3_15_0rc2_source_codecs;
 mod legacy_opcodes;
+mod packed_interns;
 
 use crate::PythonVersion;
 use crate::source::SourceCodec;
 
+/// Each pool entry starts with the byte length of its UTF-8 payload.
+pub(super) fn interned_string(offset: u16) -> &'static str {
+    const POOL: &str = include_str!("interned.bin");
+    let start = usize::from(offset);
+    let length = usize::from(POOL.as_bytes()[start]);
+    &POOL[start + 1..start + 1 + length]
+}
+
+fn interned_contains(offsets: &[u16], value: &str) -> bool {
+    offsets
+        .binary_search_by(|&offset| interned_string(offset).cmp(value))
+        .is_ok()
+}
+
 /// Source-derived retained strings from a standard codec imported while decoding.
-pub(crate) fn source_codec_strings(
+pub(crate) fn source_codec_string_offsets(
     version: PythonVersion,
     codec: SourceCodec,
-) -> &'static [&'static str] {
+) -> &'static [u16] {
     macro_rules! strings {
         ($module:ident) => {
             match codec {
-                SourceCodec::Ascii => $module::ASCII,
-                SourceCodec::Latin1 => $module::LATIN_1,
-                SourceCodec::Iso885915 => $module::ISO8859_15,
-                SourceCodec::Big5 => $module::BIG5,
-                SourceCodec::EucJp => $module::EUC_JP,
-                SourceCodec::Koi8R => $module::KOI8_R,
-                SourceCodec::Windows1251 => $module::CP1251,
-                SourceCodec::Windows1252 => $module::CP1252,
+                SourceCodec::Ascii => packed_interns::$module::ASCII,
+                SourceCodec::Latin1 => packed_interns::$module::LATIN_1,
+                SourceCodec::Iso885915 => packed_interns::$module::ISO8859_15,
+                SourceCodec::Big5 => packed_interns::$module::BIG5,
+                SourceCodec::EucJp => packed_interns::$module::EUC_JP,
+                SourceCodec::Koi8R => packed_interns::$module::KOI8_R,
+                SourceCodec::Windows1251 => packed_interns::$module::CP1251,
+                SourceCodec::Windows1252 => packed_interns::$module::CP1252,
             }
         };
     }
     match version {
-        PythonVersion::Py312 => strings!(cpython_3_12_14_source_codecs),
-        PythonVersion::Py313 => strings!(cpython_3_13_15_source_codecs),
-        PythonVersion::Py314 => strings!(cpython_3_14_5_source_codecs),
-        PythonVersion::Py315 => strings!(cpython_3_15_0rc2_source_codecs),
+        PythonVersion::Py312 => strings!(cpython_3_12_14),
+        PythonVersion::Py313 => strings!(cpython_3_13_15),
+        PythonVersion::Py314 => strings!(cpython_3_14_5),
+        PythonVersion::Py315 => strings!(cpython_3_15_0rc2),
     }
 }
 

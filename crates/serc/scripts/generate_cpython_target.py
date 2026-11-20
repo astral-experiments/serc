@@ -589,7 +589,7 @@ def render_preinterned_lookup(
         [
             "        _ => return false,",
             "    };",
-            f"    {table_name}[start..end].binary_search(&value).is_ok()",
+            f"    super::interned_contains(&packed::{table_name}[start..end], value)",
             "}",
         ]
     )
@@ -1086,6 +1086,7 @@ def render(sources: dict[str, str]) -> str:
     lines.extend(
         [
             "",
+            f"use super::packed_interns::{OUTPUT.stem} as packed;",
             "use super::Opcode;"
             if TARGET_MINOR == "3.14"
             else "use super::{Opcode, opcodes};",
@@ -1171,8 +1172,7 @@ def render(sources: dict[str, str]) -> str:
             f"pub(crate) const SMALL_INT_MAX: i64 = {small_ints['_PY_NSMALLPOSINTS'] - 1};"
         )
         lines.append("")
-    if TARGET_MINOR == "3.14":
-        lines.append('#[cfg(any(not(target_os = "linux"), test))]')
+    lines.append("#[cfg(test)]")
     lines.append("pub(crate) static PREINTERNED_STRINGS: &[&str] = &[")
     lines.extend(f"    {rust_string_literal(value)}," for value in preinterned_strings)
     lines.extend(["];", ""])
@@ -1209,7 +1209,7 @@ def render(sources: dict[str, str]) -> str:
                 "];",
                 "",
                 "// Use the canonical isolated Linux profile regardless of the Rust host architecture.",
-                '#[cfg(target_os = "linux")]',
+                '#[cfg(all(target_os = "linux", test))]',
                 "#[rustfmt::skip]",
                 "pub(super) static LINUX_PREINTERNED_STRINGS: &[&str] = &[",
             ]
@@ -1237,6 +1237,7 @@ def render(sources: dict[str, str]) -> str:
             [
                 "// Captured before the isolated minimal C reference parses any source.",
                 "// Installation paths are supplied only through an explicit InitialInternState.",
+                "#[cfg(test)]",
                 "pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[",
             ]
         )
@@ -1248,7 +1249,7 @@ def render(sources: dict[str, str]) -> str:
             [
                 "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
                 "    static STARTUP: std::sync::LazyLock<rustc_hash::FxHashSet<&'static str>> =",
-                "        std::sync::LazyLock::new(|| STARTUP_INTERNED_STRINGS.iter().copied().collect());",
+                "        std::sync::LazyLock::new(|| packed::STARTUP_INTERNED_STRINGS.iter().map(|&offset| super::interned_string(offset)).collect());",
                 "    is_preinterned_static_string(value)",
                 '        || (cfg!(target_os = "linux") && STARTUP.contains(value))',
                 "}",
