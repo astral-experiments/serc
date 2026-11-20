@@ -121,9 +121,7 @@ string pool and its per-target offsets from the repository root:
 uv run crates/serc/scripts/generate_packed_interns.py
 ```
 
-Pass `--check` to verify both files against the generated string tables. Run
-`uv run crates/serc/scripts/test_generate_packed_interns.py` to test the packing
-format.
+Pass `--check` to verify both files against the generated string tables.
 
 Adding a target also requires auditing CPython's compiler, assembler,
 code-object, and marshal semantics, wiring parser/oracle selection, and passing
