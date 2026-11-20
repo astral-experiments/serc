@@ -18,12 +18,6 @@ pub(super) fn interned_string(offset: u16) -> &'static str {
     &POOL[start + 1..start + 1 + length]
 }
 
-fn interned_contains(offsets: &[u16], value: &str) -> bool {
-    offsets
-        .binary_search_by(|&offset| interned_string(offset).cmp(value))
-        .is_ok()
-}
-
 /// Source-derived retained strings from a standard codec imported while decoding.
 pub(crate) fn source_codec_string_offsets(
     version: PythonVersion,
@@ -69,7 +63,7 @@ pub(crate) mod opcodes {
 pub(crate) use cpython_3_14_5::operands;
 pub(crate) use cpython_3_14_5::{
     TARGET_COMMIT, TARGET_IMPLEMENTATION, TARGET_MAGIC_NUMBER, TARGET_TAG, TARGET_VERSION,
-    is_conditional_jump, is_preinterned_string, is_unconditional_jump, stack_counts,
+    is_conditional_jump, is_unconditional_jump, stack_counts,
 };
 
 /// Recognizes scope exits across the semantic IR, including legacy constant returns.
@@ -259,12 +253,22 @@ pub(crate) fn stack_counts_for(
 
 /// Checks the selected release's static, startup and compiler interned strings.
 pub(crate) fn is_preinterned_string_for(version: PythonVersion, value: &str) -> bool {
-    match version {
-        PythonVersion::Py312 => cpython_3_12_14::is_preinterned_string(value),
-        PythonVersion::Py313 => cpython_3_13_15::is_preinterned_string(value),
-        PythonVersion::Py314 => is_preinterned_string(value),
-        PythonVersion::Py315 => cpython_3_15_0rc2::is_preinterned_string(value),
-    }
+    static WORDS: std::sync::LazyLock<fst::Map<&'static [u8]>> = std::sync::LazyLock::new(|| {
+        #[cfg(target_os = "linux")]
+        let data: &[u8] = include_bytes!("interned_linux.fst");
+        #[cfg(all(unix, not(target_os = "linux")))]
+        let data: &[u8] = include_bytes!("interned_unix.fst");
+        #[cfg(not(any(unix, target_os = "linux")))]
+        let data: &[u8] = include_bytes!("interned_other.fst");
+        fst::Map::new(data).expect("invalid generated intern map")
+    });
+    let bit = match version {
+        PythonVersion::Py312 => 1,
+        PythonVersion::Py313 => 2,
+        PythonVersion::Py314 => 4,
+        PythonVersion::Py315 => 8,
+    };
+    WORDS.get(value).is_some_and(|versions| versions & bit != 0)
 }
 
 /// Returns inclusive bounds of the target interpreter's cached integer singletons.
@@ -301,7 +305,10 @@ pub(crate) const fn end_send_offset_for(version: PythonVersion) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::cpython_3_14_5::{COMPILER_INTERNED_STRINGS, PREINTERNED_STRINGS};
-    use super::is_preinterned_string;
+
+    fn is_preinterned_string(value: &str) -> bool {
+        super::is_preinterned_string_for(crate::PythonVersion::Py314, value)
+    }
 
     #[test]
     fn python315_opcode_table_preserves_generated_bytes_and_panics() {
@@ -462,9 +469,9 @@ mod tests {
 
     #[test]
     fn python315_interned_lookup_includes_generated_members() {
-        use super::cpython_3_15_0rc2::{
-            COMPILER_INTERNED_STRINGS, PREINTERNED_STRINGS, is_preinterned_string,
-        };
+        use super::cpython_3_15_0rc2::{COMPILER_INTERNED_STRINGS, PREINTERNED_STRINGS};
+        let is_preinterned_string =
+            |value: &str| super::is_preinterned_string_for(crate::PythonVersion::Py315, value);
         assert!(
             PREINTERNED_STRINGS
                 .windows(2)

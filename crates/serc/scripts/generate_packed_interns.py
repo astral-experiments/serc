@@ -3,7 +3,7 @@
 # dependencies = []
 # ///
 
-"""Pack the pinned targets' generated string tables into one UTF-8 pool."""
+"""Build intern lookup maps and a shared pool of source-codec strings."""
 
 from __future__ import annotations
 
@@ -11,9 +11,16 @@ import argparse
 import ast
 import json
 import re
+import subprocess
 import sys
 
-from generate_cpython_target import CRATE_ROOT, TARGETS, format_rust
+from generate_cpython_target import (
+    CRATE_ROOT,
+    STARTUP_INTERNED_STRINGS,
+    TARGETS,
+    UNIX_STARTUP_INTERNED_STRINGS,
+    format_rust,
+)
 from generate_source_codec_interns import MODULES, metadata_path
 
 TARGET_DIR = CRATE_ROOT / "src/target"
@@ -47,24 +54,52 @@ def pack_strings(strings: set[str]) -> tuple[bytes, dict[str, int]]:
     return bytes(pool), offsets
 
 
-def generate() -> tuple[bytes, str]:
+def version_profiles(source: str, version: str) -> dict[str, set[str]]:
+    static = set(string_table(source, "PREINTERNED_STRINGS"))
+    portable = static.union(string_table(source, "COMPILER_INTERNED_STRINGS"))
+    if version == "3.14":
+        linux = set(string_table(source, "LINUX_PREINTERNED_STRINGS"))
+        portable.update(STARTUP_INTERNED_STRINGS)
+        unix = portable.union(UNIX_STARTUP_INTERNED_STRINGS)
+    else:
+        linux = static.union(string_table(source, "STARTUP_INTERNED_STRINGS"))
+        unix = portable
+    return {"linux": linux, "unix": unix, "other": portable}
+
+
+def build_fst(masks: dict[str, int]) -> bytes:
+    return subprocess.run(
+        [
+            "cargo",
+            "run",
+            "--quiet",
+            "--locked",
+            "-p",
+            "serc_fixtures",
+            "--example",
+            "generate-intern-fst",
+        ],
+        cwd=CRATE_ROOT,
+        input=json.dumps(masks).encode(),
+        stdout=subprocess.PIPE,
+        check=True,
+    ).stdout
+
+
+def generate() -> dict[str, bytes]:
     tables = {}
+    masks: dict[str, dict[str, int]] = {"linux": {}, "unix": {}, "other": {}}
     for version, (tag, commit, *_) in TARGETS.items():
         module = "cpython_" + tag[1:].replace(".", "_")
         source = (TARGET_DIR / f"{module}.rs").read_text()
+        bit = 1 << (int(version.removeprefix("3.")) - 12)
+        for platform, words in version_profiles(source, version).items():
+            for word in words:
+                masks[platform][word] = masks[platform].get(word, 0) | bit
         metadata = json.loads(metadata_path(tag).read_text())
         if (metadata["target_tag"], metadata["target_commit"]) != (tag, commit):
             raise ValueError(f"source-codec metadata does not match {tag} ({commit})")
-        profile = (
-            "LINUX_PREINTERNED_STRINGS"
-            if version == "3.14"
-            else "STARTUP_INTERNED_STRINGS"
-        )
-        tables[module] = {
-            "PREINTERNED_STRINGS": string_table(source, "PREINTERNED_STRINGS"),
-            profile: string_table(source, profile),
-            **{codec.upper(): metadata["codecs"][codec] for codec in MODULES},
-        }
+        tables[module] = {codec.upper(): metadata["codecs"][codec] for codec in MODULES}
 
     pool, offsets = pack_strings(
         {
@@ -78,24 +113,24 @@ def generate() -> tuple[bytes, str]:
     for module, target in tables.items():
         lines.append(f"pub(super) mod {module} {{")
         for name, values in target.items():
-            if name == "LINUX_PREINTERNED_STRINGS":
-                lines.append('#[cfg(target_os = "linux")]')
-            elif (
-                name == "PREINTERNED_STRINGS" and "LINUX_PREINTERNED_STRINGS" in target
-            ):
-                lines.append('#[cfg(not(target_os = "linux"))]')
             entries = ", ".join(str(offsets[value]) for value in values)
             lines.append(f"pub(crate) const {name}: &[u16] = &[{entries},];")
         lines.append("}")
-    return pool, format_rust("\n".join(lines))
+    return {
+        "interned.bin": pool,
+        "packed_interns.rs": format_rust("\n".join(lines)).encode(),
+        **{
+            f"interned_{platform}.fst": build_fst(words)
+            for platform, words in masks.items()
+        },
+    }
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--check", action="store_true")
     args = parser.parse_args()
-    pool, rust = generate()
-    for name, content in (("interned.bin", pool), ("packed_interns.rs", rust.encode())):
+    for name, content in generate().items():
         path = TARGET_DIR / name
         if args.check:
             if not path.exists() or path.read_bytes() != content:

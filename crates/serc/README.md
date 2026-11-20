@@ -114,14 +114,17 @@ committed inputs, and records their hashes. Do not hand-edit generated files in
 [Startup supplements](scripts/target_metadata/README.md) require a separately
 verified capture.
 
-After regenerating any target or source-codec string table, rebuild the shared
-string pool and its per-target offsets from the repository root:
+After regenerating any target or source-codec string table, rebuild the intern
+maps and the codec string pool from the repository root:
 
 ```console
 uv run crates/serc/scripts/generate_packed_interns.py
 ```
 
-Pass `--check` to verify both files against the generated string tables.
+Pass `--check` to verify the checked-in files. The generator uses the Rust `fst`
+crate to map each spelling to the Python versions that intern it. Each binary
+embeds the map for its platform. Codec strings stay in a separate pool so the
+decoder can iterate the strings for a single codec.
 
 Adding a target also requires auditing CPython's compiler, assembler,
 code-object, and marshal semantics, wiring parser/oracle selection, and passing

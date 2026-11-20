@@ -112,7 +112,6 @@ def render_legacy_target(sources: dict[str, str], g) -> str:
     lines.extend(
         [
             "",
-            f"use super::packed_interns::{g.OUTPUT.stem} as packed;",
             "use super::{Opcode, opcodes};",
             "",
             f'pub(crate) const TARGET_TAG: &str = "{g.TARGET_TAG}";',
@@ -176,23 +175,6 @@ def render_legacy_target(sources: dict[str, str], g) -> str:
         lines.append(f"pub(crate) static {name}: &[&str] = &[")
         lines.extend(f"    {g.rust_string_literal(value)}," for value in values)
         lines.extend(["];", ""])
-    lines.extend(
-        [
-            "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
-            "    static STARTUP: std::sync::LazyLock<rustc_hash::FxHashSet<&'static str>> =",
-            "        std::sync::LazyLock::new(|| packed::STARTUP_INTERNED_STRINGS.iter().map(|&offset| super::interned_string(offset)).collect());",
-            "    is_preinterned_static_string(value)",
-            '        || (cfg!(target_os = "linux") && STARTUP.contains(value))',
-            "}",
-            "",
-        ]
-    )
-    # Direct C compilation does not initialize builtin compile()'s AST classes.
-    lookup = g.render_preinterned_lookup(
-        static_strings, (), tuple(compiler_strings), compiler_strings_on_linux=False
-    )
-    lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
-    lines.extend(lookup)
     lines.extend(["", "#[allow(dead_code)]", "pub(crate) mod operands {"])
     render_operands(lines, sources, g)
     lines.extend(["}", "", "#[allow(dead_code)]", "pub(crate) mod code_flags {"])

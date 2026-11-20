@@ -19,6 +19,7 @@ workspace = true
 [dependencies]
 dashu-int = { workspace = true }
 encoding_rs = { workspace = true }
+fst = { workspace = true }
 hashbrown = { workspace = true }
 memchr = { workspace = true }
 ruff_index = { workspace = true }

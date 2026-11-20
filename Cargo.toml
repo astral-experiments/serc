@@ -20,6 +20,7 @@ codspeed-criterion-compat = { version = "=4.4.1", default-features = false }
 criterion = { version = "=0.8.0", default-features = false }
 dashu-int = { version = "0.6.2", default-features = false }
 encoding_rs = "0.8.35"
+fst = "0.4.7"
 hashbrown = { version = "0.17.1", default-features = false }
 libmimalloc-sys = { version = "0.1.49", default-features = false }
 memchr = "2.7.6"

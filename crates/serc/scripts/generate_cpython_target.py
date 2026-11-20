@@ -505,97 +505,6 @@ def render_compact_rust_strings(values: list[str]) -> list[str]:
     return lines
 
 
-def render_preinterned_lookup(
-    preinterned_strings: list[str],
-    startup_strings: tuple[str, ...],
-    compiler_strings: tuple[str, ...] = (),
-    table_name: str = "PREINTERNED_STRINGS",
-    *,
-    compiler_strings_on_linux: bool = True,
-) -> list[str]:
-    def prefix(value: str) -> int:
-        encoded = value.encode()
-        return (encoded[0] << 8) | (encoded[1] if len(encoded) > 1 else 0)
-
-    ranges: dict[int, tuple[int, int]] = {}
-    for index, value in enumerate(preinterned_strings):
-        if not value:
-            continue
-        key = prefix(value)
-        if key in ranges:
-            start, end = ranges[key]
-            if end != index:
-                raise ValueError("preinterned prefix ranges are not contiguous")
-            ranges[key] = (start, index + 1)
-        else:
-            ranges[key] = (index, index + 1)
-
-    supplemental: dict[int, list[str]] = {}
-    supplemental_strings = sorted(set(startup_strings) | set(compiler_strings))
-    for value in supplemental_strings:
-        if value and value not in preinterned_strings:
-            supplemental.setdefault(prefix(value), []).append(value)
-
-    empty = str("" in preinterned_strings or "" in supplemental_strings).lower()
-    if (
-        not compiler_strings_on_linux
-        and "" in compiler_strings
-        and "" not in preinterned_strings
-        and "" not in startup_strings
-    ):
-        empty = 'cfg!(not(target_os = "linux"))'
-    lines = [
-        "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
-        "    let prefix = match value.as_bytes() {",
-        f"        [] => return {empty},",
-        "        [first] => u16::from(*first) << 8,",
-        "        [first, second, ..] => u16::from_be_bytes([*first, *second]),",
-        "    };",
-        "    let (start, end) = match prefix {",
-    ]
-    for key in sorted(ranges.keys() | supplemental.keys()):
-        candidates = supplemental.get(key, [])
-        conditions = []
-        for value in candidates:
-            condition = f"value == {rust_string_literal(value)}"
-            if value in UNIX_STARTUP_INTERNED_STRINGS:
-                condition = f"(cfg!(unix) && {condition})"
-            if (
-                not compiler_strings_on_linux
-                and value in compiler_strings
-                and value not in startup_strings
-            ):
-                condition = f'cfg!(not(target_os = "linux")) && {condition}'
-            conditions.append(condition)
-        condition = " || ".join(conditions)
-        if key not in ranges:
-            lines.append(f"        0x{key:04x} => return {condition},")
-            continue
-        start, end = ranges[key]
-        if not candidates:
-            lines.append(f"        0x{key:04x} => ({start}, {end}),")
-            continue
-        lines.extend(
-            [
-                f"        0x{key:04x} => {{",
-                f"            if {condition} {{",
-                "                return true;",
-                "            }",
-                f"            ({start}, {end})",
-                "        }",
-            ]
-        )
-    lines.extend(
-        [
-            "        _ => return false,",
-            "    };",
-            f"    super::interned_contains(&packed::{table_name}[start..end], value)",
-            "}",
-        ]
-    )
-    return lines
-
-
 def parse_opcodes(source: str) -> list[tuple[str, int]]:
     section = source.split("/* Instruction opcodes for compiled code */", 1)[1]
     section = section.split("#define HAVE_ARGUMENT", 1)[0]
@@ -1086,7 +995,6 @@ def render(sources: dict[str, str]) -> str:
     lines.extend(
         [
             "",
-            f"use super::packed_interns::{OUTPUT.stem} as packed;",
             "use super::Opcode;"
             if TARGET_MINOR == "3.14"
             else "use super::{Opcode, opcodes};",
@@ -1215,23 +1123,7 @@ def render(sources: dict[str, str]) -> str:
             ]
         )
         lines.extend(render_compact_rust_strings(linux_preinterned_strings))
-        lines.extend(["];", "", '#[cfg(target_os = "linux")]'])
-        lines.extend(
-            render_preinterned_lookup(
-                linux_preinterned_strings,
-                (),
-                (),
-                "LINUX_PREINTERNED_STRINGS",
-            )
-        )
-        lines.extend(["", '#[cfg(not(target_os = "linux"))]'])
-        lines.extend(
-            render_preinterned_lookup(
-                preinterned_strings,
-                STARTUP_INTERNED_STRINGS + UNIX_STARTUP_INTERNED_STRINGS,
-                tuple(compiler_interned_strings),
-            )
-        )
+        lines.extend(["];", ""])
     else:
         lines.extend(
             [
@@ -1245,25 +1137,6 @@ def render(sources: dict[str, str]) -> str:
             f"    {rust_string_literal(value)}," for value in read_startup_strings()
         )
         lines.extend(["];", ""])
-        lines.extend(
-            [
-                "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
-                "    static STARTUP: std::sync::LazyLock<rustc_hash::FxHashSet<&'static str>> =",
-                "        std::sync::LazyLock::new(|| packed::STARTUP_INTERNED_STRINGS.iter().map(|&offset| super::interned_string(offset)).collect());",
-                "    is_preinterned_static_string(value)",
-                '        || (cfg!(target_os = "linux") && STARTUP.contains(value))',
-                "}",
-                "",
-            ]
-        )
-        lookup = render_preinterned_lookup(
-            preinterned_strings,
-            (),
-            tuple(compiler_interned_strings),
-            compiler_strings_on_linux=False,
-        )
-        lookup[0] = "fn is_preinterned_static_string(value: &str) -> bool {"
-        lines.extend(lookup)
     jumps = {name for name in opcode_names if "HAS_JUMP_FLAG" in opcode_flags[name]}
     expression = opcode_match_expression(opcodes, jumps)
     if TARGET_MINOR == "3.14":

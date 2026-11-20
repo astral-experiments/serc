@@ -9,6 +9,8 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
+from generate_packed_interns import version_profiles
+
 SCRIPT = Path(__file__).with_name("generate_cpython_target.py")
 SPEC = importlib.util.spec_from_file_location("generate_cpython_target", SCRIPT)
 assert SPEC is not None and SPEC.loader is not None
@@ -173,7 +175,7 @@ class NumericAuthorityTest(unittest.TestCase):
                                 path.write_text("")
 
 
-class RenderPreinternedLookupTest(unittest.TestCase):
+class RenderStringTableTest(unittest.TestCase):
     def test_escapes_rust_string_literals(self) -> None:
         self.assertEqual(
             generator.rust_string_literal('quote" slash\\ \n\r\t\0 ☃\x01\x7f'),
@@ -187,78 +189,31 @@ class RenderPreinternedLookupTest(unittest.TestCase):
             [f'    "{long}",', '    "quote\\"", "two words",'],
         )
 
-    def test_renders_combined_strings_against_the_named_table(self) -> None:
-        static = ["", "alpha", "beta"]
-        bootstrap = ["alpine", "beta", "méthode"]
-        rendered = generator.render_preinterned_lookup(
-            sorted(set(static) | set(bootstrap)),
-            ("albatross",),
-            table_name="LINUX_PREINTERNED_STRINGS",
-        )
-        self.assertIn("            (1, 3)", rendered)
-        self.assertIn("        0x6265 => (3, 4),", rendered)
-        self.assertIn("        0x6dc3 => (4, 5),", rendered)
-        self.assertIn(
-            "    super::interned_contains(&packed::LINUX_PREINTERNED_STRINGS[start..end], value)",
-            rendered,
-        )
 
-    def test_gates_unix_startup_candidates(self) -> None:
-        rendered = generator.render_preinterned_lookup(
-            ["package"], ("patterns", "pause")
-        )
-        self.assertIn(
-            '            if value == "patterns" || (cfg!(unix) && value == "pause") {',
-            rendered,
-        )
+class InternProfilesTest(unittest.TestCase):
+    def test_platform_and_target_membership(self) -> None:
+        source = """
+static PREINTERNED_STRINGS: &[&str] = &["", "static",
+];
+static COMPILER_INTERNED_STRINGS: &[&str] = &["compiler",
+];
+static STARTUP_INTERNED_STRINGS: &[&str] = &["startup",
+];
+static LINUX_PREINTERNED_STRINGS: &[&str] = &["", "static", "captured",
+];
+"""
+        for version in ("3.12", "3.13", "3.15"):
+            profiles = version_profiles(source, version)
+            self.assertEqual(profiles["linux"], {"", "static", "startup"})
+            self.assertEqual(profiles["other"], {"", "static", "compiler"})
+            self.assertEqual(profiles["unix"], profiles["other"])
 
-    def test_preserves_compiler_aliases_only_in_non_linux_fallback(self) -> None:
-        arguments = (["static"], ("retained",), ("", "left", "retained", "static"))
-        original = generator.render_preinterned_lookup(*arguments)
-        native = generator.render_preinterned_lookup(
-            *arguments, compiler_strings_on_linux=False
-        )
-        self.assertIn("        [] => return true,", original)
-        self.assertIn('        0x6c65 => return value == "left",', original)
-        self.assertIn('        [] => return cfg!(not(target_os = "linux")),', native)
-        self.assertIn(
-            '        0x6c65 => return cfg!(not(target_os = "linux")) && value == "left",',
-            native,
-        )
-        for lines in [original, native]:
-            self.assertIn('        0x7265 => return value == "retained",', lines)
-            self.assertIn("        0x7374 => (0, 1),", lines)
-
-    def test_renders_exact_prefix_ranges_and_startup_candidates(self) -> None:
-        self.assertEqual(
-            generator.render_preinterned_lookup(
-                ["", "a", "alpha", "alpine", "beta"],
-                ("500", "albatross", "ascii"),
-            ),
-            [
-                "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
-                "    let prefix = match value.as_bytes() {",
-                "        [] => return true,",
-                "        [first] => u16::from(*first) << 8,",
-                "        [first, second, ..] => u16::from_be_bytes([*first, *second]),",
-                "    };",
-                "    let (start, end) = match prefix {",
-                '        0x3530 => return value == "500",',
-                "        0x6100 => (1, 2),",
-                "        0x616c => {",
-                '            if value == "albatross" {',
-                "                return true;",
-                "            }",
-                "            (2, 4)",
-                "        }",
-                '        0x6173 => return value == "ascii",',
-                "        0x6265 => (4, 5),",
-                "        _ => return false,",
-                "    };",
-                "    super::interned_contains(&packed::PREINTERNED_STRINGS[start..end], value)",
-                "}",
-            ],
-        )
+        profiles = version_profiles(source, "3.14")
+        self.assertEqual(profiles["linux"], {"", "static", "captured"})
+        self.assertIn("compiler", profiles["other"])
+        self.assertIn("MISSING", profiles["other"])
+        self.assertNotIn("pause", profiles["other"])
+        self.assertEqual(profiles["unix"], profiles["other"] | {"pause"})
 
 
 class TargetSelectionTest(unittest.TestCase):
