@@ -1,3 +1,8 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+
 """Check the boundaries shared by the intern pool generator and its Rust reader."""
 
 from __future__ import annotations
@@ -29,3 +34,7 @@ class PackedInternTests(unittest.TestCase):
             pack_strings({"é" * 64})
         with self.assertRaisesRegex(ValueError, "offset range"):
             pack_strings({f"{i:0127d}" for i in range(513)})
+
+
+if __name__ == "__main__":
+    unittest.main()

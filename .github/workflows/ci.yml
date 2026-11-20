@@ -51,7 +51,8 @@ jobs:
       - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.14.5"
-      - uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
+      - &setup-uv
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
           version: "0.13.5"
           checksum: "f68d291c75783122dad58ab77def0e13f3233f358731db5d6d7e8715603b928f"
@@ -143,6 +144,7 @@ jobs:
           persist-credentials: false
           sparse-checkout: mypy_primer/projects.py
           sparse-checkout-cone-mode: false
+      - *setup-uv
       - name: "Install Rustfmt"
         run: rustup component add rustfmt
       - name: "Check Ruff revision"
@@ -152,7 +154,7 @@ jobs:
       - name: "Check mypy_primer catalog"
         run: python scripts/mypy_primer_corpus.py check-catalog --primer-checkout target/mypy_primer
       - name: "Test target generator"
-        run: python -m unittest discover -s crates/serc/scripts -p 'test_*.py'
+        run: uv run --no-project -m unittest discover -s crates/serc/scripts -p 'test_*.py'
       - name: "Check generated Python 3.12 target"
         run: python crates/serc/scripts/generate_cpython_target.py --cpython target/cpython-3.12 --target-version 3.12 --check
       - name: "Check generated Python 3.13 target"
@@ -162,7 +164,7 @@ jobs:
       - name: "Check generated Python 3.15 target"
         run: python crates/serc/scripts/generate_cpython_target.py --cpython target/cpython-3.15 --target-version 3.15 --check
       - name: "Check packed interned strings"
-        run: python crates/serc/scripts/generate_packed_interns.py --check
+        run: uv run crates/serc/scripts/generate_packed_interns.py --check
 
   check-lint:
     name: "clippy on linux"

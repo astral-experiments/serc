@@ -1,3 +1,8 @@
+# /// script
+# requires-python = ">=3.10"
+# dependencies = []
+# ///
+
 """Pack the pinned targets' generated string tables into one UTF-8 pool."""
 
 from __future__ import annotations
