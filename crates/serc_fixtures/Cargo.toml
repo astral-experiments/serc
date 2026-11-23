@@ -17,3 +17,7 @@ doctest = false
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+fst = { workspace = true }
+serde_json = { workspace = true }
