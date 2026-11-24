@@ -91,6 +91,9 @@ impl Body<'_, '_, '_> {
         end: usize,
         level: usize,
     ) -> Result<(), String> {
+        if crate::stack_growth_required() {
+            return crate::grow_stack(|| self.region(ops, start, end, level));
+        }
         if level > 32 || end > ops.len() || start > end {
             return Err("unsupported region bounds or nesting".into());
         }
@@ -98,6 +101,62 @@ impl Body<'_, '_, '_> {
         while i < end {
             let op = ops[i];
             let next = match op.name {
+                "CALL_INTRINSIC_1"
+                    if op.arg
+                        == crate::target::operands::UnaryIntrinsic::IMPORT_STAR.argument()
+                        && i + 1 < end
+                        && ops[i + 1].name == "POP_TOP" =>
+                {
+                    self.import_star()?;
+                    Ok(i + 2)
+                }
+                "COPY"
+                    if op.arg == 1
+                        && i + 1 < end
+                        && matches!(
+                            ops[i + 1].name,
+                            "STORE_FAST" | "STORE_NAME" | "STORE_DEREF" | "STORE_GLOBAL"
+                        ) =>
+                {
+                    let rhs = self.expr()?;
+                    let store = ops[i + 1];
+                    let table = if matches!(store.name, "STORE_NAME" | "STORE_GLOBAL") {
+                        self.code.names
+                    } else {
+                        self.code.locals
+                    };
+                    let lhs = self.name(table, store.arg)?;
+                    self.push(format!("({lhs} := {rhs})"))?;
+                    Ok(i + 2)
+                }
+                "SET_ADD"
+                    if i + 1 < end
+                        && ops[i + 1].name == "POP_TOP"
+                        && !self.annotations.is_empty() =>
+                {
+                    self.annotation_site()?;
+                    Ok(i + 2)
+                }
+                "SWAP"
+                    if op.arg == 2
+                        && i + 1 < end
+                        && ops[i + 1].name == "POP_TOP"
+                        && matches!(
+                            self.stack.as_slice(),
+                            [.., Value::Import(_), Value::Member(_)]
+                        ) =>
+                {
+                    // A dotted import walks the package before binding its final member.
+                    self.pop()?;
+                    Ok(i + 2)
+                }
+                "KW_NAMES" if i + 1 < end && ops[i + 1].name == "CALL" => {
+                    self.constant(op.arg)?;
+                    let keys = self.expr()?;
+                    self.keyword_call(ops[i + 1].arg, &keys)?;
+                    Ok(i + 2)
+                }
+                "UNPACK_SEQUENCE" => self.unpack_names(ops, i, end),
                 "RETURN_GENERATOR" if i + 1 < end && ops[i + 1].name == "POP_TOP" => Ok(i + 2),
                 "GET_AWAITABLE" | "GET_YIELD_FROM_ITER" => self.delegated(ops, i, end),
                 "GET_ITER"
@@ -279,14 +338,43 @@ impl Body<'_, '_, '_> {
             return Err("unsupported conditional destination".into());
         }
         let value = self.expr()?;
+        let start = i + 1 + usize::from(ops.get(i + 1).is_some_and(|op| op.name == "NOT_TAKEN"));
+        let tail = target - 1;
+        if start < tail
+            && ops[tail].name == "RAISE_VARARGS"
+            && ops[tail].arg == 1
+            && (ops[start].name == "LOAD_ASSERTION_ERROR"
+                || (ops[start].name == "LOAD_COMMON_CONSTANT"
+                    && ops[start].arg
+                        == crate::target::operands315::CommonConstant::ASSERTIONERROR.argument()))
+        {
+            let test = if ops[i].name == "POP_JUMP_IF_TRUE" {
+                value
+            } else if ops[i].name == "POP_JUMP_IF_FALSE" {
+                format!("not ({value})")
+            } else {
+                return Err("unsupported assertion condition".into());
+            };
+            let msg = if start + 1 == tail {
+                String::new()
+            } else if ops[tail - 1].name == "CALL" {
+                format!(
+                    ", {}",
+                    self.fragment(ops, start + 1, tail - 1, level)?
+                        .expression()?
+                )
+            } else {
+                return Err("unsupported assertion argument".into());
+            };
+            self.line(&format!("assert {test}{msg}"))?;
+            return Ok(target);
+        }
         let test = match ops[i].name {
             "POP_JUMP_IF_FALSE" => value,
             "POP_JUMP_IF_TRUE" => format!("not ({value})"),
             "POP_JUMP_IF_NONE" => format!("({value}) is not None"),
             _ => format!("({value}) is None"),
         };
-        let start = i + 1 + usize::from(ops.get(i + 1).is_some_and(|op| op.name == "NOT_TAKEN"));
-        let tail = target - 1;
         if self.loop_transfer(ops, tail).is_some() {
             let suite = self.fragment(ops, start, target, level)?.suite()?;
             self.block(&format!("if {test}:"), &suite)?;

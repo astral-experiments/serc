@@ -71,6 +71,20 @@ Pass `--force` (or `-f`) to recompile every file, for example after switching
 compilers or native build profiles. (Even with `--force`, Serc refuses to
 overwrite symlinks or special files.)
 
+### Recovering source from a cache file
+
+Build the CLI with the optional `decompile` feature to recover Python source
+from a `.pyc` on a supported target. The cache file's magic selects the target.
+
+```console
+cargo run --locked -p serc-cli --features decompile -- decompile __pycache__/hello.cpython-314.pyc
+```
+
+The command prints a module only after its reconstructed source passes
+verification. If any nested scope fails, the command exits with status 2 and
+writes the reason to stderr. See the
+[coverage and limitations](docs/decompilation.md).
+
 ### Python version
 
 Serc emits Python 3.14-compatible bytecode by default, but supports target
