@@ -50,7 +50,7 @@ impl Body<'_, '_, '_> {
         })
     }
 
-    fn block(&mut self, header: &str, suite: &str) -> Result<(), String> {
+    pub(super) fn block(&mut self, header: &str, suite: &str) -> Result<(), String> {
         self.line(header)?;
         if suite.is_empty() {
             self.line("    pass")?;
