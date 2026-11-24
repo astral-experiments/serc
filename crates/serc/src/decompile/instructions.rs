@@ -61,6 +61,9 @@ impl Bytecode {
                     return Err(format!("too many EXTENDED_ARG prefixes at byte {offset}"));
                 }
             };
+            if arg > i32::MAX.cast_unsigned() {
+                return Err(format!("invalid signed operand at byte {offset}"));
+            }
             if opcode == opcodes::CACHE {
                 return Err(format!("unexpected CACHE at byte {offset}"));
             }
@@ -81,7 +84,9 @@ impl Bytecode {
                     .ok_or("jump operand overflow")?;
                 let dest = if matches!(
                     opcode,
-                    opcodes::JUMP_BACKWARD | opcodes::JUMP_BACKWARD_NO_INTERRUPT
+                    opcodes::JUMP_BACKWARD
+                        | opcodes::JUMP_BACKWARD_NO_INTERRUPT
+                        | opcodes::END_ASYNC_FOR
                 ) {
                     end.checked_sub(distance)
                 } else {

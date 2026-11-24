@@ -1,14 +1,16 @@
 //! Structure a slice of the instruction graph. Each arm gets a fresh operand
 //! stack; values that survive a join must be expressible as a Python expression.
+use std::fmt::Write as _;
+
 use super::{Body, Instruction, Value};
 
-struct Fragment {
+pub(super) struct Fragment {
     lines: String,
-    stack: Vec<Value>,
+    pub(super) stack: Vec<Value>,
 }
 
 impl Fragment {
-    fn expression(mut self) -> Result<String, String> {
+    pub(super) fn expression(mut self) -> Result<String, String> {
         if self.lines.is_empty()
             && self.stack.len() == 1
             && let Some(Value::Expr(value)) = self.stack.pop()
@@ -18,7 +20,17 @@ impl Fragment {
             Err("region is not a single expression".into())
         }
     }
-    fn suite(self) -> Result<String, String> {
+    pub(super) fn pending_return(mut self) -> Result<(String, bool), String> {
+        match self.stack.pop() {
+            None => Ok((self.lines, false)),
+            Some(Value::Expr(value)) if self.stack.is_empty() => {
+                writeln!(self.lines, "return {value}").unwrap();
+                Ok((self.lines, true))
+            }
+            _ => Err("unsupported protected stack outcome".into()),
+        }
+    }
+    pub(super) fn suite(self) -> Result<String, String> {
         if self.stack.is_empty() {
             Ok(self.lines)
         } else {
@@ -34,14 +46,25 @@ fn destination(ops: &[Instruction], i: usize) -> Result<usize, String> {
 }
 
 impl Body<'_, '_, '_> {
-    fn fragment(
+    pub(super) fn fragment(
         &mut self,
         ops: &[Instruction],
         start: usize,
         end: usize,
         level: usize,
     ) -> Result<Fragment, String> {
-        let outer_stack = std::mem::take(&mut self.stack);
+        self.seeded(ops, start, end, level, Vec::new())
+    }
+
+    pub(super) fn seeded(
+        &mut self,
+        ops: &[Instruction],
+        start: usize,
+        end: usize,
+        level: usize,
+        stack: Vec<Value>,
+    ) -> Result<Fragment, String> {
+        let outer_stack = std::mem::replace(&mut self.stack, stack);
         let outer_lines = std::mem::take(&mut self.lines);
         self.region(ops, start, end, level + 1)?;
         Ok(Fragment {
@@ -75,6 +98,25 @@ impl Body<'_, '_, '_> {
         while i < end {
             let op = ops[i];
             let next = match op.name {
+                "RETURN_GENERATOR" if i + 1 < end && ops[i + 1].name == "POP_TOP" => Ok(i + 2),
+                "GET_AWAITABLE" | "GET_YIELD_FROM_ITER" => self.delegated(ops, i, end),
+                "GET_ITER"
+                    if ops
+                        .get(i + 1)
+                        .is_some_and(|next| next.name == "CALL" && next.arg == 0) =>
+                {
+                    Ok(i + 1)
+                }
+                "GET_ITER" if self.m.version == crate::PythonVersion::Py315 && op.arg == 3 => {
+                    self.delegated(ops, i, end)
+                }
+                "GET_AITER" if i + 1 < end && ops[i + 1].name == "GET_ANEXT" => {
+                    self.async_loop(ops, i, end, level)
+                }
+                "GET_ITER" if i + 1 < end && ops[i + 1].name == "LOAD_FAST_AND_CLEAR" => {
+                    self.comprehension(ops, i + 1, end, level)
+                }
+                "LOAD_FAST_AND_CLEAR" => self.comprehension(ops, i, end, level),
                 "JUMP_BACKWARD" | "JUMP_FORWARD" if self.loop_transfer(ops, i).is_some() => {
                     self.line(self.loop_transfer(ops, i).unwrap())?;
                     Ok(i + 1)
@@ -88,6 +130,15 @@ impl Body<'_, '_, '_> {
                                 && self.loop_transfer(ops, i + 2) == Some("break"))) =>
                 {
                     Ok(i + 1)
+                }
+                "MATCH_SEQUENCE" | "MATCH_MAPPING" | "MATCH_CLASS" => {
+                    self.match_cases(ops, i, end, level)
+                }
+                "COPY"
+                    if i + 1 < end
+                        && matches!(ops[i + 1].name, "MATCH_SEQUENCE" | "MATCH_MAPPING") =>
+                {
+                    self.match_cases(ops, i, end, level)
                 }
                 "COPY" if op.arg == 1 => self.boolean(ops, i, end, level),
                 "GET_ITER" if ops.get(i + 1).is_some_and(|next| next.name == "FOR_ITER") => {
