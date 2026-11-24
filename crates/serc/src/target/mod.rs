@@ -144,6 +144,16 @@ static OPCODE_CODES_315: [Option<u8>; 256] = {
 };
 
 impl Opcode {
+    #[cfg(feature = "decompile")]
+    pub(crate) fn from_wire(version: PythonVersion, byte: u8) -> Option<(Self, &'static str)> {
+        match version {
+            PythonVersion::Py312 => cpython_3_12_14::decode_opcode(byte),
+            PythonVersion::Py313 => cpython_3_13_15::decode_opcode(byte),
+            PythonVersion::Py314 => cpython_3_14_5::decode_opcode(byte),
+            PythonVersion::Py315 => cpython_3_15_0rc2::decode_opcode(byte),
+        }
+    }
+
     /// Read mnemonics from the same generated metadata that defines the IR opcodes.
     #[cfg(test)]
     pub(crate) fn name(self) -> &'static str {
