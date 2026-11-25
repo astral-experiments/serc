@@ -165,7 +165,9 @@ Update the fixture's pinned digest in
 [`generate_cpython_target.py`](../generate_cpython_target.py), then
 [regenerate and check the target](../../README.md#updating-the-cpython-target).
 
-Source-codec intern strings are generated separately for each supported target.
+Each `*_source_codecs.json` file contains the source-codec intern strings for
+one supported target and the hashes of its CPython inputs.
+
 Byte-source decoding may load a standard codec before compilation; the generated
 sets describe names made immortal by its code objects and strings retained by
 its codec module, plus the CJK mapping exports. Generation reads only files from

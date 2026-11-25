@@ -29,6 +29,7 @@
 // scripts/target_metadata/cpython_3_14_5_startup.json: sha256:2f4c1896da530468f57bd870ae893498da6e84b93c93dabfe773a1c4bd828bc5
 
 use super::Opcode;
+use super::packed_interns::cpython_3_14_5 as packed;
 
 pub(crate) const TARGET_TAG: &str = "v3.14.5";
 pub(crate) const TARGET_COMMIT: &str = "5607950ef232dad16d75c0cf53101d9649d89115";
@@ -191,7 +192,7 @@ impl Opcode {
     }
 }
 
-#[cfg(any(not(target_os = "linux"), test))]
+#[cfg(test)]
 pub(crate) static PREINTERNED_STRINGS: &[&str] = &[
     "",
     "%%",
@@ -2117,7 +2118,7 @@ pub(crate) static BOOTSTRAP_INTERNED_STRINGS: &[&str] = &[
 ];
 
 // Use the canonical isolated Linux profile regardless of the Rust host architecture.
-#[cfg(target_os = "linux")]
+#[cfg(all(target_os = "linux", test))]
 #[rustfmt::skip]
 pub(super) static LINUX_PREINTERNED_STRINGS: &[&str] = &[
     "", "%%", ".0", ".<locals>", ".defaults", ".format", ".generic_base", ".kwdefaults",
@@ -3160,9 +3161,7 @@ pub(crate) fn is_preinterned_string(value: &str) -> bool {
         0x7d7d => (3314, 3315),
         _ => return false,
     };
-    LINUX_PREINTERNED_STRINGS[start..end]
-        .binary_search(&value)
-        .is_ok()
+    super::interned_contains(&packed::LINUX_PREINTERNED_STRINGS[start..end], value)
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -3652,9 +3651,7 @@ pub(crate) fn is_preinterned_string(value: &str) -> bool {
         0x7d7d => (777, 778),
         _ => return false,
     };
-    PREINTERNED_STRINGS[start..end]
-        .binary_search(&value)
-        .is_ok()
+    super::interned_contains(&packed::PREINTERNED_STRINGS[start..end], value)
 }
 
 impl Opcode {

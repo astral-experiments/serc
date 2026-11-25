@@ -114,6 +114,15 @@ committed inputs, and records their hashes. Do not hand-edit generated files in
 [Startup supplements](scripts/target_metadata/README.md) require a separately
 verified capture.
 
+After regenerating any target or source-codec string table, rebuild the shared
+string pool and its per-target offsets from the repository root:
+
+```console
+uv run crates/serc/scripts/generate_packed_interns.py
+```
+
+Pass `--check` to verify both files against the generated string tables.
+
 Adding a target also requires auditing CPython's compiler, assembler,
 code-object, and marshal semantics, wiring parser/oracle selection, and passing
 the [compatibility gates](../../docs/compatibility.md). Generated tables alone

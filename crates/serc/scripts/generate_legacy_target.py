@@ -112,6 +112,7 @@ def render_legacy_target(sources: dict[str, str], g) -> str:
     lines.extend(
         [
             "",
+            f"use super::packed_interns::{g.OUTPUT.stem} as packed;",
             "use super::{Opcode, opcodes};",
             "",
             f'pub(crate) const TARGET_TAG: &str = "{g.TARGET_TAG}";',
@@ -171,8 +172,7 @@ def render_legacy_target(sources: dict[str, str], g) -> str:
         ("COMPILER_INTERNED_STRINGS", compiler_strings),
         ("STARTUP_INTERNED_STRINGS", startup_strings),
     ):
-        if name == "COMPILER_INTERNED_STRINGS":
-            lines.append("#[cfg(test)]")
+        lines.append("#[cfg(test)]")
         lines.append(f"pub(crate) static {name}: &[&str] = &[")
         lines.extend(f"    {g.rust_string_literal(value)}," for value in values)
         lines.extend(["];", ""])
@@ -180,7 +180,7 @@ def render_legacy_target(sources: dict[str, str], g) -> str:
         [
             "pub(crate) fn is_preinterned_string(value: &str) -> bool {",
             "    static STARTUP: std::sync::LazyLock<rustc_hash::FxHashSet<&'static str>> =",
-            "        std::sync::LazyLock::new(|| STARTUP_INTERNED_STRINGS.iter().copied().collect());",
+            "        std::sync::LazyLock::new(|| packed::STARTUP_INTERNED_STRINGS.iter().map(|&offset| super::interned_string(offset)).collect());",
             "    is_preinterned_static_string(value)",
             '        || (cfg!(target_os = "linux") && STARTUP.contains(value))',
             "}",

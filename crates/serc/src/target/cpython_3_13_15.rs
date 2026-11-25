@@ -20,6 +20,7 @@
 // Lib/_opcode_metadata.py: sha256:9a27d5830732442110b5945ddac1668db17abb51c44882ba9d4a8536bcc0ea1c
 // scripts/target_metadata/cpython_3_13_15_startup.json: sha256:8304f6b6c8a3b1004ca1423686d2e856ec0309c3133ea91772daca87eb061124
 
+use super::packed_interns::cpython_3_13_15 as packed;
 use super::{Opcode, opcodes};
 
 pub(crate) const TARGET_TAG: &str = "v3.13.15";
@@ -212,6 +213,7 @@ pub(crate) const fn is_conditional_jump(opcode: Opcode) -> bool {
     )
 }
 
+#[cfg(test)]
 pub(crate) static PREINTERNED_STRINGS: &[&str] = &[
     "",
     "%%",
@@ -1046,6 +1048,7 @@ pub(crate) static COMPILER_INTERNED_STRINGS: &[&str] = &[
     "vararg",
 ];
 
+#[cfg(test)]
 pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
     ".0",
     "037",
@@ -3620,7 +3623,12 @@ pub(crate) static STARTUP_INTERNED_STRINGS: &[&str] = &[
 
 pub(crate) fn is_preinterned_string(value: &str) -> bool {
     static STARTUP: std::sync::LazyLock<rustc_hash::FxHashSet<&'static str>> =
-        std::sync::LazyLock::new(|| STARTUP_INTERNED_STRINGS.iter().copied().collect());
+        std::sync::LazyLock::new(|| {
+            packed::STARTUP_INTERNED_STRINGS
+                .iter()
+                .map(|&offset| super::interned_string(offset))
+                .collect()
+        });
     is_preinterned_static_string(value) || (cfg!(target_os = "linux") && STARTUP.contains(value))
 }
 
@@ -4033,9 +4041,7 @@ fn is_preinterned_static_string(value: &str) -> bool {
         0x7d7d => (739, 740),
         _ => return false,
     };
-    PREINTERNED_STRINGS[start..end]
-        .binary_search(&value)
-        .is_ok()
+    super::interned_contains(&packed::PREINTERNED_STRINGS[start..end], value)
 }
 
 #[allow(dead_code)]
