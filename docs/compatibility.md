@@ -73,6 +73,12 @@ retains the filename argument and a second reference to the root code object as
 a Python caller would. The `minimal-v2` protocol fixes this ownership across
 Python versions and rejects older reference artifacts.
 
+Byte comparisons with `compileall` also require the same initial intern state.
+Imports and earlier compilations in a reused Python process can change constant
+sharing, including frozensets, without changing decoded code fields. The
+library's `InitialInternState` can model a fixed bootstrap; the CLI defaults to
+the isolated startup state above.
+
 The Linux 3.12 through 3.15 default startup tables are captured from this C
 protocol, not from builtin `compile()` and its AST-type initialization. Their
 generated inputs bind the reference source and two independent native startup

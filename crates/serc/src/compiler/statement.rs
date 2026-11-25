@@ -3099,6 +3099,13 @@ impl<'source> Compiler<'source> {
                     || (self.context.python_version <= crate::PythonVersion::Py313
                         && body.len() > 1
                         && (self.control.withs.active_with_exits.is_empty()
+                            // An iterator entered inside the manager owns its
+                            // unlocated backedge before manager cleanup begins.
+                            || self.control.loops.contexts.last().is_some_and(|context| {
+                                context.with_depth > 0
+                                    && context.with_depth
+                                        == self.control.withs.active_with_exits.len()
+                            })
                             || self.control.exceptions.active_exception_handlers.last().is_some_and(
                                 |handler| {
                                     // A direct handler tail owns its Pass even inside a

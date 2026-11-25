@@ -1,4 +1,6 @@
-use crate::{common, startup_reference};
+use crate::common;
+#[cfg(target_os = "linux")]
+use crate::startup_reference;
 
 #[test]
 fn matches_cpython_frozenset_tuple_marshal_order() {
